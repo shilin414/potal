@@ -1,0 +1,208 @@
+/* Theme variables must load before Tailwind */
+@import './variables.css';
+@import './tailwind.css';
+
+/* Google Fonts for design spec typography */
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;700&display=swap');
+
+/* ============================================
+   Keyframe Animations (from design-mockup.html)
+   ============================================ */
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeInScale {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+@keyframes slideInRight {
+  from { opacity: 0; transform: translateX(16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes typingDot {
+  0%, 60%, 100% { opacity: 0.2; transform: translateY(0); }
+  30%           { opacity: 1;   transform: translateY(-4px); }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes logoReveal {
+  0%   { opacity: 0; letter-spacing: 0.3em; filter: blur(8px); }
+  100% { opacity: 1; letter-spacing: 0;     filter: blur(0); }
+}
+
+@keyframes orbFloat {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  25%      { transform: translate(30px, -20px) scale(1.05); }
+  50%      { transform: translate(-10px, 15px) scale(0.95); }
+  75%      { transform: translate(-25px, -10px) scale(1.02); }
+}
+
+/* ============================================
+   Global Reset & Base Styles
+   ============================================ */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  color: var(--color-text);
+  background-color: var(--color-bg-void);
+  transition: background-color 0.3s ease, color 0.3s ease;
+  overflow: hidden;
+}
+
+#root {
+  width: 100%;
+  height: 100vh;
+  overflow: hidden;
+}
+
+::selection {
+  background: var(--color-primary);
+  color: var(--color-bg-void);
+}
+
+a {
+  color: var(--color-primary);
+  text-decoration: none;
+}
+
+a:hover {
+  color: #F0C060;
+}
+
+/* Smooth theme transition on all elements */
+*,
+*::before,
+*::after {
+  transition-property: background-color, border-color, color, box-shadow;
+  transition-duration: 0.2s;
+  transition-timing-function: ease;
+}
+
+/* ============================================
+   App Layout (matches mockup CSS Grid)
+   ============================================ */
+
+.app-layout {
+  display: grid;
+  height: 100vh;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  grid-template-rows: var(--header-h) 1fr;
+  grid-template-areas:
+    "header header"
+    "sidebar main";
+  animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Variant: header + main only, no left sidebar (e.g. launched app in its own tab) */
+.app-layout--nosidebar {
+  grid-template-columns: 1fr;
+  grid-template-areas:
+    "header"
+    "main";
+}
+
+/* Variant: fullscreen launched-app view — no header, no sidebar, main fills the viewport */
+.app-layout--noheader {
+  grid-template-columns: 1fr;
+  grid-template-rows: 1fr;
+  grid-template-areas: "main";
+}
+
+.app-layout > header {
+  grid-area: header;
+}
+
+.app-layout-body {
+  grid-area: auto;
+  display: contents;
+}
+
+.app-layout-body > aside {
+  grid-area: sidebar;
+}
+
+.app-main {
+  grid-area: main;
+  overflow: hidden;
+  position: relative;
+  background: var(--color-bg-void);
+}
+
+.app-main--padded {
+  overflow-y: auto;
+  padding: 32px;
+}
+
+/* ============================================
+   Ant Design Dark Theme Overrides
+   ============================================ */
+
+.dark .ant-layout {
+  background: var(--color-bg-void);
+}
+
+.dark .ant-layout-header {
+  background: var(--color-bg-surface);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.dark .ant-layout-sider {
+  background: var(--color-bg-surface);
+}
+
+/* ============================================
+   Scrollbar Styling
+   ============================================ */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-lit);
+}
+
+/* ============================================
+   Utility Animation Classes
+   ============================================ */
+
+.animate-fade-in {
+  animation: fadeIn 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.animate-fade-in-scale {
+  animation: fadeInScale 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.animate-slide-in-right {
+  animation: slideInRight 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}

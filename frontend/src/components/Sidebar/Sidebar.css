@@ -1,0 +1,214 @@
+/* App Sidebar — matches design-mockup.html .app-sidebar */
+
+.app-sidebar {
+  grid-area: sidebar;
+  background: var(--color-bg-surface);
+  border-right: 1px solid var(--color-border);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-section {
+  padding: 20px 16px 8px;
+}
+
+.sidebar-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 12px;
+  padding: 0 8px;
+}
+
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--border-radius-sm);
+  color: var(--color-text-sec);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+  font-size: 13px;
+  margin: 2px 0;
+}
+
+.sidebar-item:hover {
+  color: var(--color-text);
+  background: var(--color-bg-card);
+}
+
+.sidebar-item.active {
+  color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 10%, transparent);
+}
+
+.sidebar-item-icon {
+  width: 20px;
+  text-align: center;
+  font-size: 15px;
+  flex-shrink: 0;
+}
+
+.sidebar-item-label {
+  flex: 1;
+}
+
+.sidebar-item-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  background: var(--color-bg-card);
+  border-radius: 10px;
+  color: var(--color-text-dim);
+}
+
+.sidebar-search {
+  margin: 0 16px 8px;
+  padding: 8px 12px;
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius-sm);
+  color: var(--color-text);
+  font-size: 13px;
+  width: calc(100% - 32px);
+  transition: border-color 0.2s;
+}
+
+.sidebar-search:focus {
+  border-color: var(--color-primary);
+}
+
+.sidebar-search::placeholder {
+  color: var(--color-text-dim);
+}
+
+.sidebar-new-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 12px 16px;
+  padding: 10px;
+  border: 1px dashed var(--color-border);
+  border-radius: var(--border-radius-md);
+  color: var(--color-text-dim);
+  font-size: 13px;
+  cursor: pointer;
+  transition: color 0.2s, border-color 0.2s, background 0.2s;
+}
+
+.sidebar-new-btn:hover {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 6%, transparent);
+}
+
+/* ── Ant Design Menu overrides inside sidebar ── */
+.app-sidebar .ant-menu {
+  background: transparent !important;
+  border-inline-end: none !important;
+}
+
+.app-sidebar .ant-menu-item {
+  color: var(--color-text-sec) !important;
+  border-radius: var(--border-radius-sm);
+  margin: 2px 8px !important;
+}
+
+.app-sidebar .ant-menu-item:hover {
+  color: var(--color-text) !important;
+  background: var(--color-bg-card) !important;
+}
+
+.app-sidebar .ant-menu-item-selected {
+  color: var(--color-primary) !important;
+  background: color-mix(in srgb, var(--color-primary) 10%, transparent) !important;
+}
+
+.app-sidebar .ant-menu-item-selected::after {
+  display: none !important;
+}
+
+/* Ant Design List overrides inside sidebar */
+.app-sidebar .ant-list {
+  background: transparent !important;
+}
+
+.app-sidebar .ant-list-item {
+  border-block-end-color: var(--color-border) !important;
+}
+
+/* ── Template library sidebar (history + categories) ── */
+.tpl-sidebar {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+.tpl-sidebar-section {
+  padding: 8px 0;
+}
+
+.tpl-sidebar-section .sidebar-title {
+  padding: 12px 16px 6px;
+  margin-bottom: 0;
+}
+
+.tpl-sidebar-empty {
+  padding: 16px;
+}
+
+.tpl-history-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.tpl-history-item {
+  align-items: flex-start !important;
+  margin: 2px 8px !important;
+}
+
+.tpl-history-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.tpl-history-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tpl-history-sub {
+  font-size: 11px;
+  color: var(--color-text-dim);
+  margin-top: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tpl-history-delete {
+  flex-shrink: 0;
+  color: var(--color-text-dim);
+  font-size: 14px;
+  padding: 4px;
+  border-radius: var(--border-radius-sm);
+  opacity: 0;
+  transition: opacity 0.15s, color 0.15s, background 0.15s;
+}
+
+.tpl-history-item:hover .tpl-history-delete {
+  opacity: 1;
+}
+
+.tpl-history-delete:hover {
+  color: #EF4444;
+  background: color-mix(in srgb, #EF4444 12%, transparent);
+}

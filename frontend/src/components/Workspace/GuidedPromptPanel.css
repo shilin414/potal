@@ -1,0 +1,100 @@
+.ws-guided {
+  flex: 1;
+  overflow-y: auto;
+  padding: 32px 24px 48px;
+}
+
+.ws-guided-head {
+  max-width: 620px;
+  margin: 0 auto 24px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.ws-guided-icon {
+  width: 48px;
+  height: 48px;
+  border-radius: var(--border-radius-md);
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  flex-shrink: 0;
+}
+
+.ws-guided-title {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--color-text);
+}
+
+.ws-guided-desc {
+  font-size: 13px;
+  color: var(--color-text-sec);
+  margin-top: 2px;
+}
+
+.ws-guided-form {
+  max-width: 620px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.ws-field {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ws-field-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--color-text);
+}
+
+.ws-field-required {
+  color: #ef4444;
+  margin-left: 2px;
+}
+
+.ws-field-control {
+  width: 100%;
+}
+
+.ws-guided-actions {
+  max-width: 620px;
+  margin: 24px auto 0;
+}
+
+.ws-guided-preview {
+  max-width: 620px;
+  margin: 20px auto 0;
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius-lg);
+  padding: 16px;
+}
+
+.ws-guided-preview-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 8px;
+}
+
+.ws-guided-preview-area {
+  margin-bottom: 12px;
+  background: var(--color-bg-surface) !important;
+}
+
+.ws-guided-start {
+  width: 100%;
+}

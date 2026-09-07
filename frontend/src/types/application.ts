@@ -1,0 +1,123 @@
+export type ApplicationKind = 'chat' | 'task' | 'custom';
+
+export interface SkillBinding {
+  skill_id: string;
+  skill_name: string;
+  skill_slug: string;
+  mode: 'required' | 'default' | 'optional';
+}
+
+export interface AgentBinding {
+  agent_id: number;
+  agent_name: string;
+  agent_slug: string;
+  agent_icon?: string;
+  label?: string;
+  is_default: boolean;
+}
+
+export interface GuidedOption {
+  id: string;
+  value: string;
+  label: string;
+  description?: string;
+  icon?: string;
+  order?: number;
+}
+
+export interface GuidedQuestion {
+  id: string;
+  key: string;
+  label: string;
+  help_text?: string;
+  type: 'text' | 'single_choice' | 'multi_choice' | 'number' | 'file';
+  placeholder?: string;
+  required: boolean;
+  default_value?: unknown;
+  order?: number;
+  options: GuidedOption[];
+}
+
+export interface GuidedPrompt {
+  id: string;
+  key: string;
+  title: string;
+  description?: string;
+  icon?: string;
+  prompt_template: string;
+  action: 'fill' | 'preview' | 'send';
+  is_featured: boolean;
+  order?: number;
+  questions: GuidedQuestion[];
+}
+
+export interface ChatApplicationProfile {
+  welcome_message?: string;
+  input_placeholder?: string;
+  empty_state_title?: string;
+  allow_agent_selection: boolean;
+  allow_skill_selection: boolean;
+  allow_extra_skills: boolean;
+  conversation_policy?: 'new_each_open' | 'resume_last' | 'choose_history';
+  starter_layout: 'cards' | 'list' | 'compact';
+}
+
+export interface ApplicationRuntime {
+  id: number;
+  application_id: number;
+  application_slug: string;
+  application_name: string;
+  application_description: string;
+  application_icon: string;
+  application_color?: string;
+  kind: ApplicationKind;
+  renderer_key: string;
+  executor_key?: string;
+  default_config: Record<string, unknown>;
+  chat_profile?: ChatApplicationProfile;
+  agent_bindings: AgentBinding[];
+  skill_bindings: SkillBinding[];
+  guided_prompts: GuidedPrompt[];
+}
+
+export interface WorkflowStep {
+  id: string;
+  name?: string;
+  order: number;
+  config: Record<string, unknown>;
+  application_id?: number;
+  application: ApplicationRuntime;
+}
+
+export interface Workflow {
+  id: string;
+  name: string;
+  description?: string;
+  icon?: string;
+  is_public: boolean;
+  step_count?: number;
+  steps?: WorkflowStep[];
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface WorkflowStepRun {
+  id: string;
+  status: 'idle' | 'active' | 'completed';
+  state: Record<string, unknown>;
+  last_opened_at?: string;
+  completed_at?: string;
+  step: WorkflowStep;
+}
+
+export interface WorkflowRun {
+  id: string;
+  workflow: string;
+  workflow_name: string;
+  project_id: number;
+  status: 'active' | 'completed' | 'archived';
+  selected_step_id?: string;
+  step_runs: WorkflowStepRun[];
+  created_at?: string;
+  updated_at?: string;
+}

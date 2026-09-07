@@ -1,0 +1,50 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.crt
+*.cer
+*.der
+*.keystore
+id_rsa
+id_ed25519
+.envrc
+.npmrc
+.pypirc
+.netrc
+credentials.json
+service-account*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+venv/
+.venv/
+*.egg-info/
+
+# Django runtime data
+*.sqlite3
+*.sqlite3-journal
+staticfiles/
+media/
+agent_workspaces/
+logs/
+*.log
+
+# Frontend
+node_modules/
+dist/
+dist-ssr/
+coverage/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

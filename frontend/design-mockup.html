@@ -1,0 +1,1900 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Creation Studio — 创作智能体工作室</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Noto+Sans+SC:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+/* ═══════════════════════════════════════════
+   DESIGN TOKENS
+   ═══════════════════════════════════════════ */
+:root {
+  --void:       #0C0C11;
+  --surface:    #14141C;
+  --card:       #1C1C28;
+  --elevated:   #242434;
+  --border:     #2C2C3C;
+  --border-lit: #3A3A4E;
+
+  --text:       #EAEAF0;
+  --text-sec:   #9898A8;
+  --text-dim:   #5C5C6E;
+
+  --amber:      #E8A838;
+  --amber-soft: #E8A83822;
+  --amber-mid:  #E8A83844;
+  --amber-glow: #E8A83818;
+
+  --success:    #4ADE80;
+  --error:      #F87171;
+  --warning:    #FBBF24;
+
+  --font-display: 'Space Grotesk', 'Noto Sans SC', system-ui, sans-serif;
+  --font-body:    'Noto Sans SC', 'Space Grotesk', system-ui, sans-serif;
+  --font-mono:    'SF Mono', 'Consolas', 'Liberation Mono', monospace;
+
+  --radius-sm:  6px;
+  --radius-md:  10px;
+  --radius-lg:  16px;
+  --radius-xl:  24px;
+
+  --header-h:   56px;
+  --sidebar-w:  260px;
+
+  --ease-out:   cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+/* ═══════════════════════════════════════════
+   RESET & BASE
+   ═══════════════════════════════════════════ */
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  background: var(--void);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: 14px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+::selection { background: var(--amber); color: var(--void); }
+
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border-lit); }
+
+a { color: var(--amber); text-decoration: none; }
+a:hover { color: #F0C060; }
+
+input, textarea, button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  border: none;
+  outline: none;
+  background: none;
+}
+
+button { cursor: pointer; }
+
+/* ═══════════════════════════════════════════
+   ANIMATIONS
+   ═══════════════════════════════════════════ */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeInScale {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+@keyframes slideInRight {
+  from { opacity: 0; transform: translateX(16px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes glowPulse {
+  0%, 100% { opacity: 0.4; transform: translateX(-50%) scaleX(1); }
+  50%      { opacity: 0.8; transform: translateX(-50%) scaleX(1.3); }
+}
+
+@keyframes typingDot {
+  0%, 60%, 100% { opacity: 0.2; transform: translateY(0); }
+  30%           { opacity: 1;   transform: translateY(-4px); }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes logoReveal {
+  0%   { opacity: 0; letter-spacing: 0.3em; filter: blur(8px); }
+  100% { opacity: 1; letter-spacing: 0;     filter: blur(0); }
+}
+
+@keyframes orbFloat {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  25%      { transform: translate(30px, -20px) scale(1.05); }
+  50%      { transform: translate(-10px, 15px) scale(0.95); }
+  75%      { transform: translate(-25px, -10px) scale(1.02); }
+}
+
+/* ═══════════════════════════════════════════
+   LOGIN VIEW
+   ═══════════════════════════════════════════ */
+#view-login {
+  position: fixed; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--void);
+  z-index: 1000;
+  transition: opacity 0.5s var(--ease-out), transform 0.5s var(--ease-out);
+}
+
+#view-login.hidden {
+  opacity: 0;
+  transform: scale(1.02);
+  pointer-events: none;
+}
+
+.login-bg-orb {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(100px);
+  opacity: 0.15;
+  animation: orbFloat 20s ease-in-out infinite;
+}
+
+.login-bg-orb:nth-child(1) {
+  width: 400px; height: 400px;
+  background: var(--amber);
+  top: 10%; left: 15%;
+}
+
+.login-bg-orb:nth-child(2) {
+  width: 300px; height: 300px;
+  background: #6D28D9;
+  bottom: 15%; right: 20%;
+  animation-delay: -7s;
+  animation-duration: 25s;
+}
+
+.login-bg-orb:nth-child(3) {
+  width: 250px; height: 250px;
+  background: #3B82F6;
+  top: 50%; left: 60%;
+  animation-delay: -13s;
+  animation-duration: 22s;
+}
+
+.login-card {
+  position: relative;
+  width: 420px;
+  padding: 48px 40px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  animation: fadeInScale 0.6s var(--ease-out);
+}
+
+.login-brand {
+  text-align: center;
+  margin-bottom: 40px;
+}
+
+.login-brand h1 {
+  font-family: var(--font-display);
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  animation: logoReveal 1s var(--ease-out) 0.2s both;
+}
+
+.login-brand h1 span {
+  color: var(--amber);
+}
+
+.login-brand p {
+  margin-top: 8px;
+  font-size: 14px;
+  color: var(--text-sec);
+  animation: fadeIn 0.6s var(--ease-out) 0.5s both;
+}
+
+.login-field {
+  margin-bottom: 20px;
+}
+
+.login-field label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-sec);
+  margin-bottom: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.login-field input {
+  width: 100%;
+  padding: 12px 16px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text);
+  font-size: 15px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.login-field input:focus {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 3px var(--amber-soft);
+}
+
+.login-field input::placeholder {
+  color: var(--text-dim);
+}
+
+.login-btn {
+  width: 100%;
+  padding: 14px;
+  margin-top: 8px;
+  background: var(--amber);
+  color: var(--void);
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 600;
+  border-radius: var(--radius-md);
+  letter-spacing: 0.02em;
+  transition: transform 0.15s, box-shadow 0.2s, background 0.2s;
+}
+
+.login-btn:hover {
+  background: #F0B84D;
+  box-shadow: 0 4px 20px var(--amber-mid);
+  transform: translateY(-1px);
+}
+
+.login-btn:active {
+  transform: translateY(0);
+}
+
+.login-footer {
+  margin-top: 24px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-dim);
+}
+
+.login-divider {
+  display: flex; align-items: center; gap: 16px;
+  margin: 28px 0;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.login-divider::before, .login-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+/* ═══════════════════════════════════════════
+   APP LAYOUT
+   ═══════════════════════════════════════════ */
+#view-app {
+  display: none;
+  height: 100vh;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  grid-template-rows: var(--header-h) 1fr;
+  grid-template-areas:
+    "header header"
+    "sidebar main";
+}
+
+#view-app.active {
+  display: grid;
+  animation: fadeIn 0.4s var(--ease-out);
+}
+
+/* ─── Header ─── */
+.app-header {
+  grid-area: header;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  padding: 0 24px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  z-index: 100;
+}
+
+.header-logo {
+  font-family: var(--font-display);
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.header-logo span { color: var(--amber); }
+
+.header-nav {
+  display: flex;
+  gap: 4px;
+  justify-content: center;
+}
+
+.header-nav-item {
+  padding: 8px 18px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-sec);
+  border-radius: var(--radius-sm);
+  transition: color 0.2s, background 0.2s;
+  position: relative;
+}
+
+.header-nav-item:hover {
+  color: var(--text);
+  background: var(--card);
+}
+
+.header-nav-item.active {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.header-nav-item.active::after {
+  content: '';
+  position: absolute;
+  bottom: -8px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 20px;
+  height: 2px;
+  background: var(--amber);
+  border-radius: 1px;
+}
+
+.header-user {
+  display: flex;
+  align-items: center;
+  justify-self: end;
+  gap: 10px;
+  padding: 6px 12px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.header-user:hover { background: var(--card); }
+
+.header-avatar {
+  width: 32px; height: 32px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--amber), #D97706);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; font-weight: 600;
+  color: var(--void);
+}
+
+.header-username {
+  font-size: 13px;
+  color: var(--text-sec);
+}
+
+/* ─── Sidebar ─── */
+.app-sidebar {
+  grid-area: sidebar;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-section {
+  padding: 20px 16px 8px;
+}
+
+.sidebar-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 12px;
+  padding: 0 8px;
+}
+
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  color: var(--text-sec);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+  font-size: 13px;
+}
+
+.sidebar-item:hover {
+  color: var(--text);
+  background: var(--card);
+}
+
+.sidebar-item.active {
+  color: var(--amber);
+  background: var(--amber-soft);
+}
+
+.sidebar-item-icon {
+  width: 20px;
+  text-align: center;
+  font-size: 15px;
+  flex-shrink: 0;
+}
+
+.sidebar-item-label { flex: 1; }
+
+.sidebar-item-badge {
+  font-size: 11px;
+  padding: 1px 7px;
+  background: var(--card);
+  border-radius: 10px;
+  color: var(--text-dim);
+}
+
+.sidebar-new-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: 12px 16px;
+  padding: 10px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-dim);
+  font-size: 13px;
+  cursor: pointer;
+  transition: color 0.2s, border-color 0.2s, background 0.2s;
+}
+
+.sidebar-new-btn:hover {
+  color: var(--amber);
+  border-color: var(--amber);
+  background: var(--amber-glow);
+}
+
+.sidebar-search {
+  margin: 0 16px 8px;
+  padding: 8px 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 13px;
+  transition: border-color 0.2s;
+}
+
+.sidebar-search:focus {
+  border-color: var(--amber);
+}
+
+.sidebar-search::placeholder { color: var(--text-dim); }
+
+/* Sidebar content panels */
+.sidebar-panel { display: none; flex-direction: column; height: 100%; }
+.sidebar-panel.active { display: flex; }
+
+/* ─── Main Content ─── */
+.app-main {
+  grid-area: main;
+  overflow: hidden;
+  position: relative;
+  background: var(--void);
+}
+
+.page { display: none; height: 100%; }
+.page.active { display: flex; flex-direction: column; animation: fadeIn 0.3s var(--ease-out); }
+
+/* ═══════════════════════════════════════════
+   CHAT PAGE
+   ═══════════════════════════════════════════ */
+.page-chat {
+  display: none;
+  height: 100%;
+}
+
+.page-chat.active {
+  display: flex;
+  flex-direction: column;
+  animation: fadeIn 0.3s var(--ease-out);
+}
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 32px 24px;
+}
+
+.chat-messages-inner {
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+/* Empty state */
+.chat-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.chat-empty-icon {
+  width: 80px; height: 80px;
+  border-radius: 50%;
+  background: var(--card);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 36px;
+}
+
+.chat-empty h3 {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.chat-empty p {
+  color: var(--text-sec);
+  font-size: 14px;
+  max-width: 400px;
+  text-align: center;
+  line-height: 1.6;
+}
+
+.chat-empty-suggestions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.chat-suggestion {
+  padding: 8px 16px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  font-size: 13px;
+  color: var(--text-sec);
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.chat-suggestion:hover {
+  color: var(--amber);
+  border-color: var(--amber);
+  background: var(--amber-glow);
+}
+
+/* Messages */
+.msg {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 24px;
+  animation: fadeIn 0.3s var(--ease-out);
+}
+
+.msg.user-msg {
+  flex-direction: row-reverse;
+}
+
+.msg-avatar {
+  width: 36px; height: 36px;
+  border-radius: var(--radius-sm);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.msg-avatar.user {
+  background: linear-gradient(135deg, #3B82F6, #6366F1);
+}
+
+.msg-avatar.assistant {
+  background: linear-gradient(135deg, var(--amber), #D97706);
+}
+
+.msg.user-msg .msg-body { align-items: flex-end; }
+
+.msg-body { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+.msg-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-sec);
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.msg.user-msg .msg-name { flex-direction: row-reverse; }
+
+.msg-name-time {
+  font-weight: 400;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.msg-bubble {
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text);
+}
+
+.msg.user-msg .msg-bubble {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg) var(--radius-lg) 4px var(--radius-lg);
+  padding: 10px 16px;
+  max-width: 80%;
+  align-self: flex-end;
+}
+
+.msg-bubble p { margin-bottom: 8px; }
+.msg-bubble p:last-child { margin-bottom: 0; }
+
+.msg-bubble code {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 2px 6px;
+  background: var(--card);
+  border-radius: 4px;
+  color: var(--amber);
+}
+
+/* Typing indicator */
+.typing-indicator {
+  display: flex;
+  gap: 4px;
+  padding: 4px 0;
+}
+
+.typing-indicator span {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--amber);
+  opacity: 0.3;
+}
+
+.typing-indicator span:nth-child(1) { animation: typingDot 1.4s ease-in-out infinite 0s; }
+.typing-indicator span:nth-child(2) { animation: typingDot 1.4s ease-in-out infinite 0.2s; }
+.typing-indicator span:nth-child(3) { animation: typingDot 1.4s ease-in-out infinite 0.4s; }
+
+/* Chat Input Area */
+.chat-input-area {
+  position: relative;
+  padding: 16px 24px 24px;
+}
+
+.chat-input-glow {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 300px;
+  height: 80px;
+  background: radial-gradient(ellipse, rgba(232, 168, 56, 0.08) 0%, transparent 70%);
+  animation: glowPulse 4s ease-in-out infinite;
+  pointer-events: none;
+}
+
+.chat-input-wrapper {
+  max-width: 800px;
+  margin: 0 auto;
+  position: relative;
+}
+
+.chat-input-box {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 12px 16px;
+  transition: border-color 0.2s, box-shadow 0.3s;
+}
+
+.chat-input-box:focus-within {
+  border-color: var(--amber);
+  box-shadow: 0 0 0 3px var(--amber-soft), 0 8px 32px rgba(0,0,0,0.2);
+}
+
+.chat-input-box textarea {
+  flex: 1;
+  resize: none;
+  min-height: 24px;
+  max-height: 160px;
+  line-height: 1.5;
+  background: transparent;
+  color: var(--text);
+}
+
+.chat-input-box textarea::placeholder { color: var(--text-dim); }
+
+.chat-send-btn {
+  width: 36px; height: 36px;
+  border-radius: var(--radius-sm);
+  background: var(--amber);
+  color: var(--void);
+  display: flex; align-items: center; justify-content: center;
+  transition: background 0.2s, transform 0.15s;
+  flex-shrink: 0;
+}
+
+.chat-send-btn:hover {
+  background: #F0B84D;
+  transform: scale(1.05);
+}
+
+.chat-send-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.chat-input-hint {
+  text-align: center;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* ═══════════════════════════════════════════
+   AGENTS PAGE
+   ═══════════════════════════════════════════ */
+.page-agents, .page-templates {
+  overflow-y: auto;
+  padding: 32px;
+}
+
+.page-title {
+  font-family: var(--font-display);
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-bottom: 4px;
+}
+
+.page-subtitle {
+  font-size: 14px;
+  color: var(--text-sec);
+  margin-bottom: 28px;
+}
+
+.agent-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.agent-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  cursor: pointer;
+  transition: border-color 0.25s, transform 0.2s var(--ease-out), box-shadow 0.25s;
+  animation: fadeIn 0.4s var(--ease-out) both;
+}
+
+.agent-card:hover {
+  border-color: var(--amber);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 32px rgba(232, 168, 56, 0.08), 0 0 0 1px var(--amber-mid);
+}
+
+.agent-card-icon {
+  width: 48px; height: 48px;
+  border-radius: var(--radius-md);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 24px;
+  margin-bottom: 16px;
+}
+
+.agent-card-icon.creative  { background: linear-gradient(135deg, #E8A838, #F59E0B); }
+.agent-card-icon.video     { background: linear-gradient(135deg, #3B82F6, #6366F1); }
+.agent-card-icon.audio     { background: linear-gradient(135deg, #EC4899, #F43F5E); }
+.agent-card-icon.text      { background: linear-gradient(135deg, #10B981, #34D399); }
+.agent-card-icon.design    { background: linear-gradient(135deg, #8B5CF6, #A78BFA); }
+.agent-card-icon.data      { background: linear-gradient(135deg, #F97316, #FB923C); }
+
+.agent-card-name {
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: var(--text);
+}
+
+.agent-card-desc {
+  font-size: 13px;
+  color: var(--text-sec);
+  line-height: 1.5;
+  margin-bottom: 14px;
+}
+
+.agent-card-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.agent-tag {
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 20px;
+  background: var(--elevated);
+  color: var(--text-sec);
+}
+
+.agent-card-meta {
+  font-size: 11px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* ═══════════════════════════════════════════
+   TEMPLATES PAGE
+   ═══════════════════════════════════════════ */
+.template-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.template-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 0.25s, transform 0.2s var(--ease-out), box-shadow 0.25s;
+  animation: fadeIn 0.4s var(--ease-out) both;
+}
+
+.template-card:hover {
+  border-color: var(--amber);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 32px rgba(232, 168, 56, 0.08), 0 0 0 1px var(--amber-mid);
+}
+
+.template-thumb {
+  height: 160px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 48px;
+  position: relative;
+  overflow: hidden;
+}
+
+.template-thumb::after {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(180deg, transparent 60%, var(--card) 100%);
+}
+
+.template-thumb.t1 { background: linear-gradient(135deg, #1a1a2e, #16213e); }
+.template-thumb.t2 { background: linear-gradient(135deg, #1a2e1a, #162e3e); }
+.template-thumb.t3 { background: linear-gradient(135deg, #2e1a1a, #3e1621); }
+.template-thumb.t4 { background: linear-gradient(135deg, #1a2e2e, #213e16); }
+
+.template-body {
+  padding: 18px 20px;
+}
+
+.template-name {
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.template-desc {
+  font-size: 13px;
+  color: var(--text-sec);
+  line-height: 1.5;
+  margin-bottom: 12px;
+}
+
+.template-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.template-tags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.template-tag {
+  padding: 2px 8px;
+  font-size: 11px;
+  border-radius: 4px;
+  background: var(--elevated);
+  color: var(--text-sec);
+}
+
+.template-stat {
+  font-size: 11px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+/* ═══════════════════════════════════════════
+   DETAIL MODAL
+   ═══════════════════════════════════════════ */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+  animation: fadeIn 0.2s var(--ease-out);
+}
+
+.modal-overlay.active { display: flex; }
+
+.modal {
+  width: 560px;
+  max-height: 80vh;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+  overflow-y: auto;
+  animation: fadeInScale 0.3s var(--ease-spring);
+}
+
+.modal-header {
+  padding: 24px 28px 16px;
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.modal-icon {
+  width: 56px; height: 56px;
+  border-radius: var(--radius-md);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 28px;
+  flex-shrink: 0;
+}
+
+.modal-header-text h2 {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.modal-header-text p {
+  font-size: 13px;
+  color: var(--text-sec);
+}
+
+.modal-close {
+  margin-left: auto;
+  width: 32px; height: 32px;
+  border-radius: var(--radius-sm);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text-dim);
+  transition: color 0.2s, background 0.2s;
+  flex-shrink: 0;
+}
+
+.modal-close:hover {
+  color: var(--text);
+  background: var(--card);
+}
+
+.modal-body {
+  padding: 0 28px 28px;
+}
+
+.modal-section {
+  margin-bottom: 20px;
+}
+
+.modal-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 8px;
+}
+
+.modal-section-content {
+  font-size: 14px;
+  color: var(--text-sec);
+  line-height: 1.6;
+}
+
+.modal-tags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.modal-tag {
+  padding: 4px 12px;
+  font-size: 12px;
+  border-radius: 20px;
+  background: var(--card);
+  color: var(--text-sec);
+  border: 1px solid var(--border);
+}
+
+.modal-actions {
+  display: flex;
+  gap: 12px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+
+.btn-primary {
+  padding: 10px 24px;
+  background: var(--amber);
+  color: var(--void);
+  font-weight: 600;
+  border-radius: var(--radius-md);
+  transition: background 0.2s, transform 0.15s;
+}
+
+.btn-primary:hover { background: #F0B84D; transform: translateY(-1px); }
+
+.btn-secondary {
+  padding: 10px 24px;
+  background: var(--card);
+  color: var(--text-sec);
+  font-weight: 500;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  transition: all 0.2s;
+}
+
+.btn-secondary:hover {
+  color: var(--text);
+  border-color: var(--border-lit);
+}
+
+/* ═══════════════════════════════════════════
+   RESPONSIVE
+   ═══════════════════════════════════════════ */
+@media (max-width: 768px) {
+  :root { --sidebar-w: 0px; }
+  .app-sidebar { display: none; }
+  .page-agents, .page-templates { padding: 20px 16px; }
+  .agent-grid { grid-template-columns: 1fr; }
+  .template-grid { grid-template-columns: 1fr; }
+  .login-card { width: 90%; padding: 32px 24px; }
+}
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════
+     LOGIN VIEW
+     ═══════════════════════════════════════════ -->
+<div id="view-login">
+  <div class="login-bg-orb"></div>
+  <div class="login-bg-orb"></div>
+  <div class="login-bg-orb"></div>
+
+  <div class="login-card">
+    <div class="login-brand">
+      <h1>Creation <span>Studio</span></h1>
+      <p>你的 AI 创作智能体工作室</p>
+    </div>
+
+    <div class="login-field">
+      <label>用户名</label>
+      <input type="text" placeholder="输入你的用户名" value="creator" id="login-user">
+    </div>
+
+    <div class="login-field">
+      <label>密码</label>
+      <input type="password" placeholder="输入密码" value="••••••••" id="login-pass">
+    </div>
+
+    <button class="login-btn" onclick="doLogin()">进入工作室</button>
+
+    <div class="login-footer">
+      还没有账户？<a href="#">立即注册</a>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     MAIN APP VIEW
+     ═══════════════════════════════════════════ -->
+<div id="view-app">
+
+  <!-- Header -->
+  <header class="app-header">
+    <div class="header-logo" onclick="navigateTo('chat')">
+      Creation <span>Studio</span>
+    </div>
+
+    <nav class="header-nav">
+      <div class="header-nav-item active" data-page="chat" onclick="navigateTo('chat')">
+        💬 对话
+      </div>
+      <div class="header-nav-item" data-page="agents" onclick="navigateTo('agents')">
+        🤖 智能体
+      </div>
+      <div class="header-nav-item" data-page="templates" onclick="navigateTo('templates')">
+        📐 模板库
+      </div>
+    </nav>
+
+    <div class="header-user">
+      <div class="header-avatar">C</div>
+      <span class="header-username">Creator</span>
+    </div>
+  </header>
+
+  <!-- Sidebar -->
+  <aside class="app-sidebar">
+    <!-- Chat sidebar -->
+    <div class="sidebar-panel active" id="sidebar-chat">
+      <div class="sidebar-new-btn" onclick="newConversation()">
+        ✦ 新建对话
+      </div>
+
+      <div class="sidebar-section">
+        <input type="text" class="sidebar-search" placeholder="搜索对话...">
+        <div class="sidebar-title">今天</div>
+        <div class="sidebar-item active">
+          <span class="sidebar-item-icon">💬</span>
+          <span class="sidebar-item-label">短视频脚本：咖啡店探店</span>
+        </div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">💬</span>
+          <span class="sidebar-item-label">直播话术优化方案</span>
+        </div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">💬</span>
+          <span class="sidebar-item-label">小红书图文排版建议</span>
+        </div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="sidebar-title">昨天</div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">💬</span>
+          <span class="sidebar-item-label">产品种草文案</span>
+        </div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">💬</span>
+          <span class="sidebar-item-label">品牌故事叙事结构</span>
+        </div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">💬</span>
+          <span class="sidebar-item-label">知识分享视频脚本</span>
+        </div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="sidebar-title">本周更早</div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">💬</span>
+          <span class="sidebar-item-label">美食 Vlog 分镜设计</span>
+        </div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">💬</span>
+          <span class="sidebar-item-label">活动宣传片脚本</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Agents sidebar -->
+    <div class="sidebar-panel" id="sidebar-agents">
+      <div class="sidebar-section">
+        <div class="sidebar-title">智能体分类</div>
+        <div class="sidebar-item active">
+          <span class="sidebar-item-icon">🌐</span>
+          <span class="sidebar-item-label">全部智能体</span>
+          <span class="sidebar-item-badge">6</span>
+        </div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">✍️</span>
+          <span class="sidebar-item-label">文案创作</span>
+          <span class="sidebar-item-badge">2</span>
+        </div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">🎬</span>
+          <span class="sidebar-item-label">视频制作</span>
+          <span class="sidebar-item-badge">2</span>
+        </div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">🎨</span>
+          <span class="sidebar-item-label">视觉设计</span>
+          <span class="sidebar-item-badge">1</span>
+        </div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">🎵</span>
+          <span class="sidebar-item-label">音频配乐</span>
+          <span class="sidebar-item-badge">1</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Templates sidebar -->
+    <div class="sidebar-panel" id="sidebar-templates">
+      <div class="sidebar-section">
+        <div class="sidebar-title">模板分类</div>
+        <div class="sidebar-item active">
+          <span class="sidebar-item-icon">📂</span>
+          <span class="sidebar-item-label">全部模板</span>
+          <span class="sidebar-item-badge">4</span>
+        </div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">📹</span>
+          <span class="sidebar-item-label">短视频</span>
+          <span class="sidebar-item-badge">2</span>
+        </div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">📺</span>
+          <span class="sidebar-item-label">直播</span>
+          <span class="sidebar-item-badge">1</span>
+        </div>
+        <div class="sidebar-item">
+          <span class="sidebar-item-icon">📢</span>
+          <span class="sidebar-item-label">品牌宣传</span>
+          <span class="sidebar-item-badge">1</span>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main content area -->
+  <main class="app-main">
+    <!-- ── Chat Page ── -->
+    <div class="page-chat active" id="page-chat">
+      <div class="chat-messages" id="chat-messages">
+        <div class="chat-messages-inner">
+          <!-- Messages rendered by JS -->
+        </div>
+      </div>
+
+      <div class="chat-input-area">
+        <div class="chat-input-glow"></div>
+        <div class="chat-input-wrapper">
+          <div class="chat-input-box">
+            <textarea id="chat-input" rows="1" placeholder="描述你的创作需求... (Enter 发送，Shift+Enter 换行)" oninput="autoResize(this)"></textarea>
+            <button class="chat-send-btn" id="send-btn" onclick="sendMessage()" disabled>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <line x1="22" y1="2" x2="11" y2="13"></line>
+                <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+              </svg>
+            </button>
+          </div>
+          <div class="chat-input-hint">Enter 发送 · Shift+Enter 换行</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Agents Page ── -->
+    <div class="page-agents" id="page-agents">
+      <h1 class="page-title">智能体市场</h1>
+      <p class="page-subtitle">选择一个创作智能体，让 AI 协助你完成专业创作任务</p>
+
+      <div class="agent-grid" id="agent-grid">
+        <!-- Rendered by JS -->
+      </div>
+    </div>
+
+    <!-- ── Templates Page ── -->
+    <div class="page-templates" id="page-templates">
+      <h1 class="page-title">创作模板库</h1>
+      <p class="page-subtitle">精选创作模板，快速启动你的下一个作品</p>
+
+      <div class="template-grid" id="template-grid">
+        <!-- Rendered by JS -->
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     DETAIL MODAL
+     ═══════════════════════════════════════════ -->
+<div class="modal-overlay" id="modal-overlay" onclick="closeModal(event)">
+  <div class="modal" id="modal-content">
+    <!-- Rendered by JS -->
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     JAVASCRIPT
+     ═══════════════════════════════════════════ -->
+<script>
+// ─── Data ───
+const agents = [
+  {
+    id: 1,
+    name: '视频脚本生成器',
+    desc: '根据主题和风格自动生成短视频脚本，包含分镜、台词和画面描述。',
+    category: '视频制作',
+    icon: '🎬',
+    iconClass: 'video',
+    uses: 2340,
+    prompt: '你是一个专业的短视频脚本编剧。根据用户提供的主题、目标受众和风格要求，生成包含分镜描述、台词和拍摄建议的完整脚本。'
+  },
+  {
+    id: 2,
+    name: '文案润色专家',
+    desc: '优化你的营销文案、社交媒体帖子和产品描述，让文字更有感染力。',
+    category: '文案创作',
+    icon: '✍️',
+    iconClass: 'text',
+    uses: 1856,
+    prompt: '你是一位资深文案编辑，擅长优化各类营销文案。在保持原意的基础上，提升文案的吸引力、可读性和转化效果。'
+  },
+  {
+    id: 3,
+    name: '直播话术顾问',
+    desc: '为直播场景设计互动话术、产品介绍流程和观众引导策略。',
+    category: '文案创作',
+    icon: '🎙️',
+    iconClass: 'audio',
+    uses: 1203,
+    prompt: '你是一名经验丰富的直播策划师。帮助用户设计直播流程、编写产品介绍话术、设计互动环节，提升直播间活跃度和转化率。'
+  },
+  {
+    id: 4,
+    name: '短视频剪辑助手',
+    desc: '分析视频素材并提供剪辑建议，包括节奏把控、转场方案和配乐推荐。',
+    category: '视频制作',
+    icon: '✂️',
+    iconClass: 'creative',
+    uses: 978,
+    prompt: '你是一个视频剪辑指导专家。根据用户提供的素材描述和目标风格，给出专业的剪辑建议，包括片段取舍、节奏设计、转场方式和配乐搭配。'
+  },
+  {
+    id: 5,
+    name: '图文排版设计师',
+    desc: '为小红书、微信公众号等平台设计图文排版方案和视觉风格指导。',
+    category: '视觉设计',
+    icon: '🎨',
+    iconClass: 'design',
+    uses: 1567,
+    prompt: '你是一名专业的平面设计师，专注于社交媒体图文内容的排版设计。根据内容主题和平台特性，提供配色方案、字体选择、版式布局等设计建议。'
+  },
+  {
+    id: 6,
+    name: '音乐配乐推荐',
+    desc: '根据视频风格和情感氛围，推荐合适的背景音乐和音效方案。',
+    category: '音频配乐',
+    icon: '🎵',
+    iconClass: 'data',
+    uses: 834,
+    prompt: '你是一位音乐顾问，专精于视频配乐。根据用户描述的视频类型、节奏和情感氛围，推荐匹配的背景音乐风格、具体曲目建议和音效设计方案。'
+  }
+];
+
+const templates = [
+  {
+    id: 1,
+    name: '产品种草短视频',
+    desc: '适用于带货类短视频，包含产品展示、使用场景和购买引导的标准结构。',
+    category: '短视频',
+    tags: ['种草', '带货', '电商'],
+    thumb: '🛍️',
+    thumbClass: 't1',
+    uses: 3245
+  },
+  {
+    id: 2,
+    name: '知识分享系列',
+    desc: '适合教育类内容创作者，包含知识讲解、案例分析和总结回顾的完整流程。',
+    category: '短视频',
+    tags: ['知识', '教育', '科普'],
+    thumb: '📚',
+    thumbClass: 't2',
+    uses: 2187
+  },
+  {
+    id: 3,
+    name: '品牌宣传片',
+    desc: '专业品牌形象视频模板，包含品牌故事、价值主张和情感共鸣的结构设计。',
+    category: '品牌宣传',
+    tags: ['品牌', '宣传', '企业形象'],
+    thumb: '🏢',
+    thumbClass: 't3',
+    uses: 1567
+  },
+  {
+    id: 4,
+    name: '活动直播模板',
+    desc: '为线下活动直播设计的完整流程模板，包含预热、直播和回顾的各环节话术。',
+    category: '直播',
+    tags: ['直播', '活动', '互动'],
+    thumb: '🎥',
+    thumbClass: 't4',
+    uses: 989
+  }
+];
+
+const sampleConversation = [
+  {
+    role: 'user',
+    content: '帮我写一个咖啡店探店的短视频脚本，目标受众是 20-30 岁的年轻人，风格要轻松有趣。'
+  },
+  {
+    role: 'assistant',
+    content: `好的，我来为你设计一个轻松有趣的咖啡店探店短视频脚本。
+
+**主题：** 隐藏在老巷子里的宝藏咖啡馆
+
+**时长：** 45-60秒
+
+**风格：** Vlog + 解说，轻快节奏
+
+---
+
+**分镜 1 — 开场钩子 (0-3s)**
+画面：推门进入的慢动作，暖色灯光洒落
+配音：「这家藏在巷子深处的咖啡馆，我愿意称它为城市里最温柔的角落」
+
+**分镜 2 — 环境展示 (3-12s)**
+画面：快速切换店内细节 — 复古台灯、手写菜单、窗边绿植
+配音：「老板是个从日本留学回来的咖啡师，整家店的审美都很在线」
+字幕：📍 城中村·老巷子 | ☕ 手冲 ¥28 起
+
+**分镜 3 — 咖啡特写 (12-25s)**
+画面：手冲咖啡的特写 — 热水注入、泡沫升起、拉花成型
+配音：「他们家的招牌是冰博客拿铁，奶泡绵密得像在喝一朵云」
+字幕：☁️ 冰博客拿铁 ¥32 — 本期推荐
+
+**分镜 4 — 互动环节 (25-35s)**
+画面：和朋友在店内拍照、聊天、翻书
+配音：「最重要的是，这里拍照真的太好看了，随便一拍就是日系杂志风」
+
+**分镜 5 — 结尾引导 (35-45s)**
+画面：咖啡杯特写 + 店名招牌
+配音：「如果你也知道这样隐藏的好店，评论区告诉我呀～」
+字幕：❤️ 点赞收藏 · 周末打卡
+
+---
+
+需要我调整某个分镜的内容，或者补充 BGM 推荐吗？`
+  }
+];
+
+const sampleResponses = [
+  `好的，让我基于你的需求进一步优化这个脚本。
+
+我注意到你提到的目标受众是 20-30 岁年轻人，这里有几个优化方向：
+
+1. **节奏更快** — 开场 3 秒钩子可以更冲击，直接用"这家咖啡店，我去了 7 次"作为开场白
+2. **增加互动** — 在分镜 4 加入投票或问答贴纸，提升互动率
+3. **BGM 推荐** — 建议使用轻快的日系 City Pop 风格，推荐《Plastic Love》的轻音乐版本
+
+你觉得这几个方向哪个最想深入？`,
+
+  `没问题！以下是调整后的开场和 BGM 方案：
+
+**优化开场：**
+「这家藏在巷子里的咖啡馆...我去了 7 次」
+（配合推门慢动作 + 暖色光晕）
+
+这个开场利用了数字悬念，能在前 3 秒抓住注意力。
+
+**BGM 方案：**
+- 风格：City Pop / Lo-fi
+- 推荐曲目：轻柔钢琴 + 电子节拍
+- 音量控制：解说时降低，转场时渐强
+
+需要我把完整的最终版脚本整理出来吗？`,
+
+  `以下是整理好的完整脚本最终版 👇
+
+**《隐藏在老巷子的宝藏咖啡馆》**
+**时长：** 45-60 秒 | **风格：** 轻快 Vlog
+
+🎬 **完整分镜已保存**
+
+你可以在工作区中直接使用这个脚本，也可以选择一个模板来快速生成配套的视频素材清单。`
+];
+
+// ─── State ───
+let currentPage = 'chat';
+let currentModal = null;
+let responseIndex = 0;
+let isTyping = false;
+let chatInitialized = false;
+
+// ─── Login ───
+function doLogin() {
+  const loginView = document.getElementById('view-login');
+  loginView.classList.add('hidden');
+
+  setTimeout(() => {
+    loginView.style.display = 'none';
+    const appView = document.getElementById('view-app');
+    appView.classList.add('active');
+    if (!chatInitialized) {
+      initChat();
+      chatInitialized = true;
+    }
+  }, 500);
+}
+
+// ─── Navigation ───
+function navigateTo(page) {
+  currentPage = page;
+
+  // Update nav items
+  document.querySelectorAll('.header-nav-item').forEach(item => {
+    item.classList.toggle('active', item.dataset.page === page);
+  });
+
+  // Update sidebar panels
+  document.querySelectorAll('.sidebar-panel').forEach(panel => {
+    panel.classList.toggle('active', panel.id === `sidebar-${page}`);
+  });
+
+  // Update pages
+  document.querySelectorAll('.page-chat, .page-agents, .page-templates').forEach(p => {
+    p.classList.remove('active');
+  });
+
+  const pageEl = document.getElementById(`page-${page}`);
+  if (pageEl) pageEl.classList.add('active');
+}
+
+// ─── Chat ───
+function initChat() {
+  const container = document.querySelector('.chat-messages-inner');
+  container.innerHTML = '';
+
+  // Show welcome state with suggestions
+  const emptyHTML = `
+    <div class="chat-empty" id="chat-empty">
+      <div class="chat-empty-icon">✦</div>
+      <h3>开始你的创作之旅</h3>
+      <p>向创作智能体描述你的需求，AI 会协助你完成脚本编写、文案优化、视频策划等专业创作任务</p>
+      <div class="chat-empty-suggestions">
+        <div class="chat-suggestion" onclick="useSuggestion('帮我写一个咖啡店探店的短视频脚本')">🎬 写一个短视频脚本</div>
+        <div class="chat-suggestion" onclick="useSuggestion('优化这段产品文案')">✍️ 优化产品文案</div>
+        <div class="chat-suggestion" onclick="useSuggestion('设计一个直播话术方案')">🎙️ 直播话术方案</div>
+      </div>
+    </div>
+  `;
+  container.innerHTML = emptyHTML;
+}
+
+function useSuggestion(text) {
+  const emptyEl = document.getElementById('chat-empty');
+  if (emptyEl) emptyEl.remove();
+
+  document.getElementById('chat-input').value = text;
+  document.getElementById('send-btn').disabled = false;
+  sendMessage();
+}
+
+function sendMessage() {
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text || isTyping) return;
+
+  // Remove empty state
+  const emptyEl = document.getElementById('chat-empty');
+  if (emptyEl) emptyEl.remove();
+
+  // Add user message
+  addMessage('user', text);
+  input.value = '';
+  input.style.height = 'auto';
+  document.getElementById('send-btn').disabled = true;
+
+  // Show typing
+  isTyping = true;
+  showTyping();
+
+  // Simulate response
+  const delay = 1500 + Math.random() * 1000;
+  setTimeout(() => {
+    hideTyping();
+    const response = responseIndex < sampleResponses.length
+      ? sampleResponses[responseIndex]
+      : sampleConversation[0].content;
+    if (responseIndex === 0) {
+      addMessage('assistant', sampleConversation[0].content);
+    } else {
+      addMessage('assistant', response);
+    }
+    responseIndex++;
+    isTyping = false;
+  }, delay);
+}
+
+function addMessage(role, content) {
+  const container = document.querySelector('.chat-messages-inner');
+  const time = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+
+  const avatarClass = role === 'user' ? 'user' : 'assistant';
+  const name = role === 'user' ? '你' : '创作助手';
+  const avatarContent = role === 'user' ? '👤' : '✦';
+
+  const formatted = formatContent(content);
+
+  const msgClass = role === 'user' ? 'msg user-msg' : 'msg';
+
+  const msgHTML = `
+    <div class="${msgClass}">
+      <div class="msg-avatar ${avatarClass}">${avatarContent}</div>
+      <div class="msg-body">
+        <div class="msg-name">${name} <span class="msg-name-time">${time}</span></div>
+        <div class="msg-bubble">${formatted}</div>
+      </div>
+    </div>
+  `;
+
+  container.insertAdjacentHTML('beforeend', msgHTML);
+  scrollToBottom();
+}
+
+function formatContent(text) {
+  // Simple markdown-like formatting
+  return text
+    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+    .replace(/`(.*?)`/g, '<code>$1</code>')
+    .replace(/\n\n/g, '</p><p>')
+    .replace(/\n- /g, '<br>• ')
+    .replace(/^/, '<p>')
+    .replace(/$/, '</p>')
+    .replace(/<p><\/p>/g, '');
+}
+
+function showTyping() {
+  const container = document.querySelector('.chat-messages-inner');
+  const html = `
+    <div class="msg" id="typing-msg">
+      <div class="msg-avatar assistant">✦</div>
+      <div class="msg-body">
+        <div class="msg-name">创作助手</div>
+        <div class="typing-indicator">
+          <span></span><span></span><span></span>
+        </div>
+      </div>
+    </div>
+  `;
+  container.insertAdjacentHTML('beforeend', html);
+  scrollToBottom();
+}
+
+function hideTyping() {
+  const el = document.getElementById('typing-msg');
+  if (el) el.remove();
+}
+
+function scrollToBottom() {
+  const el = document.getElementById('chat-messages');
+  setTimeout(() => { el.scrollTop = el.scrollHeight; }, 50);
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+
+  const sendBtn = document.getElementById('send-btn');
+  sendBtn.disabled = !el.value.trim();
+}
+
+function newConversation() {
+  responseIndex = 0;
+  initChat();
+}
+
+// ─── Agents ───
+function renderAgents() {
+  const grid = document.getElementById('agent-grid');
+  grid.innerHTML = agents.map((a, i) => `
+    <div class="agent-card" style="animation-delay: ${i * 0.06}s" onclick="openAgentModal(${a.id})">
+      <div class="agent-card-icon ${a.iconClass}">${a.icon}</div>
+      <div class="agent-card-name">${a.name}</div>
+      <div class="agent-card-desc">${a.desc}</div>
+      <div class="agent-card-footer">
+        <span class="agent-tag">${a.category}</span>
+        <span class="agent-card-meta">⚡ ${a.uses.toLocaleString()} 次使用</span>
+      </div>
+    </div>
+  `).join('');
+}
+
+// ─── Templates ───
+function renderTemplates() {
+  const grid = document.getElementById('template-grid');
+  grid.innerHTML = templates.map((t, i) => `
+    <div class="template-card" style="animation-delay: ${i * 0.06}s" onclick="openTemplateModal(${t.id})">
+      <div class="template-thumb ${t.thumbClass}">${t.thumb}</div>
+      <div class="template-body">
+        <div class="template-name">${t.name}</div>
+        <div class="template-desc">${t.desc}</div>
+        <div class="template-footer">
+          <div class="template-tags">
+            ${t.tags.slice(0, 3).map(tag => `<span class="template-tag">${tag}</span>`).join('')}
+          </div>
+          <span class="template-stat">👁 ${t.uses.toLocaleString()}</span>
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+// ─── Modals ───
+function openAgentModal(id) {
+  const agent = agents.find(a => a.id === id);
+  if (!agent) return;
+
+  const modal = document.getElementById('modal-content');
+  modal.innerHTML = `
+    <div class="modal-header">
+      <div class="modal-icon agent-card-icon ${agent.iconClass}">${agent.icon}</div>
+      <div class="modal-header-text">
+        <h2>${agent.name}</h2>
+        <p>${agent.category} · ${agent.uses.toLocaleString()} 次使用</p>
+      </div>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-section">
+        <div class="modal-section-title">描述</div>
+        <div class="modal-section-content">${agent.desc}</div>
+      </div>
+      <div class="modal-section">
+        <div class="modal-section-title">系统提示词</div>
+        <div class="modal-section-content" style="font-size:13px; background:var(--card); padding:14px 16px; border-radius:var(--radius-md); border:1px solid var(--border); line-height:1.7;">${agent.prompt}</div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-primary" onclick="startAgentChat(${agent.id})">开始对话</button>
+        <button class="btn-secondary" onclick="closeModal()">关闭</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('modal-overlay').classList.add('active');
+}
+
+function openTemplateModal(id) {
+  const template = templates.find(t => t.id === id);
+  if (!template) return;
+
+  const modal = document.getElementById('modal-content');
+  modal.innerHTML = `
+    <div class="modal-header">
+      <div class="modal-icon template-thumb ${template.thumbClass}" style="width:56px;height:56px;font-size:28px;border-radius:var(--radius-md);">${template.thumb}</div>
+      <div class="modal-header-text">
+        <h2>${template.name}</h2>
+        <p>${template.category} · 已使用 ${template.uses.toLocaleString()} 次</p>
+      </div>
+      <button class="modal-close" onclick="closeModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-section">
+        <div class="modal-section-title">描述</div>
+        <div class="modal-section-content">${template.desc}</div>
+      </div>
+      <div class="modal-section">
+        <div class="modal-section-title">标签</div>
+        <div class="modal-tags">
+          ${template.tags.map(t => `<span class="modal-tag">${t}</span>`).join('')}
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn-primary" onclick="applyTemplate(${template.id})">使用模板</button>
+        <button class="btn-secondary" onclick="closeModal()">关闭</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('modal-overlay').classList.add('active');
+}
+
+function closeModal(e) {
+  if (e && e.target !== e.currentTarget && !e.target.classList.contains('modal-close')) return;
+  document.getElementById('modal-overlay').classList.remove('active');
+}
+
+function startAgentChat(agentId) {
+  const agent = agents.find(a => a.id === agentId);
+  closeModal();
+  navigateTo('chat');
+  responseIndex = 0;
+  const emptyEl = document.getElementById('chat-empty');
+  if (emptyEl) emptyEl.remove();
+  addMessage('user', `你好，我想使用「${agent.name}」来协助我创作`);
+  isTyping = true;
+  showTyping();
+  setTimeout(() => {
+    hideTyping();
+    addMessage('assistant', `你好！我是 **${agent.name}**。\n\n${agent.desc}\n\n请告诉我你的具体需求，我来帮你完成创作任务。`);
+    isTyping = false;
+  }, 1200);
+}
+
+function applyTemplate(templateId) {
+  const template = templates.find(t => t.id === templateId);
+  closeModal();
+  navigateTo('chat');
+  responseIndex = 0;
+  const emptyEl = document.getElementById('chat-empty');
+  if (emptyEl) emptyEl.remove();
+  addMessage('user', `我想使用「${template.name}」模板`);
+  isTyping = true;
+  showTyping();
+  setTimeout(() => {
+    hideTyping();
+    addMessage('assistant', `好的，已为你加载 **${template.name}** 模板。\n\n${template.desc}\n\n模板包含完整的创作流程和结构指导。请告诉我：\n\n- 你的创作主题是什么？\n- 目标受众是谁？\n- 有没有特别偏好的风格？\n\n我会根据模板结构帮你快速生成内容。`);
+    isTyping = false;
+  }, 1200);
+}
+
+// ─── Keyboard Shortcuts ───
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    closeModal();
+  }
+});
+
+document.getElementById('chat-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+// ─── Init ───
+renderAgents();
+renderTemplates();
+
+// Auto-focus login
+document.getElementById('login-user').focus();
+</script>
+
+</body>
+</html>

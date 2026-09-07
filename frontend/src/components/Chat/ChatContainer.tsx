@@ -1,0 +1,274 @@
+import React, { useEffect, useRef, useState } from 'react';
+import { Alert } from 'antd';
+import { useConversationStore } from '@/stores/useConversationStore';
+import type { ConversationDetail } from '@/stores/useConversationStore';
+import { useAuthStore } from '@/stores/useAuthStore';
+import MessageList from './MessageList';
+import MessageInput from './MessageInput';
+import type { ComposerContext } from './MessageInput';
+import AgentQuestionCard from './AgentQuestionCard';
+import './ChatContainer.css';
+
+interface ChatSuggestion {
+  icon?: string;
+  label: string;
+  text?: string;
+  onSelect?: () => void;
+}
+
+interface ChatContainerProps {
+  conversationId: string | null;
+  /** When false, skip auto-fetching the conversation on mount/id change.
+   *  The workspace uses this to seed a guided conversation without a fetch
+   *  clobbering the streamed placeholder message. Default: true. */
+  autoFetch?: boolean;
+  /** Allow the home page to remain a local draft until its first message. */
+  createOnFirstSend?: boolean;
+  onConversationCreated?: (conversationId: string) => void;
+  creationContext?: {
+    applicationId?: number;
+    workflowStepRunId?: string;
+    agentId?: number;
+    skillIds?: string[];
+  };
+  suggestions?: ChatSuggestion[];
+  emptyTitle?: string;
+  emptyDescription?: string;
+  inputPlaceholder?: string;
+  draftRequest?: { id: number; text: string } | null;
+  projectId?: number;
+}
+
+const defaultSuggestions: ChatSuggestion[] = [
+  { icon: '🎬', label: '写一个短视频脚本', text: '帮我写一个咖啡店探店的短视频脚本' },
+  { icon: '✍️', label: '优化产品文案', text: '优化这段产品文案' },
+  { icon: '🎙️', label: '直播话术方案', text: '设计一个直播话术方案' },
+];
+
+const ChatContainer: React.FC<ChatContainerProps> = ({
+  conversationId,
+  autoFetch = true,
+  createOnFirstSend = false,
+  onConversationCreated,
+  creationContext,
+  suggestions = defaultSuggestions,
+  emptyTitle,
+  emptyDescription,
+  inputPlaceholder,
+  draftRequest,
+  projectId,
+}) => {
+  const { user } = useAuthStore();
+  const {
+    currentConversation,
+    isLoading,
+    error,
+    streamingMessageId,
+    pendingQuestion,
+    agentActivity,
+    fetchConversationDetail,
+    createConversation,
+    sendMessageStream,
+    answerQuestion,
+    cancelTurn,
+    clearError,
+    setCurrentConversation,
+  } = useConversationStore();
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const creatingConversationRef = useRef(false);
+  const skipNextFetchRef = useRef<string | null>(null);
+  const [inputValue, setInputValue] = useState('');
+  const [isCreatingConversation, setIsCreatingConversation] = useState(false);
+
+  useEffect(() => {
+    if (conversationId) {
+      if (skipNextFetchRef.current === conversationId) {
+        skipNextFetchRef.current = null;
+      } else if (autoFetch) {
+        fetchConversationDetail(conversationId);
+      }
+    } else {
+      setCurrentConversation(null);
+    }
+  }, [conversationId, autoFetch, fetchConversationDetail, setCurrentConversation]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [currentConversation?.messages, isLoading, streamingMessageId]);
+
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (draftRequest) setInputValue(draftRequest.text);
+  }, [draftRequest]);
+
+  const handleSendMessage = async (content: string, composer: ComposerContext) => {
+    if (creatingConversationRef.current) return;
+
+    let targetConversationId = conversationId;
+    if (!targetConversationId) {
+      if (!createOnFirstSend) return;
+      creatingConversationRef.current = true;
+      setIsCreatingConversation(true);
+      try {
+        const conversation = await createConversation(
+          content.slice(0, 50),
+          composer.agentId ?? undefined,
+          composer.projectId ?? projectId,
+          undefined,
+          {
+            ...creationContext,
+            workingDirectory: composer.workingDirectory,
+          },
+        );
+        // DRF may serialize numeric primary keys even though the frontend route
+        // always exposes them as strings. Keep both forms identical so the URL
+        // update does not trigger a detail fetch that overwrites this stream.
+        targetConversationId = String(conversation.id);
+        setCurrentConversation({
+          ...conversation,
+          id: targetConversationId,
+          messages: [],
+        } as ConversationDetail);
+      } catch (error) {
+        console.error('Failed to create conversation:', error);
+        return;
+      } finally {
+        creatingConversationRef.current = false;
+        setIsCreatingConversation(false);
+      }
+    }
+
+    abortControllerRef.current?.abort();
+    try {
+      const activeConversation = useConversationStore.getState().currentConversation;
+      if (activeConversation) {
+        setCurrentConversation({
+          ...activeConversation,
+          agent: composer.agent || undefined,
+        });
+      }
+      const controller = sendMessageStream(targetConversationId, content, {
+        permissionMode: composer.permissionMode,
+        skills: composer.skills,
+        agentId: composer.agentId,
+      });
+      abortControllerRef.current = controller;
+      if (!conversationId) {
+        skipNextFetchRef.current = targetConversationId;
+        onConversationCreated?.(targetConversationId);
+      }
+    } catch (error) {
+      console.error('Failed to start stream:', error);
+    }
+  };
+
+  const handleUseSuggestion = (suggestion: (typeof suggestions)[number]) => {
+    if (suggestion.onSelect) suggestion.onSelect();
+    else if (suggestion.text) setInputValue(suggestion.text);
+  };
+
+  const isStreaming = streamingMessageId !== null;
+  const messages = currentConversation?.messages || [];
+  // The first optimistic messages are added just before the URL receives its
+  // conversation id. Render them immediately instead of keeping the welcome
+  // screen visible during that transition.
+  const isEmpty = messages.length === 0;
+  const agent = currentConversation?.agent;
+
+  if (error) {
+    return (
+      <div className="flex h-full items-start justify-center p-6">
+        <Alert
+          message="Agent 执行失败"
+          description={error}
+          type="error"
+          showIcon
+          closable
+          onClose={clearError}
+        />
+      </div>
+    );
+  }
+
+  return (
+    <div className="chat-container">
+      {isEmpty && !isLoading ? (
+        <div className="chat-empty">
+          <div className="chat-empty-icon">{agent?.icon || '✦'}</div>
+          <h3>{emptyTitle || (agent ? `我是${agent.name}，请问有什么可以帮您？` : '开始你的创作之旅')}</h3>
+          <p>
+            {emptyDescription || (agent
+              ? `向${agent.name}描述你的需求，AI 会协助你完成脚本编写、文案优化、视频策划等专业创作任务`
+              : '向创作智能体描述你的需求，AI 会协助你完成脚本编写、文案优化、视频策划等专业创作任务')}
+          </p>
+          <div className="chat-empty-suggestions">
+            {suggestions.map((s) => (
+              <button
+                key={s.label}
+                className="chat-suggestion"
+                onClick={() => handleUseSuggestion(s)}
+              >
+                {s.icon || '✦'} {s.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <>
+          <div className="chat-messages">
+            <div className="chat-messages-inner">
+              <MessageList messages={messages} isLoading={isLoading} isStreaming={isStreaming} />
+              {agentActivity && isStreaming && (
+                <div className="agent-activity">{agentActivity}</div>
+              )}
+              {pendingQuestion && conversationId && (
+                <AgentQuestionCard
+                  question={pendingQuestion}
+                  onAnswer={(answer) => answerQuestion(conversationId, answer)}
+                  onCancel={() => cancelTurn(conversationId)}
+                />
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+          </div>
+        </>
+      )}
+
+      <div className="chat-input-area">
+        <div className="chat-input-wrapper">
+          <MessageInput
+            value={inputValue}
+            onValueChange={setInputValue}
+            onSendMessage={handleSendMessage}
+            currentAgent={currentConversation?.agent || null}
+            workspaceLocked={Boolean(
+              conversationId || projectId || creationContext?.applicationId
+              || creationContext?.workflowStepRunId
+            )}
+            disabled={
+              !user || isLoading || isCreatingConversation || isStreaming
+              || (!conversationId && !createOnFirstSend)
+            }
+            placeholder={user ? (inputPlaceholder || '描述你的创作需求... (Enter 发送，Shift+Enter 换行)') : '请先登录'}
+          />
+          <div className="chat-input-hint">
+            {isStreaming && conversationId ? (
+              <button className="agent-cancel-link" onClick={() => void cancelTurn(conversationId)}>
+                停止当前任务
+              </button>
+            ) : 'Enter 发送 · Shift+Enter 换行'}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default ChatContainer;

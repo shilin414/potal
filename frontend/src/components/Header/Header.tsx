@@ -1,0 +1,97 @@
+import React from 'react';
+import { Dropdown, Avatar } from 'antd';
+import { UserOutlined, LogoutOutlined, SettingOutlined } from '@ant-design/icons';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { useAuthStore } from '@/stores/useAuthStore';
+import { ThemeToggle } from '@/components/Theme';
+import './Header.css';
+
+const navItems = [
+  { key: '/', label: '💬 对话' },
+  { key: '/agents', label: '🤖 智能体' },
+  { key: '/skills', label: '⚡ 技能' },
+  { key: '/templates', label: '📚 案例库' },
+  { key: '/apps', label: '🧩 应用' },
+  { key: '/workflows', label: '🔀 工作流' },
+  { key: '/enterprise', label: '🏢 企业控制台' },
+];
+
+const Header: React.FC = () => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const { user, logout, isAuthenticated } = useAuthStore();
+
+  const handleLogout = async () => {
+    await logout();
+    navigate('/auth/login');
+  };
+
+  const userMenuItems = [
+    {
+      key: 'profile',
+      icon: <UserOutlined />,
+      label: '个人中心',
+      onClick: () => navigate('/profile'),
+    },
+    {
+      key: 'settings',
+      icon: <SettingOutlined />,
+      label: '设置',
+      onClick: () => navigate('/settings'),
+    },
+    { type: 'divider' as const },
+    {
+      key: 'logout',
+      icon: <LogoutOutlined />,
+      label: '登出',
+      onClick: handleLogout,
+    },
+  ];
+
+  const currentPath = location.pathname;
+
+  return (
+    <header className="app-header">
+      {/* Left: Logo */}
+      <div className="header-logo" onClick={() => navigate('/')}>
+        Creation <span>Studio</span>
+      </div>
+
+      {/* Center: Nav */}
+      <nav className="header-nav">
+        {navItems.map((item) => (
+          <div
+            key={item.key}
+            className={`header-nav-item ${
+              currentPath === item.key || (item.key !== '/' && currentPath.startsWith(item.key))
+                ? 'active' : ''}`}
+            onClick={() => navigate(item.key)}
+          >
+            {item.label}
+          </div>
+        ))}
+      </nav>
+
+      {/* Right: User */}
+      <div className="header-right">
+        <ThemeToggle />
+        {isAuthenticated && (
+          <Dropdown menu={{ items: userMenuItems }} placement="bottomRight">
+            <div className="header-user">
+              <div className="header-avatar">
+                {user?.avatar ? (
+                  <Avatar size={32} src={user.avatar} />
+                ) : (
+                  user?.username?.charAt(0)?.toUpperCase() || 'U'
+                )}
+              </div>
+              <span className="header-username">{user?.username || 'User'}</span>
+            </div>
+          </Dropdown>
+        )}
+      </div>
+    </header>
+  );
+};
+
+export default Header;

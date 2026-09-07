@@ -1,0 +1,160 @@
+/* ChatContainer — matches design-mockup.html chat styles */
+
+.chat-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--color-bg-void);
+}
+
+/* Messages area */
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 32px 24px;
+}
+
+.chat-messages-inner {
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+/* Empty state */
+.chat-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 16px;
+  padding: 32px 24px;
+}
+
+.chat-empty-icon {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: var(--color-bg-card);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 36px;
+}
+
+.chat-empty h3 {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.chat-empty p {
+  color: var(--color-text-sec);
+  font-size: 14px;
+  max-width: 400px;
+  text-align: center;
+  line-height: 1.6;
+}
+
+.chat-empty-suggestions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.chat-suggestion {
+  padding: 8px 16px;
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius-lg);
+  font-size: 13px;
+  color: var(--color-text-sec);
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: inherit;
+}
+
+.chat-suggestion:hover {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 6%, transparent);
+}
+
+/* Input area */
+.chat-input-area {
+  position: relative;
+  /* Balanced vertical padding: lift the box off the bottom and even out
+     the top/bottom whitespace so it no longer looks bottom-heavy. */
+  padding: 16px 24px 24px;
+}
+
+.chat-input-wrapper {
+  max-width: 800px;
+  margin: 0 auto;
+  position: relative;
+}
+
+.chat-input-hint {
+  text-align: center;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--color-text-dim);
+}
+
+.agent-activity {
+  margin: -8px 0 14px 48px;
+  color: var(--color-text-dim);
+  font-size: 12px;
+}
+
+.agent-question-card {
+  margin: 4px 0 20px 48px;
+  padding: 16px;
+  border: 1px solid color-mix(in srgb, var(--color-primary) 45%, var(--color-border));
+  border-radius: var(--border-radius-lg);
+  background: color-mix(in srgb, var(--color-primary) 7%, var(--color-bg-card));
+}
+
+.agent-question-eyebrow {
+  margin-bottom: 6px;
+  color: var(--color-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.agent-question-title {
+  margin-bottom: 12px;
+  color: var(--color-text);
+  line-height: 1.6;
+  white-space: pre-wrap;
+}
+
+.agent-question-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.agent-question-option-description {
+  display: block;
+  color: var(--color-text-dim);
+  font-size: 12px;
+}
+
+.agent-question-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.agent-cancel-link {
+  border: 0;
+  background: transparent;
+  color: var(--color-error, #ff4d4f);
+  cursor: pointer;
+  font: inherit;
+}

@@ -1,0 +1,52 @@
+import { useCallback, useEffect, useState } from 'react';
+import { Alert, Button, Card, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Switch, Table, Tabs, message } from 'antd';
+import { api } from '@/services/api';
+
+type Row = Record<string, any>;
+const roles = ['admin', 'developer', 'operator', 'auditor', 'viewer'].map(value => ({ value, label: value }));
+const json = (value: string, fallback: any) => value?.trim() ? JSON.parse(value) : fallback;
+
+export default function OrganizationGovernancePanel({ organizationId, role }: { organizationId: string; role?: string }) {
+  const [members, setMembers] = useState<Row[]>([]);
+  const [quota, setQuota] = useState<Row>({});
+  const [policy, setPolicy] = useState<Row>({});
+  const [memberOpen, setMemberOpen] = useState(false);
+  const [quotaOpen, setQuotaOpen] = useState(false);
+  const [policyOpen, setPolicyOpen] = useState(false);
+  const [memberForm] = Form.useForm(); const [quotaForm] = Form.useForm(); const [policyForm] = Form.useForm();
+  const canAdmin = role === 'owner' || role === 'admin';
+
+  const load = useCallback(async () => {
+    if (!organizationId) return;
+    const [memberData, quotaData, policyData] = await Promise.all([
+      api.get(`/enterprise/organizations/${organizationId}/members/`), api.get('/enterprise/quota/'), api.get('/enterprise/governance/'),
+    ]);
+    setMembers(memberData as Row[]); setQuota(quotaData as Row); setPolicy(policyData as Row);
+  }, [organizationId]);
+  useEffect(() => { void load(); }, [load]);
+
+  const saveMember = async () => { const values = await memberForm.validateFields(); await api.post(`/enterprise/organizations/${organizationId}/members/`, values); message.success('成员已添加'); setMemberOpen(false); await load(); };
+  const updateRole = async (member: Row, nextRole: string) => { await api.patch(`/enterprise/organizations/${organizationId}/members/${member.id}/`, { role: nextRole }); message.success('角色已更新'); await load(); };
+  const removeMember = async (member: Row) => { await api.delete(`/enterprise/organizations/${organizationId}/members/${member.id}/`); message.success('成员已停用'); await load(); };
+  const openQuota = () => { quotaForm.setFieldsValue(quota); setQuotaOpen(true); };
+  const saveQuota = async () => { const values = await quotaForm.validateFields(); await api.patch('/enterprise/quota/current/', values); message.success('配额已更新'); setQuotaOpen(false); await load(); };
+  const openPolicy = () => { policyForm.setFieldsValue({ ...policy, allowed_models: JSON.stringify(policy.allowed_models || []), blocked_terms: JSON.stringify(policy.blocked_terms || []), allowed_tool_patterns: JSON.stringify(policy.allowed_tool_patterns || []), blocked_tool_patterns: JSON.stringify(policy.blocked_tool_patterns || []), network_allowlist: JSON.stringify(policy.network_allowlist || []) }); setPolicyOpen(true); };
+  const savePolicy = async () => { try { const values = await policyForm.validateFields(); ['allowed_models', 'blocked_terms', 'allowed_tool_patterns', 'blocked_tool_patterns', 'network_allowlist'].forEach(key => { values[key] = json(values[key], []); }); await api.patch('/enterprise/governance/current/', values); message.success('治理策略已更新'); setPolicyOpen(false); await load(); } catch (error: any) { if (!error?.errorFields) message.error(error.message || 'JSON 格式不正确'); } };
+
+  return <div className="enterprise-subpanel">
+    {!canAdmin && <Alert type="info" showIcon message="只读访问" description="只有组织 owner/admin 可修改成员、配额和治理策略。" />}
+    <Tabs items={[
+      { key: 'members', label: '成员与 RBAC', children: <Card extra={canAdmin && <Button type="primary" onClick={() => { memberForm.resetFields(); setMemberOpen(true); }}>添加成员</Button>}><Table rowKey="id" pagination={false} dataSource={members} columns={[
+        { title: '用户', render: (_, r: Row) => <><strong>{r.username}</strong><div>{r.email}</div></> },
+        { title: '角色', render: (_, r: Row) => r.role === 'owner' ? 'owner' : <Select disabled={!canAdmin} value={r.role} options={roles} onChange={value => void updateRole(r, value)} /> },
+        { title: '状态', render: (_, r: Row) => r.is_active ? '启用' : '停用' },
+        { title: '操作', render: (_, r: Row) => r.role !== 'owner' && canAdmin ? <Popconfirm title="确认停用该成员？" onConfirm={() => removeMember(r)}><Button danger size="small">停用</Button></Popconfirm> : '—' },
+      ]} /></Card> },
+      { key: 'quota', label: '配额与预算', children: <Card extra={canAdmin && <Button onClick={openQuota}>编辑配额</Button>}><div className="enterprise-policy-grid">{Object.entries(quota).filter(([key]) => !['id','created_at','updated_at'].includes(key)).map(([key, value]) => <div key={key}><span>{key}</span><strong>{String(value)}</strong></div>)}</div></Card> },
+      { key: 'policy', label: '治理策略', children: <Card extra={canAdmin && <Button onClick={openPolicy}>编辑策略</Button>}><div className="enterprise-policy-grid">{Object.entries(policy).filter(([key]) => !['id','created_at','updated_at'].includes(key)).map(([key, value]) => <div key={key}><span>{key}</span><strong>{typeof value === 'object' ? JSON.stringify(value) : String(value)}</strong></div>)}</div></Card> },
+    ]} />
+    <Modal title="添加组织成员" open={memberOpen} onCancel={() => setMemberOpen(false)} onOk={saveMember}><Form layout="vertical" form={memberForm}><Form.Item name="user_id" label="用户 ID" rules={[{ required: true }]}><InputNumber style={{ width: '100%' }} /></Form.Item><Form.Item name="role" label="角色" initialValue="viewer"><Select options={roles} /></Form.Item></Form></Modal>
+    <Modal title="编辑配额" open={quotaOpen} onCancel={() => setQuotaOpen(false)} onOk={saveQuota}><Form layout="vertical" form={quotaForm}><Form.Item name="monthly_token_limit" label="每月 Token"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item><Form.Item name="monthly_cost_limit" label="每月成本预算"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item><Form.Item name="max_concurrent_runs" label="最大并发运行"><InputNumber min={1} style={{ width: '100%' }} /></Form.Item><Form.Item name="requests_per_minute" label="每分钟请求"><InputNumber min={1} style={{ width: '100%' }} /></Form.Item><Form.Item name="storage_bytes_limit" label="存储字节"><InputNumber min={0} style={{ width: '100%' }} /></Form.Item><Form.Item name="hard_limit" label="硬限制" valuePropName="checked"><Switch /></Form.Item></Form></Modal>
+    <Modal title="编辑治理策略" open={policyOpen} onCancel={() => setPolicyOpen(false)} onOk={savePolicy} width={760}><Form layout="vertical" form={policyForm}><Space align="start"><Form.Item name="retention_days" label="数据保留天数"><InputNumber min={1} /></Form.Item><Form.Item name="redact_pii" label="PII 脱敏" valuePropName="checked"><Switch /></Form.Item><Form.Item name="require_tool_approval" label="工具审批" valuePropName="checked"><Switch /></Form.Item><Form.Item name="export_enabled" label="允许导出" valuePropName="checked"><Switch /></Form.Item></Space>{['allowed_models','blocked_terms','allowed_tool_patterns','blocked_tool_patterns','network_allowlist'].map(key => <Form.Item key={key} name={key} label={`${key}（JSON 数组）`}><Input.TextArea rows={2} /></Form.Item>)}</Form></Modal>
+  </div>;
+}

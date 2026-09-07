@@ -1,0 +1,1194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>山海集 · 运营后台</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700&family=Inter:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+<style>
+/* ============================================================
+   山海集 · 运营后台  —  design tokens
+   Palette: 墨 ink · 宣纸 paper · 松柏 celadon · 朱砂 vermilion
+   Type: Bricolage Grotesque (display) · Inter (ui) · Space Mono (data)
+   ============================================================ */
+:root{
+  --ink:#1B1D1C; --ink-2:#474B48; --muted:#767B77; --faint:#9CA19C;
+  --paper:#F3F4F0; --panel:#FFFFFF; --panel-2:#FAFBF8;
+  --rule:#E7E8E3; --rule-2:#EEF0EA;
+  --brand:#2E5E50; --brand-2:#244A40; --brand-soft:#E7EFEB; --brand-line:#C9DCD4;
+  --seal:#C13C2F; --seal-soft:#F6E6E3;
+  --up:#2F7D54; --down:#C13C2F; --gold:#B68A1E; --info:#3F6E91; --warn:#C77A1B;
+  --shadow-sm:0 1px 2px rgba(27,29,28,.05);
+  --shadow:0 1px 2px rgba(27,29,28,.04), 0 6px 18px -10px rgba(27,29,28,.10);
+  --shadow-lg:0 2px 6px rgba(27,29,28,.05), 0 24px 48px -24px rgba(27,29,28,.18);
+  --r-sm:6px; --r:10px; --r-lg:14px; --r-xl:18px; --pill:999px;
+  --rail-w:244px;
+  --topbar-h:60px;
+  --fd:"Bricolage Grotesque", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  --fu:"Inter","PingFang SC","Microsoft YaHei", system-ui, sans-serif;
+  --fm:"Space Mono","SF Mono",ui-monospace,monospace;
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  font-family:var(--fu); color:var(--ink); background:var(--paper);
+  font-size:14px; line-height:1.5; -webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility;
+}
+a{color:inherit; text-decoration:none}
+button{font:inherit; color:inherit; background:none; border:0; cursor:pointer}
+input,select{font:inherit}
+::selection{background:var(--brand-soft); color:var(--brand-2)}
+
+:focus-visible{outline:2px solid var(--brand); outline-offset:2px; border-radius:4px}
+
+/* ---------- app shell ---------- */
+.shell{display:grid; grid-template-columns:var(--rail-w) 1fr; min-height:100vh}
+
+/* ---------- left rail ---------- */
+.rail{
+  background:var(--panel); border-right:1px solid var(--rule);
+  display:flex; flex-direction:column; position:sticky; top:0; height:100vh; z-index:30;
+}
+.brand{display:flex; align-items:center; gap:11px; padding:16px 18px; border-bottom:1px solid var(--rule-2)}
+.seal{
+  width:34px; height:34px; border-radius:7px; background:var(--seal); color:#FBF6EE;
+  display:grid; place-items:center; font-family:var(--fd); font-weight:700; font-size:19px;
+  letter-spacing:0; box-shadow: inset 0 0 0 2px rgba(255,255,255,.18), inset 0 0 0 3px var(--seal);
+  flex:none; line-height:1;
+}
+.brand-txt b{font-family:var(--fd); font-weight:600; font-size:16px; letter-spacing:.5px; display:block; line-height:1.1}
+.brand-txt span{font-family:var(--fm); font-size:9.5px; color:var(--muted); letter-spacing:1.5px; text-transform:uppercase}
+
+.nav{flex:1; overflow-y:auto; padding:10px 12px 16px}
+.nav-group{margin-top:14px}
+.nav-group>label{
+  display:block; font-size:10px; font-weight:600; letter-spacing:1.4px; text-transform:uppercase;
+  color:var(--faint); padding:6px 10px 4px;
+}
+.nav-item{
+  display:flex; align-items:center; gap:11px; width:100%; padding:9px 10px; border-radius:8px;
+  color:var(--ink-2); font-size:13.5px; font-weight:500; position:relative; transition:background .15s, color .15s;
+}
+.nav-item:hover{background:var(--panel-2); color:var(--ink)}
+.nav-item.is-active{background:var(--brand-soft); color:var(--brand-2); font-weight:600}
+.nav-item.is-active::before{
+  content:""; position:absolute; left:-12px; top:8px; bottom:8px; width:3px; border-radius:0 3px 3px 0; background:var(--brand);
+}
+.nav-item svg{width:18px; height:18px; flex:none; stroke:currentColor; fill:none; stroke-width:1.6; stroke-linecap:round; stroke-linejoin:round}
+.nav-item .lbl{flex:1}
+.nav-item .cnt{
+  font-family:var(--fm); font-size:10.5px; padding:1px 7px; border-radius:var(--pill);
+  background:var(--rule-2); color:var(--muted);
+}
+.nav-item .cnt.hot{background:var(--seal-soft); color:var(--seal)}
+
+.rail-foot{padding:12px; border-top:1px solid var(--rule-2)}
+.store{
+  display:flex; align-items:center; gap:10px; padding:9px 10px; border-radius:9px; background:var(--panel-2);
+  border:1px solid var(--rule);
+}
+.store .dot{width:30px;height:30px;border-radius:7px;background:linear-gradient(135deg,var(--brand),var(--brand-2));display:grid;place-items:center;color:#EAF3EE;font-family:var(--fd);font-weight:600;font-size:13px;flex:none}
+.store b{font-size:12.5px; font-weight:600; display:block; line-height:1.2}
+.store small{font-size:10.5px; color:var(--muted); font-family:var(--fm)}
+.store .chev{margin-left:auto; color:var(--faint)}
+
+/* ---------- main column ---------- */
+.main{display:flex; flex-direction:column; min-width:0}
+.topbar{
+  height:var(--topbar-h); background:rgba(255,255,255,.82); backdrop-filter:saturate(140%) blur(8px);
+  border-bottom:1px solid var(--rule); position:sticky; top:0; z-index:20;
+  display:flex; align-items:center; gap:16px; padding:0 22px;
+}
+.menu-btn{display:none; width:36px;height:36px;border-radius:8px;align-items:center;justify-content:center}
+.menu-btn:hover{background:var(--panel-2)}
+.menu-btn svg{width:20px;height:20px;stroke:var(--ink);fill:none;stroke-width:1.7}
+.crumb{display:flex; align-items:baseline; gap:9px; min-width:0}
+.crumb .page{font-family:var(--fd); font-size:17px; font-weight:600; letter-spacing:.2px}
+.crumb .sub{font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+
+.search{
+  margin-left:auto; display:flex; align-items:center; gap:8px; width:300px; max-width:34vw;
+  background:var(--panel-2); border:1px solid var(--rule); border-radius:var(--pill); padding:7px 14px;
+}
+.search:focus-within{border-color:var(--brand-line); background:var(--panel); box-shadow:0 0 0 3px var(--brand-soft)}
+.search svg{width:15px;height:15px;stroke:var(--muted);fill:none;stroke-width:1.7}
+.search input{border:0; background:none; outline:none; width:100%; font-size:13px}
+.search kbd{font-family:var(--fm); font-size:10px; color:var(--faint); border:1px solid var(--rule); border-radius:5px; padding:1px 5px; background:var(--panel)}
+
+.tbx{display:flex; align-items:center; gap:6px}
+.iconbtn{
+  width:38px; height:38px; border-radius:9px; display:grid; place-items:center; color:var(--ink-2); position:relative; transition:background .15s
+}
+.iconbtn:hover{background:var(--panel-2); color:var(--ink)}
+.iconbtn svg{width:19px;height:19px;stroke:currentColor;fill:none;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.iconbtn .ping{position:absolute; top:8px; right:9px; width:7px;height:7px;border-radius:50%;background:var(--seal); border:1.5px solid var(--panel)}
+.user{display:flex; align-items:center; gap:10px; padding:5px 8px 5px 5px; border-radius:var(--pill); margin-left:4px}
+.user:hover{background:var(--panel-2)}
+.user .av{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#E9CFB0,#C99A6B);display:grid;place-items:center;color:#5A3D1E;font-weight:700;font-size:13px;font-family:var(--fd)}
+.user .meta{display:flex;flex-direction:column;line-height:1.15}
+.user .meta b{font-size:12.5px;font-weight:600}
+.user .meta small{font-size:10.5px;color:var(--muted)}
+
+.content{padding:22px 26px 56px; max-width:1480px; width:100%}
+.view{display:none; animation:viewin .28s ease both}
+.view.is-active{display:block}
+@keyframes viewin{from{opacity:0; transform:translateY(6px)}to{opacity:1; transform:none}}
+
+/* ---------- generic primitives ---------- */
+.row{display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap}
+.grid{display:grid; gap:16px}
+.card{background:var(--panel); border:1px solid var(--rule); border-radius:var(--r-lg); box-shadow:var(--shadow-sm)}
+.card.pad{padding:18px}
+.card-h{display:flex; align-items:center; gap:10px; padding:15px 18px; border-bottom:1px solid var(--rule-2)}
+.card-h h3{margin:0; font-size:14px; font-weight:600}
+.card-h .more{margin-left:auto; font-size:12px; color:var(--brand); font-weight:500}
+.card-h .more:hover{text-decoration:underline}
+.eyebrow{font-family:var(--fm); font-size:10.5px; letter-spacing:1.4px; text-transform:uppercase; color:var(--muted)}
+
+.btn{display:inline-flex; align-items:center; gap:7px; padding:8px 14px; border-radius:8px; font-size:13px; font-weight:500; border:1px solid transparent; transition:background .15s, border-color .15s, color .15s; white-space:nowrap}
+.btn svg{width:15px;height:15px;stroke:currentColor;fill:none;stroke-width:1.7}
+.btn--primary{background:var(--brand); color:#F1F7F4}
+.btn--primary:hover{background:var(--brand-2)}
+.btn--ghost{background:var(--panel); border-color:var(--rule); color:var(--ink-2)}
+.btn--ghost:hover{border-color:var(--brand-line); color:var(--ink); background:var(--brand-soft)}
+.btn--sm{padding:6px 11px; font-size:12px}
+
+.tag{display:inline-flex; align-items:center; gap:5px; font-size:11.5px; padding:2px 9px; border-radius:var(--pill); font-weight:500; line-height:1.7; white-space:nowrap}
+.tag::before{content:""; width:6px;height:6px;border-radius:50%; background:currentColor; opacity:.85}
+.tag.ok{color:var(--up); background:#E8F2EC}
+.tag.warn{color:var(--warn); background:#F8EEDD}
+.tag.bad{color:var(--down); background:var(--seal-soft)}
+.tag.mute{color:var(--muted); background:var(--rule-2)}
+.tag.info{color:var(--info); background:#E9F0F6}
+.tag.plain{color:var(--ink-2); background:var(--rule-2)}
+.tag.plain::before{display:none}
+.mono{font-family:var(--fm); font-variant-numeric:tabular-nums}
+.up{color:var(--up)} .down{color:var(--down)}
+.delta{font-family:var(--fm); font-size:12px; display:inline-flex; align-items:center; gap:3px}
+
+/* ---------- dashboard hero ---------- */
+.hero{position:relative; overflow:hidden; border:1px solid var(--rule); border-radius:var(--r-xl); background:var(--panel); box-shadow:var(--shadow); padding:24px 26px 22px}
+.hero::after{content:""; position:absolute; right:-60px; top:-60px; width:260px; height:260px; border-radius:50%; background:radial-gradient(closest-side,var(--brand-soft),transparent); opacity:.7; pointer-events:none}
+.hero-top{display:flex; align-items:flex-end; justify-content:space-between; gap:24px; position:relative; flex-wrap:wrap}
+.hero-left .live{display:inline-flex; align-items:center; gap:7px; font-size:11.5px; color:var(--muted)}
+.hero-left .live .blip{width:7px;height:7px;border-radius:50%; background:var(--up); position:relative}
+.hero-left .live .blip::after{content:""; position:absolute; inset:0; border-radius:50%; background:var(--up); animation:blip 1.8s ease-out infinite}
+@keyframes blip{0%{transform:scale(1);opacity:.6}100%{transform:scale(3);opacity:0}}
+.hero h1{font-family:var(--fd); font-weight:600; font-size:15px; margin:10px 0 6px; letter-spacing:.2px}
+.gmv{display:flex; align-items:baseline; gap:10px; flex-wrap:wrap}
+.gmv .sym{font-family:var(--fd); font-size:24px; font-weight:500; color:var(--ink-2)}
+.gmv .num{font-family:var(--fd); font-weight:600; font-size:54px; line-height:.95; letter-spacing:-1px; font-variant-numeric:tabular-nums}
+.gmv .num .cents{font-size:22px; color:var(--muted)}
+.gmv .unit{font-size:13px; color:var(--muted)}
+.hero-meta{display:flex; gap:22px; margin-top:14px; flex-wrap:wrap}
+.hero-meta .m{display:flex; flex-direction:column; gap:3px}
+.hero-meta .m .v{font-family:var(--fm); font-size:16px; font-weight:700}
+.hero-meta .m .k{font-size:11px; color:var(--muted)}
+.hero-meta .sep{width:1px; background:var(--rule); align-self:stretch}
+.hero-right{display:flex; flex-direction:column; align-items:flex-end; gap:8px; min-width:240px}
+.sparkbox{width:280px; max-width:42vw}
+.spark-cap{display:flex; justify-content:space-between; font-size:11px; color:var(--muted); font-family:var(--fm)}
+
+/* KPI action cards */
+.kpis{display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:16px}
+.kpi{background:var(--panel); border:1px solid var(--rule); border-radius:var(--r-lg); padding:15px 16px; position:relative; transition:transform .15s, box-shadow .15s, border-color .15s; cursor:pointer}
+.kpi:hover{transform:translateY(-2px); box-shadow:var(--shadow); border-color:var(--brand-line)}
+.kpi .ktop{display:flex; align-items:center; justify-content:space-between}
+.kpi .ktop .ic{width:32px;height:32px;border-radius:8px; display:grid; place-items:center}
+.kpi .ktop .ic svg{width:17px;height:17px;stroke-width:1.7; fill:none}
+.kpi .ktop .ic.a{background:var(--brand-soft);color:var(--brand)}
+.kpi .ktop .ic.b{background:#F8EEDD;color:var(--warn)}
+.kpi .ktop .ic.c{background:var(--seal-soft);color:var(--seal)}
+.kpi .ktop .ic.d{background:#E9F0F6;color:var(--info)}
+.kpi .kn{font-family:var(--fd); font-weight:600; font-size:30px; line-height:1; margin:12px 0 4px; font-variant-numeric:tabular-nums}
+.kpi .kl{font-size:12.5px; color:var(--muted)}
+
+/* dashboard grid sections */
+.dash-grid{display:grid; grid-template-columns:1.55fr 1fr; gap:16px; margin-top:16px}
+.dash-grid.col3{grid-template-columns:repeat(3,1fr)}
+
+.chart-wrap{padding:8px 10px 14px}
+.axis{font-family:var(--fm); font-size:10px; fill:var(--faint)}
+
+/* lists inside cards */
+.tlist{width:100%; border-collapse:collapse}
+.tlist th, .tlist td{text-align:left; padding:11px 18px; font-size:13px}
+.tlist th{font-size:10.5px; letter-spacing:.6px; text-transform:uppercase; color:var(--faint); font-weight:600; border-bottom:1px solid var(--rule-2); background:var(--panel-2)}
+.tlist td{border-bottom:1px solid var(--rule-2); vertical-align:middle}
+.tlist tr:last-child td{border-bottom:0}
+.tlist tbody tr{transition:background .12s}
+.tlist tbody tr:hover{background:var(--panel-2)}
+.tlist .pr{display:flex; align-items:center; gap:10px}
+.thumb{width:34px;height:34px;border-radius:7px;flex:none;background:var(--rule-2); object-fit:cover; border:1px solid var(--rule)}
+.cust{display:flex;flex-direction:column;line-height:1.3}
+.cust small{color:var(--muted); font-size:11px}
+
+/* generic data table */
+.table-card .tlist th, .table-card .tlist td{padding:13px 16px}
+
+/* toolbar */
+.toolbar{display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:14px}
+.tabs{display:inline-flex; background:var(--panel); border:1px solid var(--rule); border-radius:9px; padding:3px; gap:2px; flex-wrap:wrap}
+.tab{padding:6px 13px; font-size:13px; color:var(--muted); border-radius:7px; font-weight:500; position:relative}
+.tab .c{font-family:var(--fm); font-size:11px; margin-left:5px; color:var(--faint)}
+.tab:hover{color:var(--ink)}
+.tab.is-active{background:var(--ink); color:#fff}
+.tab.is-active .c{color:#cfd2cf}
+.seg{display:inline-flex; background:var(--panel); border:1px solid var(--rule); border-radius:9px; overflow:hidden}
+.seg button{padding:7px 12px; font-size:12.5px; color:var(--muted)}
+.seg button.is-active{background:var(--brand-soft); color:var(--brand-2); font-weight:600}
+.field{background:var(--panel); border:1px solid var(--rule); border-radius:8px; padding:7px 12px; font-size:13px; color:var(--ink-2); display:inline-flex; align-items:center; gap:7px}
+.field input,.field select{border:0;background:none;outline:none}
+.field svg{width:14px;height:14px;stroke:var(--muted);fill:none;stroke-width:1.7}
+
+/* pagination */
+.pager{display:flex; align-items:center; gap:6px; padding:14px 18px; justify-content:space-between; border-top:1px solid var(--rule-2); flex-wrap:wrap}
+.pager .info{font-size:12px; color:var(--muted); font-family:var(--fm)}
+.pager .pages{display:flex; gap:4px}
+.pager .pages button{min-width:30px; height:30px; padding:0 9px; border-radius:7px; font-size:12.5px; font-family:var(--fm); color:var(--ink-2); border:1px solid transparent}
+.pager .pages button:hover{background:var(--panel-2)}
+.pager .pages button.is-active{background:var(--brand); color:#fff}
+.pager .pages .nav-btn{color:var(--muted)}
+
+/* stat tiles (members / stats) */
+.stat-grid{display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:16px}
+.stat{background:var(--panel); border:1px solid var(--rule); border-radius:var(--r-lg); padding:16px}
+.stat .k{font-size:12.5px; color:var(--muted)}
+.stat .v{font-family:var(--fd); font-weight:600; font-size:28px; margin:8px 0 4px; font-variant-numeric:tabular-nums}
+.stat .f{display:flex; align-items:center; gap:8px; font-size:12px; color:var(--muted)}
+
+/* product cards */
+.prod-grid{display:grid; grid-template-columns:repeat(4,1fr); gap:14px}
+.prod{background:var(--panel); border:1px solid var(--rule); border-radius:var(--r-lg); overflow:hidden; transition:transform .15s, box-shadow .15s}
+.prod:hover{transform:translateY(-3px); box-shadow:var(--shadow)}
+.prod .ph{height:120px; position:relative; overflow:hidden}
+.prod .ph .art{position:absolute; inset:0}
+.prod .ph .flag{position:absolute; top:9px; left:9px}
+.prod .pb{padding:12px 13px}
+.prod .pb .sku{font-family:var(--fm); font-size:10.5px; color:var(--faint); letter-spacing:.4px}
+.prod .pb h4{margin:4px 0 9px; font-size:13.5px; font-weight:600; line-height:1.3; min-height:35px}
+.prod .pb .price{display:flex; align-items:baseline; gap:7px}
+.prod .pb .price b{font-family:var(--fm); font-size:17px; font-weight:700}
+.prod .pb .price s{font-size:11.5px; color:var(--faint)}
+.prod .pb .row2{display:flex; justify-content:space-between; margin-top:10px; padding-top:10px; border-top:1px solid var(--rule-2); font-size:11.5px; color:var(--muted)}
+
+/* campaign cards */
+.camp{display:flex; gap:14px; padding:16px; border:1px solid var(--rule); border-radius:var(--r-lg); background:var(--panel)}
+.camp .badge{width:46px;height:46px;border-radius:11px;display:grid;place-items:center;flex:none;font-family:var(--fd);font-weight:700;color:#fff;font-size:13px;letter-spacing:.5px}
+.camp .body{flex:1; min-width:0}
+.camp .body h4{margin:0 0 4px; font-size:14px; font-weight:600; display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+.camp .body p{margin:0; font-size:12.5px; color:var(--muted)}
+.camp .meter{height:6px; border-radius:var(--pill); background:var(--rule-2); overflow:hidden; margin-top:10px}
+.camp .meter i{display:block; height:100%; background:var(--brand); border-radius:inherit}
+.camp .nums{display:flex; gap:18px; margin-top:8px}
+.camp .nums div span{display:block}
+.camp .nums .v{font-family:var(--fm); font-weight:700; font-size:14px}
+.camp .nums .k{font-size:10.5px; color:var(--muted)}
+
+/* funnel */
+.funnel{display:flex; flex-direction:column; gap:9px; padding:6px 0}
+.fstep{display:grid; grid-template-columns:84px 1fr 78px; align-items:center; gap:12px}
+.fstep .lab{font-size:12.5px; color:var(--ink-2)}
+.fstep .bar{height:26px; border-radius:6px; background:var(--brand); position:relative; display:flex; align-items:center}
+.fstep .bar i{position:absolute; inset:0; border-radius:inherit; opacity:.16; background:#000}
+.fstep .pct{font-family:var(--fm); font-size:12.5px; color:var(--muted); text-align:right}
+
+/* settings */
+.set-grid{display:grid; grid-template-columns:200px 1fr; gap:20px; align-items:flex-start}
+.setnav{background:var(--panel); border:1px solid var(--rule); border-radius:var(--r-lg); padding:8px; position:sticky; top:84px}
+.setnav button{display:block; width:100%; text-align:left; padding:9px 12px; border-radius:8px; font-size:13px; color:var(--ink-2); font-weight:500}
+.setnav button.is-active{background:var(--brand-soft); color:var(--brand-2); font-weight:600}
+.setnav button:hover{background:var(--panel-2)}
+.form-row{display:grid; grid-template-columns:160px 1fr; gap:18px; align-items:flex-start; padding:14px 0; border-bottom:1px solid var(--rule-2)}
+.form-row:last-child{border-bottom:0}
+.form-row label{font-size:13px; font-weight:500; color:var(--ink-2); padding-top:8px}
+.form-row label small{display:block; font-weight:400; color:var(--muted); font-size:11.5px; margin-top:2px}
+.input{width:100%; background:var(--panel); border:1px solid var(--rule); border-radius:8px; padding:9px 12px; font-size:13px}
+.input:focus{outline:none; border-color:var(--brand-line); box-shadow:0 0 0 3px var(--brand-soft)}
+.switch{position:relative; width:38px; height:22px; border-radius:var(--pill); background:var(--rule); transition:background .2s; cursor:pointer; flex:none}
+.switch.on{background:var(--brand)}
+.switch::after{content:""; position:absolute; top:2px; left:2px; width:18px;height:18px;border-radius:50%; background:#fff; transition:transform .2s; box-shadow:0 1px 2px rgba(0,0,0,.2)}
+.switch.on::after{transform:translateX(16px)}
+
+/* log entries */
+.log{display:flex; gap:13px; padding:13px 18px; border-bottom:1px solid var(--rule-2)}
+.log:last-child{border-bottom:0}
+.log .av{width:30px;height:30px;border-radius:50%;flex:none;display:grid;place-items:center;font-size:12px;font-weight:600;color:#fff}
+.log p{margin:0; font-size:13px}
+.log p b{font-weight:600}
+.log .when{font-size:11px; color:var(--faint); font-family:var(--fm); margin-top:2px}
+
+/* empty / tip strip */
+.tipstrip{display:flex; align-items:center; gap:10px; font-size:12.5px; color:var(--ink-2); background:var(--brand-soft); border:1px solid var(--brand-line); border-radius:9px; padding:9px 13px; margin-bottom:14px}
+.tipstrip svg{width:15px;height:15px;stroke:var(--brand);fill:none;stroke-width:1.7;flex:none}
+
+/* toast */
+.toast{position:fixed; bottom:24px; right:24px; background:var(--ink); color:#fff; padding:12px 16px; border-radius:10px; font-size:13px; box-shadow:var(--shadow-lg); display:flex; align-items:center; gap:9px; transform:translateY(20px); opacity:0; pointer-events:none; transition:.25s; z-index:60}
+.toast.show{transform:none; opacity:1}
+.toast svg{width:16px;height:16px;stroke:#7FD1A8;fill:none;stroke-width:2}
+
+/* responsive */
+@media (max-width:1180px){
+  .kpis{grid-template-columns:repeat(2,1fr)}
+  .dash-grid{grid-template-columns:1fr}
+  .dash-grid.col3{grid-template-columns:1fr 1fr}
+  .stat-grid{grid-template-columns:repeat(2,1fr)}
+  .prod-grid{grid-template-columns:repeat(2,1fr)}
+}
+@media (max-width:980px){
+  :root{--rail-w:0px}
+  .shell{grid-template-columns:1fr}
+  .rail{position:fixed; left:0; top:0; width:260px; transform:translateX(-100%); transition:transform .25s; box-shadow:var(--shadow-lg)}
+  body.nav-open .rail{transform:none}
+  body.nav-open::after{content:""; position:fixed; inset:0; background:rgba(20,22,21,.4); z-index:25}
+  .menu-btn{display:flex}
+  .set-grid{grid-template-columns:1fr}
+  .setnav{position:static; display:flex; overflow:auto}
+  .setnav button{white-space:nowrap}
+}
+@media (max-width:640px){
+  .content{padding:16px 14px 48px}
+  .kpis,.stat-grid,.prod-grid,.dash-grid.col3{grid-template-columns:1fr}
+  .search{display:none}
+  .hero-meta{gap:14px}
+  .gmv .num{font-size:42px}
+  .form-row{grid-template-columns:1fr}
+  .topbar{padding:0 14px}
+  .user .meta{display:none}
+}
+@media (prefers-reduced-motion:reduce){
+  *{animation:none!important; transition:none!important}
+  .view{animation:none!important}
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- ===================== LEFT RAIL ===================== -->
+  <aside class="rail" aria-label="主导航">
+    <div class="brand">
+      <span class="seal" aria-hidden="true">山</span>
+      <span class="brand-txt"><b>山海集</b><span>OPERATIONS</span></span>
+    </div>
+
+    <nav class="nav" id="nav">
+      <div class="nav-group">
+        <label>经营概览</label>
+        <button class="nav-item is-active" data-nav="dashboard" data-title="工作台" data-sub="今日经营概览 · 2026/06/11 周四">
+          <svg viewBox="0 0 24 24"><path d="M4 13h6V4H4zM14 20h6V4h-6zM4 20h6v-4H4z"/></svg>
+          <span class="lbl">工作台</span>
+        </button>
+      </div>
+      <div class="nav-group">
+        <label>交易管理</label>
+        <button class="nav-item" data-nav="orders" data-title="订单管理" data-sub="全渠道订单 · 待发货 47">
+          <svg viewBox="0 0 24 24"><path d="M6 6h15l-1.5 9h-12z"/><circle cx="9" cy="20" r="1.4"/><circle cx="18" cy="20" r="1.4"/><path d="M6 6 5 3H2"/></svg>
+          <span class="lbl">订单管理</span>
+          <!-- <span class="cnt hot">47</span> -->
+        </button>
+      </div>
+      <div class="nav-group">
+        <label>商品管理</label>
+        <button class="nav-item" data-nav="goods" data-title="商品中心" data-sub="在售 128 · 缺货 1 · 待审核 1">
+          <svg viewBox="0 0 24 24"><path d="M3 8l9-5 9 5v8l-9 5-9-5z"/><path d="M3 8l9 5 9-5M12 13v8"/></svg>
+          <span class="lbl">商品中心</span>
+          <!-- <span class="cnt">128</span> -->
+        </button>
+      </div>
+      <div class="nav-group">
+        <label>客户经营</label>
+        <button class="nav-item" data-nav="members" data-title="会员管理" data-sub="会员总数 12,840 · 本月新增 312">
+          <svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0M16 5.5a3 3 0 0 1 0 5.8M17 19a5.5 5.5 0 0 0-2.5-4.6"/></svg>
+          <span class="lbl">会员管理</span>
+        </button>
+        <button class="nav-item" data-nav="marketing" data-title="营销活动" data-sub="进行中 3 · 提升 GMV +18%">
+          <svg viewBox="0 0 24 24"><path d="M4 10v4h3l7 4V6l-7 4z"/><path d="M17.5 9a4 4 0 0 1 0 6"/></svg>
+          <span class="lbl">营销活动</span>
+          <!-- <span class="cnt">3</span> -->
+        </button>
+      </div>
+      <div class="nav-group">
+        <label>数据洞察</label>
+        <button class="nav-item" data-nav="stats" data-title="数据统计" data-sub="近 30 日经营数据">
+          <svg viewBox="0 0 24 24"><path d="M4 20V4M4 20h16M8 16v-4M12 16V8M16 16v-6M20 16v-9"/></svg>
+          <span class="lbl">数据统计</span>
+        </button>
+      </div>
+      <div class="nav-group">
+        <label>系统</label>
+        <button class="nav-item" data-nav="settings" data-title="系统设置" data-sub="店铺 · 支付 · 物流 · 权限">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.4 1a7 7 0 0 0-1.7-1L14.5 3h-5l-.3 2.5a7 7 0 0 0-1.7 1l-2.4-1-2 3.4L3.1 11a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 1.7 1l.3 2.5h5l.3-2.5a7 7 0 0 0 1.7-1l2.4 1 2-3.4-2-1.6a7 7 0 0 0 .1-1z"/></svg>
+          <span class="lbl">系统设置</span>
+        </button>
+      </div>
+    </nav>
+
+    <div class="rail-foot">
+      <div class="store">
+        <span class="dot">山</span>
+        <div>
+          <b>山海集 · 旗舰店</b>
+          <small>STORE · CN-001</small>
+        </div>
+        <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 9l4-4 4 4M8 15l4 4 4-4"/></svg>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ===================== MAIN ===================== -->
+  <div class="main">
+    <header class="topbar">
+      <button class="menu-btn" id="menuBtn" aria-label="打开导航"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+      <div class="crumb">
+        <span class="page" id="pageTitle">工作台</span>
+        <span class="sub" id="pageSub">今日经营概览 · 2026/06/11 周四</span>
+      </div>
+
+      <label class="search">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+        <input type="search" placeholder="搜索订单号、商品、会员…" />
+        <kbd>⌘K</kbd>
+      </label>
+
+      <div class="tbx">
+        <button class="iconbtn" aria-label="新建"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+        <button class="iconbtn" aria-label="帮助"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 1 1 3.5 2.3c-.7.3-1 .8-1 1.7M12 17h.01"/></svg></button>
+        <button class="iconbtn" aria-label="消息"><svg viewBox="0 0 24 24"><path d="M4 6h16v11H8l-4 3z"/></svg><span class="ping"></span></button>
+        <button class="iconbtn" aria-label="通知"><svg viewBox="0 0 24 24"><path d="M6 9a6 6 0 1 1 12 0c0 5 2 6 2 6H4s2-1 2-6M10 20a2 2 0 0 0 4 0"/></svg></button>
+        <button class="user" aria-label="账户">
+          <span class="av">林</span>
+          <span class="meta"><b>林屿</b><small>运营负责人</small></span>
+        </button>
+      </div>
+    </header>
+
+    <main class="content">
+
+      <!-- ============ 工作台 ============ -->
+      <section class="view is-active" data-module="dashboard">
+
+        <div class="hero">
+          <div class="hero-top">
+            <div class="hero-left">
+              <span class="live"><span class="blip"></span>实时 · 今日 00:00 至今</span>
+              <h1>今日成交额（GMV）</h1>
+              <div class="gmv">
+                <span class="sym">¥</span>
+                <span class="num mono">248,930<span class="cents">.50</span></span>
+                <span class="delta up">▲ 12.4%<span class="unit" style="color:var(--muted);margin-left:4px">较昨日</span></span>
+              </div>
+              <div class="hero-meta">
+                <div class="m"><span class="v">1,284</span><span class="k">成交订单</span></div>
+                <div class="sep"></div>
+                <div class="m"><span class="v">¥193</span><span class="k">客单价</span></div>
+                <div class="sep"></div>
+                <div class="m"><span class="v">312</span><span class="k">新增访客</span></div>
+                <div class="sep"></div>
+                <div class="m"><span class="v">3.8%</span><span class="k">支付转化</span></div>
+              </div>
+            </div>
+            <div class="hero-right">
+              <div class="spark-cap"><span>近 7 日趋势</span><span class="up">+¥27,420</span></div>
+              <svg class="sparkbox" viewBox="0 0 300 90" preserveAspectRatio="none" aria-hidden="true">
+                <defs>
+                  <linearGradient id="sg" x1="0" x2="0" y1="0" y2="1">
+                    <stop offset="0" stop-color="#2E5E50" stop-opacity=".28"/>
+                    <stop offset="1" stop-color="#2E5E50" stop-opacity="0"/>
+                  </linearGradient>
+                </defs>
+                <path d="M0,70 L43,64 L86,68 L129,50 L172,54 L215,34 L258,38 L300,14 L300,90 L0,90 Z" fill="url(#sg)"/>
+                <path d="M0,70 L43,64 L86,68 L129,50 L172,54 L215,34 L258,38 L300,14" fill="none" stroke="#2E5E50" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <circle cx="300" cy="14" r="3.5" fill="#2E5E50"/>
+                <circle cx="300" cy="14" r="6" fill="#2E5E50" fill-opacity=".2"/>
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        <div class="kpis">
+          <div class="kpi">
+            <div class="ktop"><span class="ic a"><svg viewBox="0 0 24 24" stroke="currentColor"><path d="M5 7h14l-1.4 9H6.4zM4 7l1-2h14l1 2"/></svg></span><span class="tag bad">待处理 23</span></div>
+            <div class="kn mono">23</div>
+            <div class="kl">待处理订单 · 含 5 笔超时未付款</div>
+          </div>
+          <div class="kpi">
+            <div class="ktop"><span class="ic b"><svg viewBox="0 0 24 24" stroke="currentColor"><rect x="3" y="8" width="13" height="10" rx="1"/><path d="M16 11h3l2 3v4h-5M7 20a1.6 1.6 0 1 0 0-3.2A1.6 1.6 0 0 0 7 20zM18 20a1.6 1.6 0 1 0 0-3.2A1.6 1.6 0 0 0 18 20z"/></svg></span><span class="tag warn">今日新增 18</span></div>
+            <div class="kn mono">47</div>
+            <div class="kl">待发货 · 建议今日 18:00 前发出</div>
+          </div>
+          <div class="kpi">
+            <div class="ktop"><span class="ic c"><svg viewBox="0 0 24 24" stroke="currentColor"><path d="M3 10l9-6 9 6M5 10v9h14v-9M9 19v-5h6v5"/></svg></span><span class="tag bad">缺货 1</span></div>
+            <div class="kn mono">8</div>
+            <div class="kl">库存预警 · 青苔·陶土花器已售罄</div>
+          </div>
+          <div class="kpi">
+            <div class="ktop"><span class="ic d"><svg viewBox="0 0 24 24" stroke="currentColor"><path d="M4 4h16v6H4zM4 14h16v6H4zM8 7h.01M8 17h.01"/></svg></span><span class="tag mute">待审 3</span></div>
+            <div class="kn mono">3</div>
+            <div class="kl">待审核商品 · 竹影·收纳托盘 等</div>
+          </div>
+        </div>
+
+        <div class="dash-grid">
+          <div class="card">
+            <div class="card-h">
+              <h3>今日销售脉搏</h3>
+              <span class="eyebrow" style="margin-left:8px">每小时 · 元</span>
+              <div class="more">导出报表</div>
+            </div>
+            <div class="chart-wrap">
+              <svg viewBox="0 0 720 220" width="100%" role="img" aria-label="今日每小时销售额折线图">
+                <defs>
+                  <linearGradient id="pg" x1="0" x2="0" y1="0" y2="1">
+                    <stop offset="0" stop-color="#2E5E50" stop-opacity=".22"/>
+                    <stop offset="1" stop-color="#2E5E50" stop-opacity="0"/>
+                  </linearGradient>
+                </defs>
+                <!-- gridlines -->
+                <g stroke="#EEF0EA" stroke-width="1">
+                  <line x1="40" y1="40" x2="700" y2="40"/>
+                  <line x1="40" y1="90" x2="700" y2="90"/>
+                  <line x1="40" y1="140" x2="700" y2="140"/>
+                  <line x1="40" y1="190" x2="700" y2="190"/>
+                </g>
+                <!-- y labels -->
+                <g class="axis" text-anchor="end">
+                  <text x="34" y="44">20k</text><text x="34" y="94">14k</text><text x="34" y="144">8k</text><text x="34" y="194">0</text>
+                </g>
+                <!-- area + line: hours 0,2,4,...,22 (12 pts) -->
+                <path d="M40,182 L94,184 L148,186 L202,170 L256,150 L310,128 L364,118 L418,128 L472,108 L526,86 L580,54 L634,44 L688,72 L688,190 L40,190 Z" fill="url(#pg)"/>
+                <path d="M40,182 L94,184 L148,186 L202,170 L256,150 L310,128 L364,118 L418,128 L472,108 L526,86 L580,54 L634,44 L688,72" fill="none" stroke="#2E5E50" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+                <!-- peak marker -->
+                <line x1="634" y1="44" x2="634" y2="190" stroke="#C9DCD4" stroke-width="1" stroke-dasharray="3 3"/>
+                <circle cx="634" cy="44" r="4" fill="#fff" stroke="#2E5E50" stroke-width="2"/>
+                <g class="axis" text-anchor="middle">
+                  <text x="40" y="208">00</text><text x="202" y="208">06</text><text x="364" y="208">12</text><text x="526" y="208">18</text><text x="688" y="208">23</text>
+                </g>
+                <text x="634" y="36" class="axis" text-anchor="middle" fill="#2E5E50" font-weight="700">峰值 20:00 · ¥19,840</text>
+              </svg>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-h"><h3>待处理订单</h3><a class="more" href="#" data-nav-jump="orders">全部 →</a></div>
+            <table class="tlist">
+              <thead><tr><th>订单 / 商品</th><th>金额</th><th>状态</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/teapot/80" alt=""/><div class="cust"><b class="mono">DD20260611-8847</b><small>「云栖」粗陶茶壶套装 · 林知夏</small></div></div></td>
+                  <td class="mono">¥328.00</td>
+                  <td><span class="tag warn">待发货</span></td>
+                </tr>
+                <tr>
+                  <td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/incense/80" alt=""/><div class="cust"><b class="mono">DD20260611-8846</b><small>山雾线香 ×2 · 周屿</small></div></div></td>
+                  <td class="mono">¥336.00</td>
+                  <td><span class="tag warn">待发货</span></td>
+                </tr>
+                <tr>
+                  <td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/bowl/80" alt=""/><div class="cust"><b class="mono">DD20260611-8844</b><small>「素白」手作碗 ×4 · 苏念</small></div></div></td>
+                  <td class="mono">¥392.00</td>
+                  <td><span class="tag mute">待付款</span></td>
+                </tr>
+                <tr>
+                  <td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/throw/80" alt=""/><div class="cust"><b class="mono">DD20260611-8842</b><small>暮山远·羊绒盖毯 · 何川</small></div></div></td>
+                  <td class="mono">¥1,017.00</td>
+                  <td><span class="tag info">已发货</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="dash-grid col3" style="margin-top:16px">
+          <div class="card pad">
+            <div class="card-h" style="padding:0 0 12px; margin:0; border-bottom:1px solid var(--rule-2)">
+              <h3>热销商品 TOP5</h3><span class="eyebrow" style="margin-left:auto">本月</span>
+            </div>
+            <table class="tlist" style="margin-top:4px">
+              <tbody>
+                <tr><td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/bowl2/80" alt=""/><div class="cust"><b>「素白」手作碗</b><small>餐具</small></div></div></td><td class="mono">890</td><td class="mono up">+24%</td></tr>
+                <tr><td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/incense2/80" alt=""/><div class="cust"><b>山雾线香·沉水檀</b><small>香薰</small></div></div></td><td class="mono">512</td><td class="mono up">+18%</td></tr>
+                <tr><td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/teapot2/80" alt=""/><div class="cust"><b>「云栖」粗陶茶壶</b><small>茶器</small></div></div></td><td class="mono">386</td><td class="mono down">-3%</td></tr>
+                <tr><td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/vase/80" alt=""/><div class="cust"><b>青苔·陶土花器</b><small>花器</small></div></div></td><td class="mono">233</td><td class="mono up">+9%</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="card pad">
+            <div class="card-h" style="padding:0 0 12px; margin:0; border-bottom:1px solid var(--rule-2)">
+              <h3>品类销售占比</h3><span class="eyebrow" style="margin-left:auto">本月</span>
+            </div>
+            <div style="display:flex; align-items:center; gap:14px; margin-top:8px">
+              <svg viewBox="0 0 180 180" width="150" height="150" style="flex:none" role="img" aria-label="品类销售占比环形图">
+                <g transform="rotate(-90 90 90)" fill="none" stroke-width="22">
+                  <circle cx="90" cy="90" r="62" stroke="#EFEFEA"/>
+                  <circle cx="90" cy="90" r="62" stroke="#2E5E50" stroke-dasharray="109 280" stroke-dashoffset="0"/>
+                  <circle cx="90" cy="90" r="62" stroke="#3F6E91" stroke-dasharray="86 280" stroke-dashoffset="-109"/>
+                  <circle cx="90" cy="90" r="62" stroke="#B68A1E" stroke-dasharray="70 280" stroke-dashoffset="-195"/>
+                  <circle cx="90" cy="90" r="62" stroke="#C13C2F" stroke-dasharray="62 280" stroke-dashoffset="-265"/>
+                </g>
+                <text x="90" y="86" text-anchor="middle" class="mono" font-size="11" fill="#767B77">合计</text>
+                <text x="90" y="102" text-anchor="middle" font-family="var(--fd)" font-weight="700" font-size="18" fill="#1B1D1C">¥1.8M</text>
+              </svg>
+              <div style="flex:1; display:flex; flex-direction:column; gap:9px; font-size:12.5px">
+                <div style="display:flex; align-items:center; gap:8px"><i style="width:9px;height:9px;border-radius:2px;background:#2E5E50"></i>茶器 <b class="mono" style="margin-left:auto">28%</b></div>
+                <div style="display:flex; align-items:center; gap:8px"><i style="width:9px;height:9px;border-radius:2px;background:#3F6E91"></i>香薰 <b class="mono" style="margin-left:auto">22%</b></div>
+                <div style="display:flex; align-items:center; gap:8px"><i style="width:9px;height:9px;border-radius:2px;background:#B68A1E"></i>织物 <b class="mono" style="margin-left:auto">18%</b></div>
+                <div style="display:flex; align-items:center; gap:8px"><i style="width:9px;height:9px;border-radius:2px;background:#C13C2F"></i>餐具 <b class="mono" style="margin-left:auto">16%</b></div>
+                <div style="display:flex; align-items:center; gap:8px; color:var(--muted)"><i style="width:9px;height:9px;border-radius:2px;background:#EFEFEA; border:1px solid var(--rule)"></i>其他 <b class="mono" style="margin-left:auto">16%</b></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card pad">
+            <div class="card-h" style="padding:0 0 12px; margin:0; border-bottom:1px solid var(--rule-2)">
+              <h3>待办事项</h3><span class="eyebrow" style="margin-left:auto">7 项</span>
+            </div>
+            <ul style="list-style:none; margin:10px 0 0; padding:0; display:flex; flex-direction:column; gap:6px">
+              <li><label style="display:flex; gap:10px; align-items:flex-start; padding:7px 4px; cursor:pointer; font-size:13px"><input type="checkbox" style="margin-top:3px; accent-color:var(--brand)"><span><b>审核 3 个上架商品</b><br><small style="color:var(--muted)">竹影·收纳托盘 等 · 预计 5 分钟</small></span></label></li>
+              <li><label style="display:flex; gap:10px; align-items:flex-start; padding:7px 4px; cursor:pointer; font-size:13px"><input type="checkbox" style="margin-top:3px; accent-color:var(--brand)"><span><b>处理 5 笔超时订单</b><br><small style="color:var(--muted)">超过 30 分钟未付款，需提醒或关闭</small></span></label></li>
+              <li><label style="display:flex; gap:10px; align-items:flex-start; padding:7px 4px; cursor:pointer; font-size:13px"><input type="checkbox" style="margin-top:3px; accent-color:var(--brand)" checked><span style="color:var(--muted); text-decoration:line-through"><b>开启「六月·清夏」满减</b><br><small style="color:var(--faint)">已于 00:00 自动生效</small></span></label></li>
+              <li><label style="display:flex; gap:10px; align-items:flex-start; padding:7px 4px; cursor:pointer; font-size:13px"><input type="checkbox" style="margin-top:3px; accent-color:var(--brand)"><span><b>补货青苔·陶土花器</b><br><small style="color:var(--muted)">已售罄，景德镇工坊预计 6/14 到货</small></span></label></li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 订单管理 ============ -->
+      <section class="view" data-module="orders">
+        <div class="tipstrip">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>
+          <span><b>47 笔待发货订单</b> · 建议今日 18:00 前完成发货，可批量打印面单。</span>
+          <button class="btn btn--primary btn--sm" style="margin-left:auto">批量发货</button>
+        </div>
+
+        <div class="toolbar">
+          <div class="tabs" id="orderTabs">
+            <button class="tab is-active" data-tab="all">全部<span class="c">2,061</span></button>
+            <button class="tab" data-tab="pay">待付款<span class="c">23</span></button>
+            <button class="tab" data-tab="ship">待发货<span class="c">47</span></button>
+            <button class="tab" data-tab="sent">已发货<span class="c">186</span></button>
+            <button class="tab" data-tab="done">已完成<span class="c">1,782</span></button>
+            <button class="tab" data-tab="close">已取消<span class="c">23</span></button>
+          </div>
+          <span style="flex:1"></span>
+          <label class="field"><svg viewBox="0 0 24 24"><path d="M3 6h18M6 12h12M10 18h4"/></svg><select><option>全部渠道</option><option>微信小程序</option><option>天猫</option><option>抖音</option></select></label>
+          <label class="field"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 9h18M8 3v4M16 3v4"/></svg><input type="text" placeholder="2026/06/01 — 06/11" /></label>
+          <label class="field"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input type="search" placeholder="搜索订单号 / 收件人" /></label>
+          <button class="btn btn--ghost"><svg viewBox="0 0 24 24"><path d="M12 4v12M5 11l7 7 7-7M4 20h16"/></svg>导出</button>
+        </div>
+
+        <div class="card table-card">
+          <table class="tlist">
+            <thead><tr>
+              <th style="width:28%">订单 / 商品</th><th>客户</th><th>金额</th><th>支付</th><th>状态</th><th>下单时间</th><th></th>
+            </tr></thead>
+            <tbody>
+              <tr>
+                <td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/o1/80" alt=""/><div class="cust"><b class="mono">DD20260611-8847</b><small>「云栖」粗陶茶壶套装</small></div></div></td>
+                <td><div class="cust"><b>林知夏</b><small>上海 · 浦东</small></div></td>
+                <td class="mono"><b>¥328.00</b></td>
+                <td><span class="tag plain">微信支付</span></td>
+                <td><span class="tag warn">待发货</span></td>
+                <td class="mono" style="color:var(--muted)">06-11 14:32</td>
+                <td><a class="more" href="#" style="font-size:12.5px">详情</a></td>
+              </tr>
+              <tr>
+                <td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/o2/80" alt=""/><div class="cust"><b class="mono">DD20260611-8846</b><small>山雾线香·沉水檀 ×2</small></div></div></td>
+                <td><div class="cust"><b>周屿</b><small>杭州 · 西湖</small></div></td>
+                <td class="mono"><b>¥336.00</b></td>
+                <td><span class="tag plain">支付宝</span></td>
+                <td><span class="tag warn">待发货</span></td>
+                <td class="mono" style="color:var(--muted)">06-11 14:18</td>
+                <td><a class="more" href="#" style="font-size:12.5px">详情</a></td>
+              </tr>
+              <tr>
+                <td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/o3/80" alt=""/><div class="cust"><b class="mono">DD20260611-8845</b><small>暮山远·羊绒盖毯</small></div></div></td>
+                <td><div class="cust"><b>陈墨白</b><small>北京 · 朝阳</small></div></td>
+                <td class="mono"><b>¥689.00</b></td>
+                <td><span class="tag plain">微信支付</span></td>
+                <td><span class="tag info">已发货</span></td>
+                <td class="mono" style="color:var(--muted)">06-11 13:55</td>
+                <td><a class="more" href="#" style="font-size:12.5px">详情</a></td>
+              </tr>
+              <tr>
+                <td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/o4/80" alt=""/><div class="cust"><b class="mono">DD20260611-8844</b><small>「素白」手作碗 ×4 + 花器</small></div></div></td>
+                <td><div class="cust"><b>苏念</b><small>成都 · 锦江</small></div></td>
+                <td class="mono"><b>¥650.00</b></td>
+                <td><span class="tag plain">信用卡</span></td>
+                <td><span class="tag mute">待付款</span></td>
+                <td class="mono" style="color:var(--muted)">06-11 13:40</td>
+                <td><a class="more" href="#" style="font-size:12.5px">催付</a></td>
+              </tr>
+              <tr>
+                <td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/o5/80" alt=""/><div class="cust"><b class="mono">DD20260611-8843</b><small>青苔·陶土花器</small></div></div></td>
+                <td><div class="cust"><b>高远</b><small>广州 · 天河</small></div></td>
+                <td class="mono"><b>¥258.00</b></td>
+                <td><span class="tag plain">微信支付</span></td>
+                <td><span class="tag ok">已完成</span></td>
+                <td class="mono" style="color:var(--muted)">06-11 13:22</td>
+                <td><a class="more" href="#" style="font-size:12.5px">详情</a></td>
+              </tr>
+              <tr>
+                <td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/o6/80" alt=""/><div class="cust"><b class="mono">DD20260611-8842</b><small>云栖茶壶 + 暮山盖毯</small></div></div></td>
+                <td><div class="cust"><b>何川</b><small>深圳 · 南山</small></div></td>
+                <td class="mono"><b>¥1,017.00</b></td>
+                <td><span class="tag plain">微信支付</span></td>
+                <td><span class="tag info">已发货</span></td>
+                <td class="mono" style="color:var(--muted)">06-11 12:48</td>
+                <td><a class="more" href="#" style="font-size:12.5px">详情</a></td>
+              </tr>
+              <tr>
+                <td><div class="pr"><img class="thumb" src="https://picsum.photos/seed/o7/80" alt=""/><div class="cust"><b class="mono">DD20260611-8841</b><small>望山·香插铜座 ×3</small></div></div></td>
+                <td><div class="cust"><b>沈青</b><small>苏州 · 姑苏</small></div></td>
+                <td class="mono"><b>¥288.00</b></td>
+                <td><span class="tag plain">支付宝</span></td>
+                <td><span class="tag ok">已完成</span></td>
+                <td class="mono" style="color:var(--muted)">06-11 11:30</td>
+                <td><a class="more" href="#" style="font-size:12.5px">详情</a></td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="pager">
+            <span class="info">显示第 1–7 条 · 共 2,061 条</span>
+            <div class="pages">
+              <button class="nav-btn">‹</button>
+              <button class="is-active">1</button><button>2</button><button>3</button><button>4</button>
+              <button class="nav-btn">…</button>
+              <button>295</button>
+              <button class="nav-btn">›</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 商品中心 ============ -->
+      <section class="view" data-module="goods">
+        <div class="toolbar">
+          <div class="stat-grid" style="margin:0; grid-template-columns:repeat(4,minmax(140px,1fr)); flex:1">
+            <div class="stat"><div class="k">在售商品</div><div class="v mono">128</div><div class="f"><span class="delta up">+4</span>本周新增</div></div>
+            <div class="stat"><div class="k">待审核</div><div class="v mono">3</div><div class="f">含 1 个加急</div></div>
+            <div class="stat"><div class="k">库存预警</div><div class="v mono" style="color:var(--warn)">8</div><div class="f">低于安全库存</div></div>
+            <div class="stat"><div class="k">缺货</div><div class="v mono" style="color:var(--seal)">1</div><div class="f">青苔·陶土花器</div></div>
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <div class="tabs">
+            <button class="tab is-active">全部<span class="c">132</span></button>
+            <button class="tab">在售<span class="c">128</span></button>
+            <button class="tab">待审核<span class="c">3</span></button>
+            <button class="tab">已下架<span class="c">1</span></button>
+          </div>
+          <span style="flex:1"></span>
+          <label class="field"><select><option>全部分类</option><option>茶器</option><option>香薰</option><option>织物</option><option>餐具</option><option>家居</option></select></label>
+          <label class="field"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><input type="search" placeholder="搜索商品名 / SKU" /></label>
+          <button class="btn btn--primary"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新建商品</button>
+        </div>
+
+        <div class="prod-grid">
+          <div class="prod">
+            <div class="ph"><div class="art" style="background:linear-gradient(135deg,#C9DCD4,#9DBCB0)"></div><span class="flag tag ok">在售</span></div>
+            <div class="pb"><div class="sku">CP-3104 · 茶器</div><h4>「云栖」粗陶茶壶套装</h4>
+              <div class="price"><b class="mono">¥328</b><s class="mono">¥398</s></div>
+              <div class="row2"><span>库存 <b class="mono" style="color:var(--ink-2)">124</b></span><span>月销 <b class="mono" style="color:var(--ink-2)">386</b></span></div>
+            </div>
+          </div>
+          <div class="prod">
+            <div class="ph"><div class="art" style="background:linear-gradient(135deg,#E7D9C0,#C9A86A)"></div><span class="flag tag warn">低库存</span></div>
+            <div class="pb"><div class="sku">CP-2208 · 香薰</div><h4>山雾线香 · 沉水檀</h4>
+              <div class="price"><b class="mono">¥168</b></div>
+              <div class="row2"><span>库存 <b class="mono" style="color:var(--warn)">8</b></span><span>月销 <b class="mono" style="color:var(--ink-2)">512</b></span></div>
+            </div>
+          </div>
+          <div class="prod">
+            <div class="ph"><div class="art" style="background:linear-gradient(135deg,#D8C9B4,#A88B66)"></div><span class="flag tag ok">在售</span></div>
+            <div class="pb"><div class="sku">CP-4501 · 织物</div><h4>暮山远 · 羊绒盖毯</h4>
+              <div class="price"><b class="mono">¥689</b></div>
+              <div class="row2"><span>库存 <b class="mono" style="color:var(--ink-2)">56</b></span><span>月销 <b class="mono" style="color:var(--ink-2)">142</b></span></div>
+            </div>
+          </div>
+          <div class="prod">
+            <div class="ph"><div class="art" style="background:linear-gradient(135deg,#EFEAE0,#CFC6B4)"></div><span class="flag tag ok">在售</span></div>
+            <div class="pb"><div class="sku">CP-1180 · 餐具</div><h4>「素白」景德镇手作碗</h4>
+              <div class="price"><b class="mono">¥98</b></div>
+              <div class="row2"><span>库存 <b class="mono" style="color:var(--ink-2)">320</b></span><span>月销 <b class="mono" style="color:var(--ink-2)">890</b></span></div>
+            </div>
+          </div>
+          <div class="prod">
+            <div class="ph"><div class="art" style="background:linear-gradient(135deg,#C2D3C6,#7E9C84)"></div><span class="flag tag bad">缺货</span></div>
+            <div class="pb"><div class="sku">CP-3302 · 花器</div><h4>青苔 · 陶土花器</h4>
+              <div class="price"><b class="mono">¥258</b></div>
+              <div class="row2"><span>库存 <b class="mono" style="color:var(--seal)">0</b></span><span>月销 <b class="mono" style="color:var(--ink-2)">233</b></span></div>
+            </div>
+          </div>
+          <div class="prod">
+            <div class="ph"><div class="art" style="background:linear-gradient(135deg,#DCD3C0,#B8A985)"></div><span class="flag tag info">待审核</span></div>
+            <div class="pb"><div class="sku">CP-5077 · 家居</div><h4>竹影 · 收纳托盘</h4>
+              <div class="price"><b class="mono">¥139</b></div>
+              <div class="row2"><span>库存 <b class="mono" style="color:var(--ink-2)">88</b></span><span>月销 <b class="mono" style="color:var(--ink-2)">95</b></span></div>
+            </div>
+          </div>
+          <div class="prod">
+            <div class="ph"><div class="art" style="background:linear-gradient(135deg,#D6CDA8,#A8975E)"></div><span class="flag tag ok">在售</span></div>
+            <div class="pb"><div class="sku">CP-2210 · 香薰</div><h4>望山 · 香插铜座</h4>
+              <div class="price"><b class="mono">¥96</b></div>
+              <div class="row2"><span>库存 <b class="mono" style="color:var(--ink-2)">210</b></span><span>月销 <b class="mono" style="color:var(--ink-2)">178</b></span></div>
+            </div>
+          </div>
+          <div class="prod">
+            <div class="ph"><div class="art" style="background:linear-gradient(135deg,#C8CFB8,#8E9A6E)"></div><span class="flag tag ok">在售</span></div>
+            <div class="pb"><div class="sku">CP-4420 · 织物</div><h4>远黛 · 亚麻床品四件</h4>
+              <div class="price"><b class="mono">¥1,280</b></div>
+              <div class="row2"><span>库存 <b class="mono" style="color:var(--ink-2)">34</b></span><span>月销 <b class="mono" style="color:var(--ink-2)">61</b></span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 会员管理 ============ -->
+      <section class="view" data-module="members">
+        <div class="stat-grid">
+          <div class="stat"><div class="k">会员总数</div><div class="v mono">12,840</div><div class="f"><span class="delta up">+312</span>本月新增</div></div>
+          <div class="stat"><div class="k">活跃会员（30日）</div><div class="v mono">5,206</div><div class="f">活跃率 40.5%</div></div>
+          <div class="stat"><div class="k">会员复购率</div><div class="v mono">38.2%</div><div class="f"><span class="delta up">+2.1pt</span>较上月</div></div>
+          <div class="stat"><div class="k">会员客单价</div><div class="v mono">¥412</div><div class="f">高于非会员 2.1×</div></div>
+        </div>
+
+        <div class="dash-grid col3" style="grid-template-columns:1.4fr 1fr">
+          <div class="card table-card">
+            <div class="card-h"><h3>会员列表</h3><span class="eyebrow" style="margin-left:auto">按累计消费排序</span></div>
+            <table class="tlist">
+              <thead><tr><th>会员</th><th>等级</th><th>累计消费</th><th>订单</th><th>最近活跃</th></tr></thead>
+              <tbody>
+                <tr><td><div class="cust"><b>陈墨白</b><small class="mono">M-76903 · 北京</small></div></td><td><span class="tag info">玉石</span></td><td class="mono"><b>¥28,900</b></td><td class="mono">88</td><td class="mono" style="color:var(--muted)">1 天前</td></tr>
+                <tr><td><div class="cust"><b>周屿</b><small class="mono">M-88120 · 杭州</small></div></td><td><span class="tag info">青瓷</span></td><td class="mono"><b>¥12,360</b></td><td class="mono">42</td><td class="mono" style="color:var(--muted)">4 小时前</td></tr>
+                <tr><td><div class="cust"><b>何川</b><small class="mono">M-86451 · 深圳</small></div></td><td><span class="tag info">玉石</span></td><td class="mono"><b>¥19,480</b></td><td class="mono">61</td><td class="mono" style="color:var(--muted)">2 小时前</td></tr>
+                <tr><td><div class="cust"><b>林知夏</b><small class="mono">M-90234 · 上海</small></div></td><td><span class="tag plain">檀香</span></td><td class="mono"><b>¥4,820</b></td><td class="mono">18</td><td class="mono" style="color:var(--muted)">2 小时前</td></tr>
+                <tr><td><div class="cust"><b>苏念</b><small class="mono">M-91082 · 成都</small></div></td><td><span class="tag plain">檀香</span></td><td class="mono"><b>¥3,150</b></td><td class="mono">12</td><td class="mono" style="color:var(--muted)">6 小时前</td></tr>
+                <tr><td><div class="cust"><b>沈青</b><small class="mono">M-87609 · 苏州</small></div></td><td><span class="tag info">青瓷</span></td><td class="mono"><b>¥9,840</b></td><td class="mono">35</td><td class="mono" style="color:var(--muted)">3 小时前</td></tr>
+              </tbody>
+            </table>
+            <div class="pager"><span class="info">共 12,840 位会员</span><div class="pages"><button class="nav-btn">‹</button><button class="is-active">1</button><button>2</button><button>3</button><button class="nav-btn">›</button></div></div>
+          </div>
+
+          <div class="card pad">
+            <div class="card-h" style="padding:0 0 12px; margin:0; border-bottom:1px solid var(--rule-2)"><h3>等级分布</h3></div>
+            <div class="funnel" style="margin-top:8px">
+              <div class="fstep"><span class="lab">檀香 <small style="color:var(--muted)">注册</small></span><div class="bar" style="background:var(--faint); width:100%"><i></i></div><span class="pct mono">8,420</span></div>
+              <div class="fstep"><span class="lab">青瓷 <small style="color:var(--muted)">¥3k+</small></span><div class="bar" style="background:var(--info); width:34%"><i></i></div><span class="pct mono">3,180</span></div>
+              <div class="fstep"><span class="lab">玉石 <small style="color:var(--muted)">¥15k+</small></span><div class="bar" style="background:var(--brand); width:9%"><i></i></div><span class="pct mono">1,240</span></div>
+            </div>
+            <div class="tipstrip" style="margin:14px 0 0; background:var(--panel-2); border-color:var(--rule); color:var(--ink-2)">
+              <svg viewBox="0 0 24 24" stroke="var(--gold)"><path d="M12 2l2.5 6.5L21 9l-5 4 1.5 7L12 16l-5.5 4L8 13 3 9l6.5-.5z"/></svg>
+              <span>玉石会员贡献了 <b>42%</b> 的销售额，建议针对该人群投放新品首发。</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 营销活动 ============ -->
+      <section class="view" data-module="marketing">
+        <div class="toolbar">
+          <div class="tabs"><button class="tab is-active">进行中<span class="c">3</span></button><button class="tab">待开始<span class="c">1</span></button><button class="tab">已结束<span class="c">12</span></button></div>
+          <span style="flex:1"></span>
+          <button class="btn btn--primary"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>新建活动</button>
+        </div>
+
+        <div class="grid" style="grid-template-columns:1fr 1fr">
+          <div class="camp">
+            <div class="badge" style="background:var(--brand)">满减</div>
+            <div class="body">
+              <h4>「六月·清夏」限时满减 <span class="tag ok">进行中</span></h4>
+              <p>全场满 399 减 50 · 叠加会员折扣 · 6/01 — 6/30</p>
+              <div class="meter"><i style="width:64%"></i></div>
+              <div class="nums">
+                <div><span class="k">参与订单</span><span class="v">1,284</span></div>
+                <div><span class="k">核销金额</span><span class="v">¥412k</span></div>
+                <div><span class="k">GMV 提升</span><span class="v up">+18%</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="camp">
+            <div class="badge" style="background:var(--info)">券</div>
+            <div class="body">
+              <h4>新客首单 · 赠望山香插 <span class="tag ok">进行中</span></h4>
+              <p>注册即赠 · 限首单可用 · 长期</p>
+              <div class="meter"><i style="width:42%; background:var(--info)"></i></div>
+              <div class="nums">
+                <div><span class="k">领取</span><span class="v">312</span></div>
+                <div><span class="k">核销</span><span class="v">186</span></div>
+                <div><span class="k">转化率</span><span class="v">59.6%</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="camp">
+            <div class="badge" style="background:var(--gold)">复购</div>
+            <div class="body">
+              <h4>老客复购券 · 全场 8 折 <span class="tag ok">进行中</span></h4>
+              <p>30 天未下单会员专享 · 6/05 — 6/20</p>
+              <div class="meter"><i style="width:78%; background:var(--gold)"></i></div>
+              <div class="nums">
+                <div><span class="k">定向发放</span><span class="v">2,140</span></div>
+                <div><span class="k">核销</span><span class="v">540</span></div>
+                <div><span class="k">唤醒率</span><span class="v up">25.2%</span></div>
+              </div>
+            </div>
+          </div>
+          <div class="camp" style="opacity:.78">
+            <div class="badge" style="background:var(--ink-2)">预售</div>
+            <div class="body">
+              <h4>「端午礼盒」定金预售 <span class="tag warn">待开始</span></h4>
+              <p>定金 ¥50 抵 ¥80 · 6/15 开售 · 限 500 份</p>
+              <div class="meter"><i style="width:12%; background:var(--ink-2)"></i></div>
+              <div class="nums">
+                <div><span class="k">预约提醒</span><span class="v">86</span></div>
+                <div><span class="k">目标份数</span><span class="v">500</span></div>
+                <div><span class="k">开售</span><span class="v" style="color:var(--muted)">4 天后</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 数据统计 ============ -->
+      <section class="view" data-module="stats">
+        <div class="toolbar">
+          <div class="seg">
+            <button>今日</button><button>7 日</button><button class="is-active">近 30 日</button><button>本月</button><button>自定义</button>
+          </div>
+          <span style="flex:1"></span>
+          <label class="field"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 9h18M8 3v4M16 3v4"/></svg><input value="2026/05/12 — 06/11" /></label>
+          <button class="btn btn--ghost"><svg viewBox="0 0 24 24"><path d="M12 4v12M5 11l7 7 7-7M4 20h16"/></svg>下载报表</button>
+        </div>
+
+        <div class="stat-grid">
+          <div class="stat"><div class="k">累计 GMV</div><div class="v mono">¥7.42M</div><div class="f"><span class="delta up">+14.6%</span>环比</div></div>
+          <div class="stat"><div class="k">成交订单</div><div class="v mono">38,420</div><div class="f"><span class="delta up">+9.2%</span>环比</div></div>
+          <div class="stat"><div class="k">访客数（UV）</div><div class="v mono">1.02M</div><div class="f"><span class="delta up">+6.8%</span>环比</div></div>
+          <div class="stat"><div class="k">退货率</div><div class="v mono">2.4%</div><div class="f"><span class="delta down">+0.3pt</span>需关注</div></div>
+        </div>
+
+        <div class="dash-grid">
+          <div class="card">
+            <div class="card-h"><h3>销售趋势</h3><span class="eyebrow" style="margin-left:auto">每日 GMV · 元</span></div>
+            <div class="chart-wrap">
+              <svg viewBox="0 0 720 220" width="100%" role="img" aria-label="近30日每日销售额柱状图">
+                <g stroke="#EEF0EA"><line x1="40" y1="40" x2="700" y2="40"/><line x1="40" y1="100" x2="700" y2="100"/><line x1="40" y1="160" x2="700" y2="160"/></g>
+                <g class="axis" text-anchor="end"><text x="34" y="44">400k</text><text x="34" y="104">250k</text><text x="34" y="164">100k</text></g>
+                <g fill="#2E5E50">
+                  <!-- 30 bars across 660px -->
+                  <rect x="50" y="120" width="14" height="60" rx="2"/><rect x="70" y="110" width="14" height="70" rx="2"/>
+                  <rect x="90" y="130" width="14" height="50" rx="2"/><rect x="110" y="100" width="14" height="80" rx="2"/>
+                  <rect x="130" y="90" width="14" height="90" rx="2"/><rect x="150" y="70" width="14" height="110" rx="2"/>
+                  <rect x="170" y="115" width="14" height="65" rx="2"/><rect x="190" y="95" width="14" height="85" rx="2"/>
+                  <rect x="210" y="80" width="14" height="100" rx="2"/><rect x="230" y="60" width="14" height="120" rx="2"/>
+                  <rect x="250" y="75" width="14" height="105" rx="2"/><rect x="270" y="105" width="14" height="75" rx="2"/>
+                  <rect x="290" y="125" width="14" height="55" rx="2"/><rect x="310" y="85" width="14" height="95" rx="2"/>
+                  <rect x="330" y="65" width="14" height="115" rx="2"/><rect x="350" y="50" width="14" height="130" rx="2" fill="#244A40"/>
+                  <rect x="370" y="55" width="14" height="125" rx="2"/><rect x="390" y="78" width="14" height="102" rx="2"/>
+                  <rect x="410" y="98" width="14" height="82" rx="2"/><rect x="430" y="68" width="14" height="112" rx="2"/>
+                  <rect x="450" y="48" width="14" height="132" rx="2"/><rect x="470" y="58" width="14" height="122" rx="2"/>
+                  <rect x="490" y="88" width="14" height="92" rx="2"/><rect x="510" y="72" width="14" height="108" rx="2"/>
+                  <rect x="530" y="52" width="14" height="128" rx="2"/><rect x="550" y="42" width="14" height="138" rx="2" fill="#244A40"/>
+                  <rect x="570" y="62" width="14" height="118" rx="2"/><rect x="590" y="82" width="14" height="98" rx="2"/>
+                  <rect x="610" y="56" width="14" height="124" rx="2"/><rect x="630" y="36" width="14" height="144" rx="2" fill="#C13C2F"/>
+                  <rect x="650" y="66" width="14" height="114" rx="2"/>
+                </g>
+                <g class="axis" text-anchor="middle"><text x="50" y="200">05/12</text><text x="230" y="200">05/22</text><text x="430" y="200">06/01</text><text x="630" y="200">06/11</text></g>
+              </svg>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-h"><h3>流量来源</h3><span class="eyebrow" style="margin-left:auto">UV 占比</span></div>
+            <div style="padding:14px 18px; display:flex; flex-direction:column; gap:13px">
+              <div><div style="display:flex; justify-content:space-between; font-size:12.5px; margin-bottom:5px"><span>自然搜索</span><b class="mono">38%</b></div><div class="meter" style="height:7px"><i style="width:38%; background:var(--brand)"></i></div></div>
+              <div><div style="display:flex; justify-content:space-between; font-size:12.5px; margin-bottom:5px"><span>站内推荐</span><b class="mono">24%</b></div><div class="meter" style="height:7px"><i style="width:24%; background:var(--info)"></i></div></div>
+              <div><div style="display:flex; justify-content:space-between; font-size:12.5px; margin-bottom:5px"><span>直播 / 短视频</span><b class="mono">18%</b></div><div class="meter" style="height:7px"><i style="width:18%; background:var(--gold)"></i></div></div>
+              <div><div style="display:flex; justify-content:space-between; font-size:12.5px; margin-bottom:5px"><span>私域复购</span><b class="mono">12%</b></div><div class="meter" style="height:7px"><i style="width:12%; background:var(--up)"></i></div></div>
+              <div><div style="display:flex; justify-content:space-between; font-size:12.5px; margin-bottom:5px"><span>付费广告</span><b class="mono">8%</b></div><div class="meter" style="height:7px"><i style="width:8%; background:var(--muted)"></i></div></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-h"><h3>转化漏斗</h3><span class="eyebrow" style="margin-left:auto">浏览 → 支付</span></div>
+          <div style="padding:14px 22px">
+            <div class="funnel">
+              <div class="fstep"><span class="lab">浏览商品</span><div class="bar" style="background:var(--brand); width:100%"><i></i></div><span class="pct mono">1,024,000</span></div>
+              <div class="fstep"><span class="lab">加入购物车</span><div class="bar" style="background:#3F6E91; width:24%"><i></i></div><span class="pct mono">245,760 · 24%</span></div>
+              <div class="fstep"><span class="lab">提交订单</span><div class="bar" style="background:#B68A1E; width:8.2%"><i></i></div><span class="pct mono">83,968 · 8.2%</span></div>
+              <div class="fstep"><span class="lab">完成支付</span><div class="bar" style="background:#C13C2F; width:6.4%"><i></i></div><span class="pct mono">65,536 · 6.4%</span></div>
+            </div>
+            <div class="tipstrip" style="margin:10px 0 0">
+              <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v5M12 16h.01"/></svg>
+              <span>「提交订单 → 支付」环节流失 22%，建议在收银台增加微信一键支付与倒计时提醒。</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 系统设置 ============ -->
+      <section class="view" data-module="settings">
+        <div class="set-grid">
+          <nav class="setnav" id="setNav">
+            <button class="is-active">店铺信息</button>
+            <button>支付与结算</button>
+            <button>物流模板</button>
+            <button>角色与权限</button>
+            <button>操作日志</button>
+          </nav>
+
+          <div class="card pad">
+            <div class="card-h" style="padding:0 0 14px; margin:0 0 6px; border-bottom:1px solid var(--rule-2)">
+              <h3>店铺信息</h3><span class="eyebrow" style="margin-left:auto">对外展示</span>
+            </div>
+
+            <div class="form-row">
+              <label>店铺名称<small>显示在店铺首页与订单</small></label>
+              <div><input class="input" value="山海集 · 旗舰店" /></div>
+            </div>
+            <div class="form-row">
+              <label>品牌标语<small>一句话介绍</small></label>
+              <div><input class="input" value="以器载道，把山水日常带回家。" /></div>
+            </div>
+            <div class="form-row">
+              <label>客服电话</label>
+              <div><input class="input mono" value="400-820-0611" /></div>
+            </div>
+            <div class="form-row">
+              <label>退换货地址</label>
+              <div><input class="input" value="浙江省杭州市西湖区转塘街道艺创小镇 12 栋" /></div>
+            </div>
+            <div class="form-row">
+              <label>自动接单<small>新订单自动进入待发货</small></label>
+              <div style="display:flex; align-items:center; gap:10px"><span class="switch on" role="switch" aria-checked="true" tabindex="0"></span><span style="font-size:13px; color:var(--muted)">开启</span></div>
+            </div>
+            <div class="form-row">
+              <label>库存预警阈值<small>低于此值触发提醒</small></label>
+              <div style="display:flex; align-items:center; gap:8px"><input class="input mono" style="width:120px" value="10" /><span style="font-size:12px; color:var(--muted)">件</span></div>
+            </div>
+
+            <div style="display:flex; gap:10px; margin-top:18px">
+              <button class="btn btn--primary" id="saveBtn">保存更改</button>
+              <button class="btn btn--ghost">放弃修改</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:16px">
+          <div class="card-h"><h3>近期操作日志</h3><span class="eyebrow" style="margin-left:auto">仅显示最近 24 小时</span></div>
+          <div>
+            <div class="log">
+              <span class="av" style="background:var(--brand)">林</span>
+              <div style="flex:1"><p><b>林屿</b> 发布了营销活动「老客复购券 · 全场 8 折」</p><span class="when">06-11 09:42 · IP 117.136.*.21</span></div>
+              <span class="tag plain">营销</span>
+            </div>
+            <div class="log">
+              <span class="av" style="background:var(--info)">周</span>
+              <div style="flex:1"><p><b>周明</b> 将「青苔·陶土花器」标记为缺货，并创建补货工单 #PO-2061</p><span class="when">06-11 08:15 · IP 117.136.*.88</span></div>
+              <span class="tag plain">商品</span>
+            </div>
+            <div class="log">
+              <span class="av" style="background:var(--gold)">陈</span>
+              <div style="flex:1"><p><b>陈萱</b> 更新了物流模板「顺丰特惠」，时效由 72h 调整为 48h</p><span class="when">06-10 17:30 · IP 114.88.*.6</span></div>
+              <span class="tag plain">系统</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+</div>
+
+<div class="toast" id="toast"><svg viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></svg><span id="toastMsg">已保存</span></div>
+
+<script>
+(function(){
+  var navItems = document.querySelectorAll('[data-nav]');
+  var views = document.querySelectorAll('.view');
+  var pageTitle = document.getElementById('pageTitle');
+  var pageSub = document.getElementById('pageSub');
+
+  function activate(item){
+    var m = item.getAttribute('data-nav');
+    navItems.forEach(function(n){ n.classList.toggle('is-active', n === item); });
+    views.forEach(function(v){ v.classList.toggle('is-active', v.getAttribute('data-module') === m); });
+    pageTitle.textContent = item.getAttribute('data-title') || item.querySelector('.lbl').textContent;
+    pageSub.textContent = item.getAttribute('data-sub') || '';
+    document.body.classList.remove('nav-open');
+    // scroll content to top on module change
+    var c = document.querySelector('.content'); if(c) c.scrollTop = 0;
+  }
+  navItems.forEach(function(item){ item.addEventListener('click', function(){ activate(item); }); });
+
+  // jump links (e.g. "全部 →" from dashboard to orders)
+  document.querySelectorAll('[data-nav-jump]').forEach(function(a){
+    a.addEventListener('click', function(e){
+      e.preventDefault();
+      var target = document.querySelector('[data-nav="' + a.getAttribute('data-nav-jump') + '"]');
+      if(target) activate(target);
+    });
+  });
+
+  // order tabs (visual state)
+  var tabs = document.querySelectorAll('#orderTabs .tab');
+  tabs.forEach(function(t){ t.addEventListener('click', function(){
+    tabs.forEach(function(x){ x.classList.toggle('is-active', x === t); });
+  }); });
+
+  // generic tab groups + seg groups
+  document.querySelectorAll('.tabs').forEach(function(group){
+    if(group.id === 'orderTabs') return;
+    var ts = group.querySelectorAll('.tab');
+    ts.forEach(function(t){ t.addEventListener('click', function(){
+      ts.forEach(function(x){ x.classList.toggle('is-active', x === t); });
+    }); });
+  });
+  document.querySelectorAll('.seg').forEach(function(group){
+    var bs = group.querySelectorAll('button');
+    bs.forEach(function(b){ b.addEventListener('click', function(){
+      bs.forEach(function(x){ x.classList.toggle('is-active', x === b); });
+    }); });
+  });
+  document.querySelectorAll('.setnav').forEach(function(group){
+    var bs = group.querySelectorAll('button');
+    bs.forEach(function(b){ b.addEventListener('click', function(){
+      bs.forEach(function(x){ x.classList.toggle('is-active', x === b); });
+    }); });
+  });
+
+  // mobile drawer
+  var menuBtn = document.getElementById('menuBtn');
+  if(menuBtn) menuBtn.addEventListener('click', function(){ document.body.classList.toggle('nav-open'); });
+  document.addEventListener('click', function(e){
+    if(document.body.classList.contains('nav-open') && !e.target.closest('.rail') && !e.target.closest('#menuBtn')){
+      document.body.classList.remove('nav-open');
+    }
+  });
+
+  // switch + save toast
+  document.querySelectorAll('.switch').forEach(function(sw){
+    var toggle = function(){ sw.classList.toggle('on'); sw.setAttribute('aria-checked', sw.classList.contains('on')); };
+    sw.addEventListener('click', toggle);
+    sw.addEventListener('keydown', function(e){ if(e.key === ' ' || e.key === 'Enter'){ e.preventDefault(); toggle(); } });
+  });
+  var toast = document.getElementById('toast');
+  var toastMsg = document.getElementById('toastMsg');
+  var saveBtn = document.getElementById('saveBtn');
+  if(saveBtn) saveBtn.addEventListener('click', function(){
+    toastMsg.textContent = '店铺信息已保存';
+    toast.classList.add('show');
+    clearTimeout(window.__t);
+    window.__t = setTimeout(function(){ toast.classList.remove('show'); }, 2200);
+  });
+})();
+</script>
+</body>
+</html>

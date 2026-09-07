@@ -1,0 +1,135 @@
+/* MessageList styles — layout handled by Tailwind */
+.message-list {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow-y: auto;
+}
+
+.dark .prose pre {
+  background-color: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius-md);
+}
+
+.dark .prose code {
+  color: var(--color-primary);
+}
+
+.tool-call-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 4px 0 10px;
+}
+
+.message-loaded-skills {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  color: var(--color-primary);
+  font-size: 12px;
+}
+
+.tool-call-row {
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--color-bg-elevated) 76%, transparent);
+  font-size: 12px;
+}
+
+.tool-call-summary {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  color: var(--color-text-sec);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.tool-call-summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-call-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--color-primary);
+}
+
+.tool-call-row--running .tool-call-dot {
+  animation: tool-call-pulse 1.2s ease-in-out infinite;
+}
+
+.tool-call-row--failed .tool-call-dot {
+  background: var(--color-error, #ff4d4f);
+}
+
+.tool-call-row--cancelled .tool-call-dot {
+  background: var(--color-text-dim);
+}
+
+.tool-call-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-call-status {
+  color: var(--color-text-dim);
+}
+
+.tool-call-expand {
+  width: 7px;
+  height: 7px;
+  margin-left: auto;
+  border-right: 1.5px solid var(--color-primary);
+  border-bottom: 1.5px solid var(--color-primary);
+  transform: rotate(-45deg);
+  transition: transform 0.18s ease;
+}
+
+.tool-call-row[open] .tool-call-expand {
+  transform: rotate(45deg);
+}
+
+.tool-call-details {
+  display: grid;
+  gap: 8px;
+  padding: 8px 10px 10px 25px;
+  border-top: 1px solid var(--color-border);
+  color: var(--color-text-dim);
+}
+
+.tool-call-details pre {
+  max-height: 220px;
+  margin: 4px 0 0;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--color-bg-void);
+  padding: 8px;
+  color: var(--color-text-sec);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-call-error {
+  color: var(--color-error, #ff4d4f);
+}
+
+@keyframes tool-call-pulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1); }
+}
