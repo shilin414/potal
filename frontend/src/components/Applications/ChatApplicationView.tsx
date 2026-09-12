@@ -1,12 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Input, InputNumber, Modal, Select, Spin, message } from 'antd';
 import { useSearchParams } from 'react-router-dom';
-import ChatContainer from '@/components/Chat/ChatContainer';
+import { RunChatPanel } from '@/components/Chat';
 import GuidedPromptPanel from '@/components/Workspace/GuidedPromptPanel';
-import WorkspaceFilesPanel from '@/components/Workspace/WorkspaceFilesPanel';
-import { useWorkspaceFiles } from '@/hooks/useWorkspaceFiles';
 import { api } from '@/services/api';
-import { useConversationStore } from '@/stores/useConversationStore';
+import { useRunChatStore } from '@/stores/useRunChatStore';
 import type { ApplicationRuntime, GuidedPrompt, GuidedQuestion } from '@/types';
 import type { WorkflowProcess } from '@/types/workflow';
 import './ChatApplicationView.css';
@@ -17,33 +15,16 @@ interface Props {
   workflowStepRunId?: string;
 }
 
-const ChatApplicationView: React.FC<Props> = ({ application, projectId, workflowStepRunId }) => {
-  const [searchParams] = useSearchParams();
+const ChatApplicationView: React.FC<Props> = ({ application }) => {
+  const [searchParams, setSearchParams] = useSearchParams();
   const requestedConversationId = searchParams.get('conversation');
-  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [conversationId, setConversationId] = useState<number | null>(null);
   const [activePrompt, setActivePrompt] = useState<GuidedPrompt | null>(null);
   const [answers, setAnswers] = useState<Record<string, unknown>>({});
   const [composing, setComposing] = useState(false);
-  const [starting, setStarting] = useState(false);
-  const [conversationLookupComplete, setConversationLookupComplete] = useState(false);
   const [draftRequest, setDraftRequest] = useState<{ id: number; text: string } | null>(null);
-  const { createConversation, fetchConversationDetail, sendMessageStream, streamingMessageId } =
-    useConversationStore();
-  const {
-    working_directory: workingDirectory,
-    entries: workspaceEntries,
-    file_count: workspaceFileCount,
-    truncated: workspaceListingTruncated,
-    isRefreshing: isRefreshingWorkspace,
-    refresh: refreshWorkspaceFiles,
-    readFile: readWorkspaceFile,
-  } = useWorkspaceFiles(projectId);
-
-  const defaultAgent = application.agent_bindings.find((item) => item.is_default)
-    ?? application.agent_bindings[0];
-  const defaultSkills = application.skill_bindings
-    .filter((item) => item.mode !== 'optional')
-    .map((item) => item.skill_id);
+  const [conversationLookupComplete, setConversationLookupComplete] = useState(false);
+  const loadConversation = useRunChatStore((state) => state.loadConversation);
 
   const guidedEntryProcess = useMemo<WorkflowProcess | null>(() => {
     const configuredKey = application.default_config.guided_entry_prompt_key;
@@ -72,28 +53,27 @@ const ChatApplicationView: React.FC<Props> = ({ application, projectId, workflow
     };
   }, [application.default_config, application.guided_prompts]);
 
+  // Restore the most recent conversation for this application (v2 chain
+  // keeps Conversations in the same backend table, so history survives).
   useEffect(() => {
     let active = true;
     setConversationLookupComplete(false);
     const restoreConversation = async () => {
       try {
-        let restoredConversationId = requestedConversationId;
-        if (!restoredConversationId) {
-          const params = workflowStepRunId
-            ? { workflow_step_run_id: workflowStepRunId }
-            : { application_id: application.id, ...(projectId ? { project_id: projectId } : {}) };
+        let restored: string | null = requestedConversationId;
+        if (!restored) {
           const response = await api.get<any[] | { results?: any[] }>(
-            '/conversations/', params);
+            '/conversations/', { application_id: application.id });
           const items = Array.isArray(response) ? response : response.results ?? [];
-          restoredConversationId = items[0]?.id ? String(items[0].id) : null;
+          restored = items[0]?.id ? String(items[0].id) : null;
         }
-        if (restoredConversationId) {
-          // Guided applications disable ChatContainer's automatic fetch to
-          // protect a newly seeded stream. History restoration therefore has
-          // to hydrate the selected conversation before showing the chat.
-          await fetchConversationDetail(restoredConversationId);
+        const numeric = restored ? Number(restored) : null;
+        if (numeric && Number.isInteger(numeric)) {
+          await loadConversation(numeric);
+          if (active) setConversationId(numeric);
+        } else if (active) {
+          setConversationId(null);
         }
-        if (active) setConversationId(restoredConversationId);
       } catch {
         if (active) setConversationId(null);
       } finally {
@@ -101,36 +81,16 @@ const ChatApplicationView: React.FC<Props> = ({ application, projectId, workflow
       }
     };
     void restoreConversation();
-    return () => {
-      active = false;
-    };
-  }, [application.id, guidedEntryProcess, projectId, workflowStepRunId,
-    fetchConversationDetail, requestedConversationId]);
+    return () => { active = false; };
+  }, [application.id, requestedConversationId, loadConversation]);
 
-  useEffect(() => {
-    if (!projectId) return;
-    void refreshWorkspaceFiles();
-    if (!streamingMessageId) return;
-    const timer = window.setInterval(() => {
-      void refreshWorkspaceFiles();
-    }, 1200);
-    return () => window.clearInterval(timer);
-  }, [projectId, streamingMessageId, refreshWorkspaceFiles]);
-
-  const suggestions = useMemo(() => application.guided_prompts.map((prompt) => ({
-    icon: prompt.icon,
-    label: prompt.title,
-    onSelect: () => {
-      if (prompt.questions.length === 0) {
-        setDraftRequest({ id: Date.now(), text: prompt.prompt_template });
-      } else {
-        setAnswers(Object.fromEntries(prompt.questions
-          .filter((question) => question.default_value !== undefined)
-          .map((question) => [question.key, question.default_value])));
-        setActivePrompt(prompt);
-      }
-    },
-  })), [application.guided_prompts]);
+  const suggestions = useMemo(() => application.guided_prompts
+    .filter((prompt) => prompt.questions.length === 0)
+    .map((prompt) => ({
+      icon: prompt.icon,
+      label: prompt.title,
+      text: prompt.prompt_template,
+    })), [application.guided_prompts]);
 
   const updateAnswer = (question: GuidedQuestion, value: unknown) => {
     setAnswers((current) => ({ ...current, [question.key]: value }));
@@ -154,42 +114,34 @@ const ChatApplicationView: React.FC<Props> = ({ application, projectId, workflow
     }
   };
 
-  const startGuidedConversation = async (prompt: string) => {
-    setStarting(true);
-    try {
-      const conversation = await createConversation(
-        application.application_name,
-        defaultAgent?.agent_id,
-        projectId,
-        undefined,
-        {
-          applicationId: application.id,
-          workflowStepRunId,
-          agentId: defaultAgent?.agent_id,
-          skillIds: defaultSkills,
-        },
-      );
-      const id = String(conversation.id);
-      await fetchConversationDetail(id);
-      sendMessageStream(id, prompt);
-      setConversationId(id);
-    } catch {
-      message.error('创建对话失败');
-    } finally {
-      setStarting(false);
-    }
-  };
-
   if (!conversationLookupComplete) {
     return <div style={{ display: 'grid', height: '100%', placeItems: 'center' }}><Spin /></div>;
+  }
+
+  const defaultText = draftRequest?.text;
+  if (defaultText) {
+    return (
+      <RunChatPanel
+        applicationId={application.id}
+        conversationId={conversationId}
+        onConversationCreated={(id) => {
+          setConversationId(id);
+          setSearchParams({ conversation: String(id) }, { replace: true });
+        }}
+        title={application.chat_profile?.empty_state_title || application.application_name}
+        description={application.chat_profile?.welcome_message || application.application_description}
+        suggestions={suggestions}
+        draftText={defaultText}
+      />
+    );
   }
 
   if (guidedEntryProcess && !conversationId) {
     return (
       <GuidedPromptPanel
         process={guidedEntryProcess}
-        applying={starting}
-        onStart={startGuidedConversation}
+        applying={false}
+        onStart={(prompt) => setDraftRequest({ id: Date.now(), text: prompt })}
       />
     );
   }
@@ -198,36 +150,18 @@ const ChatApplicationView: React.FC<Props> = ({ application, projectId, workflow
     <>
       <div className="chat-application-layout">
         <div className="chat-application-main">
-          <ChatContainer
+          <RunChatPanel
+            applicationId={application.id}
             conversationId={conversationId}
-            createOnFirstSend
-            onConversationCreated={setConversationId}
-            projectId={projectId}
-            creationContext={{
-              applicationId: application.id,
-              workflowStepRunId,
-              agentId: defaultAgent?.agent_id,
-              skillIds: defaultSkills,
+            onConversationCreated={(id) => {
+              setConversationId(id);
+              setSearchParams({ conversation: String(id) }, { replace: true });
             }}
+            title={application.chat_profile?.empty_state_title || application.application_name}
+            description={application.chat_profile?.welcome_message || application.application_description}
             suggestions={suggestions}
-            emptyTitle={application.chat_profile?.empty_state_title || application.application_name}
-            emptyDescription={application.chat_profile?.welcome_message || application.application_description}
-            inputPlaceholder={application.chat_profile?.input_placeholder}
-            draftRequest={draftRequest}
-            autoFetch={!guidedEntryProcess}
           />
         </div>
-
-        {workspaceFileCount > 0 && (
-          <WorkspaceFilesPanel
-            workingDirectory={workingDirectory}
-            entries={workspaceEntries}
-            truncated={workspaceListingTruncated}
-            isRefreshing={isRefreshingWorkspace}
-            onRefresh={() => { void refreshWorkspaceFiles(); }}
-            onReadFile={readWorkspaceFile}
-          />
-        )}
       </div>
 
       <Modal

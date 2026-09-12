@@ -1,92 +1,58 @@
-# Enterprise deployment and operations
+# Enterprise deployment and operations (planned — G13/G15)
 
-Creation Agent Studio now uses a control-plane/data-plane architecture:
+> The Django control plane described by the previous version of this document
+> has been retired (G10). Its historical implementation is archived, sanitized,
+> under [docs/archive/django-reference/](docs/archive/django-reference/README.md).
+> Enterprise governance is not yet implemented on the Go backend; this file
+> now records the target scope and its current status only.
 
-- Django is the durable control plane for organizations, RBAC, agents, versions,
-  deployments, policy, audit, quota, knowledge, evaluations and integrations.
-- `run_job_worker` claims persistent application jobs from PostgreSQL. Job
-  events, retries, heartbeat and reconnect state survive web-process restarts.
-- GraphFlow provides the interactive runtime. Every tenant receives an isolated
-  working directory and organization-specific model routing.
-- Redis carries WebSocket events, cache and API throttling. PostgreSQL remains
-  the source of truth. Uploaded assets use Django Storage so S3/OSS can be
-  enabled without changing business APIs.
+## Current status
 
-## Production start
+- The Go backend (`backend-go/`) owns Identity, Catalog, Execution, SSE, and
+  the Aily Agent provider. Enterprise console surfaces under `/enterprise/*`
+  (organizations, RBAC, API keys, quota, audit, provider health) are planned
+  for G13 and currently return 404 through the Vite proxy.
+- Production deployment topology (Nginx REST/SSE split, container images,
+  resource limits) is G15. The historical Docker Compose stack belonged to the
+  Django deployment and was removed with it.
+- Governance storage (quota_policies, audit_logs) already exists in the Go
+  schema; the runtime enforcement and the React admin console are the missing
+  parts (G13).
 
-1. Copy `backend/.env.example` to `backend/.env` and replace every secret.
-2. Configure `GRAPHFLOW_*`, or create organization ProviderConfig and
-   SecretReference records. SecretReference stores only an environment/Vault
-   reference, never a provider secret.
-3. Run `docker compose -f backend/docker-compose.yml up --build -d`.
-4. Verify `GET /healthz/` and `GET /readyz/`.
-5. Open `http://localhost:3000/enterprise` after signing in.
+## Planned Go topology (G15)
 
-The stack starts frontend, ASGI web, PostgreSQL, Redis, a persistent job worker
-and the automation scheduler. Apply retention periodically with:
-
-```shell
-python manage.py enforce_retention
+```text
+                    Nginx
+                      │
+      ┌───────────────┴────────────────┐
+      ▼                                ▼
+React SPA (static)              Go Backend
+                    ┌──────────────┴─────────────┐
+                    ▼                            ▼
+             studio-api :8080             studio-stream :8081
+             (REST control plane)         (SSE long connections)
+                    │                            │
+                    └──────────────┬─────────────┘
+                                   │
+                 ┌─────────────────┼─────────────────┐
+                 ▼                 ▼                 ▼
+               TiDB              Redis         Object Storage
+                                   │
+                                   ▼
+                          Execution Plane
+                    studio-worker --provider=feishu_aily
+                                   │
+                                   ▼
+                             Feishu Aily
 ```
 
-## Tenant and identity
+## Governance scope (G13)
 
-Every user receives a personal organization. Requests select a tenant using
-`X-Organization-ID`. Membership roles are owner, admin, developer, operator,
-auditor and viewer. Enterprise APIs include OIDC/SAML provider discovery and a
-SCIM 2.0 Users surface at `/api/enterprise/scim/v2/Users`.
-
-SSO metadata, client IDs and claim mappings are stored in IdentityProvider.
-Client secrets are SecretReference values. OIDC uses Authorization Code + PKCE,
-state validation, server-side token/userinfo exchange, verified email/domain
-checks, durable external-identity binding and a one-time frontend exchange.
-SAML metadata can be governed in the same control plane, but signed assertion
-validation is intentionally not exposed until a production SAML adapter and
-certificate trust policy are configured.
-
-## Agent release lifecycle
-
-1. Create a draft containing prompt, model, tools, skills, knowledge,
-   guardrails and a validated DAG workflow.
-2. Submit it and have an organization administrator approve it.
-3. Run an EvaluationSuite. Production deployment is blocked when a configured
-   suite has no passing result for that version.
-4. Deploy independently to development, staging or production. Rollback swaps
-   the current and previous version atomically.
-
-## Governance and observability
-
-- GovernancePolicy controls retention, PII redaction, model/tool allowlists,
-  blocked terms, network allowlists and export policy.
-- API keys are hashed, scoped, expirable, auditable and revocable.
-- RunTrace, TraceSpan, UsageRecord and AuditLog expose lifecycle, latency,
-  tokens, cost, actor, request ID and resource context.
-- QuotaPolicy enforces token, cost and concurrent-run budgets.
-- OrganizationRateThrottle applies the organization-specific per-minute limit.
-- Knowledge APIs ingest, chunk and return ranked results with citations.
-- Automation supports API dispatch and five-field cron scheduling.
-
-Enterprise endpoints under `/api/enterprise/` include `organizations`,
-`providers`, `secrets`, `identity-providers`, `governance`, `quota`, `usage`,
-`traces`, `audit-logs`, `knowledge-bases`, `evaluations`, `connectors` and
-`automations`.
-
-The `/enterprise` console exposes organization membership/RBAC, quotas,
-governance, model and secret references, knowledge documents, evaluation cases,
-connector invocation, automation dispatch, identity providers, traces, audit,
-and the agent draft/review/deploy/rollback lifecycle.
-
-## Verification
-
-```shell
-cd backend
-python manage.py makemigrations --check --dry-run
-python manage.py check --deploy --settings=backend.settings.production
-python -m pytest -q
-
-cd ../frontend
-npm ci
-npm test -- --run
-npm run build
-npm audit
-```
+- Quota: per-user token/cost/concurrent-run budgets backed by quota_policies.
+- Audit: append-only audit_logs for admin/provider/binding changes.
+- Provider health, circuit breaking, and usage accounting in the worker plane.
+- React admin console replacing the retired Django Admin for Provider,
+  RuntimeBinding, User, and runtime monitoring management.
+- Organization/enterprise APIs and SSO/SCIM surfaces are future work under the
+  same unified Application → RuntimeBinding → Run model; no Django-era chain
+  will be restored.

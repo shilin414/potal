@@ -1,0 +1,164 @@
+/* ============================================
+   Shell — Mobile layout (§21-§23) + workspace surfaces
+   Shares WorkspaceHost with the desktop shell (§24).
+   ============================================ */
+
+.mobile-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh;
+  background: var(--color-bg-void);
+}
+
+/* Top bar: drawer handle · current agent · account (§21) */
+.mobile-shell__bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--header-h);
+  padding: 0 12px;
+  padding-top: env(safe-area-inset-top);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-surface);
+}
+
+.mobile-shell__icon-btn {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: var(--border-radius-sm);
+  background: transparent;
+  color: var(--color-text);
+  font-size: 17px;
+  cursor: pointer;
+}
+
+.mobile-shell__icon-btn:hover {
+  background: var(--color-bg-elevated);
+}
+
+/* The switcher takes the free space so the current agent is the anchor. */
+.mobile-shell__bar .application-switcher {
+  flex: 1;
+  min-width: 0;
+}
+
+.mobile-shell__avatar {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  overflow: hidden;
+  background: var(--color-bg-elevated);
+  color: var(--color-primary);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.mobile-shell__avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* The workspace fills the space between the bar and the composer, which the
+   chat renderer keeps at the bottom of its own layout (soft-keyboard safe). */
+.mobile-shell__main {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
+}
+
+.mobile-shell__nav {
+  display: flex;
+  flex-direction: column;
+  padding: 8px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.mobile-shell__nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 10px;
+  border: none;
+  border-radius: var(--border-radius-sm);
+  background: transparent;
+  color: var(--color-text);
+  font-size: 15px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.mobile-shell__nav-item:hover {
+  background: var(--color-bg-elevated);
+}
+
+.mobile-shell__history {
+  height: calc(100% - 220px);
+  overflow: hidden;
+}
+
+/* ============================================
+   WorkspaceHost surfaces
+   ============================================ */
+
+.workspace-host {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.workspace-host__loading,
+.workspace-host__missing {
+  display: grid;
+  height: 100%;
+  place-items: center;
+  text-align: center;
+  color: var(--color-text-sec);
+}
+
+/* Fixed application surface: fills the body under the renderer header. */
+.workspace-host__frame {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* Agent header of a chat workspace: current agent ▼ + actions (§31) */
+.chat-renderer__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-surface);
+}
+
+.chat-renderer__head-spacer {
+  flex: 1;
+}
+
+.chat-renderer__body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-renderer__body > .chat-container {
+  flex: 1;
+  min-height: 0;
+}
+
+@media (max-width: 768px) {
+  .chat-renderer__head {
+    display: none; /* the mobile top bar already carries the switcher */
+  }
+}

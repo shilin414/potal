@@ -1,0 +1,1536 @@
+openapi: 3.0.3
+info:
+  title: Creation Agent Studio API
+  version: 2.0.0
+  description: |
+    Creation Agent Studio backend contract (Go control plane).
+
+    This file is the single source of truth for the HTTP API.
+    Go server types and TypeScript clients are generated from it.
+
+    ## Error envelope conventions (legacy-compatible)
+
+    The React frontend was validated against the Django reference
+    implementation, which produced four distinct error shapes:
+
+    - `{"detail": "message"}` — 403/404 style errors (DRF PermissionDenied / NotFound).
+    - `{"error": "message"}` — simple JSON errors (identity endpoints, 409/502 conflicts).
+    - `{"field": ["message", ...]}` — field validation errors (DRF serializer style).
+    - `["message"]` — bare array, 400 for hand-raised DRF ValidationErrors (e.g. "application_id is required").
+
+    All four shapes are reproduced exactly. Clients should read the
+    `detail` / `error` / first field message in that order.
+
+    ## Authentication
+
+    Normal users authenticate with the HttpOnly opaque session cookie
+    `studio_session` (set by OAuth exchange / admin login). All
+    state-changing requests additionally require the CSRF header
+    `X-CSRF-Token` matching the `studio_csrf` cookie (double-submit).
+    `GET /api/v2/artifacts/{id}/open` is cookie-authenticated because it is
+    opened via browser navigation (window.open) and cannot send headers.
+
+    ## SSE
+
+    `GET /api/v2/runs/{id}/stream` responds with `text/event-stream`.
+    Frames: `event: run.event` + `data: {run_id, sequence, event_type, payload[, created_at]}`,
+    keepalive comment lines `: keepalive` every 15s of silence.
+    Replay covers every persisted event from sequence 0 (clients dedupe by
+    sequence); live frames end after the first terminal event
+    (`run.completed` / `run.failed` / `run.interrupted`), then the connection closes.
+servers:
+  - url: /
+tags:
+  - name: identity
+  - name: auth
+  - name: applications
+  - name: runtimes
+  - name: runs
+  - name: artifacts
+
+paths:
+  # ─────────────────────────────────────────────────────────── identity ──
+  /api/identity/oauth/start:
+    get:
+      operationId: oauthStart
+      tags: [identity]
+      summary: Redirect (302) the browser to the Feishu OAuth authorize page
+      parameters:
+        - name: return_to
+          in: query
+          schema: { type: string, default: "/" }
+          description: SPA path to return to after login; must start with "/" and not "//".
+      responses:
+        "302":
+          description: Redirect to Feishu authorize URL (state signed, 10 min TTL).
+          headers:
+            Location:
+              schema: { type: string }
+        "500":
+          description: OAuth not configured
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+
+  /api/identity/oauth/exchange:
+    get:
+      operationId: oauthExchange
+      tags: [identity]
+      summary: Exchange the OAuth ?code&state for a studio session
+      description: |
+        Verifies the signed state, exchanges the code at the Feishu token
+        endpoint, upserts the local user (auth_source=feishu), stores the
+        refresh token AES-256-GCM encrypted, sets the `studio_session`
+        HttpOnly cookie and returns the session user plus JWT tokens for the
+        legacy transition window.
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string }
+        - name: state
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Authenticated
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, tokens, return_to]
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+                  tokens: { $ref: "#/components/schemas/Tokens" }
+                  return_to: { type: string }
+        "400":
+          description: missing code / invalid or expired oauth state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "502":
+          description: oauth exchange failed / no access token / user info failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+
+  /api/identity/session:
+    get:
+      operationId: getSession
+      tags: [identity]
+      summary: Current session user (cookie-authenticated)
+      responses:
+        "200":
+          description: Session user payload
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionUser" }
+        "401":
+          description: not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+
+  /api/identity/admin/login:
+    post:
+      operationId: adminLogin
+      tags: [identity]
+      summary: Local admin login (Argon2id password)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+      responses:
+        "200":
+          description: Admin session established
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, username, is_staff, auth_source]
+                properties:
+                  id: { type: integer }
+                  username: { type: string }
+                  is_staff: { type: boolean }
+                  auth_source: { type: string }
+                  display_name: { type: string }
+                  display_id: { type: string }
+        "401":
+          description: invalid credentials
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+
+  # ─────────────────────────────────────────────────────────────── auth ──
+  /api/auth/login/:
+    post:
+      operationId: authLogin
+      tags: [auth]
+      summary: Local username/password login (transition window)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+      responses:
+        "200":
+          description: Logged in; also sets studio_session cookie
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, tokens]
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+                  tokens: { $ref: "#/components/schemas/Tokens" }
+        "401":
+          description: bad credentials
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/auth/logout/:
+    post:
+      operationId: authLogout
+      tags: [auth]
+      summary: Logout; clears the studio_session cookie
+      responses:
+        "200":
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail: { type: string }
+
+  /api/auth/token/refresh/:
+    post:
+      operationId: tokenRefresh
+      tags: [auth]
+      summary: Rotate a JWT refresh token (transition window)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh]
+              properties:
+                refresh: { type: string }
+      responses:
+        "200":
+          description: New access token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access: { type: string }
+                  refresh: { type: string }
+
+  /api/auth/me/:
+    get:
+      operationId: getMe
+      tags: [auth]
+      summary: Current user profile
+      responses:
+        "200":
+          description: User profile
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+    patch:
+      operationId: patchMe
+      tags: [auth]
+      summary: Update current user profile
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                username: { type: string }
+                email: { type: string }
+                avatar: { type: string }
+                bio: { type: string }
+                display_id: { type: string }
+      responses:
+        "200":
+          description: Updated profile
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+
+  # ─────────────────────────────────────────────────────── applications ──
+  /api/v2/applications:
+    get:
+      operationId: listApplications
+      tags: [applications]
+      summary: List openable applications (bare array, no pagination envelope)
+      parameters:
+        - name: kind
+          in: query
+          schema: { type: string, enum: [chat, task, custom, all], default: chat }
+          description: Invalid values fall back to chat.
+        - name: scope
+          in: query
+          schema: { type: string, enum: [public, mine, manage], default: public }
+          description: Invalid values fall back to public.
+        - name: include_unbound
+          in: query
+          schema: { type: string }
+          description: Truthy when case-insensitively in {1,true,yes}.
+      responses:
+        "200":
+          description: Application list items (bare array)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ApplicationListItem" }
+    post:
+      operationId: createApplication
+      tags: [applications]
+      summary: Create an application (agent marketplace "new Aily agent")
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ApplicationCreateRequest" }
+      responses:
+        "201":
+          description: Created (compact detail shape)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplicationDetail" }
+        "400":
+          description: field errors
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldErrors" }
+
+  /api/v2/applications/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ApplicationId"
+    get:
+      operationId: getApplication
+      tags: [applications]
+      summary: Application detail (compact shape)
+      responses:
+        "200":
+          description: Detail
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplicationDetail" }
+        "404":
+          description: application not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+    patch:
+      operationId: updateApplication
+      tags: [applications]
+      summary: Update an application / rebind runtime (creator or staff)
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ApplicationUpdateRequest" }
+      responses:
+        "200":
+          description: Updated (compact shape)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplicationDetail" }
+        "403":
+          description: only creator or staff
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "404":
+          description: application not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+    delete:
+      operationId: deleteApplication
+      tags: [applications]
+      summary: Delete an application (409 when referenced by conversations/runs)
+      responses:
+        "204":
+          description: Deleted
+        "403":
+          description: only creator or staff
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "409":
+          description: has conversations or runs
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/applications/{id}/favorite:
+    parameters:
+      - $ref: "#/components/parameters/ApplicationId"
+    post:
+      operationId: favoriteApplication
+      tags: [applications]
+      summary: Pin application (idempotent)
+      responses:
+        "200":
+          description: Favorite state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FavoriteResult" }
+        "404":
+          description: application not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+    delete:
+      operationId: unfavoriteApplication
+      tags: [applications]
+      summary: Unpin application (idempotent)
+      responses:
+        "200":
+          description: Favorite state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FavoriteResult" }
+        "404":
+          description: application not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/applications/{id}/avatar:
+    parameters:
+      - $ref: "#/components/parameters/ApplicationId"
+    get:
+      operationId: getApplicationAvatar
+      tags: [applications]
+      summary: Stream avatar image bytes
+      responses:
+        "200":
+          description: Image bytes
+          content:
+            image/png: {}
+            image/jpeg: {}
+            image/gif: {}
+            image/webp: {}
+        "404":
+          description: avatar not set
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+    post:
+      operationId: uploadApplicationAvatar
+      tags: [applications]
+      summary: Replace avatar (multipart file; png/jpg/jpeg/gif/webp ≤ 2MB)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        "200":
+          description: Updated (compact shape)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplicationDetail" }
+        "400":
+          description: field errors
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldErrors" }
+    delete:
+      operationId: clearApplicationAvatar
+      tags: [applications]
+      summary: Clear avatar (falls back to emoji icon)
+      responses:
+        "200":
+          description: Updated (compact shape)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplicationDetail" }
+
+  /api/v2/applications/{id}/default-agent:
+    parameters:
+      - $ref: "#/components/parameters/ApplicationId"
+    post:
+      operationId: setDefaultAgent
+      tags: [applications]
+      summary: Set as workspace main agent (chat + enabled binding only)
+      responses:
+        "200":
+          description: Updated (compact shape)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplicationDetail" }
+        "400":
+          description: not eligible
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "403":
+          description: only creator or staff
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+    delete:
+      operationId: unsetDefaultAgent
+      tags: [applications]
+      summary: Unset workspace main agent
+      responses:
+        "200":
+          description: Updated (compact shape)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplicationDetail" }
+
+  /api/v2/applications/{id}/attachments:
+    parameters:
+      - $ref: "#/components/parameters/ApplicationId"
+    post:
+      operationId: uploadApplicationAttachment
+      tags: [applications]
+      summary: Pre-run attachment upload (stored in studio storage; the worker uploads to the provider with the user's UAT)
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                type:
+                  type: string
+                  enum: [image, file, feishu_doc, bitable]
+                  default: file
+                doc_url:
+                  type: string
+      responses:
+        "201":
+          description: Attachment created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RuntimeAttachment" }
+        "400":
+          description: file or doc_url required / binding missing
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/DetailError" }
+                  - { $ref: "#/components/schemas/BareError" }
+                  - { $ref: "#/components/schemas/FieldErrors" }
+        "502":
+          description: attachment upload failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+
+  # ─────────────────────────────────────────────────────────── runtimes ──
+  /api/v2/runtimes:
+    get:
+      operationId: listRuntimes
+      tags: [runtimes]
+      summary: Runtime catalog (active providers × registered adapters)
+      responses:
+        "200":
+          description: Runtime descriptors (bare array)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/RuntimeDescriptor" }
+
+  /api/v2/runtimes/validate:
+    post:
+      operationId: validateRuntime
+      tags: [runtimes]
+      summary: Validate resource id format + remote visibility (best-effort)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider_key, runtime_type]
+              properties:
+                provider_key: { type: string }
+                runtime_type: { type: string, default: agent }
+                external_resource_id: { type: string }
+                identity_mode: { type: string, default: user }
+      responses:
+        "200":
+          description: Validation outcome (checked=false means skipped, not failed)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RuntimeValidationResult" }
+        "400":
+          description: field errors
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldErrors" }
+
+  # ─────────────────────────────────────────────────────────────── runs ──
+  /api/v2/runs:
+    post:
+      operationId: createRun
+      tags: [runs]
+      summary: Create a run (lazily creates the conversation when conversation_id is absent)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateRunRequest" }
+      responses:
+        "201":
+          description: Run created (status=queued)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "400":
+          description: validation errors (bare array style)
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/BareError" }
+                  - { $ref: "#/components/schemas/FieldErrors" }
+
+  /api/v2/runs/{runId}:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    get:
+      operationId: getRun
+      tags: [runs]
+      summary: Run detail (owner or staff only; unknown ids return 404)
+      responses:
+        "200":
+          description: Run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "404":
+          description: run not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/runs/{runId}/events:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+      - name: after
+        in: query
+        schema: { type: integer, minimum: 0, default: 0 }
+        description: Return events with sequence > after (ascending).
+    get:
+      operationId: listRunEvents
+      tags: [runs]
+      summary: Persisted run events (replay after reconnect)
+      responses:
+        "200":
+          description: Events (bare array)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/RunEvent" }
+        "404":
+          description: run not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/runs/{runId}/stream:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    get:
+      operationId: streamRun
+      tags: [runs]
+      summary: SSE stream (DB replay from sequence 0, then Redis live frames)
+      description: |
+        `text/event-stream`. Frames:
+        `event: run.event\ndata: {"run_id","sequence","event_type","payload"[,"created_at"]}\n\n`
+        Keepalive comment `: keepalive` after 15s of silence.
+        Closes after replay when the run is already terminal, or after the
+        first terminal live event.
+      responses:
+        "200":
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "404":
+          description: run not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/runs/{runId}/commands:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    post:
+      operationId: createRunCommand
+      tags: [runs]
+      summary: Issue a run command (cancel / respond / resume)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateRunCommandRequest" }
+      responses:
+        "201":
+          description: Command recorded (status=pending)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RunCommand" }
+        "400":
+          description: field errors
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldErrors" }
+        "404":
+          description: run not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "409":
+          description: provider does not support cancel
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+
+  /api/v2/runs/{runId}/attachments:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    post:
+      operationId: uploadRunAttachment
+      tags: [runs]
+      summary: Attach a file to a queued run
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                type:
+                  type: string
+                  enum: [image, file, feishu_doc, bitable]
+                  default: file
+                doc_url:
+                  type: string
+      responses:
+        "201":
+          description: Attachment bound to the run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RuntimeAttachment" }
+        "404":
+          description: run not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "409":
+          description: run no longer queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "502":
+          description: attachment upload failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+
+  /api/v2/runs/{runId}/artifacts:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    get:
+      operationId: listRunArtifacts
+      tags: [runs]
+      summary: Artifacts of a run (created_at ascending)
+      responses:
+        "200":
+          description: Artifacts (bare array)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/RunArtifact" }
+        "404":
+          description: run not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/conversations/{conversationId}/runs:
+    parameters:
+      - name: conversationId
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      operationId: listConversationRuns
+      tags: [runs]
+      summary: Runs of a conversation (newest first, owner only)
+      responses:
+        "200":
+          description: Runs (bare array)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Run" }
+        "404":
+          description: conversation not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  # ─────────────────────────────────────────────────────────── artifacts ──
+  /api/v2/artifacts/{artifactId}/open:
+    parameters:
+      - name: artifactId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      operationId: openArtifact
+      tags: [artifacts]
+      summary: Resolve artifact URL (24h cache refresh) and 302 to the provider URL
+      description: Cookie-authenticated (browser navigation). The provider
+        signed URL is cached for 23h and refreshed when <25min of validity
+        remain. The long-term reference is external_artifact_id, never the URL.
+      responses:
+        "302":
+          description: Redirect to provider URL
+          headers:
+            Location:
+              schema: { type: string }
+        "404":
+          description: artifact not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "502":
+          description: resolution failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+
+  # ─────────────────────────────────────────────────────── conversations ──
+  /api/conversations/:
+    get:
+      operationId: listConversations
+      tags: [runs]
+      summary: Conversation list for the history sidebar (newest first)
+      parameters:
+        - name: application_id
+          in: query
+          schema: { type: integer }
+          description: Restrict to one application.
+      responses:
+        "200":
+          description: Bare array (or {results} envelope is accepted by the client)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ConversationSummary" }
+        "401":
+          description: not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/conversations/{conversationId}/:
+    parameters:
+      - name: conversationId
+        in: path
+        required: true
+        schema: { type: integer }
+    get:
+      operationId: getConversation
+      tags: [runs]
+      summary: Conversation detail with messages (history replay + deep-link resolve)
+      responses:
+        "200":
+          description: Conversation with messages (owner only)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConversationDetail" }
+        "404":
+          description: conversation not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/conversations/{conversationId}/delete_conversation/:
+    parameters:
+      - name: conversationId
+        in: path
+        required: true
+        schema: { type: integer }
+    delete:
+      operationId: deleteConversation
+      tags: [runs]
+      summary: Delete a conversation and its messages/runs (owner only)
+      responses:
+        "200":
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail: { type: string }
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/conversations/{conversationId}/clear/:
+    parameters:
+      - name: conversationId
+        in: path
+        required: true
+        schema: { type: integer }
+    delete:
+      operationId: clearConversation
+      tags: [runs]
+      summary: Delete the conversation's messages (keep the conversation)
+      responses:
+        "200":
+          description: Cleared
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail: { type: string }
+
+  # ─────────────────────────────────────────────────────────────── auth ──
+  /api/auth/register/:
+    post:
+      operationId: authRegister
+      tags: [auth]
+      summary: Local account registration (password stored Argon2id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password, password_confirm]
+              properties:
+                username: { type: string }
+                email: { type: string }
+                password: { type: string, format: password }
+                password_confirm: { type: string, format: password }
+      responses:
+        "201":
+          description: Registered (session cookie set)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+                  tokens: { $ref: "#/components/schemas/Tokens" }
+        "400":
+          description: field errors
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldErrors" }
+
+  # ───────────────────────────────────────── legacy compat shims ──
+  # The local "creative agents" (Django Agent model) become Applications in
+  # G12; until then these return empty collections so the marketplace and
+  # editor render runtime agents without error toasts.
+  /api/agents/:
+    get:
+      operationId: listLegacyAgents
+      tags: [applications]
+      summary: Local creative agents (legacy) — empty until G12
+      responses:
+        "200":
+          description: Bare array
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: object, additionalProperties: true }
+
+  /api/agents/categories/:
+    get:
+      operationId: listLegacyAgentCategories
+      tags: [applications]
+      summary: Local agent categories (legacy) — empty until G12
+      responses:
+        "200":
+          description: Bare array
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: object, additionalProperties: true }
+
+  /api/apps/skills/:
+    get:
+      operationId: listSkills
+      tags: [applications]
+      summary: Skill catalog (legacy) — empty until G12
+      responses:
+        "200":
+          description: Bare array
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: object, additionalProperties: true }
+
+components:
+  parameters:
+    ApplicationId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+    RunId:
+      name: runId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  schemas:
+    ConversationSummary:
+      type: object
+      required: [id, title, updated_at]
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        application_id:
+          nullable: true
+          type: integer
+        message_count: { type: integer }
+        updated_at: { type: string, format: date-time }
+        last_message:
+          nullable: true
+          type: object
+          properties:
+            role: { type: string }
+            content: { type: string }
+            created_at: { type: string, format: date-time }
+
+    ConversationDetail:
+      type: object
+      required: [id, title, messages]
+      properties:
+        id: { type: integer }
+        title: { type: string }
+        application_id:
+          nullable: true
+          type: integer
+        messages:
+          type: array
+          items:
+            type: object
+            required: [id, role, content, created_at]
+            properties:
+              id: { type: integer }
+              role: { type: string, enum: [user, assistant, system] }
+              content: { type: string }
+              created_at: { type: string, format: date-time }
+              metadata:
+                nullable: true
+                type: object
+                additionalProperties: true
+
+    DetailError:
+      type: object
+      required: [detail]
+      properties:
+        detail: { type: string }
+    SimpleError:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+    BareError:
+      type: array
+      items: { type: string }
+    FieldErrors:
+      type: object
+      description: map of field name -> list of messages
+      additionalProperties:
+        type: array
+        items: { type: string }
+
+    Tokens:
+      type: object
+      properties:
+        access: { type: string }
+        refresh: { type: string }
+
+    User:
+      type: object
+      description: session_user_payload — the single canonical user shape
+      required: [id, username]
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        email: { type: string }
+        role: { type: string }
+        avatar: { type: string }
+        avatar_url: { type: string }
+        auth_source: { type: string }
+        is_staff: { type: boolean }
+        display_name: { type: string }
+        display_id: { type: string }
+
+    SessionUser:
+      type: object
+      required: [username]
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        display_name: { type: string }
+        display_id: { type: string }
+        avatar_url: { type: string }
+        auth_source: { type: string }
+        is_staff: { type: boolean }
+
+    ApplicationListItem:
+      type: object
+      description: shape returned by GET /api/v2/applications
+      required:
+        - id
+        - slug
+        - name
+        - description
+        - icon
+        - avatar_url
+        - color
+        - kind
+        - renderer_key
+        - executor_key
+        - category_slug
+        - category_name
+        - is_public
+        - runtime_type
+        - provider_key
+        - external_resource_id
+        - identity_mode
+        - execution_mode
+        - capabilities
+        - is_bound
+        - is_favorite
+        - is_default_agent
+        - can_manage
+        - usage_count
+        - last_used_at
+        - global_usage_count
+      properties:
+        id: { type: integer }
+        slug: { type: string }
+        name: { type: string }
+        description: { type: string }
+        icon: { type: string }
+        avatar_url: { type: string }
+        color: { type: string }
+        kind: { type: string, enum: [chat, task, custom] }
+        renderer_key: { type: string }
+        executor_key: { type: string }
+        category_slug: { type: string }
+        category_name: { type: string }
+        is_public: { type: boolean }
+        runtime_type: { type: string }
+        provider_key: { type: string }
+        external_resource_id: { type: string }
+        identity_mode: { type: string }
+        execution_mode: { type: string }
+        capabilities:
+          type: object
+          additionalProperties: { type: boolean }
+        is_bound: { type: boolean }
+        is_favorite: { type: boolean }
+        is_default_agent: { type: boolean }
+        can_manage: { type: boolean }
+        usage_count: { type: integer }
+        last_used_at:
+          type: string
+          nullable: true
+          format: date-time
+        global_usage_count: { type: integer }
+
+    ApplicationDetail:
+      type: object
+      description: compact shape returned by authoring / avatar / default-agent endpoints
+      required:
+        - id
+        - slug
+        - name
+        - description
+        - icon
+        - avatar_url
+        - color
+        - kind
+        - is_public
+        - category_slug
+        - category_name
+        - is_default_agent
+        - is_bound
+        - runtime_type
+        - provider_key
+        - external_resource_id
+        - identity_mode
+        - execution_mode
+        - can_manage
+        - updated_at
+      properties:
+        id: { type: integer }
+        slug: { type: string }
+        name: { type: string }
+        description: { type: string }
+        icon: { type: string }
+        avatar_url: { type: string }
+        color: { type: string }
+        kind: { type: string, enum: [chat, task, custom] }
+        is_public: { type: boolean }
+        category_slug: { type: string }
+        category_name: { type: string }
+        is_default_agent: { type: boolean }
+        is_bound: { type: boolean }
+        runtime_type: { type: string }
+        provider_key: { type: string }
+        external_resource_id: { type: string }
+        identity_mode: { type: string }
+        execution_mode: { type: string }
+        can_manage: { type: boolean }
+        updated_at: { type: string, format: date-time }
+
+    RuntimeBindingInput:
+      type: object
+      required: [provider_key]
+      properties:
+        provider_key: { type: string, maxLength: 64 }
+        runtime_type:
+          type: string
+          enum: [agent, workflow, http, local_task, media, none]
+          default: agent
+        external_resource_id: { type: string, maxLength: 255 }
+        identity_mode: { type: string, enum: [user, tenant], default: user }
+        execution_mode: { type: string, enum: [interactive, background], default: interactive }
+        session_policy: { type: string, enum: [lazy, eager], default: lazy }
+        artifact_policy:
+          type: string
+          enum: [external_refresh, mirror_on_access, mirror_on_complete]
+          default: external_refresh
+        timeout_seconds: { type: integer, minimum: 10, maximum: 3600, default: 300 }
+        config:
+          type: object
+          additionalProperties: true
+
+    ApplicationCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 100, minLength: 1 }
+        slug:
+          type: string
+          maxLength: 100
+          pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        description: { type: string }
+        icon: { type: string, maxLength: 50 }
+        color: { type: string, maxLength: 20 }
+        category_slug: { type: string, maxLength: 100 }
+        category_name: { type: string, maxLength: 100 }
+        is_public: { type: boolean, default: true }
+        kind: { type: string, enum: [chat], default: chat }
+        renderer_key: { type: string, default: chat }
+        runtime: { $ref: "#/components/schemas/RuntimeBindingInput" }
+        set_default_agent: { type: boolean, default: false }
+
+    ApplicationUpdateRequest:
+      type: object
+      properties:
+        name: { type: string, maxLength: 100 }
+        description: { type: string }
+        icon: { type: string }
+        color: { type: string }
+        is_public: { type: boolean }
+        category_slug: { type: string }
+        category_name: { type: string }
+        runtime: { $ref: "#/components/schemas/RuntimeBindingInput" }
+        set_default_agent: { type: boolean }
+
+    FavoriteResult:
+      type: object
+      required: [application_id, is_favorite]
+      properties:
+        application_id: { type: integer }
+        is_favorite: { type: boolean }
+
+    RuntimeDescriptor:
+      type: object
+      required:
+        - key
+        - provider_key
+        - provider_name
+        - runtime_type
+        - label
+        - resource_id_label
+        - resource_id_hint
+        - resource_id_pattern
+        - resource_id_required
+        - identity_modes
+        - execution_modes
+        - capabilities
+      properties:
+        key: { type: string, description: "provider_key:runtime_type" }
+        provider_key: { type: string }
+        provider_name: { type: string }
+        runtime_type: { type: string }
+        label: { type: string }
+        resource_id_label: { type: string }
+        resource_id_hint: { type: string }
+        resource_id_pattern: { type: string }
+        resource_id_required: { type: boolean }
+        identity_modes:
+          type: array
+          items: { type: string }
+        execution_modes:
+          type: array
+          items: { type: string }
+        capabilities:
+          type: object
+          additionalProperties: { type: boolean }
+
+    RuntimeValidationResult:
+      type: object
+      required: [ok, checked, detail]
+      properties:
+        ok: { type: boolean }
+        checked: { type: boolean }
+        detail: { type: string }
+
+    CreateRunRequest:
+      type: object
+      required: [application_id, content]
+      properties:
+        application_id: { type: integer }
+        content: { type: string, description: plain text user message }
+        conversation_id: { type: integer }
+        attachment_ids:
+          type: array
+          items: { type: string, format: uuid }
+          description: studio attachment ids uploaded by this user, unbound to a run
+
+    Run:
+      type: object
+      required:
+        - id
+        - organization
+        - user
+        - application
+        - conversation
+        - runtime_binding
+        - provider
+        - runtime_type
+        - external_run_id
+        - status
+        - provider_status
+        - provider_finish_reason
+        - input
+        - output
+        - attempt
+        - max_attempts
+        - queued_at
+        - started_at
+        - finished_at
+        - error_code
+        - error_message
+        - created_at
+        - updated_at
+      properties:
+        id: { type: string, format: uuid }
+        organization:
+          type: integer
+          nullable: true
+        user:
+          type: integer
+          nullable: true
+        application: { type: integer }
+        conversation: { type: integer }
+        runtime_binding: { type: integer }
+        provider: { type: string }
+        runtime_type: { type: string }
+        external_run_id: { type: string, description: Aily agent_chat_id }
+        status:
+          type: string
+          enum: [queued, running, waiting_input, waiting_external, cancelling, cancelled, succeeded, failed, interrupted]
+        provider_status: { type: string }
+        provider_finish_reason: { type: string }
+        input:
+          type: object
+          additionalProperties: true
+        output:
+          type: object
+          additionalProperties: true
+        attempt: { type: integer }
+        max_attempts: { type: integer }
+        queued_at: { type: string, format: date-time }
+        started_at:
+          type: string
+          nullable: true
+          format: date-time
+        finished_at:
+          type: string
+          nullable: true
+          format: date-time
+        error_code: { type: string }
+        error_message: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    RunEvent:
+      type: object
+      required: [id, run, sequence, event_type, payload, created_at]
+      properties:
+        id: { type: integer }
+        run: { type: string, format: uuid }
+        sequence: { type: integer }
+        event_type:
+          type: string
+          enum:
+            - run.started
+            - content.started
+            - content.delta
+            - content.completed
+            - content.snapshot
+            - tool.started
+            - tool.completed
+            - artifact.discovered
+            - artifact.created
+            - input.required
+            - run.completed
+            - run.failed
+            - run.interrupted
+            - run.poll
+        payload:
+          type: object
+          additionalProperties: true
+        created_at: { type: string, format: date-time }
+
+    RunCommand:
+      type: object
+      required: [id, run, command_type, payload, status, created_by, created_at, resolved_at]
+      properties:
+        id: { type: string, format: uuid }
+        run: { type: string, format: uuid }
+        command_type: { type: string, enum: [cancel, respond, resume] }
+        payload:
+          type: object
+          additionalProperties: true
+        status: { type: string, enum: [pending, accepted, rejected] }
+        created_by:
+          type: integer
+          nullable: true
+        created_at: { type: string, format: date-time }
+        resolved_at:
+          type: string
+          nullable: true
+          format: date-time
+
+    CreateRunCommandRequest:
+      type: object
+      required: [command_type]
+      properties:
+        command_type: { type: string, enum: [cancel, respond, resume] }
+        payload:
+          type: object
+          additionalProperties: true
+
+    RuntimeAttachment:
+      type: object
+      required: [id, run, conversation, provider, external_attachment_id, attachment_type, name, source_type, status, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        run:
+          type: string
+          nullable: true
+          format: uuid
+        conversation:
+          type: integer
+          nullable: true
+        provider: { type: string }
+        external_attachment_id: { type: string, description: Aily agent_attachment_id }
+        attachment_type: { type: string, enum: [image, file, feishu_doc, bitable] }
+        name: { type: string }
+        source_type: { type: string, enum: [upload, doc_url] }
+        status: { type: string, enum: [pending, uploaded, failed] }
+        created_at: { type: string, format: date-time }
+
+    RunArtifact:
+      type: object
+      required:
+        - id
+        - run
+        - provider
+        - external_artifact_id
+        - provider_artifact_type
+        - name
+        - normalized_type
+        - storage_type
+        - cached_url_expires_at
+        - resolution_status
+        - created_at
+        - updated_at
+      properties:
+        id: { type: string, format: uuid }
+        run: { type: string, format: uuid }
+        provider: { type: string }
+        external_artifact_id: { type: string, description: Aily agent_artifact_id — the long-term reference }
+        provider_artifact_type: { type: string }
+        name: { type: string }
+        normalized_type: { type: string, default: file }
+        storage_type: { type: string, enum: [external, mirrored] }
+        cached_url_expires_at:
+          type: string
+          nullable: true
+          format: date-time
+        resolution_status: { type: string, enum: [pending, resolved, expired, failed, mirrored] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }

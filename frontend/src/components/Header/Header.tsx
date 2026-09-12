@@ -3,6 +3,8 @@ import { Dropdown, Avatar } from 'antd';
 import { UserOutlined, LogoutOutlined, SettingOutlined } from '@ant-design/icons';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '@/stores/useAuthStore';
+import { userAvatarFallback, userAvatarUrl, userDisplayName } from '@/lib/chatIdentity';
+import { useApplicationCatalogStore, resolveDefaultApplication } from '@/stores/useApplicationCatalogStore';
 import { ThemeToggle } from '@/components/Theme';
 import './Header.css';
 
@@ -20,10 +22,23 @@ const Header: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const { user, logout, isAuthenticated } = useAuthStore();
+  const applications = useApplicationCatalogStore((state) => state.applications);
 
   const handleLogout = async () => {
     await logout();
     navigate('/auth/login');
+  };
+
+  const handleNav = (key: string) => {
+    // "对话" is the chat surface, not the idle home: open the main agent's
+    // workspace so the switcher / new-conversation header is available. Falls
+    // back to the home workspace when no bound chat application exists yet.
+    if (key === '/') {
+      const main = resolveDefaultApplication(applications);
+      navigate(main ? `/chat/${main.slug}` : '/');
+      return;
+    }
+    navigate(key);
   };
 
   const userMenuItems = [
@@ -65,7 +80,7 @@ const Header: React.FC = () => {
             className={`header-nav-item ${
               currentPath === item.key || (item.key !== '/' && currentPath.startsWith(item.key))
                 ? 'active' : ''}`}
-            onClick={() => navigate(item.key)}
+            onClick={() => handleNav(item.key)}
           >
             {item.label}
           </div>
@@ -79,13 +94,13 @@ const Header: React.FC = () => {
           <Dropdown menu={{ items: userMenuItems }} placement="bottomRight">
             <div className="header-user">
               <div className="header-avatar">
-                {user?.avatar ? (
-                  <Avatar size={32} src={user.avatar} />
+                {userAvatarUrl(user) ? (
+                  <Avatar size={32} src={userAvatarUrl(user)} />
                 ) : (
-                  user?.username?.charAt(0)?.toUpperCase() || 'U'
+                  userAvatarFallback(user)
                 )}
               </div>
-              <span className="header-username">{user?.username || 'User'}</span>
+              <span className="header-username">{userDisplayName(user)}</span>
             </div>
           </Dropdown>
         )}

@@ -34,15 +34,14 @@ export function streamChat(
   options: ChatRunOptions = {},
 ): AbortController {
   const controller = new AbortController();
-  const authToken = localStorage.getItem('token') || getStoredToken();
-  const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
+  const baseUrl = import.meta.env.VITE_API_BASE_URL || '/api';
   const url = `${baseUrl}/conversations/${conversationId}/stream/`;
 
   fetch(url, {
     method: 'POST',
+    credentials: 'same-origin', // studio_session cookie
     headers: {
       'Content-Type': 'application/json',
-      ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
     },
     body: JSON.stringify({
       message,
@@ -122,15 +121,14 @@ async function postAgentAction(
   action: string,
   body: Record<string, unknown>,
 ): Promise<void> {
-  const authToken = localStorage.getItem('token') || getStoredToken();
-  const baseUrl = import.meta.env.VITE_API_BASE_URL || '';
+  const baseUrl = import.meta.env.VITE_API_BASE_URL || '/api';
   const response = await fetch(
     `${baseUrl}/conversations/${conversationId}/${action}/`,
     {
       method: 'POST',
+      credentials: 'same-origin', // studio_session cookie
       headers: {
         'Content-Type': 'application/json',
-        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
       },
       body: JSON.stringify(body),
     },
@@ -139,14 +137,4 @@ async function postAgentAction(
     const payload = await response.json().catch(() => ({}));
     throw new Error(payload.detail || `HTTP ${response.status}`);
   }
-}
-
-function getStoredToken(): string | null {
-  try {
-    const authStorage = localStorage.getItem('auth-storage');
-    if (authStorage) return JSON.parse(authStorage)?.state?.token || null;
-  } catch {
-    // Ignore malformed persisted auth state.
-  }
-  return null;
 }

@@ -1,0 +1,376 @@
+// Package config loads runtime configuration for the studio backend.
+//
+// Precedence: real environment variables win over .env.local / .env files.
+// Secrets (DB/Redis/Feishu/encryption keys) must only arrive through the
+// environment or a local secret file that is git-ignored.
+package config
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Config is the full runtime configuration of any studio process.
+// Each binary (api / stream / worker) reads the same set and uses the
+// subset it needs.
+type Config struct {
+	Env      string // development | production | test
+	LogLevel string
+	DevMode  bool
+
+	APIAddr      string // short-request plane (studio-api)
+	StreamAddr   string // SSE plane (studio-stream)
+	MetricsAddr  string
+	PPROFEnabled bool
+
+	Database DatabaseConfig
+	Redis    RedisConfig
+	Feishu   FeishuConfig
+	Aily     AilyConfig
+	Runner   RunnerConfig
+	Session  SessionConfig
+	Storage  StorageConfig
+	Auth     AuthConfig
+	OTel     OTelConfig
+}
+
+type DatabaseConfig struct {
+	Host            string
+	Port            int
+	Name            string
+	User            string
+	Password        string
+	MaxOpenConns    int
+	MaxIdleConns    int
+	ConnMaxLifetime time.Duration
+	ConnMaxIdleTime time.Duration
+	QueryTimeout    time.Duration
+}
+
+func (d DatabaseConfig) DSN() string {
+	// UTC everywhere: DATETIME columns are written/read in UTC; the app
+	// converts to local time only at the presentation edge.
+	// time_zone pins the SESSION clock to UTC so DB-side
+	// CURRENT_TIMESTAMP/ON UPDATE match the driver's loc=UTC parsing —
+	// otherwise DATETIME columns mix server-local DEFAULTs with
+	// Go-written UTC values (an 8h skew on CST servers breaks lease
+	// expiry comparisons and client timestamps).
+	// '+00:00' URL-encoded; appended AFTER Sprintf so the format parser
+	// never sees the % escapes.
+	const sysVars = "&time_zone=%27%2B00%3A00%27"
+	return fmt.Sprintf(
+		"%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=true&loc=UTC&multiStatements=true&timeout=10s&readTimeout=60s&writeTimeout=60s",
+		d.User, d.Password, d.Host, d.Port, d.Name,
+	) + sysVars
+}
+
+type RedisConfig struct {
+	Host      string
+	Port      int
+	DB        int
+	Password  string
+	KeyPrefix string
+	PoolSize  int
+}
+
+func (r RedisConfig) Addr() string { return fmt.Sprintf("%s:%d", r.Host, r.Port) }
+
+func (r RedisConfig) Key(parts ...string) string {
+	return r.KeyPrefix + ":" + strings.Join(parts, ":")
+}
+
+type FeishuConfig struct {
+	AppID       string
+	AppSecret   string
+	RedirectURI string
+	BaseURL     string
+}
+
+type AilyConfig struct {
+	BaseURL              string
+	StartRateLimitPerSec int
+	MaxInflight          int
+	PollBackoff          []time.Duration
+	StreamTimeout        time.Duration
+	RequestTimeout       time.Duration
+}
+
+type RunnerConfig struct {
+	LeaseSeconds      time.Duration
+	HeartbeatInterval time.Duration
+	ClaimBatch        int
+	WorkerID          string
+	Concurrency       int
+	ReaperInterval    time.Duration
+	RelayInterval     time.Duration
+	RequeueDelay      time.Duration
+}
+
+type SessionConfig struct {
+	TTL        time.Duration
+	CookieName string
+	Secure     bool
+}
+
+type StorageConfig struct {
+	Driver      string // localfs | s3
+	LocalRoot   string
+	S3Endpoint  string
+	S3Region    string
+	S3Bucket    string
+	S3AccessKey string
+	S3SecretKey string
+	S3UseSSL    bool
+}
+
+type AuthConfig struct {
+	// TokenEncryptionKey encrypts Feishu refresh tokens at rest (AES-256-GCM).
+	// 32 bytes base64 or raw passphrase; required in production.
+	TokenEncryptionKey string
+	// Argon2id parameters for local admin passwords.
+	AdminBootstrapUsername string
+	AdminBootstrapPassword string
+	CSRFCookieName         string
+}
+
+type OTelConfig struct {
+	Endpoint     string
+	Insecure     bool
+	ServiceName  string
+	SamplingRate float64
+}
+
+// Load reads configuration from the environment, overlaying .env.local
+// then .env from searchPaths (values already in the environment win).
+func Load(searchPaths ...string) (*Config, error) {
+	loadDotEnv(searchPaths...)
+
+	cfg := &Config{
+		Env:          getEnv("APP_ENV", "development"),
+		LogLevel:     getEnv("LOG_LEVEL", "info"),
+		APIAddr:      getEnv("API_ADDR", ":8080"),
+		StreamAddr:   getEnv("STREAM_ADDR", ":8081"),
+		MetricsAddr:  getEnv("METRICS_ADDR", ":9090"),
+		PPROFEnabled: getEnvBool("PPROF_ENABLED", false),
+		Database: DatabaseConfig{
+			Host:            getEnv("DB_HOST", "127.0.0.1"),
+			Port:            getEnvInt("DB_PORT", 4000),
+			Name:            getEnv("DB_NAME", "xiaoan3_go"),
+			User:            getEnv("DB_USER", "root"),
+			Password:        getEnv("DB_PASSWORD", ""),
+			MaxOpenConns:    getEnvInt("DB_MAX_OPEN_CONNS", 40),
+			MaxIdleConns:    getEnvInt("DB_MAX_IDLE_CONNS", 10),
+			ConnMaxLifetime: getEnvDuration("DB_CONN_MAX_LIFETIME", 30*time.Minute),
+			ConnMaxIdleTime: getEnvDuration("DB_CONN_MAX_IDLE_TIME", 5*time.Minute),
+			QueryTimeout:    getEnvDuration("DB_QUERY_TIMEOUT", 15*time.Second),
+		},
+		Redis: RedisConfig{
+			Host:      getEnv("REDIS_HOST", "127.0.0.1"),
+			Port:      getEnvInt("REDIS_PORT", 6379),
+			DB:        getEnvInt("REDIS_DB", 2),
+			Password:  getEnv("REDIS_PASSWORD", ""),
+			KeyPrefix: getEnv("REDIS_KEY_PREFIX", "xiaoan3"),
+			PoolSize:  getEnvInt("REDIS_POOL_SIZE", 64),
+		},
+		Feishu: FeishuConfig{
+			AppID:       getEnv("FEISHU_APP_ID", ""),
+			AppSecret:   getEnv("FEISHU_APP_SECRET", ""),
+			RedirectURI: getEnv("FEISHU_REDIRECT_URI", ""),
+			BaseURL:     getEnv("FEISHU_BASE_URL", "https://open.feishu.cn"),
+		},
+		Aily: AilyConfig{
+			BaseURL:              getEnv("AILY_BASE_URL", "https://open.feishu.cn/open-apis"),
+			StartRateLimitPerSec: getEnvInt("AILY_START_RATE_LIMIT", 10),
+			MaxInflight:          getEnvInt("AILY_MAX_INFLIGHT", 100),
+			PollBackoff:          parseBackoff(getEnv("AILY_POLL_BACKOFF_SECONDS", "1,2,3,5")),
+			StreamTimeout:        getEnvDuration("AILY_STREAM_TIMEOUT", 330*time.Second),
+			RequestTimeout:       getEnvDuration("AILY_REQUEST_TIMEOUT", 30*time.Second),
+		},
+		Runner: RunnerConfig{
+			LeaseSeconds:      getEnvDuration("RUN_LEASE_SECONDS", 120*time.Second),
+			HeartbeatInterval: getEnvDuration("RUN_LEASE_HEARTBEAT_SECONDS", 30*time.Second),
+			ClaimBatch:        getEnvInt("RUN_CLAIM_BATCH_SIZE", 10),
+			WorkerID:          getEnv("WORKER_ID", ""),
+			Concurrency:       getEnvInt("WORKER_CONCURRENCY", 10),
+			ReaperInterval:    getEnvDuration("RUN_REAPER_INTERVAL", 20*time.Second),
+			RelayInterval:     getEnvDuration("OUTBOX_RELAY_INTERVAL", 500*time.Millisecond),
+			RequeueDelay:      getEnvDuration("RUN_REQUEUE_DELAY", 5*time.Second),
+		},
+		Session: SessionConfig{
+			TTL:        getEnvDuration("SESSION_TTL", 12*time.Hour),
+			CookieName: getEnv("SESSION_COOKIE_NAME", "studio_session"),
+			Secure:     getEnv("APP_ENV", "development") == "production",
+		},
+		Storage: StorageConfig{
+			Driver:      getEnv("STORAGE_DRIVER", "localfs"),
+			LocalRoot:   getEnv("STORAGE_LOCAL_ROOT", "./data/storage"),
+			S3Endpoint:  getEnv("S3_ENDPOINT", ""),
+			S3Region:    getEnv("S3_REGION", "us-east-1"),
+			S3Bucket:    getEnv("S3_BUCKET", ""),
+			S3AccessKey: getEnv("S3_ACCESS_KEY", ""),
+			S3SecretKey: getEnv("S3_SECRET_KEY", ""),
+			S3UseSSL:    getEnvBool("S3_USE_SSL", true),
+		},
+		Auth: AuthConfig{
+			TokenEncryptionKey:     getEnv("TOKEN_ENCRYPTION_KEY", ""),
+			AdminBootstrapUsername: getEnv("ADMIN_BOOTSTRAP_USERNAME", "admin"),
+			AdminBootstrapPassword: getEnv("ADMIN_BOOTSTRAP_PASSWORD", ""),
+			CSRFCookieName:         getEnv("CSRF_COOKIE_NAME", "studio_csrf"),
+		},
+		OTel: OTelConfig{
+			Endpoint:     getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
+			Insecure:     getEnvBool("OTEL_INSECURE", true),
+			ServiceName:  getEnv("OTEL_SERVICE_NAME", "studio-backend"),
+			SamplingRate: getEnvFloat("OTEL_SAMPLING_RATE", 0.1),
+		},
+	}
+
+	if cfg.Runner.WorkerID == "" {
+		host, _ := os.Hostname()
+		cfg.Runner.WorkerID = fmt.Sprintf("%s-%d", host, os.Getpid())
+	}
+	if cfg.Env == "production" {
+		if err := cfg.validateProduction(); err != nil {
+			return nil, err
+		}
+	}
+	return cfg, nil
+}
+
+func (c *Config) validateProduction() error {
+	var missing []string
+	if c.Feishu.AppSecret == "" {
+		missing = append(missing, "FEISHU_APP_SECRET")
+	}
+	if c.Database.Password == "" && os.Getenv("DB_PASSWORD") == "" {
+		missing = append(missing, "DB_PASSWORD")
+	}
+	if c.Auth.TokenEncryptionKey == "" {
+		missing = append(missing, "TOKEN_ENCRYPTION_KEY")
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("production config missing secrets: %s", strings.Join(missing, ", "))
+	}
+	return nil
+}
+
+// loadDotEnv applies KEY=VALUE files to the process environment without
+// overriding variables that are already set. Files are searched in the
+// working directory and up to four parent directories (so test binaries
+// and relocated processes still find the repo-level .env.local).
+func loadDotEnv(searchPaths ...string) {
+	var dirs []string
+	dir, _ := os.Getwd()
+	for i := 0; i < 5 && dir != ""; i++ {
+		dirs = append(dirs, dir)
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	candidates := []string{".env.local", ".env"}
+	if len(searchPaths) > 0 {
+		candidates = searchPaths
+	}
+	for _, name := range candidates {
+		var data []byte
+		var err error
+		for _, d := range dirs {
+			data, err = os.ReadFile(filepath.Join(d, name))
+			if err == nil {
+				break
+			}
+			data = nil
+		}
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			k, v, ok := strings.Cut(line, "=")
+			if !ok {
+				continue
+			}
+			k = strings.TrimSpace(k)
+			v = strings.Trim(strings.TrimSpace(v), `"'`)
+			if _, exists := os.LookupEnv(k); !exists {
+				_ = os.Setenv(k, v)
+			}
+		}
+		_ = filepath.Base(name)
+	}
+}
+
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func getEnvInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func getEnvFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
+}
+
+func getEnvBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		switch strings.ToLower(v) {
+		case "1", "true", "yes", "on":
+			return true
+		case "0", "false", "no", "off":
+			return false
+		}
+	}
+	return def
+}
+
+func getEnvDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+		if secs, err := strconv.ParseFloat(v, 64); err == nil {
+			return time.Duration(secs * float64(time.Second))
+		}
+	}
+	return def
+}
+
+func parseBackoff(s string) []time.Duration {
+	var out []time.Duration
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if f, err := strconv.ParseFloat(part, 64); err == nil {
+			out = append(out, time.Duration(f*float64(time.Second)))
+		}
+	}
+	if len(out) == 0 {
+		out = []time.Duration{1 * time.Second, 2 * time.Second, 3 * time.Second, 5 * time.Second}
+	}
+	return out
+}

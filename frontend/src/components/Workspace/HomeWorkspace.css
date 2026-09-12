@@ -1,0 +1,157 @@
+/* HomeWorkspace — idle main workspace (§4) + shortcut cards (§35) */
+
+.home-workspace {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
+  width: 100%;
+  /* Match the composer width so the shortcuts line up with the input box. */
+  max-width: 800px;
+  padding: 8px 0;
+}
+
+.home-workspace__hero {
+  text-align: center;
+}
+
+.home-workspace__title {
+  font-family: var(--font-display);
+  font-size: 26px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.home-workspace__subtitle {
+  margin-top: 6px;
+  font-size: 14px;
+  color: var(--color-text-sec);
+}
+
+.home-shortcuts {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  width: 100%;
+}
+
+.home-shortcuts--empty {
+  color: var(--color-text-sec);
+  font-size: 14px;
+  text-align: center;
+}
+
+.home-shortcuts__group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.home-shortcuts__label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--color-text-dim);
+}
+
+/* Fixed-width tracks + centered rows: with `auto-fill` and 1fr tracks the
+   grid always created 3 tracks, so a single card stuck to the left edge
+   instead of sitting under the composer. */
+.home-shortcuts__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 236px));
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+}
+
+.home-shortcut {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius-md);
+  background: var(--color-bg-card);
+  cursor: pointer;
+  transition: border-color 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.home-shortcut:hover,
+.home-shortcut:focus-visible {
+  border-color: var(--color-primary);
+  box-shadow: var(--shadow-sm);
+  transform: translateY(-1px);
+  outline: none;
+}
+
+/* Agent face: AgentAvatar renders the uploaded image or the emoji fallback in
+   this box (34px, same rounded-square as 智能体市场 cards). Centring is expressed
+   with flex properties so it stays correct whether .agent-avatar or this rule
+   wins the cascade. */
+.home-shortcut__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  border-radius: var(--border-radius-sm);
+  background: var(--color-bg-elevated);
+  font-size: 17px;
+}
+
+.home-shortcut__body {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.home-shortcut__name {
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.home-shortcut__desc {
+  overflow: hidden;
+  color: var(--color-text-dim);
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.home-shortcut__star {
+  flex-shrink: 0;
+  padding: 4px;
+  border: none;
+  border-radius: var(--border-radius-sm);
+  background: transparent;
+  color: var(--color-text-dim);
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.home-shortcut__star:hover {
+  background: var(--color-bg-elevated);
+  color: var(--color-primary);
+}
+
+@media (max-width: 768px) {
+  .home-workspace {
+    gap: 18px;
+  }
+
+  .home-workspace__title {
+    font-size: 21px;
+  }
+
+  .home-shortcuts__grid {
+    grid-template-columns: 1fr;
+  }
+}

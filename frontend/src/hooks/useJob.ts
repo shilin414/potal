@@ -81,8 +81,7 @@ export function useJob(appSlug: string): UseJobResult {
     const id = data.id;
     setJobId(id);
 
-    const token = useAuthStore.getState().token ?? '';
-    const url = `${wsBaseUrl()}/runner/${id}/?token=${encodeURIComponent(token)}`;
+    const url = `${wsBaseUrl()}/runner/${id}/`;
     wsRef.current?.close();
     wsRef.current = createWsClient(url, {
       onMessage: (event) => setState((prev) => reduceJobEvent(prev, event)),

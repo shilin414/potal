@@ -60,7 +60,8 @@ const AppDetailPage: React.FC = () => {
   const shots = app.screenshots && app.screenshots.length > 0 ? app.screenshots : ['', '', ''];
 
   const handleOpen = () => {
-    navigate(`/apps/${app.id}/run`);
+    // Open inside the shell (§32) instead of a full page navigation.
+    navigate(`/app/${app.id}`);
   };
 
   return (

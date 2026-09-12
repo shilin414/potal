@@ -1,13 +1,12 @@
 import { lazy, Suspense } from 'react';
 import { createBrowserRouter, Navigate } from 'react-router-dom';
-import { MainLayout, AuthLayout } from '@/layouts';
+import { AuthLayout } from '@/layouts';
+import AppShell from '@/shell/AppShell';
+import WorkspaceHost from '@/components/Workspace/WorkspaceHost';
 import { ProtectedRoute, PublicRoute } from './guards';
+import LegacyAppRunRedirect from './LegacyAppRunRedirect';
 
-// Pages
-import HomePage from '@/pages/Home/HomePage';
-import LoginPage from '@/pages/Auth/LoginPage';
-import RegisterPage from '@/pages/Auth/RegisterPage';
-import SsoCallbackPage from '@/pages/Auth/SsoCallbackPage';
+// Console pages (application management).
 import AgentsPage from '@/pages/Agents/AgentsPage';
 import AgentDetailPage from '@/pages/Agents/AgentDetailPage';
 import TemplatesPage from '@/pages/Templates/TemplatesPage';
@@ -15,165 +14,108 @@ import TemplateDetailPage from '@/pages/Templates/TemplateDetailPage';
 import AppsPage from '@/pages/Apps/AppsPage';
 import AppDetailPage from '@/pages/Apps/AppDetailPage';
 import ChatApplicationEditPage from '@/pages/Apps/ChatApplicationEditPage';
-import ApplicationRuntimePage from '@/pages/Apps/ApplicationRuntimePage';
 import WorkspacePage from '@/pages/Workspace/WorkspacePage';
 import WorkflowsPage from '@/pages/Workflows/WorkflowsPage';
 import WorkflowEditorPage from '@/pages/Workflows/WorkflowEditorPage';
 import WorkflowRunnerPage from '@/pages/Workflows/WorkflowRunnerPage';
 import SkillsPage from '@/pages/Skills/SkillsPage';
+
+// Auth pages stay outside the shell entirely.
+import LoginPage from '@/pages/Auth/LoginPage';
+import RegisterPage from '@/pages/Auth/RegisterPage';
+import SsoCallbackPage from '@/pages/Auth/SsoCallbackPage';
+import FeishuCallbackPage from '@/pages/Auth/FeishuCallbackPage';
+
 const EnterprisePage = lazy(() => import('@/pages/Enterprise/EnterprisePage'));
 
 const enterpriseElement = (
-  <ProtectedRoute>
-    <MainLayout>
-      <Suspense fallback={<div style={{ padding: 32 }}>正在加载企业控制台…</div>}>
-        <EnterprisePage />
-      </Suspense>
-    </MainLayout>
-  </ProtectedRoute>
+  <Suspense fallback={<div style={{ padding: 32 }}>正在加载企业控制台…</div>}>
+    <EnterprisePage />
+  </Suspense>
 );
 
+/** Console pages scroll and pad; workspaces lay themselves out (§17/§33). */
+const consolePage = { shell: { padded: true } };
+const fullWidthConsole = { shell: { hideSidebar: true, padded: true } };
+const fullscreenConsole = { shell: { hideSidebar: true, hideHeader: true } };
+
+/**
+ * One AppShell wraps every authenticated route (§33).
+ *
+ * The shell is a *layout* route, so switching between the main workspace and
+ * the console never unmounts it — only <Outlet/> swaps. Workspace routes
+ * (`/`, `/chat/:slug`, `/app/:slug`, `/workflow/:slug`) all render the same
+ * WorkspaceHost, which is why a fixed application opens inside the shell
+ * instead of navigating away (§32).
+ */
 const router = createBrowserRouter([
   {
     path: '/',
     element: (
       <ProtectedRoute>
-        <MainLayout>
-          <HomePage />
-        </MainLayout>
+        <AppShell />
       </ProtectedRoute>
     ),
-    index: true,
+    children: [
+      // ── Workspaces (§18/§33) ──────────────────────────────────────────
+      { index: true, element: <WorkspaceHost kind="home" /> },
+      { path: 'chat/:applicationSlug', element: <WorkspaceHost kind="chat" /> },
+      { path: 'app/:applicationSlug', element: <WorkspaceHost kind="page" /> },
+      {
+        path: 'workflow/:applicationSlug',
+        element: <WorkspaceHost kind="workflow" />,
+      },
+
+      // ── Console (application management) ──────────────────────────────
+      { path: 'agents', element: <AgentsPage />, handle: consolePage },
+      { path: 'agents/:id', element: <AgentDetailPage />, handle: consolePage },
+      { path: 'templates', element: <TemplatesPage />, handle: consolePage },
+      {
+        path: 'templates/:id',
+        element: <TemplateDetailPage />,
+        handle: consolePage,
+      },
+      { path: 'apps', element: <AppsPage />, handle: consolePage },
+      { path: 'apps/:id', element: <AppDetailPage />, handle: consolePage },
+      // Launched apps now live in the shell's application workspace (§32).
+      { path: 'apps/:id/run', element: <LegacyAppRunRedirect /> },
+      {
+        path: 'apps/:id/edit',
+        element: <ChatApplicationEditPage />,
+        handle: consolePage,
+      },
+      { path: 'skills', element: <SkillsPage />, handle: fullWidthConsole },
+      { path: 'workflows', element: <WorkflowsPage />, handle: fullWidthConsole },
+      {
+        path: 'workflows/:id/edit',
+        element: <WorkflowEditorPage />,
+        handle: fullWidthConsole,
+      },
+      {
+        path: 'workflow-runs/:runId',
+        element: <WorkflowRunnerPage />,
+        handle: fullscreenConsole,
+      },
+      // Template-workflow workspace: still on the legacy agent engine.
+      { path: 'workspace', element: <WorkspacePage />, handle: consolePage },
+      {
+        path: 'workspace/:id',
+        element: <WorkspacePage />,
+        handle: fullWidthConsole,
+      },
+      { path: 'enterprise', element: enterpriseElement, handle: consolePage },
+
+      { path: '*', element: <Navigate to="/" replace /> },
+    ],
   },
-  {
-    path: '/agents',
-    element: (
-      <ProtectedRoute>
-        <MainLayout>
-          <AgentsPage />
-        </MainLayout>
-      </ProtectedRoute>
-    ),
-  },
-  {
-    path: '/agents/:id',
-    element: (
-      <ProtectedRoute>
-        <MainLayout>
-          <AgentDetailPage />
-        </MainLayout>
-      </ProtectedRoute>
-    ),
-  },
-  {
-    path: '/templates',
-    element: (
-      <ProtectedRoute>
-        <MainLayout>
-          <TemplatesPage />
-        </MainLayout>
-      </ProtectedRoute>
-    ),
-  },
-  {
-    path: '/templates/:id',
-    element: (
-      <ProtectedRoute>
-        <MainLayout>
-          <TemplateDetailPage />
-        </MainLayout>
-      </ProtectedRoute>
-    ),
-  },
-  {
-    path: '/apps',
-    element: (
-      <ProtectedRoute>
-        <MainLayout>
-          <AppsPage />
-        </MainLayout>
-      </ProtectedRoute>
-    ),
-  },
-  {
-    path: '/apps/:id',
-    element: (
-      <ProtectedRoute>
-        <MainLayout>
-          <AppDetailPage />
-        </MainLayout>
-      </ProtectedRoute>
-    ),
-  },
-  {
-    path: '/apps/:id/run',
-    element: (
-      <ProtectedRoute>
-        <MainLayout hideSidebar hideHeader>
-          <ApplicationRuntimePage />
-        </MainLayout>
-      </ProtectedRoute>
-    ),
-  },
-  {
-    path: '/apps/:id/edit',
-    element: (
-      <ProtectedRoute>
-        <MainLayout>
-          <ChatApplicationEditPage />
-        </MainLayout>
-      </ProtectedRoute>
-    ),
-  },
-  {
-    path: '/skills',
-    element: (
-      <ProtectedRoute>
-        <MainLayout hideSidebar>
-          <SkillsPage />
-        </MainLayout>
-      </ProtectedRoute>
-    ),
-  },
-  {
-    path: '/workflows',
-    element: <ProtectedRoute><MainLayout hideSidebar><WorkflowsPage /></MainLayout></ProtectedRoute>,
-  },
-  {
-    path: '/workflows/:id/edit',
-    element: <ProtectedRoute><MainLayout hideSidebar><WorkflowEditorPage /></MainLayout></ProtectedRoute>,
-  },
-  {
-    path: '/workflow-runs/:runId',
-    element: <ProtectedRoute><MainLayout hideSidebar hideHeader><WorkflowRunnerPage /></MainLayout></ProtectedRoute>,
-  },
-  {
-    path: '/workspace',
-    element: (
-      <ProtectedRoute>
-        <MainLayout>
-          <WorkspacePage />
-        </MainLayout>
-      </ProtectedRoute>
-    ),
-  },
-  {
-    path: '/workspace/:id',
-    element: (
-      <ProtectedRoute>
-        <MainLayout hideSidebar>
-          <WorkspacePage />
-        </MainLayout>
-      </ProtectedRoute>
-    ),
-  },
-  {
-    path: '/enterprise',
-    element: enterpriseElement,
-  },
+  // ── Auth (no shell) ───────────────────────────────────────────────────
   {
     path: '/auth/sso/callback',
     element: <AuthLayout><SsoCallbackPage /></AuthLayout>,
+  },
+  {
+    path: '/auth/feishu/callback',
+    element: <AuthLayout><FeishuCallbackPage /></AuthLayout>,
   },
   {
     path: '/auth/login',
@@ -183,10 +125,7 @@ const router = createBrowserRouter([
     path: '/auth/register',
     element: <AuthLayout><PublicRoute><RegisterPage /></PublicRoute></AuthLayout>,
   },
-  {
-    path: '*',
-    element: <Navigate to="/" replace />,
-  },
+  { path: '*', element: <Navigate to="/" replace /> },
 ]);
 
 export default router;

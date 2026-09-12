@@ -1,0 +1,142 @@
+/* Chat surface — the shared layout used by every chat renderer.
+ *
+ * Owned by this file (not by a specific container) because both the legacy
+ * GraphFlow ChatContainer and the unified Run RunChatPanel render into it;
+ * it used to live in ChatContainer.css and was only loaded as a side effect.
+ */
+
+.chat-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--color-bg-void);
+}
+
+/* Messages area */
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 32px 24px;
+}
+
+.chat-messages-inner {
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+/* Empty state */
+.chat-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 16px;
+  padding: 32px 24px;
+  overflow-y: auto;
+}
+
+.chat-empty-icon {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: var(--color-bg-card);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 36px;
+}
+
+.chat-empty h3 {
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.chat-empty p {
+  color: var(--color-text-sec);
+  font-size: 14px;
+  max-width: 400px;
+  text-align: center;
+  line-height: 1.6;
+}
+
+.chat-empty-suggestions {
+  display: flex;
+  gap: 10px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.chat-suggestion {
+  padding: 8px 16px;
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius-lg);
+  font-size: 13px;
+  color: var(--color-text-sec);
+  cursor: pointer;
+  transition: all 0.2s;
+  font-family: inherit;
+}
+
+.chat-suggestion:hover {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 6%, transparent);
+}
+
+/* Input area */
+.chat-input-area {
+  position: relative;
+  /* Balanced vertical padding: lift the box off the bottom and even out
+     the top/bottom whitespace so it no longer looks bottom-heavy. */
+  padding: 16px 24px 24px;
+  /* Mobile soft keyboard / home indicator safe area (§27). */
+  padding-bottom: calc(24px + env(safe-area-inset-bottom));
+}
+
+.chat-input-wrapper {
+  max-width: 800px;
+  margin: 0 auto;
+  position: relative;
+}
+
+.chat-input-hint {
+  text-align: center;
+  margin-top: 8px;
+  font-size: 11px;
+  color: var(--color-text-dim);
+}
+
+/* Participant identity — shared by the unified Run panel and the legacy list.
+ *
+ * Both sides of a conversation show a face and a real name: the human as
+ * 姓名（user_id） with their own avatar, the agent as its application name with
+ * its avatar (emoji icon while no image is uploaded). */
+.run-chat-avatar {
+  flex: 0 0 auto;
+  font-size: 14px;
+}
+
+.run-chat-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.chat-sender-name {
+  max-width: 26rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 768px) {
+  /* Long 姓名（user_id） labels must not push the status chips off-screen. */
+  .chat-sender-name {
+    max-width: 12rem;
+  }
+}

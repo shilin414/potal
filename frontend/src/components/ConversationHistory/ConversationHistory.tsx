@@ -91,11 +91,15 @@ const formatTime = (dateStr?: string) => {
 interface ConversationHistoryProps {
   onConversationSelect: (conversationId: string) => void;
   activeConversationId?: string | null;
+  /** Start a new conversation in the current workspace; provided by the
+   *  shell's sidebar so 新建 works on every workspace route. */
+  onNewConversation?: () => void;
 }
 
 const ConversationHistory: React.FC<ConversationHistoryProps> = ({
   onConversationSelect,
   activeConversationId,
+  onNewConversation,
 }) => {
   const {
     conversations,
@@ -115,6 +119,10 @@ const ConversationHistory: React.FC<ConversationHistoryProps> = ({
   const handleCreateConversation = () => {
     clearError();
     setCurrentConversation(null);
+    if (onNewConversation) {
+      onNewConversation();
+      return;
+    }
     onConversationSelect('');
   };
 

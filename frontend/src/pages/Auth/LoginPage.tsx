@@ -87,7 +87,14 @@ const LoginPage: React.FC = () => {
         </Form.Item>
 
         <Divider plain>或</Divider>
-        <Button block onClick={() => setSsoOpen(true)}>企业 SSO 登录</Button>
+        <Button
+          block
+          icon={<span aria-hidden>🪶</span>}
+          onClick={() => { window.location.href = '/api/identity/oauth/start'; }}
+        >
+          飞书登录
+        </Button>
+        <Button block style={{ marginTop: 8 }} onClick={() => setSsoOpen(true)}>企业 SSO 登录</Button>
 
         <div className="text-center">
           <Text className="text-text-sec">

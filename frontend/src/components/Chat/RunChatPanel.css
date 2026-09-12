@@ -1,0 +1,222 @@
+/* RunChatPanel composer — v2 run chain. */
+
+.run-chat-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.run-chat-input-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.run-chat-clip,
+.run-chat-send {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-bg-card);
+  color: var(--color-text-sec);
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+
+.run-chat-clip:hover:not(:disabled),
+.run-chat-send:hover:not(:disabled) {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}
+
+.run-chat-clip:disabled,
+.run-chat-send:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.run-chat-send:not(:disabled) {
+  background: var(--color-primary);
+  border-color: var(--color-primary);
+  color: #fff;
+}
+
+.run-chat-textarea {
+  flex: 1;
+  min-height: 36px;
+  max-height: 140px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-bg-card);
+  color: var(--color-text);
+  font-size: 14px;
+  line-height: 1.6;
+  resize: none;
+  outline: none;
+}
+
+.run-chat-textarea:focus {
+  border-color: var(--color-primary);
+}
+
+.run-chat-hint {
+  font-size: 12px;
+  color: var(--color-text-dim);
+}
+
+/* Uploads */
+.run-chat-upload-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.run-chat-upload-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-bg-elevated) 76%, transparent);
+  color: var(--color-text-sec);
+  font-size: 12px;
+}
+
+.run-chat-upload-chip button {
+  border: none;
+  background: none;
+  color: var(--color-text-dim);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0;
+}
+
+.run-chat-upload-chip button:hover {
+  color: var(--color-error, #ff4d4f);
+}
+
+.run-chat-upload-name {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-chat-upload-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* Messages */
+.run-chat-bubble {
+  min-width: 0;
+  max-width: 75%;
+  padding: 12px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 16px;
+  background: var(--color-bg-card);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.run-chat-bubble--user {
+  border-color: color-mix(in srgb, var(--color-primary) 30%, transparent);
+  background: color-mix(in srgb, var(--color-primary) 12%, var(--color-bg-card));
+}
+
+.run-chat-bubble__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  color: var(--color-text-dim);
+  font-size: 12px;
+}
+
+.run-chat-bubble__header .font-medium {
+  color: var(--color-text-sec);
+  font-weight: 600;
+}
+
+.run-chat-dotting {
+  color: var(--color-primary);
+}
+
+.run-chat-error-tag {
+  padding: 0 6px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--color-error, #ff4d4f) 14%, transparent);
+  color: var(--color-error, #ff4d4f);
+  font-size: 11px;
+}
+
+.run-chat-error-text {
+  margin-top: 6px;
+  color: var(--color-error, #ff4d4f);
+  font-size: 12px;
+}
+
+.run-chat-artifacts {
+  display: flex;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+/* Inline markdown images (generated artifacts). The wrapper reserves space
+   so the 302 → CDN resolution doesn't reflow the bubble, and the loading
+   spinner replaces the browser's broken-image icon. */
+.chat-img {
+  display: inline-flex;
+  position: relative;
+  align-items: center;
+  justify-content: center;
+  max-width: 100%;
+  min-height: 96px;
+  min-width: 160px;
+  margin: 6px 0;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-elevated);
+}
+
+.chat-img img {
+  display: block;
+  max-width: 100%;
+  max-height: 320px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+}
+
+.chat-img__loading {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 96px;
+}
+
+.chat-img--pending,
+.chat-img--broken {
+  padding: 20px 16px;
+  font-size: 12px;
+  color: var(--color-text-dim);
+  max-width: 240px;
+}
+
+.chat-img--broken {
+  color: var(--color-error, #ff4d4f);
+}
+
+.run-chat-error-banner {
+  padding: 12px 24px 0;
+}

@@ -1,0 +1,10 @@
+# Secrets
+.env
+.env.local
+*.local
+
+# Build artifacts
+/bin/
+/data/
+*.exe
+*.test

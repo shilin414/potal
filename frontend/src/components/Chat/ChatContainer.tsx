@@ -7,6 +7,7 @@ import MessageList from './MessageList';
 import MessageInput from './MessageInput';
 import type { ComposerContext } from './MessageInput';
 import AgentQuestionCard from './AgentQuestionCard';
+import './chatSurface.css';
 import './ChatContainer.css';
 
 interface ChatSuggestion {
@@ -224,7 +225,12 @@ const ChatContainer: React.FC<ChatContainerProps> = ({
         <>
           <div className="chat-messages">
             <div className="chat-messages-inner">
-              <MessageList messages={messages} isLoading={isLoading} isStreaming={isStreaming} />
+              <MessageList
+                messages={messages}
+                isLoading={isLoading}
+                isStreaming={isStreaming}
+                agent={currentConversation?.agent}
+              />
               {agentActivity && isStreaming && (
                 <div className="agent-activity">{agentActivity}</div>
               )}

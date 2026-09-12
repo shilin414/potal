@@ -1,0 +1,9 @@
+# oapi-codegen configuration: Go server types + chi server interface.
+# Regenerate with: make gen-api
+package: genapi
+output: internal/gen/api/api_gen.go
+generate:
+  models: true
+  chi-server: true
+  strict-server: true
+  embedded-spec: true

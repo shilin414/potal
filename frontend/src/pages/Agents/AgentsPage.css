@@ -30,6 +30,13 @@
   margin-bottom: 20px;
 }
 
+.page-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
 /* Agent Grid */
 .agent-grid {
   display: grid;
@@ -171,4 +178,104 @@
   display: flex;
   align-items: center;
   gap: 4px;
+  /* The footer now holds several tags next to the counter; keep the counter
+     on one line and let the tags take the shrinking. */
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+/* ── 智能体市场: runtime agents (Aily 自定义智能体 ...) ─────────────────── */
+
+/* Uploaded avatar, sized/rounded exactly like .agent-card-icon so cards with
+   and without a custom avatar line up. */
+.agent-card-avatar {
+  display: block;
+  width: 48px;
+  height: 48px;
+  border-radius: var(--border-radius-md);
+  object-fit: cover;
+  margin-bottom: 16px;
+  background: var(--color-bg-elevated);
+}
+
+.agent-card-main {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  margin-left: 8px;
+  padding: 0 5px;
+  border-radius: 9px;
+  font-size: 11px;
+  font-weight: 600;
+  vertical-align: middle;
+  color: #1f1300;
+  background: linear-gradient(135deg, #e8a838, #f59e0b);
+}
+
+.agent-card-tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.agent-editor-hint {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-text-sec);
+}
+
+/* ── 修改头像 modal ─────────────────────────────────────────────────── */
+
+.agent-avatar-editor {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0 4px;
+}
+
+.agent-avatar-editor__preview {
+  background: var(--color-bg-elevated);
+  font-size: 40px;
+  border: 1px solid var(--color-border);
+}
+
+.agent-avatar-editor__hint {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--color-text);
+  text-align: center;
+}
+
+.agent-avatar-editor__hint span {
+  font-size: 12px;
+  color: var(--color-text-sec);
+}
+
+.agent-avatar-editor__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.agent-avatar-editor__file {
+  font-size: 12px;
+  color: var(--color-text-dim);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

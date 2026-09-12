@@ -1,0 +1,98 @@
+version: "2"
+sql:
+  - engine: "mysql"
+    schema: "db/migrations/*.up.sql"
+    queries: "db/queries"
+    gen:
+      go:
+        package: gendb
+        out: "internal/gen/db"
+        sql_package: "database/sql"
+        emit_json_tags: false
+        emit_empty_slices: true
+        emit_interface: true
+        overrides:
+          - column: "providers.supported_runtime_types"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "providers.capabilities"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "providers.retry_policy"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "providers.circuit_breaker"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "applications.tags"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "applications.default_config"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "runtime_bindings.capabilities"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "runtime_bindings.input_schema"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "runtime_bindings.output_schema"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "runtime_bindings.config"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "agent_threads.config"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "messages.metadata"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "runs.input"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "runs.output"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "runs.runtime_snapshot"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "run_events.payload"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "run_commands.payload"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "runtime_attachments.metadata"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "run_artifacts.metadata"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "outbox_events.payload"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"
+          - column: "audit_logs.detail"
+            go_type:
+              import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+              type: "JSONText"

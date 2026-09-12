@@ -1,0 +1,641 @@
+package http
+
+import (
+	genapi "github.com/creation-agent-studio/backend-go/internal/gen/api"
+)
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime"
+	"net/http"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"bytes"
+	"database/sql"
+
+	"github.com/creation-agent-studio/backend-go/internal/catalog"
+	"github.com/creation-agent-studio/backend-go/internal/platform/storage"
+)
+
+// ───────────────────────────────────────────── application payloads ──
+
+// applicationListItem mirrors GET /api/v2/applications (24 keys, exact).
+type applicationListItem struct {
+	ID                 int64          `json:"id"`
+	Slug               string         `json:"slug"`
+	Name               string         `json:"name"`
+	Description        string         `json:"description"`
+	Icon               string         `json:"icon"`
+	AvatarURL          string         `json:"avatar_url"`
+	Color              string         `json:"color"`
+	Kind               string         `json:"kind"`
+	RendererKey        string         `json:"renderer_key"`
+	ExecutorKey        string         `json:"executor_key"`
+	CategorySlug       string         `json:"category_slug"`
+	CategoryName       string         `json:"category_name"`
+	IsPublic           bool           `json:"is_public"`
+	RuntimeType        string         `json:"runtime_type"`
+	ProviderKey        string         `json:"provider_key"`
+	ExternalResourceID string         `json:"external_resource_id"`
+	IdentityMode       string         `json:"identity_mode"`
+	ExecutionMode      string         `json:"execution_mode"`
+	Capabilities       map[string]any `json:"capabilities"`
+	IsBound            bool           `json:"is_bound"`
+	IsFavorite         bool           `json:"is_favorite"`
+	IsDefaultAgent     bool           `json:"is_default_agent"`
+	CanManage          bool           `json:"can_manage"`
+	UsageCount         int64          `json:"usage_count"`
+	LastUsedAt         *string        `json:"last_used_at"`
+	GlobalUsageCount   int64          `json:"global_usage_count"`
+}
+
+// applicationDetail mirrors the compact authoring shape (18 keys).
+type applicationDetail struct {
+	ID                 int64  `json:"id"`
+	Slug               string `json:"slug"`
+	Name               string `json:"name"`
+	Description        string `json:"description"`
+	Icon               string `json:"icon"`
+	AvatarURL          string `json:"avatar_url"`
+	Color              string `json:"color"`
+	Kind               string `json:"kind"`
+	IsPublic           bool   `json:"is_public"`
+	CategorySlug       string `json:"category_slug"`
+	CategoryName       string `json:"category_name"`
+	IsDefaultAgent     bool   `json:"is_default_agent"`
+	IsBound            bool   `json:"is_bound"`
+	RuntimeType        string `json:"runtime_type"`
+	ProviderKey        string `json:"provider_key"`
+	ExternalResourceID string `json:"external_resource_id"`
+	IdentityMode       string `json:"identity_mode"`
+	ExecutionMode      string `json:"execution_mode"`
+	CanManage          bool   `json:"can_manage"`
+	UpdatedAt          string `json:"updated_at"`
+}
+
+func avatarURL(app *catalog.Application) string {
+	if app.AvatarKey == "" {
+		return ""
+	}
+	return fmt.Sprintf("/api/v2/applications/%d/avatar?v=%d", app.ID, app.UpdatedAt.Unix())
+}
+
+func (s *Server) appDetail(app *catalog.Application, binding *catalog.Binding, caller *AuthenticatedUser) applicationDetail {
+	manage := canManageCaller(app, caller)
+	d := applicationDetail{
+		ID:             app.ID,
+		Slug:           app.Slug,
+		Name:           app.Name,
+		Description:    app.Description,
+		Icon:           app.Icon,
+		AvatarURL:      avatarURL(app),
+		Color:          app.Color,
+		Kind:           app.Kind,
+		IsPublic:       app.IsPublic,
+		CategorySlug:   app.CategorySlug,
+		CategoryName:   app.CategoryName,
+		IsDefaultAgent: app.IsDefaultAgent,
+		CanManage:      manage,
+		UpdatedAt:      app.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+	if binding != nil && binding.Enabled {
+		d.IsBound = true
+		d.RuntimeType = binding.RuntimeType
+		d.ProviderKey = binding.ProviderKey
+		d.ExternalResourceID = binding.ExternalResourceID
+		d.IdentityMode = binding.IdentityMode
+		d.ExecutionMode = binding.ExecutionMode
+	}
+	return d
+}
+
+func canManageCaller(app *catalog.Application, caller *AuthenticatedUser) bool {
+	if caller == nil {
+		return false
+	}
+	if caller.IsStaff {
+		return true
+	}
+	return app.CreatedBy != nil && *app.CreatedBy == caller.ID
+}
+
+// ListApplications implements the exact list semantics (scope/kind/
+// include_unbound + personal usage aggregation).
+func (s *Server) ListApplications(w http.ResponseWriter, r *http.Request, params genapi.ListApplicationsParams) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
+	ctx := r.Context()
+
+	kind := "chat"
+	if params.Kind != nil {
+		k := string(*params.Kind)
+		switch k {
+		case "chat", "task", "custom", "all":
+			kind = k
+		}
+	}
+	scope := "public"
+	if params.Scope != nil {
+		sc := string(*params.Scope)
+		switch sc {
+		case "public", "mine", "manage":
+			scope = sc
+		}
+	}
+	includeUnbound := params.IncludeUnbound != nil &&
+		isTruthy(*params.IncludeUnbound)
+
+	providers := map[int64]*catalog.Provider{}
+	if provs, err := s.CatalogRepo.ListActiveProviders(ctx); err == nil {
+		for i := range provs {
+			providers[provs[i].ID] = &provs[i]
+		}
+	}
+
+	// personal usage per application (own runs only)
+	usage := map[int64]struct {
+		Count int64
+		Last  *string
+	}{}
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT application_id, COUNT(*) AS n, MAX(created_at) AS last_used FROM runs WHERE user_id = ? AND application_id IS NOT NULL GROUP BY application_id`,
+		caller.ID)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var appID, n int64
+			var last sql.NullTime
+			if err := rows.Scan(&appID, &n, &last); err == nil {
+				entry := struct {
+					Count int64
+					Last  *string
+				}{Count: n}
+				if last.Valid {
+					t := last.Time.UTC().Format(time.RFC3339)
+					entry.Last = &t
+				}
+				usage[appID] = entry
+			}
+		}
+	}
+
+	favorites := map[int64]bool{}
+	if favRows, err := s.DB.QueryContext(ctx,
+		`SELECT application_id FROM application_favorites WHERE user_id = ?`, caller.ID); err == nil {
+		defer favRows.Close()
+		for favRows.Next() {
+			var appID int64
+			if favRows.Scan(&appID) == nil {
+				favorites[appID] = true
+			}
+		}
+	}
+
+	out := []applicationListItem{}
+	seenBound := map[int64]bool{}
+	if apps, err := s.CatalogRepo.ListApplicationsWithBindings(ctx, scope, caller.ID, caller.IsStaff); err == nil {
+		for _, item := range apps {
+			if seenBound[item.App.ID] {
+				continue
+			}
+			seenBound[item.App.ID] = true
+			if kind != "all" && item.App.Kind != kind {
+				continue
+			}
+			out = append(out, s.buildListItem(item, providers, favorites, usage, caller))
+		}
+	}
+	// "Extras" (unbound apps) follow the reference semantics exactly:
+	//   kind=chat        → only with include_unbound
+	//   kind=task/custom → always
+	//   kind=all         → non-chat always, chat only with include_unbound
+	extras := false
+	switch kind {
+	case "task", "custom":
+		extras = true
+	case "all":
+		extras = true
+	default: // chat
+		extras = includeUnbound
+	}
+	if extras {
+		if apps, err := s.CatalogRepo.ListUnboundApplications(ctx, scope, kind, caller.ID, caller.IsStaff); err == nil {
+			for _, item := range apps {
+				if seenBound[item.App.ID] {
+					continue
+				}
+				if kind == "all" && item.App.Kind == "chat" && !includeUnbound {
+					continue
+				}
+				seenBound[item.App.ID] = true
+				out = append(out, s.buildListItem(item, providers, favorites, usage, caller))
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func isTruthy(v string) bool {
+	switch strings.ToLower(v) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
+}
+
+func (s *Server) buildListItem(item catalog.ApplicationWithBinding, providers map[int64]*catalog.Provider,
+	favorites map[int64]bool, usage map[int64]struct {
+		Count int64
+		Last  *string
+	}, caller *AuthenticatedUser) applicationListItem {
+	app := item.App
+	capsAny := map[string]any{}
+	var rt, pk, ext, im, em string
+	isBound := false
+	if item.Binding != nil && item.Binding.Enabled {
+		isBound = true
+		rt = item.Binding.RuntimeType
+		pk = item.Binding.ProviderKey
+		ext = item.Binding.ExternalResourceID
+		im = item.Binding.IdentityMode
+		em = item.Binding.ExecutionMode
+		var provID int64
+		if item.Binding.ProviderID != nil {
+			provID = *item.Binding.ProviderID
+		}
+		boolCaps := item.Binding.EffectiveCapabilities(providers[provID])
+		capsAny = map[string]any{}
+		for k, v := range boolCaps {
+			capsAny[k] = v
+		}
+	}
+	entry := usage[app.ID]
+	disp := ""
+	if entry.Last != nil {
+		disp = *entry.Last
+	}
+	return applicationListItem{
+		ID: app.ID, Slug: app.Slug, Name: app.Name, Description: app.Description,
+		Icon: app.Icon, AvatarURL: avatarURL(app), Color: app.Color,
+		Kind: app.Kind, RendererKey: app.RendererKey, ExecutorKey: app.ExecutorKey,
+		CategorySlug: app.CategorySlug, CategoryName: app.CategoryName,
+		IsPublic:    app.IsPublic,
+		RuntimeType: rt, ProviderKey: pk, ExternalResourceID: ext,
+		IdentityMode: im, ExecutionMode: em,
+		Capabilities: capsAny, IsBound: isBound,
+		IsFavorite:     favorites[app.ID],
+		IsDefaultAgent: app.IsDefaultAgent,
+		CanManage:      canManageCaller(app, caller),
+		UsageCount:     entry.Count, LastUsedAt: dispTime(disp),
+		GlobalUsageCount: app.UsageCount,
+	}
+}
+
+func dispTime(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+func (s *Server) GetApplication(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
+	app, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
+	if err != nil {
+		writeDetail(w, http.StatusNotFound, "application not found")
+		return
+	}
+	binding, _ := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	writeJSON(w, http.StatusOK, s.appDetail(app, binding, userFrom(r.Context())))
+}
+
+func (s *Server) CreateApplication(w http.ResponseWriter, r *http.Request) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
+	var body struct {
+		Name            string        `json:"name"`
+		Slug            string        `json:"slug"`
+		Description     string        `json:"description"`
+		Icon            string        `json:"icon"`
+		Color           string        `json:"color"`
+		CategorySlug    string        `json:"category_slug"`
+		CategoryName    string        `json:"category_name"`
+		IsPublic        *bool         `json:"is_public"`
+		Kind            string        `json:"kind"`
+		RendererKey     string        `json:"renderer_key"`
+		Runtime         *runtimeInput `json:"runtime"`
+		SetDefaultAgent bool          `json:"set_default_agent"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeFieldErrors(w, map[string][]string{"body": {"invalid json"}})
+		return
+	}
+	in := &catalog.CreateInput{
+		Name: body.Name, Slug: body.Slug, Description: body.Description,
+		Icon: body.Icon, Color: body.Color,
+		CategorySlug: body.CategorySlug, CategoryName: body.CategoryName,
+		IsPublic: body.IsPublic == nil || *body.IsPublic,
+		Kind:     body.Kind, RendererKey: body.RendererKey,
+		SetDefaultAgent: body.SetDefaultAgent,
+		CreatorID:       caller.ID,
+		IsStaff:         caller.IsStaff,
+	}
+	if body.Runtime != nil {
+		in.Runtime = body.Runtime.toCatalog()
+	}
+	app, binding, err := s.Catalog.Create(r.Context(), in)
+	if err != nil {
+		s.writeCatalogError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, s.appDetail(app, binding, caller))
+}
+
+type runtimeInput struct {
+	ProviderKey        string         `json:"provider_key"`
+	RuntimeType        string         `json:"runtime_type"`
+	ExternalResourceID string         `json:"external_resource_id"`
+	IdentityMode       string         `json:"identity_mode"`
+	ExecutionMode      string         `json:"execution_mode"`
+	SessionPolicy      string         `json:"session_policy"`
+	ArtifactPolicy     string         `json:"artifact_policy"`
+	TimeoutSeconds     int64          `json:"timeout_seconds"`
+	Config             map[string]any `json:"config"`
+}
+
+func (r *runtimeInput) toCatalog() *catalog.BindingInput {
+	return &catalog.BindingInput{
+		ProviderKey:        r.ProviderKey,
+		RuntimeType:        r.RuntimeType,
+		ExternalResourceID: r.ExternalResourceID,
+		IdentityMode:       r.IdentityMode,
+		ExecutionMode:      r.ExecutionMode,
+		SessionPolicy:      r.SessionPolicy,
+		ArtifactPolicy:     r.ArtifactPolicy,
+		TimeoutSeconds:     r.TimeoutSeconds,
+		Config:             r.Config,
+	}
+}
+
+func (s *Server) UpdateApplication(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
+	var body struct {
+		Name            *string       `json:"name"`
+		Description     *string       `json:"description"`
+		Icon            *string       `json:"icon"`
+		Color           *string       `json:"color"`
+		IsPublic        *bool         `json:"is_public"`
+		CategorySlug    *string       `json:"category_slug"`
+		CategoryName    *string       `json:"category_name"`
+		Runtime         *runtimeInput `json:"runtime"`
+		SetDefaultAgent *bool         `json:"set_default_agent"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeFieldErrors(w, map[string][]string{"body": {"invalid json"}})
+		return
+	}
+	var runtime *catalog.BindingInput
+	if body.Runtime != nil {
+		runtime = body.Runtime.toCatalog()
+	}
+	app, binding, err := s.Catalog.Update(r.Context(), int64(id), caller.ID, caller.IsStaff,
+		body.Name, body.Description, body.Icon, body.Color, body.IsPublic,
+		body.CategorySlug, body.CategoryName, runtime, body.SetDefaultAgent)
+	if err != nil {
+		s.writeCatalogError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.appDetail(app, binding, caller))
+}
+
+func (s *Server) DeleteApplication(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
+	if err := s.Catalog.Delete(r.Context(), int64(id), caller.ID, caller.IsStaff); err != nil {
+		s.writeCatalogError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) writeCatalogError(w http.ResponseWriter, err error) {
+	switch {
+	case err == catalog.ErrNameRequired:
+		writeFieldErrors(w, map[string][]string{"name": {err.Error()}})
+	case err == catalog.ErrBadSlug:
+		writeFieldErrors(w, map[string][]string{"slug": {err.Error()}})
+	case err == catalog.ErrSlugTaken:
+		writeFieldErrors(w, map[string][]string{"slug": {err.Error()}})
+	case err == catalog.ErrOnlyChatRenderer:
+		writeFieldErrors(w, map[string][]string{"renderer_key": {err.Error()}})
+	case err == catalog.ErrNotManageable:
+		writeDetail(w, http.StatusForbidden, err.Error())
+	case err == catalog.ErrNotDefaultable:
+		writeFieldErrors(w, map[string][]string{"detail": {err.Error()}})
+	case err == catalog.ErrDeleteReferenced:
+		writeDetail(w, http.StatusConflict, err.Error())
+	case err == catalog.ErrNoBinding:
+		writeBare(w, http.StatusBadRequest, err.Error())
+	default:
+		msg := err.Error()
+		if strings.Contains(msg, "：") && (strings.Contains(msg, "提供方") || strings.Contains(msg, "运行时")) {
+			// provider/runtime field errors
+			field := "provider_key"
+			if strings.Contains(msg, "运行时") {
+				field = "runtime_type"
+			}
+			writeFieldErrors(w, map[string][]string{field: {msg}})
+			return
+		}
+		if strings.Contains(msg, "不能为空") || strings.Contains(msg, "格式不正确") {
+			writeFieldErrors(w, map[string][]string{"external_resource_id": {msg}})
+			return
+		}
+		writeSimpleError(w, http.StatusInternalServerError, msg)
+	}
+}
+
+// ────────────────────────────────────────────────── favorite / default ──
+
+func (s *Server) FavoriteApplication(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
+	if err := s.Catalog.Favorite(r.Context(), int64(id), caller.ID); err != nil {
+		writeDetail(w, http.StatusNotFound, "application not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"application_id": int64(id), "is_favorite": true})
+}
+
+func (s *Server) UnfavoriteApplication(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
+	if err := s.Catalog.Unfavorite(r.Context(), int64(id), caller.ID); err != nil {
+		writeDetail(w, http.StatusNotFound, "application not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"application_id": int64(id), "is_favorite": false})
+}
+
+func (s *Server) SetDefaultAgent(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
+	if err := s.Catalog.SetDefaultAgent(r.Context(), int64(id), caller.ID, caller.IsStaff); err != nil {
+		s.writeCatalogError(w, err)
+		return
+	}
+	app, _ := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
+	binding, _ := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	writeJSON(w, http.StatusOK, s.appDetail(app, binding, caller))
+}
+
+func (s *Server) UnsetDefaultAgent(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
+	if err := s.Catalog.UnsetDefaultAgent(r.Context(), int64(id), caller.ID, caller.IsStaff); err != nil {
+		s.writeCatalogError(w, err)
+		return
+	}
+	app, _ := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
+	binding, _ := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	writeJSON(w, http.StatusOK, s.appDetail(app, binding, caller))
+}
+
+// ───────────────────────────────────────────────────────────── avatar ──
+
+var allowedAvatarExts = map[string]bool{"png": true, "jpg": true, "jpeg": true, "gif": true, "webp": true}
+
+const avatarMaxBytes = 2 * 1024 * 1024
+
+func (s *Server) GetApplicationAvatar(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
+	app, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
+	if err != nil || app.AvatarKey == "" {
+		writeDetail(w, http.StatusNotFound, "avatar not set")
+		return
+	}
+	rc, _, err := s.Storage.Open(r.Context(), app.AvatarKey)
+	if err != nil {
+		writeDetail(w, http.StatusNotFound, "avatar not set")
+		return
+	}
+	defer rc.Close()
+	ct := mime.TypeByExtension(filepath.Ext(app.AvatarKey))
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	_, _ = io.Copy(w, rc)
+}
+
+func (s *Server) UploadApplicationAvatar(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
+	app, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
+	if err != nil {
+		writeDetail(w, http.StatusNotFound, "application not found")
+		return
+	}
+	if !canManageCaller(app, caller) {
+		writeDetail(w, http.StatusForbidden, catalog.ErrNotManageable.Error())
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		writeFieldErrors(w, map[string][]string{"file": {"请选择头像文件"}})
+		return
+	}
+	defer file.Close()
+	ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(header.Filename), "."))
+	if !allowedAvatarExts[ext] {
+		writeFieldErrors(w, map[string][]string{"file": {"头像仅支持 gif / jpeg / jpg / png / webp 格式"}})
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(file, avatarMaxBytes+1))
+	if err != nil || len(data) > avatarMaxBytes {
+		writeFieldErrors(w, map[string][]string{"file": {"头像不能超过 2MB"}})
+		return
+	}
+	key, err := storage.SanitizeKey(fmt.Sprintf("application-avatars/%d/%d%s", app.ID, time.Now().UnixNano(), "."+ext))
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if _, err := s.Storage.Put(r.Context(), key, bytes.NewReader(data), mime.TypeByExtension("."+ext)); err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, "avatar upload failed")
+		return
+	}
+	old := app.AvatarKey
+	if _, err := s.DB.ExecContext(r.Context(), `UPDATE applications SET avatar_key = ? WHERE id = ?`, key, app.ID); err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if old != "" && old != key {
+		_ = s.Storage.Delete(r.Context(), old)
+	}
+	updated, _ := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
+	binding, _ := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	writeJSON(w, http.StatusOK, s.appDetail(updated, binding, caller))
+}
+
+func (s *Server) ClearApplicationAvatar(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
+	app, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
+	if err != nil {
+		writeDetail(w, http.StatusNotFound, "application not found")
+		return
+	}
+	if !canManageCaller(app, caller) {
+		writeDetail(w, http.StatusForbidden, catalog.ErrNotManageable.Error())
+		return
+	}
+	if app.AvatarKey != "" {
+		if _, err := s.DB.ExecContext(r.Context(), `UPDATE applications SET avatar_key = '' WHERE id = ?`, app.ID); err != nil {
+			writeSimpleError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		_ = s.Storage.Delete(r.Context(), app.AvatarKey)
+	}
+	updated, _ := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
+	binding, _ := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	writeJSON(w, http.StatusOK, s.appDetail(updated, binding, caller))
+}
+
+// helpers
+
+func paramToInt(id genapi.ApplicationId) int64 { return int64(id) }

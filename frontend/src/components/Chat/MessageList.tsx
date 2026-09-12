@@ -1,8 +1,17 @@
 import React from 'react';
 import { Avatar, Typography } from 'antd';
-import { RobotOutlined, ThunderboltOutlined, UserOutlined } from '@ant-design/icons';
+import { ThunderboltOutlined } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
 import type { AgentToolCall } from '@/services/agentProtocol';
+import { useAuthStore } from '@/stores/useAuthStore';
+import {
+  agentAvatarFallback,
+  agentAvatarUrl,
+  agentDisplayName,
+  formatUserLabel,
+  userAvatarFallback,
+  userAvatarUrl,
+} from '@/lib/chatIdentity';
 import './MessageList.css';
 
 const { Text } = Typography;
@@ -28,13 +37,18 @@ interface MessageListProps {
   messages: Message[];
   isLoading?: boolean;
   isStreaming?: boolean;
+  /** The agent answering here (name/icon), so messages are signed by it
+   *  instead of a generic 助手. */
+  agent?: { name?: string; icon?: string; avatar_url?: string } | null;
 }
 
 const MessageList: React.FC<MessageListProps> = ({
   messages,
   isLoading = false,
   isStreaming = false,
+  agent,
 }) => {
+  const { user } = useAuthStore();
   const formatToolValue = (value: string) => {
     if (!value) return '';
     try {
@@ -110,16 +124,18 @@ const MessageList: React.FC<MessageListProps> = ({
         }`}
       >
         <Avatar
-          icon={isUser ? <UserOutlined /> : <RobotOutlined />}
           size={36}
-          className="flex-shrink-0"
+          className="run-chat-avatar flex-shrink-0"
+          src={(isUser ? userAvatarUrl(user) : agentAvatarUrl(agent)) || undefined}
           style={{
             backgroundColor: isUser
               ? 'var(--color-primary)'
               : 'var(--color-bg-elevated)',
             color: isUser ? '#fff' : 'var(--color-primary)',
           }}
-        />
+        >
+          {isUser ? userAvatarFallback(user) : agentAvatarFallback(agent)}
+        </Avatar>
 
         <div
           className={`max-w-[75%] rounded-2xl px-4 py-3 ${
@@ -136,8 +152,9 @@ const MessageList: React.FC<MessageListProps> = ({
               isUser ? 'justify-end text-text-sec' : 'text-text-dim'
             }`}
           >
-            <span className="font-medium">
-              {isUser ? '你' : isSystem ? '系统' : '助手'}
+            <span className="font-medium chat-sender-name">
+              {isUser ? formatUserLabel(user)
+                : isSystem ? '系统' : agentDisplayName(agent)}
             </span>
             <span>
               {new Date(message.created_at).toLocaleString('zh-CN', {
@@ -181,14 +198,16 @@ const MessageList: React.FC<MessageListProps> = ({
       {(isLoading || isStreaming) && (
         <div className="animate-fade-in mb-4 flex gap-3">
           <Avatar
-            icon={<RobotOutlined />}
             size={36}
-            className="flex-shrink-0"
+            className="run-chat-avatar flex-shrink-0"
+            src={agentAvatarUrl(agent) || undefined}
             style={{
               backgroundColor: 'var(--color-bg-elevated)',
               color: 'var(--color-primary)',
             }}
-          />
+          >
+            {agentAvatarFallback(agent)}
+          </Avatar>
           <div className="flex items-center gap-1 rounded-2xl border border-border bg-card px-4 py-3">
             <span className="animate-typing-dot inline-block h-2 w-2 rounded-full bg-primary" style={{ animationDelay: '0s' }} />
             <span className="animate-typing-dot inline-block h-2 w-2 rounded-full bg-primary" style={{ animationDelay: '0.2s' }} />
