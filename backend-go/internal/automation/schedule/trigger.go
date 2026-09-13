@@ -25,6 +25,7 @@ const (
 
 	MisfireFireOnce = "fire_once"
 	MisfireSkip     = "skip"
+	MisfireCatchUp  = "catch_up"
 
 	ConversationNewEachRun = "new_each_run"
 	ConversationReuse      = "reuse"
@@ -32,6 +33,11 @@ const (
 	DeadlineSkip          = "skip"
 	DeadlineExecuteAnyway = "execute_anyway"
 )
+
+// MaxCatchUpSlots bounds how many missed occurrences catch_up may replay
+// after downtime (评测 P1: a 30-day outage of a per-minute schedule must
+// not enqueue 43200 runs).
+const MaxCatchUpSlots = 10
 
 // TriggerConfig is the structured trigger the UI submits; the backend
 // derives timing from it. cron_expression stays an internal artifact.

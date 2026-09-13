@@ -44,9 +44,12 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 	published := 0
 	for _, row := range rows {
 		stream := QueueStream(r.rdb, providerFromPayload(row.EventType, dbtypes.JSONText(row.Payload)))
+		// ID boundary (§评测 P0-1): aggregate_id is BINARY(16) — it must
+		// cross the transport boundary as a canonical UUID string, never
+		// as raw bytes coerced into a Go string (workers ids.Parse it).
 		fields := map[string]any{
 			"outbox_id": row.ID,
-			"run_id":    string(row.AggregateID),
+			"run_id":    mustID(row.AggregateID).String(),
 			"event":     row.EventType,
 		}
 		if err := r.rdb.XAdd(ctx, &goredis.XAddArgs{

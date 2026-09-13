@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/creation-agent-studio/backend-go/internal/catalog"
@@ -39,14 +40,11 @@ type Executor struct {
 
 // Execute implements execution.Handler.
 func (e *Executor) Execute(ctx context.Context, run *execution.Run) error {
-	snapshot := run.RuntimeSnapshot
-	agentID := snapshot["external_resource_id"].(string)
-	if agentID == "" {
-		return e.failRun(ctx, run, "aily_no_agent_id", "missing agent_id")
-	}
-	identityMode := snapshot["identity_mode"].(string)
-	if identityMode == "" {
-		identityMode = "user"
+	agentID, identityMode, err := parseAilySnapshot(run.RuntimeSnapshot)
+	if err != nil {
+		// Configuration problems must terminate as RUN_CONFIG_INVALID, not
+		// enter the panic/retry machinery (评测 P1: typed snapshot).
+		return e.failRun(ctx, run, "run_config_invalid", err.Error())
 	}
 	if run.UserID == nil {
 		return e.failRun(ctx, run, "aily_auth_error", "run has no user identity")
@@ -65,6 +63,9 @@ func (e *Executor) Execute(ctx context.Context, run *execution.Run) error {
 	}
 
 	if err := e.ChatsL.Acquire(ctx); err != nil {
+		if ctx.Err() != nil {
+			return execution.ErrLostOwnership // cancelled by lease loss
+		}
 		return e.failRun(ctx, run, "aily_rate_limit", "waiting for provider rate limit cancelled")
 	}
 
@@ -80,7 +81,30 @@ func (e *Executor) Execute(ctx context.Context, run *execution.Run) error {
 	return nil
 }
 
+// parseAilySnapshot validates the runtime snapshot into typed fields.
+// A malformed/missing snapshot is a configuration error (never a panic).
+func parseAilySnapshot(snapshot map[string]any) (agentID, identityMode string, err error) {
+	if snapshot == nil {
+		return "", "", errors.New("empty runtime snapshot")
+	}
+	v, ok := snapshot["external_resource_id"].(string)
+	if !ok {
+		return "", "", errors.New("runtime snapshot: external_resource_id missing or not a string")
+	}
+	if v == "" {
+		return "", "", errors.New("runtime snapshot: external_resource_id is empty")
+	}
+	mode, _ := snapshot["identity_mode"].(string) // absent/null → default
+	if mode == "" {
+		mode = "user"
+	}
+	return v, mode, nil
+}
+
 func (e *Executor) classifyError(ctx context.Context, run *execution.Run, err error) error {
+	if errors.Is(err, execution.ErrLostOwnership) {
+		return err // fence verdict: stop writing, never retry from here
+	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		if errors.Is(apiErr.Kind, ErrRateLimit) {
@@ -145,14 +169,62 @@ func (e *Executor) thread(ctx context.Context, run *execution.Run) (threadID ids
 	return tid, row.RemoteID, nil
 }
 
+// preserveOwnership carries the claim-time fence across run refreshes: a
+// stale worker must never adopt the new owner's epoch by re-reading the
+// run from the database.
+func preserveOwnership(stale, refreshed *execution.Run) *execution.Run {
+	refreshed.LeaseEpoch = stale.LeaseEpoch
+	refreshed.LeaseToken = stale.LeaseToken
+	return refreshed
+}
+
 func (e *Executor) bindThreadAndRun(ctx context.Context, run *execution.Run, threadID ids.ID, agentChatID, sessionID string) {
 	q := e.Svc.Querier()
 	if agentChatID != "" && run.ExternalRunID == "" {
-		_ = q.UpdateRunExternalID(ctx, dbUpdateExternalParams(agentChatID, run.ID.Bytes()))
+		_ = e.Svc.UpdateExternalRunIDFenced(ctx, run, agentChatID)
 	}
 	if !threadID.IsZero() && sessionID != "" {
 		_ = q.BindAgentThreadSession(ctx, dbBindThreadParams(sessionID, threadID.Bytes()))
 	}
+}
+
+// deltaCoalescer batches high-frequency provider deltas into durable
+// content.chunk events (评测 P1: run_events write amplification). Live
+// consumers still see every delta via the transient Redis channel; TiDB
+// only receives a chunk every flushInterval / flushBytes.
+type deltaCoalescer struct {
+	buf          []byte
+	flushBytes   int
+	lastFlush    time.Time
+	totalFlushed int
+}
+
+func newDeltaCoalescer() *deltaCoalescer {
+	return &deltaCoalescer{flushBytes: 2000, lastFlush: time.Now()}
+}
+
+// add buffers one delta; shouldFlush reports whether the buffer crossed a
+// threshold (2000 bytes or 500ms since the last flush).
+func (c *deltaCoalescer) add(text string) bool {
+	c.buf = append(c.buf, text...)
+	return len(c.buf) >= c.flushBytes || time.Since(c.lastFlush) >= 500*time.Millisecond
+}
+
+// chunk drains the buffer into a persisted-chunk payload. The payload
+// carries the incremental text; the caller adds the cumulative snapshot
+// so live consumers can replace (not append) and always self-heal.
+func (c *deltaCoalescer) chunk() (payload map[string]any, ok bool) {
+	if len(c.buf) == 0 {
+		return nil, false
+	}
+	incremental := string(c.buf)
+	c.totalFlushed += len(c.buf)
+	c.buf = c.buf[:0]
+	c.lastFlush = time.Now()
+	return map[string]any{
+		"text":   incremental,
+		"offset": c.totalFlushed,
+	}, true
 }
 
 // executeStreaming drives the interactive SSE path.
@@ -180,6 +252,16 @@ func (e *Executor) executeStreaming(ctx context.Context, run *execution.Run, aut
 	defer cancel()
 
 	externalRunID := ""
+	coalescer := newDeltaCoalescer()
+	snapshotText := &strings.Builder{} // cumulative answer text
+	flushChunk := func() error {
+		payload, ok := coalescer.chunk()
+		if !ok {
+			return nil
+		}
+		payload["snapshot"] = snapshotText.String()
+		return e.Svc.AppendEventFenced(ctx, run, execution.EventContentChunk, payload)
+	}
 	for ev := range events {
 		switch ev.EventType {
 		case "aily.stream.started":
@@ -195,11 +277,24 @@ func (e *Executor) executeStreaming(ctx context.Context, run *execution.Run, aut
 			e.Log.Warn("aily stream transport error", "run_id", run.ID.String(), "err", ev.Payload["error"])
 			return e.reconcile(ctx, run, externalRunID)
 		case execution.EventContentDelta:
-			if err := e.Svc.AppendEvent(ctx, run.ID, execution.EventContentDelta, ev.Payload); err != nil {
-				e.Log.Warn("append delta failed", "err", err)
+			// Transient: live SSE consumers only — never persisted as-is.
+			e.Svc.PublishTransient(ctx, run.ID, execution.EventContentDelta, ev.Payload)
+			if text, ok := ev.Payload["text"].(string); ok {
+				snapshotText.WriteString(text)
+			}
+			if coalescer.add(strOf(ev.Payload["text"], "")) {
+				if err := flushChunk(); err != nil {
+					if errors.Is(err, execution.ErrLostOwnership) {
+						return err
+					}
+					e.Log.Warn("append chunk failed", "err", err)
+				}
 			}
 		case execution.EventArtifactDiscovered:
 			if err := e.recordArtifact(ctx, run, ev.Payload); err != nil {
+				if errors.Is(err, execution.ErrLostOwnership) {
+					return err
+				}
 				e.Log.Warn("record artifact failed", "err", err)
 			}
 		case execution.EventRunFailed:
@@ -207,6 +302,10 @@ func (e *Executor) executeStreaming(ctx context.Context, run *execution.Run, aut
 				strOf(ev.Payload["error_code"], "aily_stream_error"),
 				strOf(ev.Payload["error_message"], ""))
 		}
+	}
+	// Flush any tail delta before the final reconciliation.
+	if err := flushChunk(); err != nil && !errors.Is(err, execution.ErrLostOwnership) {
+		e.Log.Warn("flush tail chunk failed", "err", err)
 	}
 	// Stream ended (normally or broken): final authority is the result API.
 	return e.reconcile(ctx, run, externalRunID)
@@ -295,6 +394,7 @@ func (e *Executor) reconcile(ctx context.Context, run *execution.Run, externalRu
 		if execution.IsTerminal(refreshed.Status) {
 			return nil // someone else finished it (reaper/cancel)
 		}
+		run = preserveOwnership(run, refreshed)
 	}
 	agentID := run.SnapshotString("external_resource_id")
 	if run.UserID == nil {
@@ -380,12 +480,15 @@ func (e *Executor) finalizeFromResult(ctx context.Context, run *execution.Run, c
 // summaries for history replay) after the terminal CAS.
 func (e *Executor) finish(ctx context.Context, run *execution.Run, in *execution.FinishInput) error {
 	if err := e.Svc.Finish(ctx, run, in); err != nil {
-		return err
+		return err // includes ErrLostOwnership: stale worker stops here
 	}
 	finalText, _ := in.Output["text"].(string)
 	if finalText == "" || run.ConversationID == nil {
 		return nil
 	}
+	// Finish won the terminal CAS ⇒ this worker owned the run; the
+	// terminal run can no longer be re-claimed, so the assistant message
+	// write is safe. A stale worker returns at the error above.
 	artifacts, err := e.Svc.Querier().ListRunArtifacts(ctx, run.ID.Bytes())
 	if err == nil && len(artifacts) > 0 {
 		summaries := make([]map[string]any, 0, len(artifacts))

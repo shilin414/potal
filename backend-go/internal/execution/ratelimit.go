@@ -1,6 +1,8 @@
 package execution
 
 import (
+	"sync"
+	"sync/atomic"
 	"context"
 	"fmt"
 	"time"
@@ -45,11 +47,25 @@ return {1, '0'}
 `)
 
 // RateLimiter is a shared, distributed limiter for provider calls.
+//
+// Degradation policy (评测 P1): a Redis outage must NOT fail open to
+// "unlimited" — with a run backlog every worker would simultaneously
+// storm the provider (429 storm). On Redis errors the limiter falls back
+// to an in-process GCRA with the same emission/burst parameters (the
+// aggregate rate then bounds at limit × worker-count instead of the
+// shared limit, which is still far safer than unbounded), and reports
+// degraded=true for monitoring.
 type RateLimiter struct {
 	rdb    *redisx.Client
 	key    string
 	limit  int           // events per period
 	period time.Duration // e.g. 1s
+
+	// local fallback state (GCRA tat in microseconds, same math as the
+	// Lua script) + degraded flag for monitoring.
+	localMu  sync.Mutex
+	localTat atomic.Int64
+	degraded atomic.Bool
 }
 
 // NewRateLimiter builds a GCRA limiter: `limit` events per `period`,
@@ -78,10 +94,12 @@ func (l *RateLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, e
 	res, err := gcraLua.Run(ctx, l.rdb.Client, []string{l.key},
 		nowMicro, emissionMicro, burstOffset, ttlMillis).Slice()
 	if err != nil {
-		// Fail open on Redis errors: a limiter outage must not stop runs;
-		// the provider's own 429 + retry policy is the backstop.
-		return true, 0, err
+		// Degraded mode: fall back to the in-process limiter with the
+		// same GCRA parameters. Never fail open (评测 P1).
+		l.degraded.Store(true)
+		return l.allowLocal(nowMicro, emissionMicro, burstOffset)
 	}
+	l.degraded.Store(false)
 	allowed, _ := res[0].(int64)
 	if allowed == 1 {
 		return true, 0, nil
@@ -92,12 +110,37 @@ func (l *RateLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, e
 	return false, time.Duration(waitMicro) * time.Microsecond, nil
 }
 
+// Degraded reports whether the limiter is running on the local fallback
+// (Redis unreachable). Expose as provider_limiter_degraded in metrics.
+func (l *RateLimiter) Degraded() bool { return l.degraded.Load() }
+
+// allowLocal runs the same GCRA decision in-process (per-worker bound).
+func (l *RateLimiter) allowLocal(nowMicro, emissionMicro, burstOffset int64) (bool, time.Duration, error) {
+	l.localMu.Lock()
+	defer l.localMu.Unlock()
+	tat := l.localTat.Load()
+	if nowMicro < tat-burstOffset {
+		return false, time.Duration(tat-burstOffset-nowMicro) * time.Microsecond, nil
+	}
+	newTat := tat
+	if nowMicro > newTat {
+		newTat = nowMicro
+	}
+	l.localTat.Store(newTat + emissionMicro)
+	return true, 0, nil
+}
+
 // Acquire blocks until a token is available or ctx is done.
 func (l *RateLimiter) Acquire(ctx context.Context) error {
 	for {
 		ok, wait, err := l.Allow(ctx)
 		if err != nil {
-			return nil // fail open (see Allow)
+			// Allow already fell back to the local limiter on Redis
+			// errors; only ctx cancellation bubbles up here.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			continue
 		}
 		if ok {
 			return nil

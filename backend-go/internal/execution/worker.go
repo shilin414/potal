@@ -18,6 +18,16 @@ type Handler interface {
 	Execute(ctx context.Context, run *Run) error
 }
 
+// executionControl couples an in-flight run with its ownership fence and
+// a local cancellation handle. Losing the lease (heartbeat rejected by
+// the fence) cancels the local execution context: the provider stream /
+// poll loop stops and the handler must stop writing canonical state.
+type executionControl struct {
+	cancel context.CancelFunc
+	token  ids.ID
+	epoch  uint64
+}
+
 // Worker consumes provider queues: Redis Streams wake it up (fast), then
 // the TiDB CAS claim makes it correct. A fallback scan (FallbackScan)
 // covers messages lost to Redis restarts.
@@ -39,7 +49,7 @@ type Worker struct {
 	Log          *slog.Logger
 
 	mu       sync.Mutex
-	inflight map[ids.ID]bool
+	inflight map[ids.ID]*executionControl
 }
 
 func (w *Worker) stream() string { return QueueStream(w.RDB, w.Provider) }
@@ -130,6 +140,7 @@ func (w *Worker) process(ctx context.Context, msg goredis.XMessage) {
 	runIDStr, _ := runIDRaw.(string)
 	runID, err := ids.Parse(runIDStr)
 	if err != nil {
+		w.Log.Warn("unparseable run_id in queue message (acking)", "run_id", runIDStr)
 		w.ack(ctx, msg.ID)
 		return
 	}
@@ -145,44 +156,77 @@ func (w *Worker) process(ctx context.Context, msg goredis.XMessage) {
 			}
 		}
 	}()
-	won, err := w.Svc.CASClaim(ctx, runID)
+	w.claimAndExecute(ctx, runID, func() { w.ack(ctx, msg.ID) })
+}
+
+// claimAndExecute is the shared claim → execute path for both the Redis
+// stream wakeup and the fallback scan. The claim and the lease commit in
+// ONE transaction; only the winner (with ownership fence) executes.
+func (w *Worker) claimAndExecute(ctx context.Context, runID ids.ID, ack func()) {
+	ownership, won, err := w.Svc.ClaimAndLease(ctx, runID, w.WorkerID, w.Lease)
 	if err != nil {
-		w.Log.Error("cas claim failed", "run_id", runIDStr, "err", err)
-		// Do not ACK on transient DB errors; let pending entries retry.
+		w.Log.Error("claim+lease failed", "run_id", runID.String(), "err", err)
+		// Do NOT ack on transient DB errors: leave the entry pending so
+		// the reclaim loop re-delivers it once the database recovers.
 		return
 	}
 	if !won {
 		// Someone else claimed it (or it moved on): the message is done.
-		w.ack(ctx, msg.ID)
-		return
-	}
-	if err := w.Svc.AcquireLease(ctx, runID, w.WorkerID, w.Lease); err != nil {
-		w.Log.Error("acquire lease failed", "run_id", runIDStr, "err", err)
-		w.ack(ctx, msg.ID)
+		if ack != nil {
+			ack()
+		}
 		return
 	}
 	run, err := w.Svc.GetRun(ctx, runID)
 	if err != nil {
-		w.ack(ctx, msg.ID)
+		if ack != nil {
+			ack()
+		}
 		return
 	}
+	// Claim-time fence capture: every canonical write from here on must
+	// match this epoch/token (stale-worker fencing, 评测 P0-3).
+	run.LeaseEpoch = ownership.Epoch
+	run.LeaseToken = ownership.Token
 	// Claim event: matches the reference protocol (SSE consumers render
 	// the streaming bubble from run.started).
-	_ = w.Svc.AppendEvent(ctx, runID, EventRunStarted, map[string]any{
+	_ = w.Svc.AppendEventFenced(ctx, run, EventRunStarted, map[string]any{
 		"worker_id": w.WorkerID,
 		"attempt":   run.Attempt,
 	})
-	// Heartbeat registration.
-	w.trackInflight(runID, true)
-	defer w.trackInflight(runID, false)
+	w.execute(ctx, run)
+	if ack != nil {
+		ack()
+	}
+}
 
-	execCtx, cancel := context.WithTimeout(ctx, w.maxRuntime(run))
-	defer cancel()
+func (w *Worker) execute(ctx context.Context, run *Run) {
+	execCtx, cancel := context.WithCancel(ctx)
+	// Heartbeat registration: losing the lease cancels execCtx.
+	w.trackInflight(run, cancel)
+	defer w.trackInflight(run, nil)
+
+	defer func() {
+		if rec := recover(); rec != nil {
+			w.Log.Error("handler panic recovered (scan)", "run_id", run.ID.String(), "panic", rec)
+			_ = w.Svc.ReleaseInterruptedFenced(context.Background(), run, "worker panic")
+		}
+	}()
+	// Bound the handler by the configured runtime; the lease protects
+	// against crashes.
+	timeout := w.maxRuntime(run)
+	timer := time.AfterFunc(timeout, cancel)
+	defer timer.Stop()
 
 	if err := w.Handler.Execute(execCtx, run); err != nil {
-		w.Log.Warn("handler error", "run_id", runIDStr, "err", err)
+		if err == ErrLostOwnership {
+			// Lost the lease to a new owner: expected recovery path, not
+			// an error — this worker must simply stop.
+			w.Log.Warn("worker lost run ownership", "run_id", run.ID.String())
+		} else {
+			w.Log.Warn("handler error", "run_id", run.ID.String(), "err", err)
+		}
 	}
-	w.ack(ctx, msg.ID)
 }
 
 func (w *Worker) maxRuntime(run *Run) time.Duration {
@@ -216,36 +260,7 @@ func (w *Worker) scanLoop(ctx context.Context) {
 				continue
 			}
 			for _, runID := range ids0 {
-				won, err := w.Svc.CASClaim(ctx, runID)
-				if err != nil || !won {
-					continue
-				}
-				if err := w.Svc.AcquireLease(ctx, runID, w.WorkerID, w.Lease); err != nil {
-					continue
-				}
-				run, err := w.Svc.GetRun(ctx, runID)
-				if err != nil {
-					continue
-				}
-				_ = w.Svc.AppendEvent(ctx, runID, EventRunStarted, map[string]any{
-					"worker_id": w.WorkerID,
-					"attempt":   run.Attempt,
-				})
-				w.trackInflight(runID, true)
-				func(run *Run) {
-					defer w.trackInflight(run.ID, false)
-					defer func() {
-						if rec := recover(); rec != nil {
-							w.Log.Error("handler panic recovered (scan)", "run_id", run.ID.String(), "panic", rec)
-							_ = w.Svc.ReleaseInterrupted(context.Background(), run, "worker panic")
-						}
-					}()
-					execCtx, cancel := context.WithTimeout(ctx, w.maxRuntime(run))
-					defer cancel()
-					if err := w.Handler.Execute(execCtx, run); err != nil {
-						w.Log.Warn("handler error (scan)", "run_id", run.ID.String(), "err", err)
-					}
-				}(run)
+				w.claimAndExecute(ctx, runID, nil)
 			}
 			// Reaper: recover crashed workers' leases.
 			if n, err := w.Svc.RecoverExpiredLeases(ctx, 100); err == nil && n > 0 {
@@ -300,17 +315,18 @@ func (w *Worker) reclaimLoop(ctx context.Context) {
 	}
 }
 
-// inflight tracks leases owned by this process for heartbeat renewal.
-func (w *Worker) trackInflight(runID ids.ID, on bool) {
+// trackInflight registers an in-flight run with its cancellation handle.
+// Passing cancel == nil removes it (deferred cleanup).
+func (w *Worker) trackInflight(run *Run, cancel context.CancelFunc) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.inflight == nil {
-		w.inflight = map[ids.ID]bool{}
+		w.inflight = map[ids.ID]*executionControl{}
 	}
-	if on {
-		w.inflight[runID] = true
+	if cancel != nil {
+		w.inflight[run.ID] = &executionControl{cancel: cancel, token: run.LeaseToken, epoch: run.LeaseEpoch}
 	} else {
-		delete(w.inflight, runID)
+		delete(w.inflight, run.ID)
 	}
 }
 
@@ -323,15 +339,31 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			w.mu.Lock()
-			idsSnapshot := make([]ids.ID, 0, len(w.inflight))
-			for id := range w.inflight {
-				idsSnapshot = append(idsSnapshot, id)
+			snapshot := make(map[ids.ID]*executionControl, len(w.inflight))
+			for id, ctl := range w.inflight {
+				snapshot[id] = ctl
 			}
 			w.mu.Unlock()
-			for _, id := range idsSnapshot {
-				ok, err := w.Svc.HeartbeatLease(ctx, id, w.WorkerID, w.Lease)
+			for id, ctl := range snapshot {
+				ok, err := w.Svc.HeartbeatLeaseFenced(ctx, id, ctl.token, w.Lease)
 				if err != nil || !ok {
-					w.Log.Warn("heartbeat lost lease", "run_id", id.String(), "err", err)
+					// Ownership lost: stop the local execution immediately
+					// (the provider call cannot be cancelled remotely, but
+					// this worker loses the right to write canonical state —
+					// fenced writes will reject it anyway; cancelling here
+					// also stops pointless polling).
+					w.Log.Warn("heartbeat lost lease — cancelling local execution",
+						"run_id", id.String(), "err", err)
+					ctl.cancel()
+					w.mu.Lock()
+					// Only remove if the entry is still ours (not re-registered).
+					if cur, ok := w.inflight[id]; ok && cur == ctl {
+						delete(w.inflight, id)
+					}
+					w.mu.Unlock()
+					if w.Svc.Metrics != nil {
+						w.Svc.Metrics.LeaseExpired.Inc()
+					}
 				}
 			}
 		}

@@ -136,8 +136,10 @@ func TestDualSchedulerSingleOccurrence(t *testing.T) {
 	}
 }
 
-// TestOverlapSkip: with an active occurrence, a skip policy records the
-// slot as skipped instead of creating a second concurrent run.
+// TestOverlapSkip: with an actively running occurrence, a skip policy
+// records the slot as skipped instead of creating a second concurrent run.
+// (The previous execution is seeded as 'running' — a 'pending' row would
+// now be correctly admitted by the occurrence admission loop.)
 func TestOverlapSkip(t *testing.T) {
 	env := newScheduleEnv(t)
 	ctx := context.Background()
@@ -150,6 +152,17 @@ func TestOverlapSkip(t *testing.T) {
 		ScheduleID: uint64(id), ScheduledAt: due.Add(-24 * time.Hour),
 	}); err != nil {
 		t.Fatalf("seed active occurrence: %v", err)
+	}
+	prev, err := q.GetScheduleOccurrenceBySlot(ctx, db.GetScheduleOccurrenceBySlotParams{
+		ScheduleID: uint64(id), ScheduledAt: due.Add(-24 * time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{
+		Status: schedule.OccRunning, ID: prev.ID,
+	}); err != nil {
+		t.Fatalf("mark previous occurrence running: %v", err)
 	}
 
 	env.schd.ProcessDue(ctx)
@@ -241,5 +254,173 @@ func TestDeliveryFanoutIdempotent(t *testing.T) {
 
 	if n := env.count(t, `SELECT COUNT(*) FROM delivery_executions WHERE occurrence_id = ?`, occ.ID); n != 1 {
 		t.Fatalf("delivery executions = %d, want 1 (idempotent)", n)
+	}
+}
+
+// setMisfire flips a seeded schedule's misfire policy.
+func (e *scheduleEnv) setMisfire(t *testing.T, id int64, policy string) {
+	t.Helper()
+	if _, err := e.db.Exec(`UPDATE schedules SET misfire_policy = ? WHERE id = ?`, policy, id); err != nil {
+		t.Fatalf("set misfire policy: %v", err)
+	}
+}
+
+// TestMisfireFireOnceSingleCompensation (评测测试矩阵 #4): a daily
+// schedule whose slot is 10 days overdue (scheduler downtime) with
+// fire_once policy must create exactly ONE compensation run and jump
+// next_run_at into the future — never replay slot by slot.
+func TestMisfireFireOnceSingleCompensation(t *testing.T) {
+	env := newScheduleEnv(t)
+	ctx := context.Background()
+	due := time.Now().UTC().Add(-10 * 24 * time.Hour).Truncate(time.Millisecond)
+	id := env.seedSchedule(t, due, schedule.OverlapQueue) // default fire_once
+
+	env.schd.ProcessDue(ctx)
+
+	if n := env.count(t, `SELECT COUNT(*) FROM runs r JOIN schedule_occurrences o ON r.id = o.run_id WHERE o.schedule_id = ?`, id); n != 1 {
+		t.Fatalf("runs = %d, want exactly 1 compensation run", n)
+	}
+	var next sql.NullTime
+	if err := env.db.QueryRow(`SELECT next_run_at FROM schedules WHERE id = ?`, id).Scan(&next); err != nil || !next.Valid {
+		t.Fatalf("next_run_at missing: %v", err)
+	}
+	if !next.Time.After(time.Now().UTC()) {
+		t.Fatalf("next_run_at = %v, want in the future (fast-forwarded past 10 missed slots)", next.Time)
+	}
+
+	// The next scan must not fire anything more.
+	env.schd.ProcessDue(ctx)
+	if n := env.count(t, `SELECT COUNT(*) FROM runs r JOIN schedule_occurrences o ON r.id = o.run_id WHERE o.schedule_id = ?`, id); n != 1 {
+		t.Fatalf("runs after second scan = %d, still want 1", n)
+	}
+}
+
+// TestMisfireSkipFastForward: a misfired slot under skip policy creates no
+// run and fast-forwards next_run_at into the future.
+func TestMisfireSkipFastForward(t *testing.T) {
+	env := newScheduleEnv(t)
+	ctx := context.Background()
+	due := time.Now().UTC().Add(-10 * 24 * time.Hour).Truncate(time.Millisecond)
+	id := env.seedSchedule(t, due, schedule.OverlapQueue)
+	env.setMisfire(t, id, schedule.MisfireSkip)
+
+	env.schd.ProcessDue(ctx)
+
+	if n := env.count(t, `SELECT COUNT(*) FROM runs r JOIN schedule_occurrences o ON r.id = o.run_id WHERE o.schedule_id = ?`, id); n != 0 {
+		t.Fatalf("runs = %d, want 0 under misfire skip", n)
+	}
+	var next sql.NullTime
+	if err := env.db.QueryRow(`SELECT next_run_at FROM schedules WHERE id = ?`, id).Scan(&next); err != nil || !next.Valid {
+		t.Fatalf("next_run_at missing: %v", err)
+	}
+	if !next.Time.After(time.Now().UTC()) {
+		t.Fatalf("next_run_at = %v, want fast-forwarded into the future", next.Time)
+	}
+}
+
+// TestMisfireCatchUpOverLimit (评测测试矩阵 #5): catch_up with 30 missed
+// slots (> MaxCatchUpSlots) fast-forwards instead of flooding the queue.
+func TestMisfireCatchUpOverLimit(t *testing.T) {
+	env := newScheduleEnv(t)
+	ctx := context.Background()
+	due := time.Now().UTC().Add(-30 * 24 * time.Hour).Truncate(time.Millisecond)
+	id := env.seedSchedule(t, due, schedule.OverlapQueue)
+	env.setMisfire(t, id, schedule.MisfireCatchUp)
+
+	// Several scan ticks: even with catch_up the backlog cap must hold.
+	for i := 0; i < 3; i++ {
+		env.schd.ProcessDue(ctx)
+	}
+	if n := env.count(t, `SELECT COUNT(*) FROM runs r JOIN schedule_occurrences o ON r.id = o.run_id WHERE o.schedule_id = ?`, id); n != 0 {
+		t.Fatalf("runs = %d, want 0 (30 missed slots exceed MaxCatchUpSlots=%d)", n, schedule.MaxCatchUpSlots)
+	}
+	var next sql.NullTime
+	if err := env.db.QueryRow(`SELECT next_run_at FROM schedules WHERE id = ?`, id).Scan(&next); err != nil || !next.Valid || !next.Time.After(time.Now().UTC()) {
+		t.Fatalf("next_run_at not fast-forwarded: %v", next)
+	}
+}
+
+// TestMisfireCatchUpBoundedReplay: a small backlog (3 missed slots)
+// replays one run per scan tick and converges into the future.
+func TestMisfireCatchUpBoundedReplay(t *testing.T) {
+	env := newScheduleEnv(t)
+	ctx := context.Background()
+	due := time.Now().UTC().Add(-3 * 24 * time.Hour).Truncate(time.Millisecond)
+	id := env.seedSchedule(t, due, schedule.OverlapQueue)
+	env.setMisfire(t, id, schedule.MisfireCatchUp)
+
+	env.schd.ProcessDue(ctx)
+	if n := env.count(t, `SELECT COUNT(*) FROM runs r JOIN schedule_occurrences o ON r.id = o.run_id WHERE o.schedule_id = ?`, id); n != 1 {
+		t.Fatalf("runs after first tick = %d, want 1 (catch_up replays one at a time)", n)
+	}
+	// Keep ticking until the schedule catches up (bounded well below the cap).
+	for i := 0; i < 10; i++ {
+		var next sql.NullTime
+		if err := env.db.QueryRow(`SELECT next_run_at FROM schedules WHERE id = ?`, id).Scan(&next); err != nil {
+			t.Fatal(err)
+		}
+		if next.Valid && next.Time.After(time.Now().UTC()) {
+			break
+		}
+		env.schd.ProcessDue(ctx)
+	}
+	if n := env.count(t, `SELECT COUNT(*) FROM runs r JOIN schedule_occurrences o ON r.id = o.run_id WHERE o.schedule_id = ?`, id); n > schedule.MaxCatchUpSlots {
+		t.Fatalf("runs = %d, exceeded MaxCatchUpSlots=%d", n, schedule.MaxCatchUpSlots)
+	}
+}
+
+// TestRunNowQueueBehindActive (评测测试矩阵 #6): TriggerNow under
+// overlap=queue with an active execution must NOT create a parallel run —
+// it enqueues a pending occurrence admitted only after the active one
+// finishes.
+func TestRunNowQueueBehindActive(t *testing.T) {
+	env := newScheduleEnv(t)
+	ctx := context.Background()
+	q := db.New(env.db)
+	next := time.Now().UTC().Add(10 * time.Hour)
+	id := env.seedSchedule(t, next, schedule.OverlapQueue)
+
+	// Active execution for the schedule.
+	past := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
+	if _, err := q.CreateScheduleOccurrence(ctx, db.CreateScheduleOccurrenceParams{
+		ScheduleID: uint64(id), ScheduledAt: past,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	active, err := q.GetScheduleOccurrenceBySlot(ctx, db.GetScheduleOccurrenceBySlotParams{
+		ScheduleID: uint64(id), ScheduledAt: past,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: schedule.OccRunning, ID: active.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Manual trigger while active: queued as pending, no run yet.
+	occ, err := env.schd.TriggerNow(ctx, id, 42, false)
+	if err != nil {
+		t.Fatalf("TriggerNow: %v", err)
+	}
+	if occ.Status != schedule.OccPending {
+		t.Fatalf("triggered occurrence status = %q, want pending", occ.Status)
+	}
+	if n := env.count(t, `SELECT COUNT(*) FROM runs r JOIN schedule_occurrences o ON r.id = o.run_id WHERE o.id = ?`, occ.ID); n != 0 {
+		t.Fatalf("run-now created %d runs behind an active execution, want 0 (no parallel runs)", n)
+	}
+
+	// Admission tick while still active: still no run.
+	env.schd.ProcessDue(ctx)
+	if n := env.count(t, `SELECT COUNT(*) FROM runs r JOIN schedule_occurrences o ON r.id = o.run_id WHERE o.id = ?`, occ.ID); n != 0 {
+		t.Fatalf("admitted pending occurrence behind active run, want to wait")
+	}
+
+	// The active execution finishes → admission converts pending → run.
+	if _, err := q.MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: schedule.OccSucceeded, ID: active.ID}); err != nil {
+		t.Fatal(err)
+	}
+	env.schd.ProcessDue(ctx)
+	if n := env.count(t, `SELECT COUNT(*) FROM runs r JOIN schedule_occurrences o ON r.id = o.run_id WHERE o.id = ?`, occ.ID); n != 1 {
+		t.Fatalf("pending occurrence not admitted after active finished: runs = %d, want 1", n)
 	}
 }

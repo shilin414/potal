@@ -25,6 +25,8 @@ interface AuthState {
   user: User | null;
   isAuthenticated: boolean;
   login: (username: string, password: string) => Promise<void>;
+  /** /login/admin 入口：POST /api/identity/admin/login（本地管理员）。 */
+  adminLogin: (username: string, password: string) => Promise<void>;
   register: (data: RegisterData) => Promise<void>;
   completeSso: (exchange: string) => Promise<void>;
   logout: () => Promise<void>;
@@ -51,6 +53,25 @@ export const useAuthStore = create<AuthState>()(
         // backend (Set-Cookie); no token is stored client-side.
         const response = await axiosInstance.post('/auth/login/', { username, password }) as any;
         set({ user: response.user, isAuthenticated: true });
+      },
+
+      adminLogin: async (username: string, password: string) => {
+        // 管理员本地登录：与飞书登录共享同一套 HttpOnly Studio Session。
+        const response = await axiosInstance.post('/identity/admin/login', { username, password }) as any;
+        set({
+          user: {
+            id: String(response.id ?? ''),
+            username: response.username ?? username,
+            email: '',
+            role: response.is_staff ? 'admin' : 'user',
+            is_staff: Boolean(response.is_staff),
+            auth_source: response.auth_source ?? 'local_admin',
+            display_name: response.display_name ?? response.username,
+            display_id: response.display_id ?? '',
+            created_at: new Date().toISOString(),
+          },
+          isAuthenticated: true,
+        });
       },
 
       register: async (data: RegisterData) => {

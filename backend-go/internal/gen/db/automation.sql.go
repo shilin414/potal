@@ -70,6 +70,26 @@ func (q *Queries) CASFinishOccurrenceByRun(ctx context.Context, arg CASFinishOcc
 	return q.db.ExecContext(ctx, cASFinishOccurrenceByRun, arg.Status, arg.RunID)
 }
 
+const countActiveOccurrencesExcluding = `-- name: CountActiveOccurrencesExcluding :one
+SELECT COUNT(*) AS n FROM schedule_occurrences
+WHERE schedule_id = ? AND id != ? AND status IN ('queued', 'running')
+`
+
+type CountActiveOccurrencesExcludingParams struct {
+	ScheduleID uint64
+	ID         uint64
+}
+
+// Admission check for a pending occurrence: does anything OTHER than
+// itself still hold the schedule's execution slot (queued/running)?
+// A pending row does not block its own admission.
+func (q *Queries) CountActiveOccurrencesExcluding(ctx context.Context, arg CountActiveOccurrencesExcludingParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countActiveOccurrencesExcluding, arg.ScheduleID, arg.ID)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
 const countSkippedOccurrencesForSlot = `-- name: CountSkippedOccurrencesForSlot :one
 SELECT COUNT(*) AS n FROM schedule_occurrences
 WHERE schedule_id = ? AND scheduled_at = ? AND status = 'skipped'
@@ -412,6 +432,52 @@ func (q *Queries) LatestOccurrenceBySchedule(ctx context.Context, scheduleID uin
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const listAdmissiblePendingOccurrences = `-- name: ListAdmissiblePendingOccurrences :many
+SELECT id, schedule_id, scheduled_at, enqueued_at, admitted_at, run_id, status,
+       triggered_at, finished_at, created_at, updated_at
+FROM schedule_occurrences
+WHERE status = 'pending'
+ORDER BY id
+LIMIT ?
+`
+
+// Occurrence admission queue (overlap=queue semantics): pending rows are
+// converted into runs once the schedule has no active execution.
+func (q *Queries) ListAdmissiblePendingOccurrences(ctx context.Context, limit int32) ([]ScheduleOccurrence, error) {
+	rows, err := q.db.QueryContext(ctx, listAdmissiblePendingOccurrences, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ScheduleOccurrence{}
+	for rows.Next() {
+		var i ScheduleOccurrence
+		if err := rows.Scan(
+			&i.ID,
+			&i.ScheduleID,
+			&i.ScheduledAt,
+			&i.EnqueuedAt,
+			&i.AdmittedAt,
+			&i.RunID,
+			&i.Status,
+			&i.TriggeredAt,
+			&i.FinishedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listDeliveriesBySchedule = `-- name: ListDeliveriesBySchedule :many

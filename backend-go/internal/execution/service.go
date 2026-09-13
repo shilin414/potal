@@ -19,6 +19,11 @@ import (
 // ErrNotFound marks missing runs.
 var ErrNotFound = errors.New("execution: not found")
 
+// ErrLostOwnership marks a fenced write rejected because the caller no
+// longer owns the run (lease expired / reclaimed). Writers must stop
+// immediately on this error — another worker owns the canonical state.
+var ErrLostOwnership = errors.New("execution: lease ownership lost")
+
 // Service implements the Run lifecycle on top of TiDB.
 type Service struct {
 	DB      *sql.DB
@@ -249,6 +254,9 @@ func runFromRow(row db.Run) *Run {
 		out.FinishedAt = &t
 	}
 	out.TriggerType = row.TriggerType
+	// DB-loaded lease_epoch is informational only; the worker overwrites
+	// it with the claim-time capture right after a winning claim.
+	out.LeaseEpoch = row.LeaseEpoch
 	if out.TriggerType == "" {
 		out.TriggerType = DefaultTriggerType
 	}
@@ -287,8 +295,66 @@ func mustID(b []byte) ids.ID {
 
 // ─────────────────────────────────────────────────────── claim / lease ──
 
+// LeaseOwnership is the write fence captured at claim time: every later
+// canonical write by the winning worker must present this epoch/token.
+type LeaseOwnership struct {
+	Epoch uint64
+	Token ids.ID
+}
+
+// ClaimAndLease atomically transitions queued→running AND inserts the
+// lease row in ONE TiDB transaction (评测 P0-2). If the lease INSERT
+// fails the whole claim rolls back and the run stays queued — the
+// previous "claimed running without lease" permanent-stuck state is
+// impossible by construction.
+func (s *Service) ClaimAndLease(ctx context.Context, runID ids.ID, workerID string, leaseSeconds time.Duration) (*LeaseOwnership, bool, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := db.New(tx)
+
+	res, err := q.CASClaimRun(ctx, runID.Bytes())
+	if err != nil {
+		return nil, false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, err
+	}
+	if n != 1 {
+		return nil, false, nil // someone else won the claim
+	}
+	epoch, err := q.GetRunLeaseEpoch(ctx, runID.Bytes())
+	if err != nil {
+		return nil, false, err
+	}
+	token := ids.New()
+	if err := q.CreateRunLease(ctx, db.CreateRunLeaseParams{
+		RunID:      runID.Bytes(),
+		WorkerID:   workerID,
+		LeaseToken: token.Bytes(),
+		ExpiresAt:  time.Now().UTC().Add(leaseSeconds),
+	}); err != nil {
+		// Rollback: the run returns to 'queued' (lease INSERT failure can
+		// never strand a running run without a lease).
+		return nil, false, err
+	}
+	// Best-effort fan-out inside the same tx: a scheduled run's occurrence
+	// follows the run into 'running'. Interactive runs have no occurrence.
+	_, _ = q.MarkOccurrenceRunningByRun(ctx, sql.NullString{String: string(runID.Bytes()), Valid: true})
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	return &LeaseOwnership{Epoch: epoch, Token: token}, true, nil
+}
+
 // CASClaim tries to transition queued→running for one run.
 // Returns true iff this worker won the race (affected rows == 1).
+//
+// Deprecated: workers must use ClaimAndLease so the claim and the lease
+// commit atomically. Retained for tests/diagnostics.
 func (s *Service) CASClaim(ctx context.Context, runID ids.ID) (bool, error) {
 	res, err := s.q(ctx).CASClaimRun(ctx, runID.Bytes())
 	if err != nil {
@@ -321,6 +387,8 @@ func (s *Service) ClaimCandidates(ctx context.Context, provider string, limit in
 }
 
 // AcquireLease inserts the lease row for a claimed run.
+//
+// Deprecated: use ClaimAndLease (atomic claim + lease).
 func (s *Service) AcquireLease(ctx context.Context, runID ids.ID, workerID string, leaseSeconds time.Duration) error {
 	token := ids.New()
 	return s.q(ctx).CreateRunLease(ctx, db.CreateRunLeaseParams{
@@ -329,6 +397,22 @@ func (s *Service) AcquireLease(ctx context.Context, runID ids.ID, workerID strin
 		LeaseToken: token.Bytes(),
 		ExpiresAt:  time.Now().UTC().Add(leaseSeconds),
 	})
+}
+
+// HeartbeatLeaseFenced extends the lease; the WHERE carries the lease
+// token so only the owning worker (even after a worker-id recycle) can
+// renew it. Returns false when ownership is gone.
+func (s *Service) HeartbeatLeaseFenced(ctx context.Context, runID ids.ID, token ids.ID, leaseSeconds time.Duration) (bool, error) {
+	res, err := s.q(ctx).HeartbeatLeaseFenced(ctx, db.HeartbeatLeaseFencedParams{
+		ExpiresAt: time.Now().UTC().Add(leaseSeconds),
+		RunID:     runID.Bytes(),
+		LeaseToken: token.Bytes(),
+	})
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // HeartbeatLease extends the lease; worker_id in the WHERE makes it
@@ -346,19 +430,93 @@ func (s *Service) HeartbeatLease(ctx context.Context, runID ids.ID, workerID str
 	return n == 1, err
 }
 
-// ReleaseInterrupted requeues (or fails) a run after lease loss and
-// removes the lease.
-func (s *Service) ReleaseInterrupted(ctx context.Context, run *Run, reason string) error {
-	_ = s.AppendEvent(ctx, run.ID, EventRunInterrupted, map[string]any{"reason": reason})
-	if run.Attempt >= run.MaxAttempts {
-		if _, err := s.q(ctx).FailExpiredRun(ctx, db.FailExpiredRunParams{
-			ErrorMessage: nullText(reason),
-			ID:           run.ID.Bytes(),
+// CheckOwnership verifies the caller still holds the run at the given
+// lease epoch (run must still be running). Non-fenced writers (artifact
+// upserts, assistant message persistence) call this before writing.
+func (s *Service) CheckOwnership(ctx context.Context, runID ids.ID, epoch uint64) error {
+	if epoch == 0 {
+		return nil // unfenced system caller
+	}
+	var one int
+	err := s.DB.QueryRowContext(ctx,
+		`SELECT 1 FROM runs WHERE id = ? AND status = 'running' AND lease_epoch = ?`,
+		runID.Bytes(), epoch).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrLostOwnership
+	}
+	return err
+}
+
+// UpdateExternalRunIDFenced records the provider chat id (set-once) with
+// the lease fence: stale workers cannot stamp their external id onto a
+// run owned by someone else.
+func (s *Service) UpdateExternalRunIDFenced(ctx context.Context, run *Run, externalID string) error {
+	if externalID == "" {
+		return nil
+	}
+	if run.LeaseEpoch > 0 {
+		if err := s.q(ctx).UpdateRunExternalIDFenced(ctx, db.UpdateRunExternalIDFencedParams{
+			ExternalRunID: externalID,
+			ID:            run.ID.Bytes(),
+			LeaseEpoch:    run.LeaseEpoch,
 		}); err != nil {
 			return err
 		}
+		// Set-once guard: a fenced no-op is fine when already written; the
+		// ownership predicate is checked separately.
+		return s.CheckOwnership(ctx, run.ID, run.LeaseEpoch)
+	}
+	return s.q(ctx).UpdateRunExternalID(ctx, db.UpdateRunExternalIDParams{
+		ExternalRunID: externalID,
+		ID:            run.ID.Bytes(),
+	})
+}
+
+// ReleaseInterrupted requeues (or fails) a run after lease loss and
+// removes the lease.
+func (s *Service) ReleaseInterrupted(ctx context.Context, run *Run, reason string) error {
+	return s.releaseInterrupted(ctx, run, reason, 0)
+}
+
+// ReleaseInterruptedFenced is the worker-owned variant: the requeue/fail
+// CAS and the lease delete carry the claim-time fence, so a stale worker
+// cannot requeue or drop the new owner's lease.
+func (s *Service) ReleaseInterruptedFenced(ctx context.Context, run *Run, reason string) error {
+	return s.releaseInterrupted(ctx, run, reason, run.LeaseEpoch)
+}
+
+func (s *Service) releaseInterrupted(ctx context.Context, run *Run, reason string, epoch uint64) error {
+	_ = s.AppendEvent(ctx, run.ID, EventRunInterrupted, map[string]any{"reason": reason})
+	fenced := epoch > 0
+	if run.Attempt >= run.MaxAttempts {
+		var err error
+		if fenced {
+			_, err = s.q(ctx).FailRunFenced(ctx, db.FailRunFencedParams{
+				ErrorCode:    "interrupted",
+				ErrorMessage: nullText(reason),
+				ID:           run.ID.Bytes(),
+				LeaseEpoch:   epoch,
+			})
+		} else {
+			_, err = s.q(ctx).FailExpiredRun(ctx, db.FailExpiredRunParams{
+				ErrorMessage: nullText(reason),
+				ID:           run.ID.Bytes(),
+			})
+		}
+		if err != nil {
+			return err
+		}
 	} else {
-		if err := s.q(ctx).RequeueRun(ctx, run.ID.Bytes()); err != nil {
+		var err error
+		if fenced {
+			_, err = s.q(ctx).RequeueRunFenced(ctx, db.RequeueRunFencedParams{
+				ID:         run.ID.Bytes(),
+				LeaseEpoch: epoch,
+			})
+		} else {
+			err = s.q(ctx).RequeueRun(ctx, run.ID.Bytes())
+		}
+		if err != nil {
 			return err
 		}
 		// Re-dispatch through the outbox so the queue wakes a worker.
@@ -366,6 +524,11 @@ func (s *Service) ReleaseInterrupted(ctx context.Context, run *Run, reason strin
 		_, _ = s.q(ctx).CreateOutboxEvent(ctx, db.CreateOutboxEventParams{
 			Aggregate: "run", AggregateID: run.ID.Bytes(),
 			EventType: "run.dispatch", Payload: dbtypes.JSONText(payload),
+		})
+	}
+	if fenced {
+		return s.q(ctx).DeleteLeaseFenced(ctx, db.DeleteLeaseFencedParams{
+			RunID: run.ID.Bytes(), LeaseToken: run.LeaseToken.Bytes(),
 		})
 	}
 	return s.q(ctx).DeleteLease(ctx, run.ID.Bytes())
@@ -420,6 +583,11 @@ type FinishInput struct {
 
 // Finish applies the terminal CAS (any non-terminal → terminal) and emits
 // the terminal event. Idempotent: losing the race is a no-op.
+//
+// When the run carries claim-time fencing (worker-owned path), the CAS and
+// the lease delete are fenced by lease_epoch/lease_token: a stale worker
+// can neither finish a run it no longer owns nor drop the new owner's
+// lease (评测 P0-3).
 func (s *Service) Finish(ctx context.Context, run *Run, in *FinishInput) error {
 	output := in.Output
 	outputJSON := dbtypes.JSONText([]byte("null"))
@@ -427,23 +595,55 @@ func (s *Service) Finish(ctx context.Context, run *Run, in *FinishInput) error {
 		raw, _ := json.Marshal(output)
 		outputJSON = dbtypes.JSONText(raw)
 	}
-	res, err := s.q(ctx).CASFinishRun(ctx, db.CASFinishRunParams{
-		Status:               in.Status,
-		Output:               outputJSON,
-		ProviderStatus:       in.ProviderStatus,
-		ProviderFinishReason: in.FinishReason,
-		ErrorCode:            in.ErrorCode,
-		ErrorMessage:         nullText(in.ErrorMessage),
-		ID:                   run.ID.Bytes(),
-	})
+	fenced := run.LeaseEpoch > 0
+	var res sql.Result
+	var err error
+	if fenced {
+		res, err = s.q(ctx).CASFinishRunFenced(ctx, db.CASFinishRunFencedParams{
+			Status:               in.Status,
+			Output:               outputJSON,
+			ProviderStatus:       in.ProviderStatus,
+			ProviderFinishReason: in.FinishReason,
+			ErrorCode:            in.ErrorCode,
+			ErrorMessage:         nullText(in.ErrorMessage),
+			ID:                   run.ID.Bytes(),
+			LeaseEpoch:           run.LeaseEpoch,
+		})
+	} else {
+		res, err = s.q(ctx).CASFinishRun(ctx, db.CASFinishRunParams{
+			Status:               in.Status,
+			Output:               outputJSON,
+			ProviderStatus:       in.ProviderStatus,
+			ProviderFinishReason: in.FinishReason,
+			ErrorCode:            in.ErrorCode,
+			ErrorMessage:         nullText(in.ErrorMessage),
+			ID:                   run.ID.Bytes(),
+		})
+	}
 	if err != nil {
 		return err
 	}
-	// Lease removal happens unconditionally (even when the CAS lost).
-	_ = s.q(ctx).DeleteLease(ctx, run.ID.Bytes())
-
-	if n, _ := res.RowsAffected(); n != 1 {
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		if fenced {
+			// Either already terminal (idempotent) or the fence lost.
+			row, gerr := s.q(ctx).GetRunStatus(ctx, run.ID.Bytes())
+			if gerr == nil && IsTerminal(row) {
+				return nil // already terminal elsewhere — nothing to emit
+			}
+			// Non-terminal but the CAS missed: another worker owns the run.
+			return ErrLostOwnership
+		}
 		return nil // already terminal — nothing to emit
+	}
+	if fenced {
+		// Fenced lease removal: only the owner deletes its own lease row.
+		_ = s.q(ctx).DeleteLeaseFenced(ctx, db.DeleteLeaseFencedParams{
+			RunID: run.ID.Bytes(), LeaseToken: run.LeaseToken.Bytes(),
+		})
+	} else {
+		// Lease removal happens unconditionally (even when the CAS lost).
+		_ = s.q(ctx).DeleteLease(ctx, run.ID.Bytes())
 	}
 	payload := map[string]any{
 		"status":          in.Status,
@@ -513,6 +713,17 @@ func (s *Service) Finish(ctx context.Context, run *Run, in *FinishInput) error {
 // AppendEvent allocates the next per-run sequence under a row lock on the
 // run, inserts the event, and fans it out to Redis pub/sub (best-effort).
 func (s *Service) AppendEvent(ctx context.Context, runID ids.ID, eventType string, payload map[string]any) error {
+	return s.appendEvent(ctx, runID, 0, eventType, payload)
+}
+
+// AppendEventFenced is the worker-owned variant: the sequence-allocation
+// lock also checks the lease fence, so a stale worker (lease reclaimed by
+// another owner) is rejected with ErrLostOwnership before any write.
+func (s *Service) AppendEventFenced(ctx context.Context, run *Run, eventType string, payload map[string]any) error {
+	return s.appendEvent(ctx, run.ID, run.LeaseEpoch, eventType, payload)
+}
+
+func (s *Service) appendEvent(ctx context.Context, runID ids.ID, epoch uint64, eventType string, payload map[string]any) error {
 	if payload == nil {
 		payload = map[string]any{}
 	}
@@ -525,7 +736,19 @@ func (s *Service) AppendEvent(ctx context.Context, runID ids.ID, eventType strin
 	defer func() { _ = tx.Rollback() }()
 
 	// Serialize sequence allocation per run via SELECT ... FOR UPDATE.
-	if _, err := tx.ExecContext(ctx, `SELECT id FROM runs WHERE id = ? FOR UPDATE`, runID.Bytes()); err != nil {
+	// The fenced variant adds the ownership predicate in the same
+	// statement: no row = the caller lost the run.
+	var lockEpoch uint64
+	lockSQL := `SELECT id FROM runs WHERE id = ? FOR UPDATE`
+	if epoch > 0 {
+		lockSQL = `SELECT lease_epoch FROM runs WHERE id = ? AND status = 'running' AND lease_epoch = ? FOR UPDATE`
+		if err := tx.QueryRowContext(ctx, lockSQL, runID.Bytes(), epoch).Scan(&lockEpoch); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrLostOwnership
+			}
+			return err
+		}
+	} else if _, err := tx.ExecContext(ctx, lockSQL, runID.Bytes()); err != nil {
 		return err
 	}
 	var count uint64
@@ -546,6 +769,14 @@ func (s *Service) AppendEvent(ctx context.Context, runID ids.ID, eventType strin
 
 	s.publishLive(ctx, runID, count+1, eventType, payload)
 	return nil
+}
+
+// PublishTransient fans a HIGH-FREQUENCY event (content.delta) to live
+// SSE consumers through Redis pub/sub WITHOUT persisting it (评测 P1:
+// run_events write amplification). Transient frames use sequence 0 —
+// the SSE gateway forwards them live but they never appear in replay.
+func (s *Service) PublishTransient(ctx context.Context, runID ids.ID, eventType string, payload map[string]any) {
+	s.publishLive(ctx, runID, 0, eventType, payload)
 }
 
 // publishLive fans an event out to the SSE gateway via Redis pub/sub.

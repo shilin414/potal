@@ -2,12 +2,14 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"time"
 
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
 )
 
 func testLogger() *slog.Logger {
@@ -31,6 +33,29 @@ func dbCreateRunFixture(id []byte, provider string, input, snapshot []byte) db.C
 func dbForceExpireParams(runID []byte) db.HeartbeatLeaseParams {
 	past := time.Now().UTC().Add(-1 * time.Second)
 	return db.HeartbeatLeaseParams{ExpiresAt: past, RunID: runID, WorkerID: "dead-worker"}
+}
+
+// heartbeatExpireParams pushes a specific worker's lease into the past.
+func heartbeatExpireParams(past time.Time, runID []byte, workerID string) db.HeartbeatLeaseParams {
+	return db.HeartbeatLeaseParams{ExpiresAt: past, RunID: runID, WorkerID: workerID}
+}
+
+// outboxFixture builds a run.dispatch outbox row for the relay test.
+func outboxFixture(aggregate string, aggregateID []byte, provider string) db.CreateOutboxEventParams {
+	payload := fmt.Sprintf(`{"run_id":%q,"provider":%q}`, idsFromBytes(aggregateID), provider)
+	return db.CreateOutboxEventParams{
+		Aggregate:   aggregate,
+		AggregateID: aggregateID,
+		EventType:   "run.dispatch",
+		Payload:     dbtypes.JSONText([]byte(payload)),
+	}
+}
+
+// idsFromBytes renders BINARY(16) as a canonical UUID string.
+func idsFromBytes(b []byte) string {
+	id := ids.ID{}
+	_ = id.Scan(b)
+	return id.String()
 }
 
 // dbFinishRunParams marks a fixture run terminal directly.

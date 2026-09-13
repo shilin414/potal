@@ -22,6 +22,8 @@ type Querier interface {
 	// row another worker is already sending (no double Feishu messages).
 	CASClaimDelivery(ctx context.Context, id []byte) (sql.Result, error)
 	// CAS claim: exactly one worker wins; affected_rows == 1 means success.
+	// lease_epoch bump is the fencing token: every later write by the winning
+	// worker must match the new epoch, so stale workers lose ownership.
 	CASClaimRun(ctx context.Context, id []byte) (sql.Result, error)
 	CASFinishDelivery(ctx context.Context, arg CASFinishDeliveryParams) (sql.Result, error)
 	// Run terminal fan-out: occurrence converges with the run's outcome
@@ -29,8 +31,15 @@ type Querier interface {
 	CASFinishOccurrenceByRun(ctx context.Context, arg CASFinishOccurrenceByRunParams) (sql.Result, error)
 	// Terminal-only transition; 0 rows affected = already terminal (idempotent).
 	CASFinishRun(ctx context.Context, arg CASFinishRunParams) (sql.Result, error)
+	// Fenced terminal transition: only the current lease epoch may finish a
+	// running run. 0 rows = already terminal (idempotent) OR lost ownership.
+	CASFinishRunFenced(ctx context.Context, arg CASFinishRunFencedParams) (sql.Result, error)
 	CacheArtifactURL(ctx context.Context, arg CacheArtifactURLParams) error
 	ClearDefaultAgent(ctx context.Context) error
+	// Admission check for a pending occurrence: does anything OTHER than
+	// itself still hold the schedule's execution slot (queued/running)?
+	// A pending row does not block its own admission.
+	CountActiveOccurrencesExcluding(ctx context.Context, arg CountActiveOccurrencesExcludingParams) (int64, error)
 	CountConversationByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
 	CountMessagesByConversation(ctx context.Context, conversationID uint64) (int64, error)
 	CountPendingOutbox(ctx context.Context) (int64, error)
@@ -76,6 +85,9 @@ type Querier interface {
 	DeleteConversationRuns(ctx context.Context, conversationID sql.NullInt64) ([][]byte, error)
 	DeleteFavorite(ctx context.Context, arg DeleteFavoriteParams) error
 	DeleteLease(ctx context.Context, runID []byte) error
+	// A worker may only delete its own lease; a stale worker can never drop
+	// the new owner's lease row.
+	DeleteLeaseFenced(ctx context.Context, arg DeleteLeaseFencedParams) error
 	DeleteLeaseIfExpired(ctx context.Context, runID []byte) (sql.Result, error)
 	DeleteRunArtifacts(ctx context.Context, runID []byte) error
 	DeleteRunCommands(ctx context.Context, runID []byte) error
@@ -88,6 +100,7 @@ type Querier interface {
 	DeleteThreadByConversation(ctx context.Context, conversationID uint64) error
 	FailExpiredRun(ctx context.Context, arg FailExpiredRunParams) (sql.Result, error)
 	FailOutboxEvent(ctx context.Context, arg FailOutboxEventParams) error
+	FailRunFenced(ctx context.Context, arg FailRunFencedParams) (sql.Result, error)
 	FailStuckDeliveries(ctx context.Context, arg FailStuckDeliveriesParams) (sql.Result, error)
 	FindBinding(ctx context.Context, arg FindBindingParams) (RuntimeBinding, error)
 	GetAgentThreadByConversation(ctx context.Context, conversationID uint64) (AgentThread, error)
@@ -113,6 +126,7 @@ type Querier interface {
 	GetRunArtifactByID(ctx context.Context, id []byte) (RunArtifact, error)
 	GetRunByID(ctx context.Context, id []byte) (Run, error)
 	GetRunCommandByID(ctx context.Context, id []byte) (RunCommand, error)
+	GetRunLeaseEpoch(ctx context.Context, id []byte) (uint64, error)
 	GetRunStatus(ctx context.Context, id []byte) (string, error)
 	GetScheduleByID(ctx context.Context, id uint64) (Schedule, error)
 	GetScheduleDeliveryByID(ctx context.Context, id uint64) (ScheduleDelivery, error)
@@ -122,9 +136,15 @@ type Querier interface {
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	HasActiveOccurrence(ctx context.Context, scheduleID uint64) (int64, error)
 	HeartbeatLease(ctx context.Context, arg HeartbeatLeaseParams) (sql.Result, error)
+	// Ownership-checked by lease token (not worker_id): a recycled worker id
+	// cannot renew a lease it no longer owns.
+	HeartbeatLeaseFenced(ctx context.Context, arg HeartbeatLeaseFencedParams) (sql.Result, error)
 	IncrementApplicationUsage(ctx context.Context, id uint64) error
 	LatestOccurrenceBySchedule(ctx context.Context, scheduleID uint64) (ScheduleOccurrence, error)
 	ListActiveProviders(ctx context.Context) ([]Provider, error)
+	// Occurrence admission queue (overlap=queue semantics): pending rows are
+	// converted into runs once the schedule has no active execution.
+	ListAdmissiblePendingOccurrences(ctx context.Context, limit int32) ([]ScheduleOccurrence, error)
 	ListAllRunEvents(ctx context.Context, runID []byte) ([]RunEvent, error)
 	// show_all lets staff bypass the SQL pre-filter; the authoritative
 	// scope check still happens in Go (visible()).
@@ -171,6 +191,7 @@ type Querier interface {
 	ReclaimStuckDeliveries(ctx context.Context, updatedAt time.Time) (sql.Result, error)
 	RequeueDelivery(ctx context.Context, arg RequeueDeliveryParams) (sql.Result, error)
 	RequeueRun(ctx context.Context, id []byte) error
+	RequeueRunFenced(ctx context.Context, arg RequeueRunFencedParams) (sql.Result, error)
 	RevokeConversationShare(ctx context.Context, arg RevokeConversationShareParams) error
 	RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) error
 	SetApplicationEnabled(ctx context.Context, arg SetApplicationEnabledParams) error
@@ -190,6 +211,8 @@ type Querier interface {
 	UpdateFeishuIdentityLogin(ctx context.Context, arg UpdateFeishuIdentityLoginParams) error
 	// Set-once semantic guarded in Go (only write when empty).
 	UpdateRunExternalID(ctx context.Context, arg UpdateRunExternalIDParams) error
+	// Set-once semantic guarded in Go (only write when empty) + fence.
+	UpdateRunExternalIDFenced(ctx context.Context, arg UpdateRunExternalIDFencedParams) error
 	UpdateSchedule(ctx context.Context, arg UpdateScheduleParams) (sql.Result, error)
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (sql.Result, error)

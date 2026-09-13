@@ -147,6 +147,23 @@ WHERE run_id = ? AND status NOT IN ('succeeded', 'failed', 'skipped');
 SELECT COUNT(*) AS n FROM schedule_occurrences
 WHERE schedule_id = ? AND status IN ('pending', 'queued', 'running');
 
+-- name: CountActiveOccurrencesExcluding :one
+-- Admission check for a pending occurrence: does anything OTHER than
+-- itself still hold the schedule's execution slot (queued/running)?
+-- A pending row does not block its own admission.
+SELECT COUNT(*) AS n FROM schedule_occurrences
+WHERE schedule_id = ? AND id != ? AND status IN ('queued', 'running');
+
+-- name: ListAdmissiblePendingOccurrences :many
+-- Occurrence admission queue (overlap=queue semantics): pending rows are
+-- converted into runs once the schedule has no active execution.
+SELECT id, schedule_id, scheduled_at, enqueued_at, admitted_at, run_id, status,
+       triggered_at, finished_at, created_at, updated_at
+FROM schedule_occurrences
+WHERE status = 'pending'
+ORDER BY id
+LIMIT ?;
+
 -- name: CountSkippedOccurrencesForSlot :one
 SELECT COUNT(*) AS n FROM schedule_occurrences
 WHERE schedule_id = ? AND scheduled_at = ? AND status = 'skipped';

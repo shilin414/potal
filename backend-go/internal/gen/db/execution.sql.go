@@ -66,11 +66,14 @@ func (q *Queries) BindAttachmentToRun(ctx context.Context, arg BindAttachmentToR
 
 const cASClaimRun = `-- name: CASClaimRun :execresult
 UPDATE runs
-SET status = 'running', started_at = CURRENT_TIMESTAMP(3), attempt = attempt + 1
+SET status = 'running', started_at = CURRENT_TIMESTAMP(3), attempt = attempt + 1,
+    lease_epoch = lease_epoch + 1
 WHERE id = ? AND status = 'queued'
 `
 
 // CAS claim: exactly one worker wins; affected_rows == 1 means success.
+// lease_epoch bump is the fencing token: every later write by the winning
+// worker must match the new epoch, so stale workers lose ownership.
 func (q *Queries) CASClaimRun(ctx context.Context, id []byte) (sql.Result, error) {
 	return q.db.ExecContext(ctx, cASClaimRun, id)
 }
@@ -102,6 +105,39 @@ func (q *Queries) CASFinishRun(ctx context.Context, arg CASFinishRunParams) (sql
 		arg.ErrorCode,
 		arg.ErrorMessage,
 		arg.ID,
+	)
+}
+
+const cASFinishRunFenced = `-- name: CASFinishRunFenced :execresult
+UPDATE runs
+SET status = ?, output = ?, provider_status = ?, provider_finish_reason = ?,
+    error_code = ?, error_message = ?, finished_at = CURRENT_TIMESTAMP(3)
+WHERE id = ? AND status = 'running' AND lease_epoch = ?
+`
+
+type CASFinishRunFencedParams struct {
+	Status               string
+	Output               dbtypes.JSONText
+	ProviderStatus       string
+	ProviderFinishReason string
+	ErrorCode            string
+	ErrorMessage         sql.NullString
+	ID                   []byte
+	LeaseEpoch           uint64
+}
+
+// Fenced terminal transition: only the current lease epoch may finish a
+// running run. 0 rows = already terminal (idempotent) OR lost ownership.
+func (q *Queries) CASFinishRunFenced(ctx context.Context, arg CASFinishRunFencedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, cASFinishRunFenced,
+		arg.Status,
+		arg.Output,
+		arg.ProviderStatus,
+		arg.ProviderFinishReason,
+		arg.ErrorCode,
+		arg.ErrorMessage,
+		arg.ID,
+		arg.LeaseEpoch,
 	)
 }
 
@@ -359,6 +395,22 @@ func (q *Queries) DeleteLease(ctx context.Context, runID []byte) error {
 	return err
 }
 
+const deleteLeaseFenced = `-- name: DeleteLeaseFenced :exec
+DELETE FROM run_leases WHERE run_id = ? AND lease_token = ?
+`
+
+type DeleteLeaseFencedParams struct {
+	RunID      []byte
+	LeaseToken []byte
+}
+
+// A worker may only delete its own lease; a stale worker can never drop
+// the new owner's lease row.
+func (q *Queries) DeleteLeaseFenced(ctx context.Context, arg DeleteLeaseFencedParams) error {
+	_, err := q.db.ExecContext(ctx, deleteLeaseFenced, arg.RunID, arg.LeaseToken)
+	return err
+}
+
 const deleteLeaseIfExpired = `-- name: DeleteLeaseIfExpired :execresult
 DELETE FROM run_leases WHERE run_id = ? AND expires_at <= CURRENT_TIMESTAMP(3)
 `
@@ -398,6 +450,29 @@ type FailOutboxEventParams struct {
 func (q *Queries) FailOutboxEvent(ctx context.Context, arg FailOutboxEventParams) error {
 	_, err := q.db.ExecContext(ctx, failOutboxEvent, arg.LastError, arg.ID)
 	return err
+}
+
+const failRunFenced = `-- name: FailRunFenced :execresult
+UPDATE runs
+SET status = 'failed', error_code = ?, error_message = ?,
+    finished_at = CURRENT_TIMESTAMP(3)
+WHERE id = ? AND status = 'running' AND lease_epoch = ?
+`
+
+type FailRunFencedParams struct {
+	ErrorCode    string
+	ErrorMessage sql.NullString
+	ID           []byte
+	LeaseEpoch   uint64
+}
+
+func (q *Queries) FailRunFenced(ctx context.Context, arg FailRunFencedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, failRunFenced,
+		arg.ErrorCode,
+		arg.ErrorMessage,
+		arg.ID,
+		arg.LeaseEpoch,
+	)
 }
 
 const getAttachmentByID = `-- name: GetAttachmentByID :one
@@ -531,7 +606,7 @@ SELECT id, user_id, application_id, conversation_id, runtime_binding_id, organiz
        provider, runtime_type, external_run_id, status, provider_status, provider_finish_reason,
        input, output, runtime_snapshot, attempt, max_attempts, queued_at, started_at,
        finished_at, error_code, error_message, created_at, updated_at,
-       trigger_type, trigger_id, priority, available_at
+       trigger_type, trigger_id, priority, available_at, lease_epoch
 FROM runs WHERE id = ?
 `
 
@@ -567,6 +642,7 @@ func (q *Queries) GetRunByID(ctx context.Context, id []byte) (Run, error) {
 		&i.TriggerID,
 		&i.Priority,
 		&i.AvailableAt,
+		&i.LeaseEpoch,
 	)
 	return i, err
 }
@@ -590,6 +666,17 @@ func (q *Queries) GetRunCommandByID(ctx context.Context, id []byte) (RunCommand,
 		&i.ResolvedAt,
 	)
 	return i, err
+}
+
+const getRunLeaseEpoch = `-- name: GetRunLeaseEpoch :one
+SELECT lease_epoch FROM runs WHERE id = ?
+`
+
+func (q *Queries) GetRunLeaseEpoch(ctx context.Context, id []byte) (uint64, error) {
+	row := q.db.QueryRowContext(ctx, getRunLeaseEpoch, id)
+	var lease_epoch uint64
+	err := row.Scan(&lease_epoch)
+	return lease_epoch, err
 }
 
 const getRunStatus = `-- name: GetRunStatus :one
@@ -617,6 +704,24 @@ type HeartbeatLeaseParams struct {
 
 func (q *Queries) HeartbeatLease(ctx context.Context, arg HeartbeatLeaseParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, heartbeatLease, arg.ExpiresAt, arg.RunID, arg.WorkerID)
+}
+
+const heartbeatLeaseFenced = `-- name: HeartbeatLeaseFenced :execresult
+UPDATE run_leases
+SET heartbeat_at = CURRENT_TIMESTAMP(3), expires_at = ?
+WHERE run_id = ? AND lease_token = ?
+`
+
+type HeartbeatLeaseFencedParams struct {
+	ExpiresAt  time.Time
+	RunID      []byte
+	LeaseToken []byte
+}
+
+// Ownership-checked by lease token (not worker_id): a recycled worker id
+// cannot renew a lease it no longer owns.
+func (q *Queries) HeartbeatLeaseFenced(ctx context.Context, arg HeartbeatLeaseFencedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, heartbeatLeaseFenced, arg.ExpiresAt, arg.RunID, arg.LeaseToken)
 }
 
 const listAllRunEvents = `-- name: ListAllRunEvents :many
@@ -893,7 +998,7 @@ SELECT id, user_id, application_id, conversation_id, runtime_binding_id, organiz
        provider, runtime_type, external_run_id, status, provider_status, provider_finish_reason,
        input, output, runtime_snapshot, attempt, max_attempts, queued_at, started_at,
        finished_at, error_code, error_message, created_at, updated_at,
-       trigger_type, trigger_id, priority, available_at
+       trigger_type, trigger_id, priority, available_at, lease_epoch
 FROM runs WHERE conversation_id = ?
 ORDER BY created_at DESC
 `
@@ -936,6 +1041,7 @@ func (q *Queries) ListRunsByConversation(ctx context.Context, conversationID sql
 			&i.TriggerID,
 			&i.Priority,
 			&i.AvailableAt,
+			&i.LeaseEpoch,
 		); err != nil {
 			return nil, err
 		}
@@ -968,6 +1074,19 @@ func (q *Queries) RequeueRun(ctx context.Context, id []byte) error {
 	return err
 }
 
+const requeueRunFenced = `-- name: RequeueRunFenced :execresult
+UPDATE runs SET status = 'queued' WHERE id = ? AND status = 'running' AND lease_epoch = ?
+`
+
+type RequeueRunFencedParams struct {
+	ID         []byte
+	LeaseEpoch uint64
+}
+
+func (q *Queries) RequeueRunFenced(ctx context.Context, arg RequeueRunFencedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, requeueRunFenced, arg.ID, arg.LeaseEpoch)
+}
+
 const setAttachmentUploaded = `-- name: SetAttachmentUploaded :exec
 UPDATE runtime_attachments SET external_attachment_id = ?, status = 'uploaded' WHERE id = ?
 `
@@ -994,6 +1113,22 @@ type UpdateRunExternalIDParams struct {
 // Set-once semantic guarded in Go (only write when empty).
 func (q *Queries) UpdateRunExternalID(ctx context.Context, arg UpdateRunExternalIDParams) error {
 	_, err := q.db.ExecContext(ctx, updateRunExternalID, arg.ExternalRunID, arg.ID)
+	return err
+}
+
+const updateRunExternalIDFenced = `-- name: UpdateRunExternalIDFenced :exec
+UPDATE runs SET external_run_id = ? WHERE id = ? AND external_run_id = '' AND lease_epoch = ?
+`
+
+type UpdateRunExternalIDFencedParams struct {
+	ExternalRunID string
+	ID            []byte
+	LeaseEpoch    uint64
+}
+
+// Set-once semantic guarded in Go (only write when empty) + fence.
+func (q *Queries) UpdateRunExternalIDFenced(ctx context.Context, arg UpdateRunExternalIDFencedParams) error {
+	_, err := q.db.ExecContext(ctx, updateRunExternalIDFenced, arg.ExternalRunID, arg.ID, arg.LeaseEpoch)
 	return err
 }
 

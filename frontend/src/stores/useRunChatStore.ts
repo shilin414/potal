@@ -254,6 +254,16 @@ export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<
       case 'content.delta':
         message.content += event.payload?.text || '';
         break;
+      case 'content.chunk':
+        // Persisted coalesced chunk: carries a cumulative `snapshot` when
+        // available (replace = self-healing, no dup on replay), else the
+        // incremental text (append).
+        if (typeof event.payload?.snapshot === 'string') {
+          message.content = event.payload.snapshot;
+        } else {
+          message.content += event.payload?.text || '';
+        }
+        break;
       case 'artifact.discovered': {
         const artifacts = [...(message.artifacts || [])];
         const artifactId = event.payload?.artifact_id

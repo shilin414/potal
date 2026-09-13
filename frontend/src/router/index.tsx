@@ -22,8 +22,10 @@ import SkillsPage from '@/pages/Skills/SkillsPage';
 import { SchedulesPage } from '@/pages/Schedules/SchedulesPage';
 
 // Auth pages stay outside the shell entirely.
+// 普通用户 = 飞书 SSO Only（/login 自动发起 OAuth）；管理员 = /login/admin。
 import LoginPage from '@/pages/Auth/LoginPage';
-import RegisterPage from '@/pages/Auth/RegisterPage';
+import FeishuAutoLoginPage from '@/pages/Auth/FeishuAutoLoginPage';
+import AdminLoginPage from '@/pages/Auth/AdminLoginPage';
 import SsoCallbackPage from '@/pages/Auth/SsoCallbackPage';
 import FeishuCallbackPage from '@/pages/Auth/FeishuCallbackPage';
 
@@ -115,6 +117,16 @@ const router = createBrowserRouter([
     ],
   },
   // ── Auth (no shell) ───────────────────────────────────────────────────
+  // /login：普通用户入口，自动发起飞书 OAuth（Feishu SSO Only）。
+  {
+    path: '/login',
+    element: <AuthLayout><PublicRoute><FeishuAutoLoginPage /></PublicRoute></AuthLayout>,
+  },
+  // /login/admin：管理员本地账号口令登录（唯一出现用户名密码的入口）。
+  {
+    path: '/login/admin',
+    element: <AuthLayout><AdminLoginPage /></AuthLayout>,
+  },
   {
     path: '/auth/sso/callback',
     element: <AuthLayout><SsoCallbackPage /></AuthLayout>,
@@ -123,13 +135,10 @@ const router = createBrowserRouter([
     path: '/auth/feishu/callback',
     element: <AuthLayout><FeishuCallbackPage /></AuthLayout>,
   },
+  // /auth/login：飞书登录 fallback（OAuth 失败时的重试入口，无密码/注册）。
   {
     path: '/auth/login',
     element: <AuthLayout><PublicRoute><LoginPage /></PublicRoute></AuthLayout>,
-  },
-  {
-    path: '/auth/register',
-    element: <AuthLayout><PublicRoute><RegisterPage /></PublicRoute></AuthLayout>,
   },
   // ── Public share snapshot (no shell, works logged-out) ─────────────────
   {

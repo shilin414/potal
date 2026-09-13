@@ -37,6 +37,7 @@ const (
 	EventRunStarted         = "run.started"
 	EventContentStarted     = "content.started"
 	EventContentDelta       = "content.delta"
+	EventContentChunk       = "content.chunk"
 	EventContentCompleted   = "content.completed"
 	EventContentSnapshot    = "content.snapshot"
 	EventToolStarted        = "tool.started"
@@ -82,6 +83,16 @@ type Run struct {
 	TriggerID            *int64
 	Priority             string
 	AvailableAt          *time.Time
+
+	// Lease fencing (claim-time capture, never persisted/reloaded from the
+	// DB): LeaseEpoch is the runs.lease_epoch value this worker bumped when
+	// it won the claim; LeaseToken identifies its run_leases row. Both are
+	// set by the worker right after a successful claim and MUST NOT be
+	// refreshed from the database — a stale worker would otherwise pick up
+	// the new owner's epoch and defeat the fence. Zero values mark an
+	// unfenced (system/reaper) caller.
+	LeaseEpoch uint64
+	LeaseToken ids.ID
 }
 
 // InputContent returns the user content items sent to the provider.

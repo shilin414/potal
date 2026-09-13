@@ -217,6 +217,7 @@ type Run struct {
 	TriggerID            sql.NullInt64
 	Priority             string
 	AvailableAt          sql.NullTime
+	LeaseEpoch           uint64
 }
 
 type RunArtifact struct {
