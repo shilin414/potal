@@ -450,7 +450,19 @@ func (s *Server) OpenArtifact(w http.ResponseWriter, r *http.Request, artifactId
 		writeDetail(w, http.StatusNotFound, "artifact not found")
 		return
 	}
+	s.serveArtifactRedirect(w, r, row, run)
+}
 
+// serveArtifactRedirect is the shared tail of every artifact open flow:
+// fresh cached URL → provider resolve → 302 to the signed target URL.
+// Authorization happens in the callers; the bytes never touch this service.
+//
+// The redirect is what inline chat <img> elements hit repeatedly; without a
+// Cache-Control header every remount re-requests it. Browsers do not cache
+// 302 by default, so allow a short private cache: after it expires the
+// /open call still hits the 23h DB cache (no provider round-trip), and the
+// signed target URL itself is valid for 24h.
+func (s *Server) serveArtifactRedirect(w http.ResponseWriter, r *http.Request, row db.RunArtifact, run *execution.Run) {
 	// Cached URL still fresh? (refresh when <25min of validity remains)
 	now := time.Now().UTC()
 	if row.CachedExternalUrl.String != "" && row.CachedUrlExpiresAt.Valid &&
@@ -497,7 +509,7 @@ func (s *Server) OpenArtifact(w http.ResponseWriter, r *http.Request, artifactId
 	if name == "" {
 		name = row.Name
 	}
-	if err := s.Runs.Querier().CacheArtifactURL(r.Context(), genCacheArtifactParams(ref.URL, expires, name, name, artID.Bytes())); err != nil {
+	if err := s.Runs.Querier().CacheArtifactURL(r.Context(), genCacheArtifactParams(ref.URL, expires, name, name, row.ID)); err != nil {
 		s.Log.Warn("cache artifact url failed", "err", err)
 	}
 	w.Header().Set("Cache-Control", "private, max-age=1800")

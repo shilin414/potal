@@ -5,20 +5,22 @@
  * `AppShell → WorkspaceHost → PageRenderer` instead of a full page
  * navigation, so returning to the previous workspace restores it.
  *
- * The concrete UI is delegated to the renderer registry: the application's
- * `renderer_key` selects the runner, exactly like the console runtime page.
+ * The concrete UI comes from the renderer registry keyed on the
+ * application's `renderer_key` (§99/§100). Fixed applications are
+ * code-deployed: their renderer_key is wired here as the 页面/后端逻辑
+ * lands; until then every registered key renders the shared 占位页 so
+ * the 跳转 → 使用 → 返回 loop is complete.
  */
-import React, { useEffect, useState } from 'react';
-import { Button, Empty, Spin } from 'antd';
+import React, { useEffect } from 'react';
+import { Button, Empty } from 'antd';
 import { ArrowLeftOutlined, StarFilled, StarOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
-import ApplicationRuntime from '@/components/Applications/ApplicationRuntime';
-import { useAppStore } from '@/stores/useAppStore';
 import { useApplicationCatalogStore } from '@/stores/useApplicationCatalogStore';
+import { useAuthStore } from '@/stores/useAuthStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
-import type { AppItem, ApplicationRuntime as ApplicationRuntimeData } from '@/types';
 import type { V2Application } from '@/services/runApi';
-import ApplicationSwitcher from './ApplicationSwitcher';
+import AgentAvatar from '@/components/Agents/AgentAvatar';
+import FixedAppPlaceholder from './FixedAppPlaceholder';
 
 interface Props {
   application: V2Application;
@@ -26,24 +28,45 @@ interface Props {
   kindLabel?: string;
 }
 
+/** A fixed-application page implementation (drops in as business logic lands). */
+type FixedAppRenderer = React.ComponentType<{ application: V2Application }>;
+
+/**
+ * renderer_key → page implementation. Seeded fixed apps (迁移 0005) register
+ * here from day one; replace the placeholder with the real runner when its
+ * 前后端逻辑 ships — the workspace, shortcuts and app center need no change.
+ */
+const FIXED_RENDERERS: Record<string, FixedAppRenderer> = {
+  'barcode-query': FixedAppPlaceholder,
+  'oa-unlock': FixedAppPlaceholder,
+  'oa-password': FixedAppPlaceholder,
+  'material-query': FixedAppPlaceholder,
+};
+
 const PageRenderer: React.FC<Props> = ({ application, kindLabel = '应用' }) => {
   const navigate = useNavigate();
-  const loadApp = useAppStore((state) => state.loadApp);
+  const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
   const toggleFavorite = useApplicationCatalogStore((state) => state.toggleFavorite);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
-  const [app, setApp] = useState<AppItem | null>(null);
-  const [loading, setLoading] = useState(true);
+  const previousApplicationId = useWorkspaceStore((state) => state.previousApplicationId);
 
   useEffect(() => { openApplication(application.id); }, [application.id, openApplication]);
 
-  useEffect(() => {
-    let active = true;
-    setLoading(true);
-    loadApp(application.slug)
-      .then((loaded) => { if (active) setApp(loaded); })
-      .finally(() => { if (active) setLoading(false); });
-    return () => { active = false; };
-  }, [application.slug, loadApp]);
+  /** §80: back goes to the workspace the user came from, never a reload. */
+  const goBack = () => {
+    const previous = previousApplicationId != null
+      ? useApplicationCatalogStore.getState().applicationById(previousApplicationId)
+      : undefined;
+    if (previous) {
+      navigate(previous.kind === 'chat'
+        ? `/chat/${previous.slug}`
+        : `/${previous.kind === 'workflow' ? 'workflow' : 'app'}/${previous.slug}`);
+    } else {
+      navigate('/');
+    }
+  };
+
+  const Renderer = FIXED_RENDERERS[application.renderer_key || ''];
 
   return (
     <div className="workspace-host">
@@ -52,16 +75,19 @@ const PageRenderer: React.FC<Props> = ({ application, kindLabel = '应用' }) =>
           type="text"
           size="small"
           icon={<ArrowLeftOutlined />}
-          onClick={() => navigate('/')}
+          onClick={goBack}
         >
           返回工作台
         </Button>
-        <span className="application-switcher__icon">{application.icon || '✦'}</span>
+        <AgentAvatar application={application} size={22} shape="circle" />
         <strong>{application.name}</strong>
         <span className="home-shortcut__desc">
           {kindLabel}
           {application.renderer_key ? ` · ${application.renderer_key}` : ''}
         </span>
+        {isStaff && !application.enabled && (
+          <span className="home-shortcut__desc">已停用（仅管理员可见）</span>
+        )}
         <span className="chat-renderer__head-spacer" />
         <Button
           type="text"
@@ -71,17 +97,17 @@ const PageRenderer: React.FC<Props> = ({ application, kindLabel = '应用' }) =>
         />
       </header>
       <div className="chat-renderer__body">
-        {loading ? (
-          <div className="workspace-host__loading"><Spin size="large" /></div>
-        ) : app?.runtime ? (
-          <div className="workspace-host__frame">
-            <ApplicationRuntime application={app.runtime as ApplicationRuntimeData} />
-          </div>
+        {Renderer ? (
+          <Renderer application={application} />
         ) : (
           <div className="workspace-host__missing">
             <Empty
               image={Empty.PRESENTED_IMAGE_SIMPLE}
-              description="该应用暂无可运行配置"
+              description={
+                application.renderer_key
+                  ? `${application.name} 尚未注册界面：${application.renderer_key}`
+                  : `${application.name} 尚未配置页面`
+              }
             />
           </div>
         )}

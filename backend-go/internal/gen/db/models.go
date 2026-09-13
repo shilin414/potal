@@ -6,6 +6,7 @@ package gendb
 
 import (
 	"database/sql"
+	"encoding/json"
 	"time"
 
 	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
@@ -45,6 +46,7 @@ type Application struct {
 	OrganizationID sql.NullInt64
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+	Enabled        bool
 }
 
 type ApplicationCategory struct {
@@ -83,6 +85,36 @@ type Conversation struct {
 	Title          string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
+}
+
+type ConversationShare struct {
+	ID             uint64
+	Token          string
+	ConversationID uint64
+	UserID         uint64
+	CreatedAt      time.Time
+	RevokedAt      sql.NullTime
+	Snapshot       dbtypes.JSONText
+}
+
+type DeliveryExecution struct {
+	ID                 []byte
+	OccurrenceID       uint64
+	RunID              []byte
+	ScheduleDeliveryID uint64
+	SenderUserID       uint64
+	TargetType         string
+	TargetID           string
+	Status             string
+	ExternalMessageID  string
+	Attempt            uint32
+	MaxAttempts        uint32
+	NextAttemptAt      sql.NullTime
+	ErrorCode          string
+	ErrorMessage       sql.NullString
+	CreatedAt          time.Time
+	SentAt             sql.NullTime
+	UpdatedAt          time.Time
 }
 
 type FeishuIdentity struct {
@@ -181,6 +213,10 @@ type Run struct {
 	ErrorMessage         sql.NullString
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
+	TriggerType          string
+	TriggerID            sql.NullInt64
+	Priority             string
+	AvailableAt          sql.NullTime
 }
 
 type RunArtifact struct {
@@ -275,6 +311,59 @@ type RuntimeBinding struct {
 	Enabled            bool
 	CreatedAt          time.Time
 	UpdatedAt          time.Time
+}
+
+type Schedule struct {
+	ID                     uint64
+	OwnerUserID            uint64
+	Name                   string
+	Description            sql.NullString
+	ApplicationID          uint64
+	InputPayload           json.RawMessage
+	ScheduleType           string
+	CronExpression         string
+	TriggerConfig          json.RawMessage
+	Timezone               string
+	RunAt                  sql.NullTime
+	Enabled                bool
+	ConversationPolicy     string
+	ConversationID         sql.NullInt64
+	OverlapPolicy          string
+	MisfirePolicy          string
+	ExecutionWindowSeconds uint32
+	DeadlinePolicy         string
+	NextRunAt              sql.NullTime
+	LastRunAt              sql.NullTime
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
+type ScheduleDelivery struct {
+	ID                 uint64
+	ScheduleID         uint64
+	Channel            string
+	SenderIdentityMode string
+	TargetType         string
+	TargetID           string
+	TargetName         string
+	ContentMode        string
+	Enabled            bool
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+type ScheduleOccurrence struct {
+	ID          uint64
+	ScheduleID  uint64
+	ScheduledAt time.Time
+	EnqueuedAt  sql.NullTime
+	AdmittedAt  sql.NullTime
+	RunID       sql.NullString
+	Status      string
+	TriggeredAt sql.NullTime
+	FinishedAt  sql.NullTime
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 type User struct {

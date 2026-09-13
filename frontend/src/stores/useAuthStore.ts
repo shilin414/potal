@@ -15,6 +15,8 @@ interface User {
   /** 展示用 user_id（工号 / 飞书 user_id）；聊天里渲染成 姓名（user_id）。 */
   display_id?: string;
   auth_source?: string;
+  /** 管理员：可新建智能体、切换应用中心的 启用/公开 开关。 */
+  is_staff?: boolean;
   bio?: string;
   created_at: string;
 }

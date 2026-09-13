@@ -38,6 +38,7 @@ type applicationListItem struct {
 	CategorySlug       string         `json:"category_slug"`
 	CategoryName       string         `json:"category_name"`
 	IsPublic           bool           `json:"is_public"`
+	Enabled            bool           `json:"enabled"`
 	RuntimeType        string         `json:"runtime_type"`
 	ProviderKey        string         `json:"provider_key"`
 	ExternalResourceID string         `json:"external_resource_id"`
@@ -64,6 +65,7 @@ type applicationDetail struct {
 	Color              string `json:"color"`
 	Kind               string `json:"kind"`
 	IsPublic           bool   `json:"is_public"`
+	Enabled            bool   `json:"enabled"`
 	CategorySlug       string `json:"category_slug"`
 	CategoryName       string `json:"category_name"`
 	IsDefaultAgent     bool   `json:"is_default_agent"`
@@ -96,6 +98,7 @@ func (s *Server) appDetail(app *catalog.Application, binding *catalog.Binding, c
 		Color:          app.Color,
 		Kind:           app.Kind,
 		IsPublic:       app.IsPublic,
+		Enabled:        app.Enabled,
 		CategorySlug:   app.CategorySlug,
 		CategoryName:   app.CategoryName,
 		IsDefaultAgent: app.IsDefaultAgent,
@@ -287,6 +290,7 @@ func (s *Server) buildListItem(item catalog.ApplicationWithBinding, providers ma
 		Kind: app.Kind, RendererKey: app.RendererKey, ExecutorKey: app.ExecutorKey,
 		CategorySlug: app.CategorySlug, CategoryName: app.CategoryName,
 		IsPublic:    app.IsPublic,
+		Enabled:     app.Enabled,
 		RuntimeType: rt, ProviderKey: pk, ExternalResourceID: ext,
 		IdentityMode: im, ExecutionMode: em,
 		Capabilities: capsAny, IsBound: isBound,
@@ -319,6 +323,11 @@ func (s *Server) CreateApplication(w http.ResponseWriter, r *http.Request) {
 	caller := userFrom(r.Context())
 	if caller == nil {
 		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
+	// 智能体接入是管理员能力：普通用户只消费市场，不允许新建。
+	if !caller.IsStaff {
+		writeDetail(w, http.StatusForbidden, "只有管理员可以添加智能体，如需接入请联系平台管理员。")
 		return
 	}
 	var body struct {
@@ -398,6 +407,7 @@ func (s *Server) UpdateApplication(w http.ResponseWriter, r *http.Request, id ge
 		Icon            *string       `json:"icon"`
 		Color           *string       `json:"color"`
 		IsPublic        *bool         `json:"is_public"`
+		Enabled         *bool         `json:"enabled"`
 		CategorySlug    *string       `json:"category_slug"`
 		CategoryName    *string       `json:"category_name"`
 		Runtime         *runtimeInput `json:"runtime"`
@@ -412,7 +422,7 @@ func (s *Server) UpdateApplication(w http.ResponseWriter, r *http.Request, id ge
 		runtime = body.Runtime.toCatalog()
 	}
 	app, binding, err := s.Catalog.Update(r.Context(), int64(id), caller.ID, caller.IsStaff,
-		body.Name, body.Description, body.Icon, body.Color, body.IsPublic,
+		body.Name, body.Description, body.Icon, body.Color, body.IsPublic, body.Enabled,
 		body.CategorySlug, body.CategoryName, runtime, body.SetDefaultAgent)
 	if err != nil {
 		s.writeCatalogError(w, err)

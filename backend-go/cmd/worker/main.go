@@ -14,13 +14,14 @@ import (
 	"time"
 
 	"github.com/creation-agent-studio/backend-go/internal/app"
+	"github.com/creation-agent-studio/backend-go/internal/delivery"
 	"github.com/creation-agent-studio/backend-go/internal/execution"
 	"github.com/creation-agent-studio/backend-go/internal/platform/logging"
 	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
 )
 
 func main() {
-	provider := flag.String("provider", "feishu_aily", "provider queue to consume")
+	provider := flag.String("provider", "feishu_aily", "provider queue to consume (feishu_aily | feishu_delivery)")
 	once := flag.Bool("migrate", false, "run migrations before starting")
 	flag.Parse()
 
@@ -62,7 +63,8 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	// Outbox relay: TiDB → Redis Streams (§22).
+	// Outbox relay: TiDB → Redis Streams (§22). Also routes delivery
+	// outbox events to the feishu_delivery stream.
 	relay := execution.NewRelay(a.Runs, a.Redis, 200)
 	wg.Add(1)
 	go func() {
@@ -70,26 +72,38 @@ func main() {
 		relay.Run(runCtx, cfg.Runner.RelayInterval)
 	}()
 
-	// Provider worker pool.
-	worker := &execution.Worker{
-		Svc:         a.Runs,
-		RDB:         a.Redis,
-		Provider:    *provider,
-		WorkerID:    cfg.Runner.WorkerID,
-		Group:       "workers",
-		Handler:     a.AilyExecutor,
-		Concurrency: cfg.Runner.Concurrency,
-		Lease:       cfg.Runner.LeaseSeconds,
-		Heartbeat:   cfg.Runner.HeartbeatInterval,
-		ScanEvery:   cfg.Runner.ReaperInterval,
-		Log:         logger,
+	if *provider == delivery.ProviderKey {
+		// Delivery consumer pool: scheduled-run results → Feishu IM.
+		worker := delivery.NewWorker(a.DB, a.Redis, cfg.Runner.WorkerID,
+			a.DeliverySender, a.DeliveryLimiter, logger, a.Metrics)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			logger.Info("delivery worker consuming", "queue", delivery.ProviderKey)
+			worker.Run(runCtx)
+		}()
+	} else {
+		// Provider worker pool.
+		worker := &execution.Worker{
+			Svc:         a.Runs,
+			RDB:         a.Redis,
+			Provider:    *provider,
+			WorkerID:    cfg.Runner.WorkerID,
+			Group:       "workers",
+			Handler:     a.AilyExecutor,
+			Concurrency: cfg.Runner.Concurrency,
+			Lease:       cfg.Runner.LeaseSeconds,
+			Heartbeat:   cfg.Runner.HeartbeatInterval,
+			ScanEvery:   cfg.Runner.ReaperInterval,
+			Log:         logger,
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			logger.Info("worker consuming", "provider", *provider, "concurrency", cfg.Runner.Concurrency)
+			worker.Run(runCtx)
+		}()
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		logger.Info("worker consuming", "provider", *provider, "concurrency", cfg.Runner.Concurrency)
-		worker.Run(runCtx)
-	}()
 
 	<-runCtx.Done()
 	logger.Info("worker shutting down (in-flight runs keep their leases; the reaper recovers orphans)")

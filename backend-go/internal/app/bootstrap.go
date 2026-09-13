@@ -23,6 +23,7 @@ func NewServer(cfg *config.Config, a *App) *transporthttp.Server {
 		StateCodec:   a.StateCodec,
 		Oauth:        a.Oauth,
 		Feishu:       a.Feishu,
+		FeishuAuth:   a.AilyExecutor.Auth,
 
 		Catalog:     a.Catalog,
 		CatalogRepo: a.CatalogRepo,
@@ -31,6 +32,9 @@ func NewServer(cfg *config.Config, a *App) *transporthttp.Server {
 		Runs:               a.Runs,
 		Storage:            a.Storage,
 		RateLimitArtifacts: a.ArtifactsRL,
+
+		Schedules: a.Schedules,
+		Scheduler: a.Scheduler,
 
 		SSE: &sse.Gateway{Runs: a.Runs, Redis: a.Redis},
 	}

@@ -23,6 +23,7 @@ import {
 import { useNavigate } from 'react-router-dom';
 import { useAgentStore } from '@/stores/useAgentStore';
 import { useApplicationCatalogStore } from '@/stores/useApplicationCatalogStore';
+import { useAuthStore } from '@/stores/useAuthStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import AgentDetailModal from '@/components/Agents/AgentDetailModal';
 import AgentEditorModal, { type AgentEditorMode } from '@/components/Agents/AgentEditorModal';
@@ -74,6 +75,8 @@ const AgentsPage: React.FC = () => {
 
   const reloadCatalog = useApplicationCatalogStore((state) => state.load);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
+  // 智能体接入是管理员能力：普通用户只消费市场。
+  const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
   const isFirstRun = useRef(true);
 
   const loadAppAgents = useCallback(async () => {
@@ -355,13 +358,15 @@ const AgentsPage: React.FC = () => {
 
       <div className="page-toolbar">
         <div className="page-toolbar-left">
-          <Button
-            type="primary"
-            icon={<PlusOutlined />}
-            onClick={() => openEditor(null, 'runtime')}
-          >
-            新建智能体
-          </Button>
+          {isStaff && (
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={() => openEditor(null, 'runtime')}
+            >
+              新建智能体
+            </Button>
+          )}
           <Segmented
             value={source}
             onChange={(value) => setSource(value as SourceFilter)}

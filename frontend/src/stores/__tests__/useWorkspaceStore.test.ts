@@ -33,6 +33,22 @@ describe('useWorkspaceStore (UI state only)', () => {
     expect(state.recentApplicationIds).toEqual([7]);
   });
 
+  it('records the workspace the user came from (§80 固定应用返回)', () => {
+    const store = useWorkspaceStore.getState();
+    store.openApplication(11); // chat workspace
+    store.openApplication(42); // fixed app opened on top of it
+    expect(useWorkspaceStore.getState().previousApplicationId).toBe(11);
+
+    // Returning to the chat workspace re-points "previous" at the fixed app.
+    store.openApplication(11);
+    expect(useWorkspaceStore.getState().previousApplicationId).toBe(42);
+
+    // Re-opening the SAME application must not clobber the return target
+    // (catalog refreshes re-run the open effect).
+    store.openApplication(11);
+    expect(useWorkspaceStore.getState().previousApplicationId).toBe(42);
+  });
+
   it('keeps draft, conversation and scroll per application', () => {
     const store = useWorkspaceStore.getState();
     store.setDraft(1, '销售草稿');

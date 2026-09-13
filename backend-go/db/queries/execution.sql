@@ -3,21 +3,24 @@
 -- name: CreateRun :execresult
 INSERT INTO runs (id, user_id, application_id, conversation_id, runtime_binding_id,
     provider, runtime_type, external_run_id, status, provider_status, provider_finish_reason,
-    input, output, runtime_snapshot, attempt, max_attempts, error_code, error_message)
-VALUES (?, ?, ?, ?, ?, ?, ?, '', 'queued', '', '', ?, NULL, ?, 0, ?, '', '');
+    input, output, runtime_snapshot, attempt, max_attempts, trigger_type, trigger_id,
+    priority, available_at, error_code, error_message)
+VALUES (?, ?, ?, ?, ?, ?, ?, '', 'queued', '', '', ?, NULL, ?, 0, ?, ?, ?, ?, ?, '', '');
 
 -- name: GetRunByID :one
 SELECT id, user_id, application_id, conversation_id, runtime_binding_id, organization_id,
        provider, runtime_type, external_run_id, status, provider_status, provider_finish_reason,
        input, output, runtime_snapshot, attempt, max_attempts, queued_at, started_at,
-       finished_at, error_code, error_message, created_at, updated_at
+       finished_at, error_code, error_message, created_at, updated_at,
+       trigger_type, trigger_id, priority, available_at
 FROM runs WHERE id = ?;
 
 -- name: ListRunsByConversation :many
 SELECT id, user_id, application_id, conversation_id, runtime_binding_id, organization_id,
        provider, runtime_type, external_run_id, status, provider_status, provider_finish_reason,
        input, output, runtime_snapshot, attempt, max_attempts, queued_at, started_at,
-       finished_at, error_code, error_message, created_at, updated_at
+       finished_at, error_code, error_message, created_at, updated_at,
+       trigger_type, trigger_id, priority, available_at
 FROM runs WHERE conversation_id = ?
 ORDER BY created_at DESC;
 

@@ -42,6 +42,13 @@ type Metrics struct {
 	Reconciles    prometheus.Counter
 	DBLatency     *prometheus.HistogramVec
 	RedisLatency  *prometheus.HistogramVec
+
+	ScheduleTriggerDelay  *prometheus.HistogramVec
+	ScheduleQueueDelay    *prometheus.HistogramVec
+	ScheduleMisfireTotal  prometheus.Counter
+	OverlapSkippedTotal   prometheus.Counter
+	DeliveryDuration      *prometheus.HistogramVec
+	DeliveryFailuresTotal *prometheus.CounterVec
 }
 
 func NewMetrics(service string) *Metrics {
@@ -108,11 +115,40 @@ func NewMetrics(service string) *Metrics {
 			Help:    "Redis operation latency.",
 			Buckets: prometheus.ExponentialBuckets(0.0005, 2, 12),
 		}, []string{"op"}),
+		ScheduleTriggerDelay: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "studio_schedule_trigger_delay_seconds",
+			Help:    "Delay between scheduled time and occurrence creation.",
+			Buckets: prometheus.ExponentialBuckets(0.1, 2, 14),
+		}, []string{"result"}),
+		ScheduleQueueDelay: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "studio_schedule_queue_delay_seconds",
+			Help:    "Delay between scheduled time and run start.",
+			Buckets: prometheus.ExponentialBuckets(0.1, 2, 14),
+		}, []string{"provider"}),
+		ScheduleMisfireTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_schedule_misfire_total",
+			Help: "Misfire decisions by policy.",
+		}),
+		OverlapSkippedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_schedule_overlap_skipped_total",
+			Help: "Occurrences skipped by overlap policy.",
+		}),
+		DeliveryDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "studio_schedule_delivery_seconds",
+			Help:    "Delivery send duration by channel and status.",
+			Buckets: prometheus.ExponentialBuckets(0.05, 2, 12),
+		}, []string{"channel", "status"}),
+		DeliveryFailuresTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "studio_schedule_delivery_failures_total",
+			Help: "Delivery failures by channel and error code.",
+		}, []string{"channel", "code"}),
 	}
 	reg.MustRegister(
 		m.HTTPDuration, m.HTTPRequests, m.SSEActive, m.QueueDepth,
 		m.RunDuration, m.RunTotal, m.LeaseExpired, m.OutboxBacklog,
 		m.ProviderCalls, m.Provider429, m.Reconciles, m.DBLatency, m.RedisLatency,
+		m.ScheduleTriggerDelay, m.ScheduleQueueDelay, m.ScheduleMisfireTotal,
+		m.OverlapSkippedTotal, m.DeliveryDuration, m.DeliveryFailuresTotal,
 	)
 	return m
 }

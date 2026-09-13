@@ -1,428 +1,799 @@
 # Creation Agent Studio 未来演进完整架构文档
 
-**项目名称：** Creation Agent Studio  
-**文档类型：** 目标架构 / To-Be Architecture  
-**目标定位：** 企业 AI Application Runtime Portal  
-**前端形态：** PC + Mobile 双端交互布局，共享业务与 API  
-**认证体系：** 飞书 SSO 为默认用户入口，本地 Admin 登录作为管理入口  
-**目标数据库：** TiDB 8.0.0 / MySQL 8  
-**核心 Runtime：** 飞书 Aily 自定义智能体、Aily 工作流、Codex、GraphFlow、固定页面、HTTP 应用、企业内部服务及其他 Agent Provider  
-**总体架构：** Modular Monolith + Independent Execution Plane + Unified Runtime Protocol + Unified Run Model + Unified Workspace Shell
+**架构版本：** Application First / Go Runtime Architecture  
+**当前阶段核心：** Application + Aily Agent + Fixed Application + Schedule + Feishu Delivery  
+**暂缓范围：** Workflow / Codex / GraphFlow  
+**后端：** Go  
+**前端：** React + TypeScript + Vite  
+**主数据库：** TiDB 8.0.0  
+**最低数据库兼容目标：** MySQL 5.7  
+**实时基础设施：** Redis  
+**对象存储：** Storage Abstraction，生产环境 S3 Compatible  
+**默认企业身份：** Feishu OAuth  
+**Aily 调用身份：** User Access Token（UAT）  
+**核心产品定位：** 企业 AI Application Runtime Workspace
 
 ---
 
-# 1. 文档目标
+# 1. 项目定位
 
-本文描述 Creation Agent Studio 后续完整目标架构。
-
-项目不推倒重写，而是在现有：
-
-```text
-Django
-React
-Application
-Agent
-Conversation
-Workflow
-AgentAdapter
-AgentThread
-App Runner
-JobEvent
-```
-
-基础上逐步演进。
-
-目标是让平台长期支持：
-
-```text
-飞书 Aily 自定义智能体
-飞书 Aily Workflow
-Codex
-GraphFlow
-企业内部 Agent
-固定业务页面
-HTTP API 应用
-报表应用
-视频生成
-未来其他 Agent 产品
-```
-
-并满足：
-
-```text
-PC / 手机统一体验
-
-飞书免登录
-
-多智能体切换
-
-应用快捷入口
-
-会话恢复
-
-附件
-
-产物
-
-流式输出
-
-并发控制
-
-统一执行追踪
-
-TiDB / MySQL
-
-水平扩容
-
-企业级审计
-```
-
----
-
-# 2. 最终产品定位
-
-Creation Agent Studio 不应定位为：
+Creation Agent Studio 不再定位为：
 
 ```text
 Aily 套壳
 ```
 
-也不应只是：
+也不只是：
 
 ```text
-Agent Chat UI
+智能体聊天页面
 ```
 
-而应定位为：
+最终定位为：
 
-# 企业 AI Application Runtime Portal
+# 企业 AI 应用统一工作台
 
-平台自己管理：
+用户从飞书进入系统之后，可以在同一个 Workspace 中：
 
 ```text
-Identity
-Application Catalog
-Workspace
-Conversation
-Runtime
-Provider
-Workflow
-Execution
-Artifact
-Governance
-UI Runtime
-Audit
-Observability
+和不同 Aily 智能体对话
+
+使用固定业务应用
+
+使用表单应用
+
+使用报表 / Dashboard 应用
+
+创建定时任务
+
+定时向某个智能体发送消息
+
+将智能体结果自动发送给指定飞书用户或群组
+
+查看历史会话
+
+查看历史任务
+
+查看 AI 生成产物
 ```
 
-而：
-
-```text
-Aily
-Codex
-GraphFlow
-HTTP Service
-Media Service
-其他 Agent 平台
-```
-
-全部属于：
-
-# Runtime Provider
-
----
-
-# 3. 用户体验定位
-
-Creation Agent Studio 的用户体验核心不是“进入一个应用中心”。
-
-而是：
-
-# 用户首先进入一个像 ChatGPT / 豆包一样的主工作台。
-
-主页面天然呈现为一个：
-
-```text
-Chat-like Workspace
-```
-
-但它并不只属于某个智能体。
-
-它是整个系统的：
-
-# Main Workspace / Home Workspace
-
----
-
-# 4. 主页面默认状态
-
-用户第一次进入时：
-
-```text
-Main Workspace
-status = idle
-```
-
-此时：
-
-```text
-不创建 Conversation
-不创建 Run
-不创建 Aily Session
-```
-
-只展示：
-
-```text
-常用智能体
-常用应用
-最近使用
-收藏
-快捷入口
-主输入框
-```
-
-例如：
-
-```text
-┌─────────────────────────────────────────────────────┐
-│                                                     │
-│                  今天想做什么？                     │
-│                                                     │
-│   常用智能体                                         │
-│   [销售助手] [采购助手] [制度助手] [数据助手]      │
-│                                                     │
-│   常用应用                                           │
-│   [修改OA密码] [条码流向] [销售报表] [费用查询]    │
-│                                                     │
-│                                                     │
-│        [ 输入内容……                     ]           │
-│                                                     │
-└─────────────────────────────────────────────────────┘
-```
-
-只有用户真正：
-
-```text
-发送第一句话
-```
-
-或者：
-
-```text
-打开某个智能体
-```
-
-才 Lazy Create：
-
-```text
-Conversation
-Aily Session
-Run
-```
-
----
-
-# 5. 主页面不是主 Agent 页面
-
-必须明确：
-
-```text
-Home Workspace
-≠
-Main Agent
-```
-
-主页面是：
-
-```text
-Workspace Shell
-```
-
-而当前智能体只是：
-
-```text
-active_application
-```
-
-用户可以随时：
-
-```text
-主助手
-↓
-销售助手
-↓
-采购助手
-↓
-制度助手
-```
-
-页面整体不离开。
-
-只改变：
-
-```text
-active_application_id
-RuntimeBinding
-Conversation
-```
-
----
-
-# 6. Application 是整个系统统一入口
-
-不管用户打开的是：
-
-```text
-Aily智能体
-Aily Workflow
-固定页面
-HTTP应用
-报表
-视频生成
-```
-
-在产品层都统一定义为：
-
-# Application
-
-用户无需理解：
-
-```text
-Agent
-Workflow
-Provider
-HTTP
-Renderer
-```
-
-这些技术概念。
-
----
-
-# 7. 四层核心模型
-
-未来必须明确分离：
+底层：
 
 ```text
 Application
 Runtime
 Provider
-Renderer
+Run
+Schedule
+Delivery
+Artifact
+```
+
+这些技术概念不直接暴露给普通用户。
+
+---
+
+# 2. 当前开发范围
+
+当前阶段优先完成：
+
+```text
+Application Platform
+
+Feishu Aily Custom Agent
+
+Fixed Application
+
+Form Application
+
+Dashboard Application
+
+Identity
+
+Conversation
+
+Run
+
+SSE
+
+Attachment
+
+Artifact
+
+Schedule
+
+Feishu Message Delivery
+
+Desktop
+
+Mobile
+```
+
+暂时不实现：
+
+```text
+Workflow
+
+Codex
+
+GraphFlow
+
+Multi-Agent Workflow
+
+复杂Agent编排
+
+Agent Team
+
+Evaluation Platform
+```
+
+但通过：
+
+```text
+RuntimeAdapter
+DeliveryAdapter
+```
+
+保留未来扩展能力。
+
+---
+
+# 3. 总体设计原则
+
+必须长期坚持：
+
+```text
+Application ≠ Agent
+
+Application ≠ Runtime
+
+Runtime ≠ Provider
+
+Conversation ≠ Run
+
+Schedule ≠ Run
+
+Run ≠ Delivery
+
+Message ≠ Artifact
+
+Studio Session ≠ Feishu UAT
+
+PC Layout ≠ Mobile Layout
+```
+
+同时：
+
+```text
+所有执行最终统一进入 Run
+
+所有外部 Runtime 通过 Adapter
+
+所有外部消息发送通过 Delivery Adapter
+
+TiDB 是 Source of Truth
+
+Redis 只负责实时、队列、缓存、协调和限流
 ```
 
 ---
 
-# 8. Application
-
-Application 表示：
-
-> 用户看到的一个业务应用。
-
-例如：
+# 4. 总体系统架构
 
 ```text
-销售助手
-采购助手
-修改OA密码
-条码流向查询
-制度查询
-合同分析
-视频生成
+                              用户
+                               │
+                               ▼
+                           React SPA
+                               │
+                  ┌────────────┴────────────┐
+                  │                         │
+          DesktopAppShell             MobileAppShell
+                  │                         │
+                  └────────────┬────────────┘
+                               ▼
+                         WorkspaceHost
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+              ▼                ▼                ▼
+        System Workspace   Chat Renderer   Application Renderer
+              │                                 │
+       ┌──────┴──────┐                    ┌─────┼─────┐
+       ▼             ▼                    ▼     ▼     ▼
+ HomeWorkspace  ScheduleCenter          Page  Form  Dashboard
+
+
+                               │
+                               ▼
+                         Go Backend
+                               │
+        ┌──────────────────────┼───────────────────────┐
+        │                      │                       │
+        ▼                      ▼                       ▼
+   studio-api            studio-stream          studio-scheduler
+        │                      │                       │
+        └───────────────┬──────┴───────────────┬──────┘
+                        │                      │
+                        ▼                      ▼
+                      TiDB                   Redis
+                        │                      │
+                        │              Redis Streams
+                        │                      │
+                        │                      ▼
+                        │                studio-worker
+                        │                      │
+                        │            ┌─────────┴─────────┐
+                        │            ▼                   ▼
+                        │      Feishu Aily        Feishu IM API
+                        │
+                        ▼
+                 Object Storage
 ```
+
+---
+
+# 5. 后端技术选型
+
+正式后端采用：
+
+```text
+Go
+```
+
+HTTP：
+
+```text
+net/http
++
+chi
+```
+
+数据库：
+
+```text
+database/sql
++
+go-sql-driver/mysql
++
+sqlc
+```
+
+Migration：
+
+```text
+golang-migrate
+```
+
+Redis：
+
+```text
+go-redis/v9
+```
+
+API Contract：
+
+```text
+OpenAPI 3.1
++
+oapi-codegen
+```
+
+日志：
+
+```text
+log/slog
+```
+
+Observability：
+
+```text
+OpenTelemetry
++
+Prometheus
+```
+
+---
+
+# 6. 为什么不以 Gin / GORM 为核心
+
+本项目的主要压力不是简单 HTTP Router QPS。
+
+主要压力来源是：
+
+```text
+SSE长连接
+
+Aily SSE
+
+大量外部HTTP I/O
+
+Redis
+
+TiDB
+
+Rate Limit
+
+Queue
+
+附件
+
+Artifact
+
+Scheduler
+
+Feishu消息发送
+```
+
+因此核心架构使用：
+
+```text
+标准 net/http
+```
+
+保持：
+
+```text
+标准Context
+
+标准HTTP Client
+
+标准Streaming
+
+标准Middleware
+
+标准Tracing
+```
+
+数据库也不使用 ORM 隐藏 SQL。
+
+采用：
+
+```text
+sqlc
+```
+
+保证：
+
+```text
+SQL明确
+
+事务明确
+
+性能明确
+
+索引明确
+
+CAS明确
+
+TiDB兼容行为明确
+```
+
+---
+
+# 7. Go 项目结构
+
+推荐：
+
+```text
+backend-go/
+
+├── cmd/
+│   ├── api/
+│   ├── stream/
+│   ├── scheduler/
+│   └── worker/
+│
+├── api/
+│   └── openapi.yaml
+│
+├── db/
+│   ├── migrations/
+│   └── queries/
+│
+├── internal/
+│   │
+│   ├── platform/
+│   │   ├── config/
+│   │   ├── database/
+│   │   ├── redis/
+│   │   ├── storage/
+│   │   ├── logging/
+│   │   ├── telemetry/
+│   │   ├── crypto/
+│   │   └── httpclient/
+│   │
+│   ├── identity/
+│   │
+│   ├── catalog/
+│   │   ├── application/
+│   │   ├── provider/
+│   │   └── runtime/
+│   │
+│   ├── conversation/
+│   │
+│   ├── execution/
+│   │   ├── run/
+│   │   ├── event/
+│   │   ├── lease/
+│   │   ├── artifact/
+│   │   ├── attachment/
+│   │   └── outbox/
+│   │
+│   ├── automation/
+│   │   ├── schedule/
+│   │   ├── occurrence/
+│   │   ├── scheduler/
+│   │   └── delivery/
+│   │
+│   ├── governance/
+│   │
+│   └── integrations/
+│       ├── aily/
+│       └── feishu/
+│
+└── internal/gen/
+    ├── api/
+    └── db/
+```
+
+---
+
+# 8. 四个运行角色
+
+同一个 Go Repository，四种运行角色。
+
+## studio-api
 
 负责：
 
 ```text
-名称
-图标
-描述
-分类
-权限
-快捷入口
-收藏
-搜索
-使用统计
+Authentication
+
+Application
+
+Catalog
+
+Conversation
+
+Run创建
+
+Schedule CRUD
+
+Attachment入口
+
+Artifact Resolver
+
+Admin API
 ```
 
 ---
 
-# 9. Runtime
+## studio-stream
 
-Runtime 表示：
+专门负责：
 
-> 这个 Application 如何执行。
+```text
+SSE
+```
 
 例如：
 
 ```text
-agent
-workflow
-http
-local_task
-media
-none
+GET /api/v2/runs/{id}/stream
+```
+
+职责：
+
+```text
+历史RunEvent回放
+
+Redis实时事件
+
+Keepalive
+
+Reconnect
+
+Slow Client
 ```
 
 ---
 
-# 10. Provider
+## studio-scheduler
 
-Provider 表示：
-
-> 谁真正提供执行能力。
-
-例如：
+负责：
 
 ```text
-feishu_aily
-codex
-graphflow
-custom_http
-internal
-openai
-dify
-coze
+扫描到期Schedule
+
+创建ScheduleOccurrence
+
+创建Run
+
+更新next_run_at
+```
+
+它：
+
+```text
+不调用Aily
+
+不发送飞书消息
 ```
 
 ---
 
-# 11. Renderer
+## studio-worker
 
-Renderer 表示：
-
-> 用户看到的交互界面。
-
-例如：
+负责：
 
 ```text
-chat
-form
-page
-task
-workflow
-dashboard
-external_page
+Run Worker
+
+Aily Worker
+
+Attachment Worker
+
+Artifact Worker
+
+Delivery Worker
 ```
 
-最终：
+第一阶段可以：
+
+```text
+一个Binary
+多个Consumer Pool
+```
+
+以后根据规模拆实例。
+
+---
+
+# 9. 数据库兼容策略
+
+Primary：
+
+```text
+TiDB 8.0
+```
+
+Minimum Compatibility：
+
+```text
+MySQL 5.7
+```
+
+Secondary：
+
+```text
+MySQL 8+
+```
+
+所有核心 SQL：
+
+# 必须属于 MySQL 5.7 Compatible SQL Subset。
+
+禁止核心业务依赖：
+
+```text
+CTE
+
+Window Function
+
+JSON_TABLE
+
+Functional Index
+
+SKIP LOCKED
+
+TiDB Hint
+
+TiFlash
+
+Placement Rule
+
+TiDB TTL
+
+Stale Read
+
+MySQL 8-only Collation
+```
+
+---
+
+# 10. 数据库迁移原则
+
+这是新架构。
+
+不迁移旧 Django Schema。
+
+不保留：
+
+```text
+django_*
+
+AgentExecution
+
+AgentTurn
+
+AppRunnerJob
+
+Legacy Workflow
+```
+
+直接建立最终干净 Schema。
+
+---
+
+# 11. ID 策略
+
+核心业务 ID 推荐：
+
+```text
+UUIDv7
+```
+
+应用层生成。
+
+数据库：
+
+```text
+BINARY(16)
+```
+
+API：
+
+```text
+标准UUID String
+```
+
+不依赖：
+
+```text
+AUTO_INCREMENT
+```
+
+作为跨系统业务身份。
+
+---
+
+# 12. OpenAPI Contract First
+
+正式建立：
+
+```text
+backend-go/api/openapi.yaml
+```
+
+成为：
+
+# HTTP API 唯一事实来源。
+
+生成：
+
+```text
+Go Request / Response
+
+Go Handler Interface
+
+TypeScript Types
+
+TypeScript Client
+```
+
+禁止以后再出现：
+
+```text
+接口A手拼dict
+
+接口B手拼另一套dict
+
+前端再自己猜类型
+```
+
+---
+
+# 13. Application 模型
+
+整个产品核心是：
 
 ```text
 Application
-├── Product Definition
-├── Runtime Binding
-└── Renderer
+```
+
+用户看到：
+
+```text
+销售助手
+
+创作助手
+
+修改OA密码
+
+条码查询
+
+销售报表
+```
+
+全部是 Application。
+
+核心：
+
+```text
+Application
+├── id
+├── slug
+├── name
+├── description
+├── icon
+├── avatar_storage_key
+├── kind
+├── renderer_key
+├── category_id
+├── is_public
+├── is_default_agent
+├── created_by
+├── enabled
+├── created_at
+└── updated_at
 ```
 
 ---
 
-# 12. ApplicationRuntimeBinding
+# 14. Application Kind
 
-建议新增：
+当前支持：
 
 ```text
-ApplicationRuntimeBinding
+chat
+
+page
+
+form
+
+dashboard
 ```
+
+暂时不加入：
+
+```text
+workflow
+```
+
+当前阶段。
+
+---
+
+# 15. Runtime 与 Provider
+
+Chat Application：
+
+```text
+Application
+↓
+ApplicationRuntimeBinding
+↓
+RuntimeAdapter
+↓
+Provider
+```
+
+例如：
+
+```text
+销售助手
+
+runtime_type = agent
+
+provider_key = feishu_aily
+
+external_resource_id = agent_xxxxx
+```
+
+---
+
+# 16. ApplicationRuntimeBinding
 
 核心字段：
 
@@ -437,17 +808,6 @@ provider_key
 
 external_resource_id
 
-endpoint_key
-
-input_schema
-output_schema
-
-capabilities
-
-config
-
-secret_ref
-
 identity_mode
 
 execution_mode
@@ -456,330 +816,316 @@ session_policy
 
 artifact_policy
 
-timeout_seconds
+capabilities
+
+input_schema
+
+output_schema
+
+config
 
 enabled
+```
 
-created_at
-updated_at
+第一阶段：
+
+```text
+provider = feishu_aily
+
+runtime_type = agent
 ```
 
 ---
 
-# 13. Aily Agent Application 示例
+# 17. RuntimeAdapter
+
+统一接口概念：
+
+```text
+Capabilities
+
+Submit
+
+Status
+
+Stream
+
+UploadAttachment
+
+ResolveArtifact
+
+CheckVisibility
+```
+
+第一阶段只正式实现：
+
+```text
+AilyAgentAdapter
+```
+
+暂时不实现：
+
+```text
+CodexAdapter
+
+GraphFlowAdapter
+
+AilyWorkflowAdapter
+```
+
+---
+
+# 18. Provider 不污染业务层
+
+禁止：
+
+```go
+if provider == "feishu_aily" {
+}
+```
+
+散落在：
 
 ```text
 Application
-name = 销售助手
 
-renderer_key = chat
+Conversation
+
+Run
+
+Schedule
 ```
 
-对应：
+里面。
+
+Provider 差异只允许存在：
 
 ```text
-ApplicationRuntimeBinding
-
-runtime_type = agent
-
-provider_key = feishu_aily
-
-external_resource_id = agent_xxxxx
-
-identity_mode = user
-
-execution_mode = interactive
-
-session_policy = lazy
-
-artifact_policy = external_refresh
-```
-
----
-
-# 14. RuntimeAdapter
-
-现有 AgentAdapter 可以继续保留。
-
-上层新增：
-
-```text
+integrations/
 RuntimeAdapter
 ```
 
-统一不同 Runtime 类型。
-
-建议能力：
-
-```text
-submit()
-
-get_status()
-
-stream_events()
-
-cancel()
-
-resume()
-
-upload_attachment()
-
-resolve_artifact()
-
-check_visibility()
-```
-
 ---
 
-# 15. Capability Driven
+# 19. Main Workspace
 
-不是每个 Provider 都支持所有操作。
-
-统一声明：
+普通用户登录以后：
 
 ```text
-streaming
-
-async_execution
-
-conversation
-
-attachment
-
-artifact
-
-cancel
-
-resume
-
-human_input
-
-visibility
-
-file_upload
+Main Workspace
 ```
 
-例如当前 Aily 自定义智能体：
+主页面看起来像：
 
 ```text
-streaming       = true
-async_execution = true
-conversation    = true
-attachment      = true
-artifact        = true
-visibility      = true
-
-cancel          = false
-resume          = false
+ChatGPT / 豆包
 ```
 
-前端必须根据 Capability 决定功能是否显示。
-
----
-
-# 16. RuntimeRegistry
-
-建立：
-
-```text
-RuntimeRegistry
-```
-
-例如：
-
-```text
-feishu_aily_agent
-
-feishu_aily_workflow
-
-codex
-
-graphflow
-
-custom_http
-
-local_task
-
-page
-```
-
-业务代码不要到处出现：
-
-```python
-if provider == "aily":
-```
-
-统一由 Registry 查 Adapter。
-
----
-
-# 17. Workspace 是前端核心
-
-未来前端最重要的组件不是：
-
-```text
-ChatPage
-```
-
-而是：
-
-# WorkspaceHost
-
-总体：
-
-```text
-<AppRoot>
-
-    <ResponsiveShell>
-
-        DesktopAppShell
-        或
-        MobileAppShell
-
-            ↓
-
-        <WorkspaceHost />
-
-    </ResponsiveShell>
-
-</AppRoot>
-```
-
----
-
-# 18. WorkspaceHost
-
-WorkspaceHost 根据当前 Application 决定渲染：
+但：
 
 ```text
 HomeWorkspace
-
-ChatRenderer
-
-FormRenderer
-
-PageRenderer
-
-WorkflowRenderer
-
-TaskRenderer
-
-DashboardRenderer
-
-ExternalPageRenderer
-```
-
-因此：
-
-```text
-Chat
-```
-
-只是其中一种 Workspace。
-
----
-
-# 19. PC 端整体布局
-
-PC 端推荐：
-
-```text
-┌───────────────────────────────────────────────────────┐
-│ Logo / 搜索 / 当前应用 / 用户                         │
-├───────────────┬───────────────────────────────────────┤
-│               │                                       │
-│ 侧边栏        │          WorkspaceHost                │
-│               │                                       │
-│ 首页          │  Home / Chat / Page / Workflow       │
-│ 智能体        │                                       │
-│ 应用          │                                       │
-│ 最近会话      │                                       │
-│ 收藏          │                                       │
-│               │                                       │
-└───────────────┴───────────────────────────────────────┘
-```
-
-Sidebar 可以常驻。
-
----
-
-# 20. 手机端必须单独设计
-
-手机端不应该：
-
-```text
-把PC页面压窄
-```
-
-而应该使用：
-
-# MobileAppShell
-
-共享业务逻辑，但交互布局单独优化。
-
----
-
-# 21. 手机端总体布局
-
-推荐：
-
-```text
-┌─────────────────────────┐
-│ 当前智能体 ▼         ☰  │
-├─────────────────────────┤
-│                         │
-│                         │
-│     WorkspaceHost       │
-│                         │
-│                         │
-├─────────────────────────┤
-│ ＋   输入内容……     发送 │
-└─────────────────────────┘
+≠
+某个固定Agent
 ```
 
 ---
 
-# 22. 手机端 Drawer
+# 20. 首页空闲状态
 
-PC Sidebar 在手机端变成：
+没有发起对话：
 
 ```text
-Drawer
+不创建Conversation
+
+不创建Run
+
+不创建Aily Session
 ```
 
-内容：
+展示：
 
 ```text
-新对话
+常用智能体
 
-首页
+常用应用
 
-最近会话
-
-智能体
-
-应用中心
+最近使用
 
 收藏
 
-个人信息
-```
+推荐
 
-不常驻占屏幕宽度。
+主输入框
+```
 
 ---
 
-# 23. 手机端智能体切换
+# 21. WorkspaceHost
 
-PC 可以：
+前端：
 
 ```text
-销售助手 ▼
+WorkspaceHost
 ```
 
-使用 Dropdown。
+分为：
 
-手机应该使用：
+```text
+System Workspace
+
+Application Workspace
+```
+
+结构：
+
+```text
+WorkspaceHost
+
+├── System Workspace
+│   ├── HomeWorkspace
+│   └── ScheduleCenter
+│
+└── Application Workspace
+    ├── ChatRenderer
+    ├── PageRenderer
+    ├── FormRenderer
+    └── DashboardRenderer
+```
+
+---
+
+# 22. Desktop 一级导航
+
+PC 顶部：
+
+```text
+Logo
+
+首页
+
+智能体
+
+应用
+
+定时任务
+
+搜索
+
+用户
+```
+
+即：
+
+```text
+Top Navigation
+├── 首页
+├── 智能体
+├── 应用
+└── 定时任务
+```
+
+---
+
+# 23. Desktop Sidebar
+
+PC 左侧 Sidebar 不再重复一级导航。
+
+它负责：
+
+# Context Navigation。
+
+Chat 时：
+
+```text
+新建会话
+
+最近会话
+
+历史会话
+```
+
+Schedule 时：
+
+```text
+全部任务
+
+运行中
+
+已暂停
+
+失败任务
+```
+
+---
+
+# 24. Desktop 最终布局
+
+```text
+┌───────────────────────────────────────────────────────┐
+│ Logo  首页  智能体  应用  定时任务     搜索    用户 │
+├──────────────┬────────────────────────────────────────┤
+│              │                                        │
+│ Context      │                                        │
+│ Sidebar      │            WorkspaceHost               │
+│              │                                        │
+│              │                                        │
+└──────────────┴────────────────────────────────────────┘
+```
+
+---
+
+# 25. Mobile 一级导航
+
+Mobile：
+
+```text
+☰
+```
+
+打开 Drawer：
+
+```text
+首页
+
+智能体
+
+应用
+
+定时任务
+
+最近会话
+
+收藏
+
+设置
+```
+
+即：
+
+```text
+Desktop一级导航
+=
+TopBar
+
+Mobile一级导航
+=
+Drawer
+```
+
+两端读取同一份 Navigation Model。
+
+---
+
+# 26. Mobile 智能体切换
+
+PC：
+
+```text
+Dropdown
+```
+
+Mobile：
 
 ```text
 Bottom Sheet
@@ -790,1026 +1136,236 @@ Bottom Sheet
 ```text
 选择智能体
 
-✓ 主助手
+✓ 创作助手
+
+  问数小安
 
   销售助手
-
-  采购助手
-
-  制度助手
 
 查看全部 >
 ```
 
-更符合移动端习惯。
-
 ---
 
-# 24. PC 与 Mobile 共用 WorkspaceHost
+# 27. Mobile 输入框
 
-架构：
+Chat Composer：
 
 ```text
-Shared Business Layer
-        │
-        ▼
-WorkspaceHost
-        │
- ┌──────┴──────┐
- │             │
-Desktop       Mobile
-Shell         Shell
+固定底部
 ```
 
-因此不要创建：
+必须兼容：
 
 ```text
-PC React 项目
-+
-Mobile React 项目
-```
+Feishu Mobile WebView
 
----
+iOS Keyboard
 
-# 25. Renderer 双端策略
-
-例如：
-
-```text
-ChatRenderer
-├── DesktopChatLayout
-└── MobileChatLayout
-```
-
-固定页面：
-
-```text
-PageRenderer
-├── DesktopPageLayout
-└── MobilePageLayout
-```
-
-Dashboard：
-
-```text
-DashboardRenderer
-├── DesktopDashboard
-└── MobileDashboard
-```
-
-共享：
-
-```text
-API
-
-Hooks
-
-Conversation Logic
-
-Run Logic
-
-Artifact Logic
-```
-
-只拆：
-
-```text
-布局
-交互方式
-```
-
----
-
-# 26. 手机端表格降级
-
-PC：
-
-```text
-客户 | 销售额 | 区域 | 同比 | 负责人
-```
-
-手机不应该硬塞。
-
-应转成：
-
-```text
-客户A
-
-销售额：100万
-
-区域：华东
-
-同比：+12%
-
-负责人：张三
-```
-
-即：
-
-```text
-Desktop = Table
-
-Mobile = Card List
-```
-
----
-
-# 27. 移动端输入框
-
-手机 Chat 输入框必须：
-
-```text
-常驻底部
-```
-
-并处理：
-
-```text
-iOS Safari
-
-Android
-
-飞书 WebView
-
-软键盘
+Android Keyboard
 
 Safe Area
 
-Viewport Height
+Viewport Resize
 
-滚动位置
-```
-
-重点避免：
-
-```text
-输入框被键盘遮挡
-
-页面跳动
-
-SSE输出时自动滚动异常
+Auto Scroll
 ```
 
 ---
 
 # 28. Workspace 状态恢复
 
-为实现丝滑切换，需要单独：
+workspaceStore 只保存 UI：
 
 ```text
-workspaceStore
-```
+activeApplicationId
 
-只保存 UI 状态：
-
-```text
-active_application_id
-
-active_conversation_id
-
-previous_workspace
+activeConversationId
 
 draft
 
-scroll_position
+scrollPosition
 
-sidebar_state
+recentApplications
 
-recent_applications
+previousWorkspace
+
+sidebarState
 ```
 
-而：
+业务数据：
 
 ```text
 Conversation
+
 Message
+
 Run
+
 Artifact
 ```
 
-仍然以后端数据库为准。
+以后端为准。
 
 ---
 
-# 29. 切换智能体不能丢状态
+# 29. Conversation
 
-例如：
-
-```text
-销售助手
-```
-
-用户看到第 20 条消息。
-
-切到：
+一个 Conversation：
 
 ```text
-采购助手
+只属于一个用户
+
+只属于一个Application
 ```
 
-再回来。
-
-应该恢复：
+模型：
 
 ```text
 Conversation
-
-Scroll Position
-
-Draft
-
-Artifact State
-```
-
-用户感知：
-
-> 只是切换了一个工作区。
-
----
-
-# 30. 不同 Agent 必须有不同 Conversation
-
-例如：
-
-```text
-销售助手
-    ↓
-Conversation A
-    ↓
-Aily Session A
-
-采购助手
-    ↓
-Conversation B
-    ↓
-Aily Session B
-```
-
-不能多个 Agent 共享一个 Aily Session。
-
----
-
-# 31. 智能体快速切换
-
-Chat 页面顶部建议：
-
-```text
-销售助手 ▼
-```
-
-点击快速切换：
-
-```text
-最近使用
-
-✓ 销售助手
-
-  采购助手
-
-  制度助手
-
-全部智能体 >
-```
-
-用户不需要先：
-
-```text
-返回应用中心
-↓
-找到智能体
-↓
-重新打开
-```
-
----
-
-# 32. 固定应用在同一个 Shell 中打开
-
-例如：
-
-```text
-修改OA密码
-```
-
-点击后：
-
-```text
-AppShell
-  ↓
-WorkspaceHost
-  ↓
-PageRenderer
-```
-
-而不是：
-
-```text
-window.location
-```
-
-整页跳转。
-
-用户完成以后：
-
-```text
-返回主页面
-```
-
-恢复之前 Workspace 状态。
-
----
-
-# 33. SPA 路由建议
-
-例如：
-
-```text
-/
-→ Main Workspace
-
-/chat/:applicationSlug
-→ Chat Application
-
-/app/:applicationSlug
-→ Fixed Application
-
-/workflow/:applicationSlug
-→ Workflow Application
-```
-
-最外层：
-
-```text
-AppShell
-```
-
-始终不卸载。
-
----
-
-# 34. Workspace Navigation Stack
-
-尤其手机端不能只依赖浏览器 Back。
-
-建议维护：
-
-```text
-WorkspaceNavigationStack
-```
-
-例如：
-
-```text
-Home
-
-↓
-销售助手
-
-↓
-OA密码
-
-↓ Back
-
-销售助手
-
-↓ Back
-
-Home
-```
-
-避免手机飞书 WebView Back 直接退出应用。
-
----
-
-# 35. Home Workspace 快捷入口
-
-主页面推荐展示：
-
-```text
-常用
-
-最近使用
-
-收藏
-
-推荐
-```
-
-这些资源全部是：
-
-```text
-Application
-```
-
-不再区分：
-
-```text
-智能体快捷方式
-
-应用快捷方式
-
-工作流快捷方式
-```
-
----
-
-# 36. @ Application 路由
-
-主输入框可以支持：
-
-```text
-@销售助手
-
-@修改OA密码
-
-@条码流向查询
-```
-
-输入：
-
-```text
-@销售助手 帮我分析一下这个客户
-```
-
-系统：
-
-```text
-解析 Application
-↓
-切换 active_application
-↓
-保留原始指令
-↓
-发送给销售助手
-```
-
----
-
-# 37. @ 固定页面
-
-例如：
-
-```text
-@修改OA密码
-```
-
-系统：
-
-```text
-Chat Workspace
-↓
-Page Workspace
-```
-
-直接打开固定 Application。
-
----
-
-# 38. 未知 @
-
-例如：
-
-```text
-@测试一下
-```
-
-如果找不到 Application：
-
-```text
-继续由默认主 Agent 处理
-```
-
-不能直接报错。
-
----
-
-# 39. 登录总体设计
-
-普通用户默认：
-
-# Feishu SSO Only
-
-管理员：
-
-# Local Admin Fallback Login
-
-普通用户不应该看到传统登录页。
-
----
-
-# 40. 默认访问入口
-
-用户访问：
-
-```text
-/
-```
-
-首先检查：
-
-```text
-Creation Studio Session
-```
-
-如果存在：
-
-```text
-直接进入 Workspace
-```
-
-如果不存在：
-
-```text
-自动进入 Feishu OAuth
-```
-
-而不是显示：
-
-```text
-用户名
-密码
-登录按钮
-```
-
----
-
-# 41. 普通用户登录流程
-
-完整流程：
-
-```text
-用户打开飞书应用
-      ↓
-Creation Agent Studio
-      ↓
-检查Studio Session
-      │
-      ├── 有
-      │     ↓
-      │  Main Workspace
-      │
-      └── 无
-            ↓
-       Feishu OAuth
-            ↓
-       获得飞书身份
-            ↓
-       User Mapping
-            ↓
-       创建/更新本地User
-            ↓
-       签发Studio Session
-            ↓
-       Main Workspace
-```
-
----
-
-# 42. 不展示登录选择页
-
-不要：
-
-```text
-欢迎登录
-
-[飞书登录]
-
-[管理员登录]
-```
-
-普通用户直接：
-
-```text
-Feishu OAuth
-```
-
-管理员入口只有知道特殊 URL 才能访问。
-
----
-
-# 43. 管理员登录入口
-
-推荐：
-
-```text
-/login/admin
-```
-
-展示：
-
-```text
-管理员登录
-
-用户名
-
-密码
-
-登录
-```
-
-管理员：
-
-```text
-auth_source = local_admin
-```
-
-普通用户：
-
-```text
-auth_source = feishu
-```
-
----
-
-# 44. 为什么不直接使用 /admin
-
-Django 本身通常使用：
-
-```text
-/admin/
-```
-
-作为 Django Admin。
-
-所以推荐：
-
-```text
-/login/admin
-```
-
-作为管理员身份登录页。
-
-管理后台再使用：
-
-```text
-/admin/*
-```
-
-如果未来自己开发管理端。
-
-或者：
-
-```text
-/manage/*
-```
-
-更加清晰。
-
----
-
-# 45. Django Admin
-
-如果确实需要保留 Django Admin：
-
-建议改：
-
-```text
-/django-admin/
-```
-
-避免和业务管理后台：
-
-```text
-/admin/
-```
-
-冲突。
-
----
-
-# 46. Unified User
-
-飞书用户和管理员最终统一关联：
-
-```text
-User
-```
-
-例如：
-
-```text
-User
 ├── id
-├── username
-├── display_name
-├── avatar
-├── email
-│
-├── feishu_user_id
-├── feishu_open_id
-├── feishu_union_id
-│
-├── auth_source
-├── is_staff
-├── is_superuser
+├── user_id
+├── application_id
+├── title
+├── status
+├── created_at
+└── updated_at
+```
+
+当前不做：
+
+```text
+同一个Conversation自动切多个Agent
+```
+
+---
+
+# 30. AgentThread
+
+保存 Provider Remote Session：
+
+```text
+AgentThread
+├── id
+├── conversation_id
+├── provider
+├── remote_id
+├── auth_mode
+├── auth_subject_key
 ├── status
 └── timestamps
 ```
 
----
-
-# 47. Auth Source
-
-例如：
+Aily：
 
 ```text
-feishu
-
-local_admin
-```
-
-以后也可以扩：
-
-```text
-ldap
-
-oidc
-```
-
-但当前不要过度设计。
-
----
-
-# 48. Studio Session 与 Feishu Token 分离
-
-飞书 OAuth Token 不能直接当系统 Session。
-
-正确：
-
-```text
-Feishu OAuth
-      ↓
-Verify User
-      ↓
-Map Local User
-      ↓
-Studio Session
+remote_id = session_id
 ```
 
 ---
 
-# 49. Provider Credential 与 Login Session 分离
+# 31. Lazy Session
 
-特别是 Aily：
+用户打开智能体页面：
 
 ```text
-user_access_token
+不创建Aily Session
 ```
 
-属于：
+第一次发消息：
 
 ```text
-Provider Credential
-```
-
-不是：
-
-```text
-Studio Login Session
-```
-
-因此：
-
-```text
-登录认证
-```
-
-和：
-
-```text
-调用 Aily
-```
-
-两个领域必须分开。
-
----
-
-# 50. ProviderAuthContext
-
-运行 Aily 时生成：
-
-```text
-ProviderAuthContext
-```
-
-例如：
-
-```text
-provider = feishu_aily
-
-identity_mode = user
-
-subject_user_id = xxx
-
-credential_ref = xxx
-
-tenant_id = xxx
-```
-
-数据库不能存明文 UAT。
-
----
-
-# 51. Aily 五类资源
-
-Aily 自定义智能体实际包含：
-
-```text
-Agent
-
-Session
-
-Chat
-
-Attachment
-
-Artifact
-
-Visibility
-```
-
-Aily 文档明确区分这些资源。
-
----
-
-# 52. Aily 数据映射
-
-建议最终固定：
-
-```text
-Creation Agent Studio          Feishu Aily
-───────────────────────────────────────────
-
-RuntimeBinding
-.external_resource_id
-                        ↔       agent_id
-
-
-AgentThread.remote_id
-                        ↔       session_id
-
-
-Run.external_run_id
-                        ↔       agent_chat_id
-
-
-RuntimeAttachment
-.external_attachment_id
-                        ↔       agent_attachment_id
-
-
-RunArtifact
-.external_artifact_id
-                        ↔       agent_artifact_id
-```
-
----
-
-# 53. Conversation
-
-Conversation 表示：
-
-```text
-平台中的长期用户会话
-```
-
-而 Aily Session 是：
-
-```text
-Provider Remote Session
-```
-
-关系：
-
-```text
-Conversation
-   ↓
-AgentThread
-   ↓
-Aily session_id
-```
-
----
-
-# 54. Lazy Aily Session
-
-第一次用户真正发送消息：
-
-```text
-Conversation
+Run
 ↓
-还没有Aily session
-↓
-Start Chat
+Aily Chat
 ↓
 Aily返回session_id
 ↓
-保存到AgentThread
+AgentThread.remote_id
 ```
-
-之后多轮：
-
-```text
-继续传session_id
-```
-
-Aily Chat API 支持通过 session_id 延续多轮会话。
 
 ---
 
-# 55. Run
+# 32. Run
 
-所有真实执行统一：
+所有真实 AI 执行统一：
 
 ```text
 Run
 ```
 
-无论：
+当前：
 
 ```text
-Aily Agent
-Aily Workflow
-Codex
-GraphFlow
-HTTP
-Media
-```
-
----
-
-# 56. Aily Chat 与 Run
-
-调用：
-
-```text
-POST /agents/{agent_id}/chats
-```
-
-对应：
-
-```text
-一个 Run
-```
-
-Aily 返回：
-
-```text
-agent_chat_id
-session_id
-```
-
-因此：
-
-```text
-Run.external_run_id
+Aily Agent调用
 =
-agent_chat_id
+Run
 ```
 
+未来其他 Runtime 也仍然进入 Run。
 
-
----
-
-# 57. Run 数据模型
-
-建议：
+核心：
 
 ```text
 Run
 ├── id
-├── organization_id
 ├── user_id
 ├── application_id
 ├── conversation_id
-├── workflow_run_id
 ├── runtime_binding_id
-│
 ├── provider
 ├── runtime_type
 ├── external_run_id
-│
+├── trigger_type
+├── trigger_id
 ├── status
 ├── provider_status
 ├── provider_finish_reason
-│
 ├── input
 ├── output
-│
 ├── runtime_snapshot
-│
+├── priority
+├── available_at
 ├── queued_at
 ├── started_at
 ├── finished_at
-│
 ├── error_code
-├── error_message
-└── timestamps
+└── error_message
 ```
 
 ---
 
-# 58. Run 状态
+# 33. Run Trigger
+
+Run 需要明确记录来源：
+
+```text
+manual
+
+scheduled
+
+api
+
+retry
+```
+
+例如：
+
+```text
+trigger_type = scheduled
+
+trigger_id = occurrence_id
+```
+
+这样可以追踪：
+
+```text
+这个Run为什么产生？
+```
+
+---
+
+# 34. Run 状态
 
 统一：
 
@@ -1817,8 +1373,6 @@ Run
 queued
 
 running
-
-waiting_input
 
 waiting_external
 
@@ -1833,63 +1387,30 @@ failed
 interrupted
 ```
 
-Provider 原始状态只放：
+Aily 当前：
 
 ```text
-provider_status
+cancel = false
 ```
+
+前端不要伪造取消能力。
 
 ---
 
-# 59. RunEvent
+# 35. RunEvent
 
-统一事件：
-
-```text
-RunEvent
-```
-
-字段：
-
-```text
-id
-run_id
-sequence
-event_type
-payload
-created_at
-```
-
-唯一：
-
-```text
-(run_id, sequence)
-```
-
----
-
-# 60. 统一事件协议
-
-建议：
+统一：
 
 ```text
 run.started
 
-content.started
-
 content.delta
+
+content.snapshot
 
 content.completed
 
-tool.started
-
-tool.completed
-
 artifact.discovered
-
-artifact.created
-
-input.required
 
 run.completed
 
@@ -1900,1108 +1421,1810 @@ run.interrupted
 
 ---
 
-# 61. SSE
+# 36. 实时事件策略
 
-Aily Streaming：
+不要：
 
 ```text
-stream=true
+每一个Token
+↓
+INSERT TiDB
 ```
 
-当前文档明确流式连接最多约 5 分钟。
-
-因此：
+实时：
 
 ```text
-SSE
-≠
-Run生命周期
-```
-
----
-
-# 62. SSE 架构
-
-推荐：
-
-```text
-Browser
- │
- │ SSE
- ▼
-Studio SSE Gateway
- ▲
- │
+content.delta
+↓
 Redis
- ▲
- │
-Aily Worker
- │
- │ SSE
- ▼
-Feishu Aily
+↓
+Browser
+```
+
+持久：
+
+```text
+content.snapshot
+```
+
+例如：
+
+```text
+每250~500ms
+
+或累计一定字符
+```
+
+再写 TiDB。
+
+---
+
+# 37. SSE
+
+浏览器：
+
+```text
+GET /api/v2/runs/{id}/stream
+```
+
+Stream Gateway：
+
+```text
+TiDB Replay
+↓
+Redis Subscribe
+↓
+Live Event
+```
+
+Browser Disconnect：
+
+```text
+不等于Run取消
 ```
 
 ---
 
-# 63. SSE 断开
+# 38. Final Reconciliation
 
-如果：
-
-```text
-Browser断开
-```
-
-Run 继续。
-
-如果：
+无论：
 
 ```text
+Aily SSE正常结束
+
 Aily SSE超时
+
+连接断开
 ```
 
-也不能马上标记 Failed。
-
-需要：
+最终都：
 
 ```text
 GET Chat Result
 ```
 
-重新确认最终状态。
-
----
-
-# 64. Final Reconciliation
-
-即使流式正常结束，也建议最终：
+确认：
 
 ```text
-GET Chat Result
-```
-
-获取：
-
-```text
-最终Text
+Final Text
 
 Status
 
 Finish Reason
 
-Artifact ID
+Artifacts
 ```
 
-Aily 获取结果接口会返回文字与产物等最终信息。
+然后：
+
+```text
+Message
+
+Run
+
+RunArtifact
+```
+
+最终落库。
 
 ---
 
-# 65. Aily Cancel
+# 39. Run 分发
 
-当前 Aily 自定义智能体文档未提供：
+采用：
 
-```text
-Cancel Chat
-```
+# Transactional Outbox + Redis Streams + CAS + Lease。
 
-接口。
-
-因此：
+创建：
 
 ```text
-AilyAgentAdapter.cancel = false
+BEGIN
+
+INSERT Message
+
+INSERT Run
+
+INSERT Outbox
+
+COMMIT
 ```
 
-不能做假取消。
+Outbox Relay：
+
+```text
+TiDB
+↓
+Redis Streams
+```
 
 ---
 
-# 66. Attachment
+# 40. 为什么需要 Outbox
 
-用户输入文件统一为：
+禁止简单：
 
 ```text
-RuntimeAttachment
+INSERT Run
+COMMIT
+
+然后 Redis XADD
+```
+
+否则 Redis 恰好失败：
+
+```text
+Run存在
+但永远没人执行
+```
+
+所以：
+
+```text
+Run
++
+Outbox
+```
+
+必须同事务。
+
+---
+
+# 41. Redis Streams
+
+例如：
+
+```text
+xiaoan3:queue:run:feishu_aily
+```
+
+Worker：
+
+```text
+XREADGROUP
+↓
+CAS Claim
+↓
+Lease
+↓
+执行
+```
+
+Redis：
+
+```text
+负责快
+```
+
+TiDB：
+
+```text
+负责正确
 ```
 
 ---
 
-# 67. Aily Attachment
+# 42. RunLease
 
-Aily 支持：
+模型：
 
 ```text
-image
-
-file
-
-feishu_doc
-
-bitable
+RunLease
+├── run_id
+├── worker_id
+├── lease_token
+├── acquired_at
+├── heartbeat_at
+└── expires_at
 ```
 
-当前文档同时约束文件大小、图片大小，以及单轮最多 8 个附件 ID。
+Worker Crash：
+
+```text
+Lease Expire
+↓
+Reaper
+↓
+Run interrupted
+↓
+根据策略Requeue
+```
 
 ---
 
-# 68. Attachment Identity
+# 43. Identity
 
-Aily Attachment 属于上传者。
+普通用户：
 
-因此：
+# Feishu SSO Only。
 
-```text
-上传附件
-```
-
-与：
+流程：
 
 ```text
-发送Chat
+打开Studio
+↓
+检查Studio Session
+↓
+没有
+↓
+Feishu OAuth
+↓
+Local User Mapping
+↓
+Studio Session
+↓
+Workspace
 ```
-
-必须使用一致身份上下文。
 
 ---
 
-# 69. RuntimeAttachment
+# 44. Studio Session
+
+新的 Go Backend 使用：
+
+# HttpOnly Opaque Session Cookie。
+
+不再把：
+
+```text
+JWT
+```
+
+长期放在：
+
+```text
+localStorage
+```
+
+Cookie：
+
+```text
+HttpOnly
+
+Secure
+
+SameSite=Lax
+```
+
+Session：
+
+```text
+Redis
+```
+
+保存 Token Hash 对应状态。
+
+---
+
+# 45. CSRF
+
+Cookie Session 下：
+
+```text
+POST
+
+PUT
+
+PATCH
+
+DELETE
+```
+
+必须通过：
+
+```text
+Origin / Referer
+
+CSRF Token
+```
+
+校验。
+
+---
+
+# 46. 管理员入口
+
+管理员：
+
+```text
+/login/admin
+```
+
+Local Admin Password：
+
+```text
+Argon2id
+```
+
+普通用户界面不出现管理员登录入口。
+
+---
+
+# 47. Studio Session 和 Aily UAT
+
+必须完全分离：
+
+```text
+Studio Session
+=
+登录Studio
+```
+
+而：
+
+```text
+Aily UAT
+=
+代表该飞书用户调用Aily
+```
+
+不能：
+
+```text
+Studio Token = Provider Token
+```
+
+---
+
+# 48. Aily 必须使用用户身份
+
+Aily 自定义智能体默认：
+
+```text
+identity_mode = user
+```
+
+必须使用：
+
+```text
+user_access_token
+```
+
+不能因为后台执行：
+
+```text
+改成TAT
+```
+
+定时任务同样如此。
+
+---
+
+# 49. FeishuIdentity
 
 建议：
 
 ```text
-RuntimeAttachment
-├── id
-├── provider
-├── external_attachment_id
-├── attachment_type
-├── name
-├── source_type
-├── source_url
-├── auth_mode
-├── auth_subject_key
-├── created_by
-└── created_at
+User
++
+FeishuIdentity
+```
+
+分离。
+
+FeishuIdentity 保存：
+
+```text
+open_id
+
+union_id
+
+feishu_user_id
+
+tenant_key
+
+encrypted_refresh_token
+
+refresh_expire_at
 ```
 
 ---
 
-# 70. 大文件上传
+# 50. Token Storage
 
-不要：
+Refresh Token：
+
+```text
+AES-256-GCM
+↓
+TiDB
+```
+
+Access Token：
+
+```text
+Redis TTL Cache
+```
+
+例如：
+
+```text
+xiaoan3:provider:aily:uat:{user_id}
+```
+
+---
+
+# 51. Aily Client
+
+一个 Worker 进程共享：
+
+```text
+http.Client
+
+http.Transport
+```
+
+配置连接池。
+
+禁止：
+
+```text
+每Run创建一个HTTP Client
+```
+
+---
+
+# 52. Aily Rate Limit
+
+必须区分：
+
+```text
+chat.start
+
+chat.poll
+
+attachment.upload
+
+artifact.resolve
+
+visibility.check
+```
+
+每一个 Operation：
+
+```text
+独立Rate Policy
+```
+
+不能只有：
+
+```text
+Aily = 10/s
+```
+
+这种粗粒度。
+
+---
+
+# 53. 分布式接口限频
+
+所有 Worker 共享：
+
+```text
+Redis Distributed Rate Limiter
+```
+
+推荐：
+
+```text
+Redis Lua
++
+Token Bucket / GCRA
+```
+
+不能每个 Worker 本地：
+
+```text
+10 QPS
+```
+
+否则 5 个 Worker：
+
+```text
+50 QPS
+```
+
+会直接超限。
+
+---
+
+# 54. Rate 与 Concurrency
+
+必须分开：
+
+```text
+start_rate_limit
+```
+
+控制：
+
+```text
+每秒开始多少请求
+```
+
+而：
+
+```text
+max_inflight
+```
+
+控制：
+
+```text
+同时多少任务正在运行
+```
+
+两者独立。
+
+---
+
+# 55. 所有 Run 共享 Provider Limit
+
+不管来源：
+
+```text
+用户手动聊天
+
+定时任务
+
+API调用
+
+Retry
+```
+
+全部进入：
+
+# 同一个 Provider Admission Control。
+
+不能：
+
+```text
+聊天10/s
++
+定时任务10/s
+```
+
+分别算。
+
+---
+
+# 56. Run Priority
+
+为了防止大量 08:30 定时任务挤死用户实时聊天：
+
+```text
+Interactive Run
+```
+
+优先于：
+
+```text
+Scheduled Run
+```
+
+建议：
+
+```text
+interactive_user
+
+manual_application
+
+scheduled_high
+
+scheduled_normal
+
+retry
+```
+
+但需要：
+
+```text
+Priority Aging / Fair Queue
+```
+
+防止低优先级永远饿死。
+
+---
+
+# 57. Attachment
+
+新的标准流程：
 
 ```text
 Browser
 ↓
-Django全量内存
+Studio Storage
 ↓
-Aily
+RuntimeAttachment
+↓
+Run
+↓
+Worker
+↓
+User UAT
+↓
+Aily Upload
+↓
+Aily Chat
 ```
 
-建议：
-
-```text
-Streaming Upload
-```
-
-或者：
-
-```text
-Temporary Storage
-↓
-Upload Worker
-↓
-Aily
-```
+API Server 不长时间同步等待 Aily 上传。
 
 ---
 
-# 71. Artifact
+# 58. Storage
 
-Aily Agent 可能产生：
+统一：
 
 ```text
-图片
-
-文件
-
-飞书文档
-
-其他资源
+Storage
 ```
 
-最终通过：
+接口：
+
+```text
+Put
+
+Open
+
+Delete
+
+SignedURL
+```
+
+开发：
+
+```text
+LocalFS
+```
+
+生产：
+
+```text
+S3 Compatible
+```
+
+Application Avatar、Attachment 等都走同一套 Storage。
+
+---
+
+# 59. Artifact
+
+长期保存：
 
 ```text
 agent_artifact_id
 ```
 
-定位。
-
----
-
-# 72. RunArtifact
-
-建议：
+不能把：
 
 ```text
-RunArtifact
-├── id
-├── run_id
-├── provider
-├── external_artifact_id
-├── provider_artifact_type
-├── name
-├── normalized_type
-├── storage_type
-├── cached_external_url
-├── cached_url_fetched_at
-├── cached_url_expires_at
-├── storage_key
-├── resolution_status
-├── metadata
-├── created_at
-└── updated_at
+Aily 24h URL
 ```
 
----
+作为永久资源地址。
 
-# 73. Aily Artifact URL 不能永久保存
-
-Aily Artifact API 返回：
+用户打开：
 
 ```text
-artifact_id
-
-name
-
-url
-```
-
-其中 URL 只有：
-
-# 24 小时有效。
-
-所以永久保存的是：
-
-```text
-agent_artifact_id
-```
-
-不是 URL。
-
----
-
-# 74. Artifact 打开逻辑
-
-```text
-用户点击产物
+/api/v2/artifacts/{id}/open
 ↓
-/artifacts/{id}/open
+Permission
 ↓
-校验权限
+检查URL Cache
 ↓
-检查URL缓存
-↓
-有效 → 302
-↓
-过期
-↓
-重新调用Aily Artifact API
-↓
-新24小时URL
+必要时重新Resolve
 ↓
 302
 ```
 
 ---
 
-# 75. Artifact Policy
+# 60. Schedule 定位
 
-支持：
+Schedule 是独立一级模块。
+
+它不是：
 
 ```text
-external_refresh
-
-mirror_on_access
-
-mirror_on_complete
+Workflow
 ```
 
-初期默认：
+也不是：
 
 ```text
-external_refresh
+Agent的附属配置
 ```
 
-满足当前：
-
-> 本系统不需要展示或存储全部产物，但用户必须能找到它。
-
----
-
-# 76. Message 与 Artifact 分离
-
-最终：
+产品一级入口：
 
 ```text
-Message
-=
-文本内容
+首页
 
-RunArtifact
-=
-生成资源
-```
+智能体
 
-前端可以一起展示，但数据库不要混在一个字段里。
+应用
 
----
-
-# 77. Aily User / Tenant Identity
-
-Aily Chat 支持：
-
-```text
-user_access_token
-
-tenant_access_token
-```
-
-
-
-因此 RuntimeBinding 必须配置：
-
-```text
-identity_mode
+定时任务
 ```
 
 ---
 
-# 78. UAT
+# 61. Schedule 的业务定义
 
-如果要实现：
+用户可以定义：
 
-> 以当前用户本人身份调用 Aily。
+> 什么时间，以自己的身份，向哪个智能体发送什么消息；智能体回复完成后，是否以自己的飞书身份发送给指定飞书用户或群组。
 
-就必须使用：
-
-```text
-user_access_token
-```
-
-不能：
+核心：
 
 ```text
-TAT + employee_no
-```
-
-模拟。
-
----
-
-# 79. TAT
-
-对于公共 Agent：
-
-```text
-企业知识助手
-后台任务
-公共查询
-```
-
-可以使用：
-
-```text
-tenant_access_token
-```
-
-属于应用身份。
-
----
-
-# 80. Session 与身份绑定
-
-AgentThread 增加：
-
-```text
-auth_mode
-
-auth_subject_key
-```
-
-避免：
-
-```text
-用户A的Session
-被用户B继续使用
+Schedule
+├── Trigger
+├── Invocation
+└── Delivery
 ```
 
 ---
 
-# 81. Visibility
+# 62. Trigger
 
-Aily 支持用户 Visibility Check。
-
-当前该接口：
+定义：
 
 ```text
-使用 UAT
+什么时候执行
 ```
 
-并且 channel_type 当前明确的是：
+第一阶段支持：
 
 ```text
-web_sdk
+once
+
+daily
+
+weekly
+
+monthly
+
+cron
 ```
 
+前端普通用户不要直接输入 Cron。
 
+通过 UI 配置，后端生成 Cron / next_run_at。
 
 ---
 
-# 82. 两层权限
+# 63. Invocation
 
-平台权限：
+定义：
 
 ```text
-Application ACL
+执行哪个 Application
+
+发送什么内容
 ```
 
-负责：
-
-> 用户能不能看到这个应用。
-
-Aily 权限：
-
-负责：
-
-> Provider 是否真的允许调用。
-
-最终：
+Schedule 指向：
 
 ```text
-Local ACL
-+
-Provider Permission
-```
-
----
-
-# 83. Provider 并发
-
-系统本身不负责模型推理。
-
-主要压力来自：
-
-```text
-SSE
-
-HTTP
-
-Redis
-
-TiDB
-
-Attachment
-
-Artifact
-
-Provider连接
-```
-
-属于：
-
-# I/O Bound Runtime Gateway
-
----
-
-# 84. Aily 发起 Chat 限制
-
-当前 Aily：
-
-```text
-POST /agents/{agent_id}/chats
-```
-
-明确：
-
-# 10 次 / 秒。
-
----
-
-# 85. Rate 与 Concurrency 分离
-
-Provider 必须同时配置：
-
-```text
-start_rate_limit
-
-max_inflight
-```
-
-例如：
-
-```text
-Aily
-
-start_rate_limit = 10/s
-
-max_inflight = 100
-```
-
-其中：
-
-```text
-10/s
-```
-
-是文档限制。
-
-```text
-100
-```
-
-只是系统保护值，需要压测。
-
----
-
-# 86. AilyDispatcher
-
-负责：
-
-```text
-Queue
-
-Rate Limit
-
-Concurrency
-
-Retry
-
-Backoff
-
-Routing
-```
-
-流程：
-
-```text
-Run
-↓
-AilyDispatcher
-↓
-RateLimiter
-↓
-Concurrency Slot
-↓
-AilyWorker
-```
-
----
-
-# 87. 高并发排队
-
-如果：
-
-```text
-100个用户同时提交
-```
-
-不直接：
-
-```text
-100次打Aily
-```
-
-而是：
-
-```text
-100 Run
-↓
-queued
-↓
-10/s逐步释放
-```
-
----
-
-# 88. Polling
-
-异步运行通过：
-
-```text
-GET Chat Result
-```
-
-轮询。
-
-该接口属于特殊频控，因此必须统一管理，不允许每个前端自己轮询。
-
----
-
-# 89. Polling Backoff
-
-建议：
-
-```text
-1s
-↓
-2s
-↓
-3s
-↓
-5s
-```
-
-统一通过 Provider RateLimiter。
-
----
-
-# 90. Async Worker
-
-Aily Worker 应使用：
-
-```text
-asyncio
-
-Async HTTP Client
-
-Connection Pool
+application_id
 ```
 
 而不是：
 
 ```text
-一个Streaming请求
+Aily Agent ID
+```
+
+因为：
+
+```text
+Application
+↓
+RuntimeBinding
+↓
+Agent ID
+```
+
+才是正确边界。
+
+---
+
+# 64. Schedule Model
+
+建议：
+
+```text
+Schedule
+├── id
+├── owner_user_id
+├── name
+├── description
+├── application_id
+├── input_payload
+├── schedule_type
+├── cron_expression
+├── timezone
+├── run_at
+├── enabled
+├── conversation_policy
+├── overlap_policy
+├── misfire_policy
+├── execution_window_seconds
+├── deadline_policy
+├── next_run_at
+├── last_run_at
+├── created_at
+└── updated_at
+```
+
+---
+
+# 65. 用户输入消息
+
+对 Chat Application：
+
+```text
+input_payload
+```
+
+主要：
+
+```json
+{
+  "prompt": "请生成昨天的销售日报，并总结异常。"
+}
+```
+
+底层不要直接把字段命名死成：
+
+```text
+message
+```
+
+以便以后固定 Application 也能使用：
+
+```text
+form_data
+parameters
+```
+
+---
+
+# 66. Schedule Owner
+
+必须保存：
+
+```text
+owner_user_id
+```
+
+并遵守：
+
+```text
+Schedule Creator
 =
-一个OS Thread
+Aily Caller
+=
+Feishu Sender
+```
+
+例如吴志彬创建：
+
+```text
+调用Aily → 吴志彬UAT
+
+发送飞书 → 吴志彬身份
+```
+
+不能后台自动改成应用 TAT。
+
+---
+
+# 67. Conversation Policy
+
+定时任务支持：
+
+```text
+new_each_run
+
+reuse
+```
+
+默认：
+
+```text
+new_each_run
+```
+
+避免日报之类长期积累无限 Aily Session Context。
+
+---
+
+# 68. ScheduleOccurrence
+
+Schedule 是定义。
+
+每一次真正触发：
+
+```text
+ScheduleOccurrence
+```
+
+模型：
+
+```text
+id
+
+schedule_id
+
+scheduled_at
+
+enqueued_at
+
+admitted_at
+
+run_id
+
+status
+
+triggered_at
+
+finished_at
+```
+
+唯一：
+
+```text
+(schedule_id, scheduled_at)
+```
+
+防止两个 Scheduler：
+
+```text
+重复执行同一个08:30任务
 ```
 
 ---
 
-# 91. Execution Worker 划分
-
-推荐：
+# 69. Scheduler 执行
 
 ```text
-aily-worker
-
-codex-worker
-
-graphflow-worker
-
-http-worker
-
-media-worker
+Schedule
+↓
+next_run_at到期
+↓
+studio-scheduler
+↓
+CAS
+↓
+ScheduleOccurrence
+↓
+Create Run
+↓
+Outbox
 ```
 
-独立扩容。
+Scheduler：
+
+```text
+不调用Aily
+
+不发送消息
+```
 
 ---
 
-# 92. RunLease
+# 70. Schedule 和 Run
 
-统一 Worker Claim：
+定时任务执行仍然：
 
 ```text
-RunLease
+Run
+```
+
+例如：
+
+```text
+trigger_type = scheduled
+
+trigger_id = occurrence_id
+```
+
+绝对不要重新创造：
+
+```text
+ScheduledExecution
+```
+
+然后又自己拥有一套 AI 生命周期。
+
+---
+
+# 71. Schedule API 限频
+
+用户配置：
+
+```text
+08:30
+```
+
+代表：
+
+```text
+业务期望执行时间
+```
+
+不代表：
+
+```text
+08:30:00.000必须立即调用Aily
+```
+
+真正执行受：
+
+```text
+Queue
+
+Priority
+
+Provider Rate Limit
+
+Concurrency
+
+Execution Window
+```
+
+控制。
+
+---
+
+# 72. 大量同时间任务
+
+例如：
+
+```text
+500个任务
+都设置08:30
+```
+
+正确：
+
+```text
+08:30
+↓
+500 Occurrences
+↓
+500 Runs queued
+↓
+Aily Dispatcher
+↓
+Distributed Rate Limiter
+↓
+按限频平滑释放
+```
+
+不能瞬间 500 请求打 Aily。
+
+---
+
+# 73. Execution Window
+
+Schedule 可以增加：
+
+```text
+execution_window_seconds
+```
+
+例如：
+
+```text
+计划08:30
+
+允许08:30~08:40内执行
+```
+
+用户仍然看到：
+
+```text
+每天08:30
+```
+
+系统可以在 Provider 限频情况下平滑消化。
+
+---
+
+# 74. Deadline
+
+必要时：
+
+```text
+deadline_policy
+```
+
+例如：
+
+```text
+最晚09:00
+```
+
+超过：
+
+```text
+skip
+
+execute_anyway
+```
+
+由策略决定。
+
+---
+
+# 75. Misfire
+
+Misfire：
+
+```text
+08:30 Scheduler本身没运行
+
+09:00恢复
+```
+
+策略：
+
+```text
+fire_once
+
+skip
+```
+
+默认推荐：
+
+```text
+fire_once
+```
+
+---
+
+# 76. Overlap Policy
+
+如果：
+
+```text
+10分钟执行一次
+```
+
+上一轮跑了 15 分钟：
+
+```text
+skip
+
+queue
+
+parallel
+```
+
+第一阶段推荐：
+
+```text
+queue
+```
+
+或者按 Application 类型配置。
+
+默认不建议：
+
+```text
+parallel
+```
+
+---
+
+# 77. Schedule Delivery
+
+Schedule 可以配置：
+
+```text
+执行完成以后
+是否自动发送飞书
+```
+
+如果不开：
+
+```text
+结果只保留在Studio
+```
+
+如果开启：
+
+```text
+进入Delivery流程
+```
+
+---
+
+# 78. ScheduleDelivery
+
+一个 Schedule 可以有：
+
+```text
+0..N
+```
+
+个 Delivery Target。
+
+模型：
+
+```text
+ScheduleDelivery
+├── id
+├── schedule_id
+├── channel
+├── sender_identity_mode
+├── target_type
+├── target_id
+├── target_name
+├── content_mode
+├── enabled
+└── timestamps
+```
+
+第一阶段：
+
+```text
+channel = feishu
+
+sender_identity_mode = owner_user
+
+target_type = user | chat
+```
+
+---
+
+# 79. Delivery Target
+
+用户可以选择：
+
+```text
+飞书用户
+
+飞书群组
+```
+
+例如：
+
+```text
+销售管理群
+
+张三
+
+李四
+```
+
+发送身份始终显示：
+
+```text
+当前用户本人
+```
+
+不允许普通用户：
+
+```text
+选择其他人作为发送者
+```
+
+---
+
+# 80. DeliveryExecution
+
+每一次 Occurrence 的实际发送建立：
+
+```text
+DeliveryExecution
 ```
 
 字段：
 
 ```text
+id
+
+occurrence_id
+
 run_id
 
-worker_id
+schedule_delivery_id
 
-lease_token
+sender_user_id
 
-acquired_at
+target_type
 
-heartbeat_at
+target_id
 
-expires_at
+status
+
+external_message_id
+
+attempt
+
+error_code
+
+error_message
+
+created_at
+
+sent_at
+
+updated_at
 ```
 
 ---
 
-# 93. TiDB 与 SKIP LOCKED
-
-当前项目：
-
-```text
-select_for_update(skip_locked=True)
-```
-
-不能作为 TiDB 8.0.0 的 Worker Claim 基础。
-
-未来使用：
-
-# CAS + Lease
-
----
-
-# 94. CAS Claim
-
-流程：
-
-```text
-SELECT queued candidate
-
-↓
-
-UPDATE run
-SET status='running'
-WHERE id=?
-AND status='queued'
-
-↓
-
-affected_rows == 1
-成功
-```
-
-否则继续领取下一条。
-
----
-
-# 95. Heartbeat
-
-Worker 周期更新：
-
-```text
-heartbeat_at
-
-lease_expires_at
-```
-
-过期：
-
-```text
-running
-↓
-interrupted
-↓
-queued / failed
-```
-
----
-
-# 96. Runtime Snapshot
-
-每个 Run 保存：
-
-```text
-runtime_snapshot
-```
-
-记录：
-
-```text
-provider
-
-agent_id / workflow_id
-
-identity_mode
-
-session_id
-
-execution_mode
-
-config
-```
-
-但：
-
-```text
-不保存Token明文
-```
-
----
-
-# 97. Aily Workflow
-
-Aily Workflow 不属于：
-
-```text
-AilyAgentAdapter
-```
-
-而应该：
-
-```text
-AilyWorkflowAdapter
-```
-
-共享：
-
-```text
-AilyClient
-
-AilyAuth
-
-AilyRateLimiter
-```
-
-但执行协议独立。
-
----
-
-# 98. 本地 Workflow
-
-本系统 Workflow：
-
-```text
-Application A
-↓
-Application B
-↓
-Application C
-```
-
-是平台自己的编排。
-
-Aily Workflow 则是：
-
-```text
-External Runtime
-```
-
-两者不要混合。
-
----
-
-# 99. Fixed Page
+# 81. Run 和 Delivery 状态分离
 
 例如：
 
 ```text
-修改OA密码
+AI成功
 
-条码查询
-
-审批查询
+飞书发送失败
 ```
 
-可配置：
+正确：
 
 ```text
-runtime_type = none
-renderer = page
+Run = succeeded
+
+DeliveryExecution = failed
 ```
 
-或者：
+不能：
 
 ```text
-runtime_type = http
-renderer = page
+Run = failed
+```
+
+因为 AI 已经执行成功。
+
+---
+
+# 82. Delivery 幂等
+
+必须防止：
+
+```text
+同一结果
+给同一个群发送两次
+```
+
+建议唯一：
+
+```text
+(occurrence_id, schedule_delivery_id)
+```
+
+发送前：
+
+```text
+pending
+↓ CAS
+sending
+↓
+succeeded
 ```
 
 ---
 
-# 100. Renderer Registry
+# 83. Delivery Queue
 
-未来：
+Run 完成：
 
 ```text
-RendererRegistry
-├── chat
-├── form
-├── page
-├── task
-├── workflow
-├── dashboard
-└── external_page
+Run succeeded
+↓
+Create DeliveryExecution
+↓
+Delivery Outbox
+↓
+Redis Stream
 ```
 
-WorkspaceHost 根据：
+例如：
 
 ```text
-renderer_key
+xiaoan3:queue:delivery:feishu
 ```
 
-选择组件。
-
----
-
-# 101. Secret Management
-
-禁止：
+Delivery Worker：
 
 ```text
-Application.config
-```
-
-直接存：
-
-```text
-API Key
-
-Aily Secret
-
-Access Token
-```
-
-只保存：
-
-```text
-secret_ref
-```
-
-真实 Secret：
-
-```text
-Vault
-
-KMS
-
-Environment Secret
-
-Secret Store
+Claim
+↓
+Feishu Rate Limiter
+↓
+Feishu IM API
 ```
 
 ---
 
-# 102. 数据库目标
+# 84. DeliveryAdapter
 
-未来：
+消息发送不直接写死到 Scheduler。
+
+定义：
 
 ```text
-TiDB 8.0.0
-
-MySQL 8
+DeliveryAdapter
 ```
 
-配置：
+当前：
 
 ```text
-DB_TYPE=tidb
+FeishuDeliveryAdapter
+```
 
-DB_TYPE=mysql
+未来可以扩：
+
+```text
+Email
+
+Webhook
+```
+
+但现在只实现飞书。
+
+---
+
+# 85. Feishu Delivery 限频
+
+Aily API 和飞书消息 API：
+
+# 必须是两个独立的 Rate Limit Domain。
+
+例如：
+
+```text
+Run
+↓
+Aily Rate Limiter
+↓
+Aily
+
+
+Delivery
+↓
+Feishu IM Rate Limiter
+↓
+飞书用户/群组
 ```
 
 ---
 
-# 103. Django DB Backend
+# 86. 每个接口独立限频
 
-MySQL：
-
-```text
-django.db.backends.mysql
-```
-
-TiDB：
-
-```text
-django_tidb
-```
-
-驱动统一倾向：
-
-```text
-mysqlclient
-```
-
----
-
-# 104. JSONField
-
-可以继续大量使用：
-
-```text
-models.JSONField
-```
-
-但核心查询字段必须是真实列：
+限频不能只按：
 
 ```text
 provider
+```
 
-runtime_type
+要按：
 
-status
+```text
+provider + operation
+```
 
-enabled
+例如：
 
-organization_id
+```text
+feishu_aily:chat_start
 
-application_id
+feishu_aily:chat_poll
 
-created_at
+feishu_aily:attachment_upload
+
+feishu_aily:artifact_resolve
+
+feishu_aily:visibility
+
+feishu_im:message_send
 ```
 
 ---
 
-# 105. JSON 适用内容
+# 87. ProviderRatePolicy
 
-适合：
+建议配置：
 
 ```text
-Provider Config
-
-Runtime Snapshot
-
-Event Payload
-
-Input Schema
-
-Output Schema
-
-Metadata
+ProviderRatePolicy
+├── provider_key
+├── operation
+├── rate
+├── burst
+├── max_inflight
+├── retry_policy
+└── enabled
 ```
 
-不适合：
+具体限频值：
 
 ```text
-Run.status
+配置化
+```
 
-Provider
+不能硬编码到业务逻辑。
 
-Runtime Type
+---
+
+# 88. 429 Handling
+
+收到：
+
+```text
+429
+```
+
+不能立即疯狂重试。
+
+必须：
+
+```text
+读取Retry-After / Reset
+
+标记operation cooldown
+
+Requeue
+
+Backoff
+```
+
+避免：
+
+```text
+Retry Storm
 ```
 
 ---
 
-# 106. DB 兼容红线
+# 89. Schedule Center
 
-避免核心依赖：
+定时任务是一级模块：
 
 ```text
-PostgreSQL ArrayField
+/schedules
+```
 
-JSONB特有查询
+子页面：
 
-GIN
+```text
+/schedules/new
 
-GiST
-
-SKIP LOCKED
-
-Stored Procedure
-
-Trigger
-
-DB Event
-
-XA
-
-数据库专属RawSQL
+/schedules/:id
 ```
 
 ---
 
-# 107. 字符集
+# 90. PC Schedule Center
 
-统一：
+PC 推荐：
 
 ```text
-utf8mb4
+左侧任务列表
++
+右侧任务详情
+```
+
+例如：
+
+```text
+┌────────────────────┬────────────────────────────────┐
+│ 每日销售日报        │ 每日销售日报                    │
+│ 每周经营周报        │                                │
+│ 库存异常提醒        │ 销售助手                       │
+│                    │ 每天08:30                      │
+│                    │                                │
+│                    │ Prompt                         │
+│                    │ 请生成昨天的销售日报...         │
+│                    │                                │
+│                    │ 发送到                          │
+│                    │ 销售管理群、张三                │
+│                    │                                │
+│                    │ 最近执行记录                    │
+└────────────────────┴────────────────────────────────┘
 ```
 
 ---
 
-# 108. API V2
+# 91. Mobile Schedule Center
 
-建议：
+Mobile：
+
+```text
+定时任务                     ＋
+
+每日销售日报
+每天 08:30
+销售助手
+下一次：明天 08:30
+发送到：销售管理群 +2
+● 已启用
+
+────────────
+
+每周经营周报
+周一 09:00
+问数小安
+● 已启用
+```
+
+点击进入单页详情。
+
+---
+
+# 92. 新建定时任务 UI
+
+推荐分步骤：
+
+```text
+Step 1
+什么时候执行
+
+Step 2
+选择智能体
+
+Step 3
+发送什么消息
+
+Step 4
+是否发送飞书回复
+
+Step 5
+选择飞书用户/群组
+```
+
+---
+
+# 93. Schedule 状态展示
+
+用户层：
+
+```text
+等待执行
+
+排队中
+
+执行中
+
+发送中
+
+成功
+
+部分失败
+
+失败
+
+已跳过
+```
+
+详情可以显示：
+
+```text
+计划时间
+
+实际入队
+
+实际开始
+
+AI完成
+
+消息发送完成
+```
+
+如果限频等待：
+
+```text
+等待原因：Provider限频排队
+```
+
+---
+
+# 94. Schedule API
+
+核心：
+
+```text
+GET    /api/v2/schedules
+
+POST   /api/v2/schedules
+
+GET    /api/v2/schedules/{id}
+
+PATCH  /api/v2/schedules/{id}
+
+DELETE /api/v2/schedules/{id}
+
+POST   /api/v2/schedules/{id}/enable
+
+POST   /api/v2/schedules/{id}/disable
+
+POST   /api/v2/schedules/{id}/run-now
+
+GET    /api/v2/schedules/{id}/occurrences
+
+GET    /api/v2/schedules/{id}/runs
+```
+
+---
+
+# 95. Application API
+
+核心：
+
+```text
+GET    /api/v2/applications
+
+POST   /api/v2/applications
+
+GET    /api/v2/applications/{id}
+
+PATCH  /api/v2/applications/{id}
+
+DELETE /api/v2/applications/{id}
+
+POST   /api/v2/applications/{id}/favorite
+
+DELETE /api/v2/applications/{id}/favorite
+
+POST   /api/v2/applications/{id}/default-agent
+
+DELETE /api/v2/applications/{id}/default-agent
+
+GET    /api/v2/applications/{id}/avatar
+
+POST   /api/v2/applications/{id}/avatar
+
+DELETE /api/v2/applications/{id}/avatar
+```
+
+---
+
+# 96. Runtime API
+
+```text
+GET /api/v2/runtimes
+
+POST /api/v2/runtimes/validate
+```
+
+第一阶段目录里主要：
+
+```text
+Feishu Aily Custom Agent
+```
+
+---
+
+# 97. Run API
 
 ```text
 POST /api/v2/runs
@@ -3012,347 +3235,630 @@ GET /api/v2/runs/{id}/events
 
 GET /api/v2/runs/{id}/stream
 
-POST /api/v2/runs/{id}/commands
-
 GET /api/v2/runs/{id}/artifacts
+```
+
+---
+
+# 98. Attachment / Artifact API
+
+```text
+POST /api/v2/applications/{id}/attachments
 
 GET /api/v2/artifacts/{id}/open
 ```
 
 ---
 
-# 109. Conversation 数据关系
+# 99. 核心数据库表
+
+第一阶段：
+
+```text
+users
+
+feishu_identities
+
+sessions
+
+application_categories
+
+applications
+
+application_favorites
+
+providers
+
+runtime_bindings
+
+conversations
+
+agent_threads
+
+messages
+
+runs
+
+run_events
+
+run_leases
+
+runtime_attachments
+
+run_artifacts
+
+outbox_events
+
+schedules
+
+schedule_occurrences
+
+schedule_deliveries
+
+delivery_executions
+
+audit_logs
+```
+
+---
+
+# 100. 当前不建的表
+
+暂时不建立：
+
+```text
+workflow_steps
+
+workflow_runs
+
+codex_sessions
+
+graphflow_runs
+
+agent_execution
+
+agent_turns
+
+legacy_jobs
+```
+
+---
+
+# 101. 关键数据库索引
+
+至少：
+
+```text
+applications
+UNIQUE(slug)
+
+runtime_bindings
+(application_id, enabled)
+
+conversations
+(user_id, application_id, updated_at)
+
+messages
+(conversation_id, created_at)
+
+runs
+(status, available_at, priority, created_at)
+
+runs
+(conversation_id, created_at)
+
+runs
+(provider, external_run_id)
+
+run_events
+UNIQUE(run_id, sequence)
+
+run_leases
+(expires_at)
+
+outbox_events
+(status, available_at, created_at)
+
+schedules
+(enabled, next_run_at)
+
+schedule_occurrences
+UNIQUE(schedule_id, scheduled_at)
+
+delivery_executions
+UNIQUE(occurrence_id, schedule_delivery_id)
+```
+
+---
+
+# 102. Pagination
+
+核心长列表：
 
 ```text
 Conversation
-│
-├── Message
-│
-├── AgentThread
-│
-└── Run
-     │
-     ├── RunEvent
-     ├── RunCommand
-     ├── RunArtifact
-     ├── RuntimeAttachment
-     └── RunLease
+
+Run
+
+Schedule History
+
+Audit
+```
+
+采用：
+
+```text
+Keyset Pagination
+```
+
+避免深 Offset。
+
+---
+
+# 103. Redis Key Namespace
+
+统一：
+
+```text
+xiaoan3:
+```
+
+例如：
+
+```text
+xiaoan3:session:...
+
+xiaoan3:provider:aily:uat:...
+
+xiaoan3:queue:run:feishu_aily
+
+xiaoan3:queue:delivery:feishu
+
+xiaoan3:rate:feishu_aily:chat_start
+
+xiaoan3:rate:feishu_im:message_send
+
+xiaoan3:run:{id}:live
 ```
 
 ---
 
-# 110. Workflow 数据关系
+# 104. Redis Logical DB
+
+新架构尽量：
 
 ```text
-WorkflowRun
-│
-├── StepRun
-│    └── Run
-│
-├── StepRun
-│    └── Run
-│
-└── StepRun
-     └── Run
+统一一个Redis DB
 ```
+
+通过 Key Namespace 隔离。
+
+不要长期依赖：
+
+```text
+DB 2
+
+DB 3
+```
+
+区分模块，以便未来兼容 Redis Cluster。
 
 ---
 
-# 111. 现有执行模型迁移
+# 105. Observability
 
-当前：
-
-```text
-AgentTurn
-
-AgentExecution
-
-Job
-
-WorkflowStepRun
-```
-
-不要立即删除。
-
-先：
+第一版就必须实现：
 
 ```text
-增加 Run 关联
+Structured Logging
+
+Trace
+
+Metrics
 ```
 
-新代码优先 Run。
+所有日志至少关联：
 
-最终逐步淘汰旧 Execution Root。
+```text
+trace_id
+
+request_id
+
+user_id
+
+run_id
+
+schedule_id
+
+occurrence_id
+```
+
+按实际上下文存在。
 
 ---
 
-# 112. Aily Integration 模块
+# 106. 核心指标
 
-建议：
-
-```text
-integrations/aily/
-├── client.py
-├── auth.py
-├── rate_limit.py
-├── dispatcher.py
-├── agent_adapter.py
-├── workflow_adapter.py
-├── event_mapper.py
-├── attachment_mapper.py
-├── artifact_mapper.py
-└── exceptions.py
-```
-
----
-
-# 113. 后端目标模块
-
-建议最终：
+至少：
 
 ```text
-identity
+HTTP Latency
 
-tenancy
+HTTP Error Rate
 
-catalog
-├── applications
-├── agents
-├── skills
-├── providers
-└── runtime_bindings
+Active SSE
 
-workspace
+Run Queue Depth
 
-conversation
+Run Success Rate
 
-workflow
+Run P95
 
-execution
-├── run
-├── event
-├── command
-├── artifact
-├── attachment
-└── lease
+Outbox Backlog
 
-integrations
-├── aily
-├── codex
-├── graphflow
-└── http
+Redis Stream Lag
 
-governance
-├── secret
-├── quota
-├── policy
-└── audit
+Lease Expiration
 
-automation
-```
+Schedule Delay
 
----
-
-# 114. 推荐部署架构
-
-```text
-                          Nginx
-                            │
-              ┌─────────────┴─────────────┐
-              ▼                           ▼
-         React Static                Django ASGI
-                                          │
-                      ┌───────────────────┼──────────────┐
-                      ▼                   ▼              ▼
-                    TiDB                Redis       Object Storage
-                      │                   │
-                      └────────┬──────────┘
-                               ▼
-                       Execution Plane
-             ┌─────────────────┼────────────────┐
-             ▼                 ▼                ▼
-        Aily Worker       Codex Worker    GraphFlow Worker
-             │
-             ▼
-         Feishu Aily
-```
-
----
-
-# 115. PC / Mobile 部署
-
-PC 与手机：
-
-```text
-同一个 Web Build
-```
-
-通过 Responsive Shell 选择：
-
-```text
-DesktopAppShell
-
-MobileAppShell
-```
-
-无需两个域名，也无需两个前端项目。
-
----
-
-# 116. 飞书内嵌体验
-
-系统主要运行于：
-
-```text
-飞书 PC
-飞书 Mobile
-```
-
-因此必须重点验证：
-
-```text
-Feishu Desktop WebView
-
-Feishu Mobile WebView
-
-OAuth跳转
-
-History
-
-Safe Area
-
-File Upload
-
-Download
-
-SSE
-
-软键盘
-
-返回行为
-```
-
----
-
-# 117. Observability
-
-后台至少监控：
-
-```text
-在线用户
-
-PC / Mobile使用比例
-
-SSE连接数
-
-Queued Run
-
-Running Run
-
-成功率
-
-失败率
-
-平均Run耗时
-
-P95耗时
-
-Aily Start Rate
+Schedule Misfire
 
 Aily Inflight
 
-429
+Aily 429
 
-Timeout
+Aily Timeout
 
-Polling QPS
+Feishu Delivery Rate
 
-Artifact Resolve
+Feishu Delivery Failure
 
-Redis Latency
+Delivery 429
 
 TiDB Latency
 
-Worker Heartbeat
-
-Lease Expired
+Redis Latency
 ```
 
 ---
 
-# 118. 用户行为指标
+# 107. Schedule 特有指标
 
-Workspace 还可以统计：
-
-```text
-Application Usage
-
-Agent Usage
-
-快捷入口点击率
-
-最近应用
-
-收藏应用
-
-PC/Mobile来源
-
-Conversation数量
-
-Run数量
-```
-
-用于自动生成：
+特别监控：
 
 ```text
-常用应用
+schedule_trigger_delay_seconds
+
+schedule_queue_delay_seconds
+
+schedule_run_duration_seconds
+
+schedule_delivery_duration_seconds
+
+schedule_misfire_total
+
+schedule_overlap_skipped_total
 ```
+
+以后能直接回答：
+
+> 为什么用户设置 08:30，08:31 才收到？
 
 ---
 
-# 119. Phase 1：数据库兼容
+# 108. Health
 
-优先：
-
-```text
-PostgreSQL
-↓
-TiDB / MySQL
-```
-
-完成：
+提供：
 
 ```text
-DB_TYPE
+/health/live
 
-mysqlclient
+/health/ready
 
-django-tidb
-
-移除SKIP LOCKED
-
-CAS + Lease
+/metrics
 ```
+
+Ready：
+
+```text
+TiDB
+
+Redis
+```
+
+Aily 暂时不可用不应该导致：
+
+```text
+整个API Pod Not Ready
+```
+
+Provider Health 单独监控。
 
 ---
 
-# 120. Phase 2：Runtime 抽象
+# 109. 管理后台
 
-完成：
+不再依赖：
 
 ```text
-RuntimeAdapter
+Django Admin
+```
 
-RuntimeRegistry
+正式建设：
+
+```text
+React Admin / Enterprise Console
+```
+
+管理：
+
+```text
+Application
 
 Provider
 
-ApplicationRuntimeBinding
+RuntimeBinding
+
+User
+
+Schedules
+
+Runs
+
+Rate Policy
+
+Audit
+
+Provider Health
 ```
 
 ---
 
-# 121. Phase 3：Unified Run
+# 110. Security
+
+禁止日志输出：
+
+```text
+DB Password
+
+Redis Password
+
+App Secret
+
+User Access Token
+
+Tenant Access Token
+
+Refresh Token
+
+Authorization Header
+
+Session Token
+
+Signed Artifact URL敏感参数
+```
+
+---
+
+# 111. Test Strategy
+
+禁止使用：
+
+```text
+SQLite
+```
+
+证明数据库兼容。
+
+测试：
+
+```text
+Unit
+↓
+无数据库
+
+
+Integration
+↓
+TiDB 8
+
+
+Compatibility Integration
+↓
+MySQL 5.7
+
+
+Redis Integration
+
+API Contract Test
+
+Mock Aily Test
+
+Real UAT Test
+
+Feishu Delivery Test
+
+Playwright E2E
+```
+
+---
+
+# 112. CI Matrix
+
+至少：
+
+```text
+TiDB 8
+
+MySQL 5.7
+```
+
+同时测试：
+
+```text
+Migration
+
+Transaction
+
+CAS
+
+Lease
+
+Outbox
+
+JSON
+
+Schedule
+
+Occurrence Unique
+
+Delivery Idempotency
+
+Run Event
+
+Application
+
+Identity
+```
+
+---
+
+# 113. 性能测试重点
+
+不重点追求：
+
+```text
+Hello World Router Benchmark
+```
+
+真正测试：
+
+```text
+1000+ SSE
+
+大量Scheduled Run
+
+大量同一时间Schedule
+
+Provider限频
+
+Redis Stream Backlog
+
+Worker Crash
+
+Delivery Retry
+
+Redis Restart
+
+TiDB短暂异常
+
+Large Attachment
+
+Slow Browser
+```
+
+---
+
+# 114. 第一阶段开发顺序
+
+## Phase 0
+
+```text
+OpenAPI Contract
+```
+
+冻结现有产品行为。
+
+---
+
+## Phase 1
+
+```text
+Go Platform Foundation
+```
+
+完成：
+
+```text
+Config
+
+TiDB
+
+Redis
+
+Logging
+
+Metrics
+
+Tracing
+
+Health
+
+Graceful Shutdown
+```
+
+---
+
+## Phase 2
+
+建立：
+
+```text
+最终新Schema
+```
+
+并完成：
+
+```text
+sqlc
+```
+
+---
+
+## Phase 3
+
+完成：
+
+```text
+Identity
+
+Feishu OAuth
+
+Opaque Session
+
+UAT Refresh
+
+Admin Login
+```
+
+---
+
+## Phase 4
+
+完成：
+
+```text
+Application
+
+Provider
+
+RuntimeBinding
+
+Runtime Catalog
+
+Agent Market
+
+Default Agent
+
+Avatar
+
+Favorite
+```
+
+---
+
+## Phase 5
 
 完成：
 
@@ -3361,391 +3867,377 @@ Run
 
 RunEvent
 
-RunCommand
-
-RunArtifact
-
-RuntimeAttachment
-
 RunLease
+
+Outbox
+
+Redis Streams
+
+Worker
 ```
 
 ---
 
-# 122. Phase 4：Aily Agent
+## Phase 6
 
-实现：
+完成：
 
 ```text
-Session
-
-Chat
+Aily Agent Adapter
 
 Streaming
 
-Final Reconciliation
+Polling
 
 Attachment
 
 Artifact
 
-UAT / TAT
+Visibility
 
-Rate Limit
-
-Error Mapping
+Final Reconciliation
 ```
+
+并重新跑真实 UAT。
 
 ---
 
-# 123. Phase 5：Workspace Shell
-
-把现有前端改造成：
-
-```text
-AppShell
-↓
-WorkspaceHost
-```
-
-支持：
-
-```text
-Home Workspace
-
-Chat
-
-Fixed Page
-
-Workflow
-
-Dashboard
-```
-
----
-
-# 124. Phase 6：PC / Mobile 双布局
-
-增加：
-
-```text
-DesktopAppShell
-
-MobileAppShell
-```
-
-以及：
-
-```text
-Desktop / Mobile Renderer Layout
-```
-
----
-
-# 125. Phase 7：登录体系
+## Phase 7
 
 完成：
 
 ```text
-Default Feishu OAuth
+Stream Gateway
 
-Studio Session
+SSE Replay
 
-User Mapping
+content.snapshot
 
-/login/admin
-
-Local Admin Auth
+Reconnect
 ```
 
 ---
 
-# 126. Phase 8：主页快捷入口
+## Phase 8
 
-实现：
+完成：
 
 ```text
-常用应用
+Storage
 
-最近使用
+Attachment异步上传
 
-收藏
-
-智能体切换
-
-Application Search
+Avatar Storage
 ```
 
 ---
 
-# 127. Phase 9：@ 路由
+## Phase 9
 
-实现：
-
-```text
-@智能体
-
-@固定应用
-
-@工作流
-```
-
-并携带：
+完成：
 
 ```text
-原始指令
-```
+Schedule
 
----
+ScheduleOccurrence
 
-# 128. Phase 10：Aily Workflow
+Scheduler
 
-增加：
+Misfire
 
-```text
-AilyWorkflowAdapter
+Overlap
+
+Execution Window
 ```
 
 ---
 
-# 129. Phase 11：治理
+## Phase 10
 
-后续：
+完成：
 
 ```text
-Quota
+ScheduleDelivery
 
-Audit
+DeliveryExecution
 
-Cost
+FeishuDeliveryAdapter
 
-Circuit Breaker
+Delivery Queue
 
-Evaluation
+Delivery Rate Limit
 
-Automation
+Delivery Retry
 ```
 
 ---
 
-# 130. 最终普通用户入口
+## Phase 11
 
-完整体验：
+前端切换：
 
 ```text
-用户点击飞书应用
-       ↓
-是否已有Studio Session
-       │
-   ┌───┴────┐
-   │        │
-  有        无
-   │        │
-   │        ▼
-   │   Feishu OAuth
-   │        │
-   │        ▼
-   │    User Mapping
-   │        │
-   └────────┤
-            ▼
-       Main Workspace
-            │
-      ┌─────┼──────────────┐
-      ▼     ▼              ▼
-   主对话  常用智能体      常用应用
-      │
-      ├── 切换Aily Agent
-      │
-      ├── @Application
-      │
-      └── 普通输入
+OpenAPI Generated Client
+
+Cookie Session
+
+Go SSE
+
+Schedule Center
 ```
 
 ---
 
-# 131. 最终管理员入口
+## Phase 12
+
+完成：
 
 ```text
-/login/admin
-      ↓
-Admin Login Page
-      ↓
-Local Admin Auth
-      ↓
-Admin Workspace
-```
+Fixed Application
 
-普通用户默认不知道，也不需要看到该入口。
+FormRenderer
 
----
-
-# 132. 最终 PC 用户体验
-
-```text
-常驻 Sidebar
-
-中央 Workspace
-
-智能体快速切换
-
-最近会话
-
-常用应用
-
-Chat / Fixed Page 无缝切换
-
-返回时保持状态
+DashboardRenderer
 ```
 
 ---
 
-# 133. 最终 Mobile 用户体验
+## Phase 13
+
+完成：
 
 ```text
-顶部当前智能体
+Mobile Bottom Sheet
 
-Drawer 导航
+Mobile Keyboard
 
-Bottom Sheet 智能体切换
+Bottom Composer
 
-底部输入框
+Schedule Mobile UI
 
-单列 Application 页面
-
-移动端 Card List
-
-完整 Workspace History
-
-软键盘适配
+Workspace Back Stack
 ```
-
-整体交互参考：
-
-```text
-ChatGPT Mobile
-
-豆包 Mobile
-```
-
-但保持 Creation Agent Studio 自己的 Application Workspace 设计。
 
 ---
 
-# 134. 最终 Aily 调用链
+## Phase 14
+
+完成：
 
 ```text
-用户
- │
- ▼
+Admin Console
+
+Rate Policy管理
+
+Run监控
+
+Schedule监控
+```
+
+---
+
+## Phase 15
+
+做：
+
+```text
+Load Test
+
+Failure Test
+
+Security Test
+```
+
+---
+
+# 115. 当前暂缓内容
+
+以下不进入当前主线：
+
+```text
+Workflow
+
+Codex
+
+GraphFlow
+```
+
+旧 Django 中相关代码：
+
+```text
+只作为历史参考
+```
+
+不迁到新 Go 架构。
+
+---
+
+# 116. 未来接 Provider 的原则
+
+未来增加：
+
+```text
+Codex
+
+GraphFlow
+
+Aily Workflow
+```
+
+只能通过：
+
+```text
+RuntimeAdapter
+```
+
+增加执行能力。
+
+不能要求重新设计：
+
+```text
+Application
+
+Conversation
+
+Run
+
+Schedule
+
+Workspace
+```
+
+---
+
+# 117. Schedule 与 Workflow 的区别
+
+必须明确：
+
+```text
+Schedule
+=
+什么时候执行
+```
+
+而：
+
+```text
+Workflow
+=
+执行什么步骤以及步骤关系
+```
+
+当前：
+
+```text
+Schedule
+↓
+Application
+↓
+Run
+```
+
+未来可能：
+
+```text
+Schedule
+↓
+Workflow
+↓
+多个Run
+```
+
+所以：
+
+```text
+当前做Schedule
+```
+
+完全不需要：
+
+```text
+当前做Workflow
+```
+
+---
+
+# 118. 最终用户体验
+
+普通员工：
+
+```text
+飞书
+↓
+Creation Agent Studio
+↓
+自动飞书登录
+↓
 Main Workspace
- │
- ▼
-Chat Application
- │
- ▼
-RuntimeBinding
- │
- ▼
-Create Run
- │
- ▼
-queued
- │
- ▼
-AilyDispatcher
- │
- ├── Rate Limit
- ├── Concurrency
- ├── Auth Context
- └── Session
- │
- ▼
-AilyWorker
- │
- ▼
-Feishu Aily
- │
- │ SSE / Async
- ▼
-AilyEventMapper
- │
- ▼
-RunEvent
- │
- ├── Redis
- │     ↓
- │    SSE
- │     ↓
- │   Browser
- │
- └── Final Reconciliation
-        ↓
-      Message
-      Run
-      Artifact
 ```
 
----
-
-# 135. 最终 Artifact 链
+可以：
 
 ```text
-Aily
-↓
-agent_artifact_id
-↓
-RunArtifact
-↓
-用户后来点击
-↓
-Artifact Resolver
-↓
-重新获取24小时URL
-↓
-用户打开产物
+直接向主智能体提问
+
+切换不同Aily智能体
+
+打开固定应用
+
+使用业务表单
+
+查看报表
+
+创建定时任务
+
+配置每天几点向哪个智能体发送什么内容
+
+配置是否将AI回复自动发送给指定飞书用户或群组
+
+查看每次执行和发送情况
+
+继续历史会话
+
+查看AI产物
 ```
 
 ---
 
-# 136. 最终架构关系
+# 119. 最终 Desktop 产品结构
 
 ```text
-Organization
-│
-├── User
-│
-├── Provider
-│
-└── Application
-     │
-     ├── Renderer
-     │
-     └── RuntimeBinding
-          │
-          ▼
-      Workspace
-          │
-          └── Conversation
-               │
-               ├── Message
-               ├── AgentThread
-               │     └── External Session
-               │
-               └── Run
-                    │
-                    ├── RunEvent
-                    ├── RunCommand
-                    ├── RunArtifact
-                    ├── RuntimeAttachment
-                    └── RunLease
+顶部一级导航
+
+首页
+智能体
+应用
+定时任务
+```
+
+左侧：
+
+```text
+根据当前模块显示Context Sidebar
+```
+
+中央：
+
+```text
+WorkspaceHost
 ```
 
 ---
 
-# 137. 产品层最终结构
+# 120. 最终 Mobile 产品结构
 
-最终用户理解的产品只有几个概念：
+Top Bar：
+
+```text
+☰
+页面标题 / 当前智能体
+头像
+```
+
+Drawer：
 
 ```text
 首页
@@ -3754,193 +4246,114 @@ Organization
 
 应用
 
-会话
+定时任务
 
-我的
+最近会话
+
+收藏
+
+设置
 ```
 
-而技术架构中的：
+Chat：
 
 ```text
-Runtime
-
-Provider
-
-Run
-
-Artifact
-
-Lease
+底部Composer
 ```
 
-对普通用户完全隐藏。
-
----
-
-# 138. 最终关键边界
-
-未来架构必须始终坚持：
+Agent Switch：
 
 ```text
-Application
-≠
-Agent
+Bottom Sheet
+```
 
-Application
-≠
-Runtime
+Schedule：
 
-Conversation
-≠
-Run
-
-Message
-≠
-Artifact
-
-Platform
-≠
-Provider
-
-Studio Session
-≠
-Feishu Provider Token
-
-Desktop Layout
-≠
-Mobile Layout
-
-但：
-Desktop 与 Mobile
-共享同一套业务模型
+```text
+移动端单列任务卡片
 ```
 
 ---
 
-# 139. 最优先开发顺序
+# 121. 最终架构核心
 
-建议顺序：
-
-```text
-1. TiDB / MySQL兼容
-
-2. RuntimeBinding / RuntimeAdapter
-
-3. Unified Run
-
-4. Aily Agent完整接入
-
-5. Main Workspace / AppShell
-
-6. 多智能体切换
-
-7. 固定Application
-
-8. 飞书OAuth登录
-
-9. Admin独立登录
-
-10. MobileAppShell
-
-11. Artifact
-
-12. Aily Workflow
-
-13. 治理与观测
-```
-
-其中 Workspace 和 Feishu OAuth 可以根据产品上线节奏提前并行开发。
-
----
-
-# 140. 最终结论
-
-Creation Agent Studio 最终应该给用户一种感觉：
-
-> 打开飞书里的 Creation Agent Studio，就进入一个统一 AI 工作台。
-
-用户无需理解：
-
-```text
-这个是Aily
-
-那个是Workflow
-
-这个是HTTP
-
-那个是Fixed Page
-```
-
-用户只需要：
-
-```text
-选择一个智能体
-
-输入问题
-
-打开一个应用
-
-完成一个任务
-
-随时返回主页面
-```
-
-PC 上：
-
-```text
-像一个完整的 AI 工作台。
-```
-
-手机上：
-
-```text
-像一个真正为移动端设计的 AI 助手应用。
-```
-
-登录上：
-
-```text
-普通员工打开即飞书身份进入。
-```
-
-管理员：
-
-```text
-通过专属 Admin 入口登录。
-```
-
-技术底层则统一使用：
+Creation Agent Studio 当前最终核心可以总结成：
 
 ```text
 Application
 +
 Workspace
 +
-Renderer
-+
-RuntimeBinding
-+
-RuntimeAdapter
+Identity
 +
 Conversation
 +
 Run
 +
-Artifact
+Aily Runtime
 +
-Provider
+Schedule
++
+Delivery
++
+Artifact
 ```
 
-形成稳定的平台架构。
-
-最终 Creation Agent Studio 不只是：
+其中：
 
 ```text
-智能体门户
+Application
+=
+用户要使用什么能力
+
+
+Run
+=
+这个能力的一次真实执行
+
+
+Schedule
+=
+什么时候自动创建Run
+
+
+Delivery
+=
+Run完成以后结果要发给谁
 ```
 
-而应该成为：
+这是整个架构最核心的四层语义。
 
-# 企业 AI 应用统一入口 + AI Runtime 编排平台 + 企业任务工作台
+---
 
-这也是当前项目最适合的长期演进方向。
+# 122. 最终一句话定位
+
+Creation Agent Studio 最终不是：
+
+> 一个可以聊天的 Aily 门户。
+
+而是：
+
+# 一个以 Application 为核心、以 Run 为统一执行模型、支持用户身份 AI 调用、定时自动执行和飞书结果分发的企业 AI 工作台。
+
+当前优先把：
+
+```text
+Application
+
+Aily Agent
+
+Fixed Application
+
+Schedule
+
+Feishu Delivery
+
+Desktop
+
+Mobile
+```
+
+做到完整、稳定、高性能。
+
+Workflow、Codex、GraphFlow 等能力以后再以扩展方式加入，而不是影响当前核心平台的设计和交付。

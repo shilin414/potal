@@ -76,6 +76,7 @@ func appFromDetail(row db.GetApplicationByIDRow) *Application {
 		CategorySlug:   row.CategorySlug.String,
 		CategoryName:   row.CategoryName.String,
 		IsPublic:       row.IsPublic,
+		Enabled:        row.Enabled,
 		IsDefaultAgent: row.IsDefaultAgent,
 		UsageCount:     int64(row.UsageCount),
 		CreatedAt:      row.CreatedAt,
@@ -300,8 +301,11 @@ func (r *Repo) ListApplicationsWithBindings(ctx context.Context, scope string, c
 // ("extras" in the list semantics).
 func (r *Repo) ListUnboundApplications(ctx context.Context, scope, kind string, callerID int64, isStaff bool) ([]ApplicationWithBinding, error) {
 	rows, err := r.q(ctx).ListApplicationsByVisibility(ctx, db.ListApplicationsByVisibilityParams{
-		ShowAll:   isStaff,
-		IsPublic:  scope == "public",
+		ShowAll: isStaff,
+		// The pre-filter must be a SUPERSET of what visible() accepts:
+		// manage scope includes other users' public applications, so the
+		// SQL side keeps is_public rows as well (visible() re-checks).
+		IsPublic:  scope == "public" || scope == "manage",
 		CreatedBy: sql.NullInt64{Int64: callerID, Valid: scope != "public"},
 		Limit:     1000,
 	})
@@ -326,8 +330,10 @@ func (r *Repo) ListUnboundApplications(ctx context.Context, scope, kind string, 
 			ID: int64(row.ID), Slug: row.Slug, Name: row.Name,
 			Description: row.Description.String, Icon: row.Icon, AvatarKey: row.AvatarKey,
 			Color: row.Color, Kind: row.Kind, RendererKey: row.RendererKey, ExecutorKey: row.ExecutorKey,
-			IsPublic: row.IsPublic, IsDefaultAgent: row.IsDefaultAgent, UsageCount: int64(row.UsageCount),
-			CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
+			CategorySlug: row.CategorySlug.String, CategoryName: row.CategoryName.String,
+			IsPublic: row.IsPublic, Enabled: row.Enabled, IsDefaultAgent: row.IsDefaultAgent,
+			UsageCount: int64(row.UsageCount),
+			CreatedAt:  row.CreatedAt, UpdatedAt: row.UpdatedAt,
 		}
 		if row.CreatedBy.Valid {
 			v := int64(row.CreatedBy.Int64)
@@ -341,21 +347,30 @@ func (r *Repo) ListUnboundApplications(ctx context.Context, scope, kind string, 
 	return out, nil
 }
 
-// visible mirrors the reference scope semantics exactly:
+// visible — the 2026-09 access policy:
 //
-//	public → is_public only;  mine → own only;  manage → public | mine;
-//	staff sees everything (reference: is_staff bypass in can_manage paths).
+//   - staff (管理员) sees everything: only admins author agents / toggle
+//     应用中心 switches, so they need the full catalog for management.
+//   - a disabled application (enabled=0) is hidden from every non-admin
+//     surface — home shortcuts, switcher, agent market and app center.
+//   - a private application (is_public=0, 「仅自己可见」) is admin-only:
+//     regular users never see it, even when they created it (legacy rows).
+//   - a public application is visible to everyone; per-user usability is
+//     still governed by the provider-side identity visibility check the
+//     worker runs against the caller's own UAT.
 func visible(app *Application, scope string, callerID int64, isStaff bool) bool {
 	if isStaff {
 		return true
 	}
-	isOwn := app.CreatedBy != nil && *app.CreatedBy == callerID
-	switch scope {
-	case "mine":
-		return isOwn
-	case "manage":
-		return app.IsPublic || isOwn
-	default: // public
-		return app.IsPublic
+	if !app.Enabled {
+		return false
 	}
+	isOwn := app.CreatedBy != nil && *app.CreatedBy == callerID
+	if scope == "mine" {
+		return isOwn
+	}
+	// public / manage: regular users only ever see published applications —
+	// only admins can author agents now, so a non-staff caller has nothing
+	// of its own to merge into manage scope.
+	return app.IsPublic
 }

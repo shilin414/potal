@@ -50,6 +50,7 @@ export async function syncSessionUser(): Promise<SessionUser | null> {
     display_id: session.display_id ?? user?.display_id,
     avatar_url: session.avatar_url || user?.avatar_url,
     auth_source: session.auth_source ?? user?.auth_source,
+    is_staff: session.is_staff ?? user?.is_staff,
   } as any);
   return session;
 }

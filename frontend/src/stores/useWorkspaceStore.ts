@@ -46,6 +46,12 @@ export const RECENT_LIMIT = 8;
 
 interface WorkspaceStore {
   activeApplicationId: number | null;
+  /**
+   * The workspace the user came from (§80): a fixed application's
+   * 返回工作台 goes here instead of reloading Home, so the chat
+   * conversation / scroll / draft the user left behind is restored.
+   */
+  previousApplicationId: number | null;
   workspaces: Record<number, ApplicationWorkspaceState>;
   recentApplicationIds: number[];
   /** Prompt handed over by @mention routing, consumed exactly once. */
@@ -102,6 +108,7 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
   persist(
     (set, get) => ({
       activeApplicationId: null,
+      previousApplicationId: null,
       workspaces: {},
       recentApplicationIds: [],
       pendingPrompt: null,
@@ -110,6 +117,11 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
 
       openApplication: (applicationId) => set((state) => ({
         activeApplicationId: applicationId,
+        // Only a real switch records a return target; re-opening the same
+        // application (catalog refresh re-runs the effect) must not clobber it.
+        previousApplicationId: state.activeApplicationId === applicationId
+          ? state.previousApplicationId
+          : state.activeApplicationId,
         recentApplicationIds: withRecent(state.recentApplicationIds, applicationId),
       })),
 
@@ -164,6 +176,7 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
 
       clearAll: () => set({
         activeApplicationId: null,
+        previousApplicationId: null,
         workspaces: {},
         recentApplicationIds: [],
         pendingPrompt: null,
@@ -176,6 +189,7 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
       // instruction after a reload.
       partialize: (state) => ({
         activeApplicationId: state.activeApplicationId,
+        previousApplicationId: state.previousApplicationId,
         workspaces: state.workspaces,
         recentApplicationIds: state.recentApplicationIds,
         sidebarCollapsed: state.sidebarCollapsed,

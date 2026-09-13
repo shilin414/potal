@@ -19,12 +19,17 @@ import WorkflowsPage from '@/pages/Workflows/WorkflowsPage';
 import WorkflowEditorPage from '@/pages/Workflows/WorkflowEditorPage';
 import WorkflowRunnerPage from '@/pages/Workflows/WorkflowRunnerPage';
 import SkillsPage from '@/pages/Skills/SkillsPage';
+import { SchedulesPage } from '@/pages/Schedules/SchedulesPage';
 
 // Auth pages stay outside the shell entirely.
 import LoginPage from '@/pages/Auth/LoginPage';
 import RegisterPage from '@/pages/Auth/RegisterPage';
 import SsoCallbackPage from '@/pages/Auth/SsoCallbackPage';
 import FeishuCallbackPage from '@/pages/Auth/FeishuCallbackPage';
+
+// Public share snapshot (no shell, no auth — the backend returns only the
+// snapshotted messages for the token).
+import SharePage from '@/pages/Share/SharePage';
 
 const EnterprisePage = lazy(() => import('@/pages/Enterprise/EnterprisePage'));
 
@@ -85,6 +90,7 @@ const router = createBrowserRouter([
         handle: consolePage,
       },
       { path: 'skills', element: <SkillsPage />, handle: fullWidthConsole },
+      { path: 'schedules', element: <SchedulesPage />, handle: fullWidthConsole },
       { path: 'workflows', element: <WorkflowsPage />, handle: fullWidthConsole },
       {
         path: 'workflows/:id/edit',
@@ -124,6 +130,11 @@ const router = createBrowserRouter([
   {
     path: '/auth/register',
     element: <AuthLayout><PublicRoute><RegisterPage /></PublicRoute></AuthLayout>,
+  },
+  // ── Public share snapshot (no shell, works logged-out) ─────────────────
+  {
+    path: '/share/:token',
+    element: <SharePage />,
   },
   { path: '*', element: <Navigate to="/" replace /> },
 ]);

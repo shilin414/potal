@@ -539,7 +539,12 @@ const AgentEditorModal = ({
         ) : null}
 
         <div className="agent-form-row agent-form-row-compact">
-          <Form.Item name="is_public" label="公开到智能体市场" valuePropName="checked">
+          <Form.Item
+            name="is_public"
+            label="公开到智能体市场"
+            valuePropName="checked"
+            extra="公开后所有用户可见可用（能否真正调用以本人飞书身份的可见性为准）；仅自己可见时只有管理员看得到。"
+          >
             <Switch checkedChildren="公开" unCheckedChildren="仅自己可见" />
           </Form.Item>
           {agentType === 'runtime' ? (

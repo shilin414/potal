@@ -1,0 +1,166 @@
+/* SchedulesPage — 遵循全局 Console 页面 token（variables.css）。 */
+
+.schedules-page {
+  overflow-y: auto;
+  /* MobileAppShell 不消费 route handle 的 padded，移动端内边距在此兜底。 */
+  padding: 24px;
+}
+
+.schedules-page .page-title {
+  font-family: var(--font-display);
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--color-text);
+}
+
+.schedules-page .page-subtitle {
+  font-size: 14px;
+  color: var(--color-text-sec);
+  margin-bottom: 20px;
+}
+
+.schedules-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+
+.schedules-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+/* 状态卡片 */
+.schedule-card {
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius-lg);
+  padding: 20px;
+  margin-bottom: 12px;
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.schedule-card:hover {
+  border-color: var(--color-border-lit);
+}
+
+.schedule-card-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.schedule-card-name {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--color-text);
+}
+
+.schedule-card-meta {
+  margin-top: 6px;
+  font-size: 13px;
+  color: var(--color-text-sec);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.schedule-empty-extra {
+  text-align: center;
+}
+
+/* 编辑器区块 */
+.schedule-editor-section {
+  margin-bottom: 4px;
+}
+
+.schedule-editor-section + .schedule-editor-section {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--color-border);
+}
+
+.schedule-editor-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text-sec);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 12px;
+}
+
+.schedule-preview-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--color-text-sec);
+  font-size: 13px;
+}
+
+/* 详情时间线 */
+.schedule-detail-meta {
+  font-size: 13px;
+  color: var(--color-text-sec);
+}
+
+@media (max-width: 768px) {
+  .schedules-page {
+    padding: 16px;
+  }
+
+  .schedules-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .schedules-toolbar-left {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .schedules-toolbar-left > * {
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .schedule-card {
+    transition: none;
+  }
+}
+
+/* 桌面表格 / 移动卡片响应式切换 */
+.schedules-mobile-cards {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .schedules-desktop-table {
+    display: none;
+  }
+
+  .schedules-mobile-cards {
+    display: block;
+  }
+}
+
+.schedule-preview-btn {
+  background: none;
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius-md, 8px);
+  color: var(--color-text-sec);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 4px 12px;
+}
+
+.schedule-preview-btn:hover {
+  border-color: var(--color-primary);
+  color: var(--color-primary);
+}

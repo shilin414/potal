@@ -194,7 +194,7 @@ func (s *Service) Create(ctx context.Context, in *CreateInput) (*Application, *B
 }
 
 // Update applies partial edits; runtime rebinding upserts the binding.
-func (s *Service) Update(ctx context.Context, appID, callerID int64, isStaff bool, name, description, icon, color *string, isPublic *bool, categorySlug, categoryName *string, runtime *BindingInput, setDefaultAgent *bool) (*Application, *Binding, error) {
+func (s *Service) Update(ctx context.Context, appID, callerID int64, isStaff bool, name, description, icon, color *string, isPublic, enabled *bool, categorySlug, categoryName *string, runtime *BindingInput, setDefaultAgent *bool) (*Application, *Binding, error) {
 	app, err := s.ApplicationByID(ctx, appID)
 	if err != nil {
 		return nil, nil, err
@@ -281,6 +281,15 @@ func (s *Service) Update(ctx context.Context, appID, callerID int64, isStaff boo
 			return nil, nil, err
 		}
 		updatedBinding = b
+	}
+
+	if enabled != nil {
+		if err := s.q(tx).SetApplicationEnabled(ctx, db.SetApplicationEnabledParams{
+			Enabled: *enabled,
+			ID:      uint64(appID),
+		}); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	if setDefaultAgent != nil {

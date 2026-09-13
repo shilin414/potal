@@ -220,3 +220,178 @@
 .run-chat-error-banner {
   padding: 12px 24px 0;
 }
+
+/* ── 转发/分享：多选模式 ──────────────────────────────────────────── */
+
+.run-chat-msg-body {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  /* Width budget moves here from the bubble (bubble now lives inside this
+     wrapper with the select checkbox), keeping the same 75% cap as before. */
+  max-width: 75%;
+}
+
+.run-chat-msg-body .run-chat-bubble {
+  max-width: 100%;
+}
+
+.run-chat-msg-body--selectable {
+  cursor: pointer;
+}
+
+/* 消息气泡上的转发入口：气泡 hover 时浮现，位于头部行末。 */
+.run-chat-msg-share {
+  margin-left: auto;
+  border: none;
+  background: none;
+  padding: 0 2px;
+  color: var(--color-text-dim);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease, color 0.15s ease;
+}
+
+.run-chat-bubble:hover .run-chat-msg-share,
+.run-chat-msg-share:focus-visible {
+  opacity: 1;
+}
+
+.run-chat-msg-share:hover {
+  color: var(--color-primary);
+}
+
+/* 触屏设备没有 hover：转发入口常驻显示，直接点按即可进入多选转发。 */
+@media (hover: none) {
+  .run-chat-msg-share {
+    opacity: 1;
+  }
+}
+
+/* 选中圆点：贴着气泡一侧（用户消息在其气泡左侧，即对话中缝方向）。 */
+.run-chat-select-check {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 auto;
+  border: 1.5px solid var(--color-border-lit);
+  border-radius: 50%;
+  background: var(--color-bg-card);
+  color: #fff;
+  font-size: 11px;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.run-chat-select-check--on {
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+}
+
+.run-chat-select-check--off {
+  opacity: 0.35;
+}
+
+/* 选择模式下的气泡提示：未选中的消息淡一档，选中的亮起。 */
+.run-chat-msg-body--select .run-chat-bubble {
+  transition: border-color 0.15s ease;
+}
+
+.run-chat-msg-body--selectable .run-chat-bubble {
+  border-color: color-mix(in srgb, var(--color-primary) 45%, var(--color-border));
+}
+
+/* 底部选择操作栏（替换输入框，参考主流 IM 的多选转发交互）。 */
+.run-chat-select-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  background: var(--color-bg-card);
+}
+
+.run-chat-select-btn {
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: none;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--color-text-sec);
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.run-chat-select-btn:hover {
+  color: var(--color-primary);
+  border-color: var(--color-primary);
+}
+
+.run-chat-select-count {
+  margin-left: auto;
+  margin-right: 4px;
+  font-size: 13px;
+  color: var(--color-text-sec);
+}
+
+/* ── 分享结果弹窗 ────────────────────────────────────────────────── */
+
+.run-chat-share-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.run-chat-share-lead {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--color-text);
+}
+
+.run-chat-share-lead b {
+  color: var(--color-primary);
+}
+
+.run-chat-share-link {
+  display: flex;
+  gap: 8px;
+}
+
+.run-chat-share-link input {
+  font-size: 12px;
+  color: var(--color-text-sec);
+}
+
+.run-chat-share-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-text-dim);
+}
+
+/* ── 移动端适配 ──────────────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+  /* 选择操作栏：窄屏换行，主按钮占满剩余宽度便于点按。 */
+  .run-chat-select-bar {
+    flex-wrap: wrap;
+  }
+
+  .run-chat-select-count {
+    margin-left: 0;
+  }
+
+  .run-chat-select-bar .ant-btn {
+    flex: 1;
+  }
+
+  .run-chat-share-link {
+    flex-direction: column;
+  }
+}

@@ -7,6 +7,7 @@ package gendb
 import (
 	"context"
 	"database/sql"
+	"time"
 )
 
 type Querier interface {
@@ -16,8 +17,16 @@ type Querier interface {
 	ApplicationSlugExists(ctx context.Context, slug string) (int64, error)
 	BindAgentThreadSession(ctx context.Context, arg BindAgentThreadSessionParams) error
 	BindAttachmentToRun(ctx context.Context, arg BindAttachmentToRunParams) error
+	// CAS claim: one delivery worker wins; 0 rows = someone else got it.
+	// Only pending→sending: a duplicate stream message can never re-claim a
+	// row another worker is already sending (no double Feishu messages).
+	CASClaimDelivery(ctx context.Context, id []byte) (sql.Result, error)
 	// CAS claim: exactly one worker wins; affected_rows == 1 means success.
 	CASClaimRun(ctx context.Context, id []byte) (sql.Result, error)
+	CASFinishDelivery(ctx context.Context, arg CASFinishDeliveryParams) (sql.Result, error)
+	// Run terminal fan-out: occurrence converges with the run's outcome
+	// (the delivery layer stays independent — see delivery_executions).
+	CASFinishOccurrenceByRun(ctx context.Context, arg CASFinishOccurrenceByRunParams) (sql.Result, error)
 	// Terminal-only transition; 0 rows affected = already terminal (idempotent).
 	CASFinishRun(ctx context.Context, arg CASFinishRunParams) (sql.Result, error)
 	CacheArtifactURL(ctx context.Context, arg CacheArtifactURLParams) error
@@ -27,6 +36,7 @@ type Querier interface {
 	CountPendingOutbox(ctx context.Context) (int64, error)
 	CountRunByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
 	CountRunEvents(ctx context.Context, runID []byte) (int64, error)
+	CountSkippedOccurrencesForSlot(ctx context.Context, arg CountSkippedOccurrencesForSlotParams) (int64, error)
 	CreateAgentThread(ctx context.Context, arg CreateAgentThreadParams) (sql.Result, error)
 	CreateApplication(ctx context.Context, arg CreateApplicationParams) (sql.Result, error)
 	CreateAttachment(ctx context.Context, arg CreateAttachmentParams) (sql.Result, error)
@@ -34,6 +44,12 @@ type Querier interface {
 	CreateCategory(ctx context.Context, arg CreateCategoryParams) (sql.Result, error)
 	// ───────────────────────────────────────────────────────── conversation ──
 	CreateConversation(ctx context.Context, arg CreateConversationParams) (sql.Result, error)
+	// ────────────────────────────────────────────────── conversation shares ──
+	CreateConversationShare(ctx context.Context, arg CreateConversationShareParams) (sql.Result, error)
+	// ───────────────────────────────────────────────────── delivery_executions ──
+	// UNIQUE (occurrence_id, schedule_delivery_id) absorbs at-least-once
+	// fan-out: duplicate inserts lose and are ignored in Go.
+	CreateDeliveryExecution(ctx context.Context, arg CreateDeliveryExecutionParams) (sql.Result, error)
 	CreateFavorite(ctx context.Context, arg CreateFavoriteParams) error
 	CreateFeishuIdentity(ctx context.Context, arg CreateFeishuIdentityParams) (sql.Result, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (sql.Result, error)
@@ -43,6 +59,13 @@ type Querier interface {
 	CreateRunArtifact(ctx context.Context, arg CreateRunArtifactParams) error
 	CreateRunCommand(ctx context.Context, arg CreateRunCommandParams) (sql.Result, error)
 	CreateRunLease(ctx context.Context, arg CreateRunLeaseParams) error
+	// ─────────────────────────────────────────────────────────── automation ──
+	// Schedule / Occurrence / Delivery queries (0006_schedule_automation).
+	CreateSchedule(ctx context.Context, arg CreateScheduleParams) (sql.Result, error)
+	// ──────────────────────────────────────────────────── schedule_occurrences ──
+	// UNIQUE (schedule_id, scheduled_at) is the idempotency barrier: a losing
+	// concurrent insert must be detected in Go via duplicate-key error.
+	CreateScheduleOccurrence(ctx context.Context, arg CreateScheduleOccurrenceParams) (sql.Result, error)
 	// ─────────────────────────────────────────────────────────── identity ──
 	CreateUser(ctx context.Context, arg CreateUserParams) (sql.Result, error)
 	DeleteApplication(ctx context.Context, id uint64) error
@@ -59,9 +82,13 @@ type Querier interface {
 	DeleteRunEvents(ctx context.Context, runID []byte) error
 	DeleteRunLeaseByRun(ctx context.Context, runID []byte) error
 	DeleteRunsByConversation(ctx context.Context, conversationID sql.NullInt64) error
+	DeleteSchedule(ctx context.Context, id uint64) (sql.Result, error)
+	DeleteScheduleDeliveries(ctx context.Context, scheduleID uint64) error
+	DeleteSharesByConversation(ctx context.Context, conversationID uint64) error
 	DeleteThreadByConversation(ctx context.Context, conversationID uint64) error
 	FailExpiredRun(ctx context.Context, arg FailExpiredRunParams) (sql.Result, error)
 	FailOutboxEvent(ctx context.Context, arg FailOutboxEventParams) error
+	FailStuckDeliveries(ctx context.Context, arg FailStuckDeliveriesParams) (sql.Result, error)
 	FindBinding(ctx context.Context, arg FindBindingParams) (RuntimeBinding, error)
 	GetAgentThreadByConversation(ctx context.Context, conversationID uint64) (AgentThread, error)
 	GetApplicationByID(ctx context.Context, id uint64) (GetApplicationByIDRow, error)
@@ -71,7 +98,9 @@ type Querier interface {
 	GetCategoryByName(ctx context.Context, name string) (ApplicationCategory, error)
 	GetCategoryBySlug(ctx context.Context, slug string) (ApplicationCategory, error)
 	GetConversationByID(ctx context.Context, id uint64) (Conversation, error)
+	GetConversationShareByToken(ctx context.Context, token string) (GetConversationShareByTokenRow, error)
 	GetDefaultAgent(ctx context.Context) (GetDefaultAgentRow, error)
+	GetDeliveryExecutionByID(ctx context.Context, id []byte) (DeliveryExecution, error)
 	GetEnabledBinding(ctx context.Context, applicationID uint64) (RuntimeBinding, error)
 	GetFeishuIdentityByFeishuUserID(ctx context.Context, feishuUserID sql.NullString) (FeishuIdentity, error)
 	GetFeishuIdentityByLocalUser(ctx context.Context, userID uint64) (FeishuIdentity, error)
@@ -85,15 +114,21 @@ type Querier interface {
 	GetRunByID(ctx context.Context, id []byte) (Run, error)
 	GetRunCommandByID(ctx context.Context, id []byte) (RunCommand, error)
 	GetRunStatus(ctx context.Context, id []byte) (string, error)
+	GetScheduleByID(ctx context.Context, id uint64) (Schedule, error)
+	GetScheduleDeliveryByID(ctx context.Context, id uint64) (ScheduleDelivery, error)
+	GetScheduleOccurrenceByID(ctx context.Context, id uint64) (ScheduleOccurrence, error)
+	GetScheduleOccurrenceBySlot(ctx context.Context, arg GetScheduleOccurrenceBySlotParams) (ScheduleOccurrence, error)
 	GetUserByID(ctx context.Context, id uint64) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
+	HasActiveOccurrence(ctx context.Context, scheduleID uint64) (int64, error)
 	HeartbeatLease(ctx context.Context, arg HeartbeatLeaseParams) (sql.Result, error)
 	IncrementApplicationUsage(ctx context.Context, id uint64) error
+	LatestOccurrenceBySchedule(ctx context.Context, scheduleID uint64) (ScheduleOccurrence, error)
 	ListActiveProviders(ctx context.Context) ([]Provider, error)
 	ListAllRunEvents(ctx context.Context, runID []byte) ([]RunEvent, error)
 	// show_all lets staff bypass the SQL pre-filter; the authoritative
 	// scope check still happens in Go (visible()).
-	ListApplicationsByVisibility(ctx context.Context, arg ListApplicationsByVisibilityParams) ([]Application, error)
+	ListApplicationsByVisibility(ctx context.Context, arg ListApplicationsByVisibilityParams) ([]ListApplicationsByVisibilityRow, error)
 	ListBindingsByApplication(ctx context.Context, applicationID uint64) ([]RuntimeBinding, error)
 	ListConversationsByApplication(ctx context.Context, arg ListConversationsByApplicationParams) ([]Conversation, error)
 	// Sidebar history: latest message + count via correlated scalar subqueries
@@ -101,21 +136,53 @@ type Querier interface {
 	// window functions are MySQL 8 only — the project must stay 5.7-compatible.)
 	ListConversationsForUser(ctx context.Context, userID uint64) ([]ListConversationsForUserRow, error)
 	ListConversationsForUserApp(ctx context.Context, arg ListConversationsForUserAppParams) ([]ListConversationsForUserAppRow, error)
+	ListDeliveriesBySchedule(ctx context.Context, scheduleID uint64) ([]ScheduleDelivery, error)
+	ListDeliveryExecutionsByOccurrence(ctx context.Context, occurrenceID uint64) ([]DeliveryExecution, error)
+	// Batch fetch for the occurrences page (delivery results per slot).
+	ListDeliveryExecutionsByOccurrences(ctx context.Context, ids []uint64) ([]DeliveryExecution, error)
+	ListDeliveryExecutionsByRun(ctx context.Context, runID []byte) ([]DeliveryExecution, error)
+	ListDueDeliveries(ctx context.Context, arg ListDueDeliveriesParams) ([]DeliveryExecution, error)
+	ListDueSchedules(ctx context.Context, arg ListDueSchedulesParams) ([]Schedule, error)
 	ListEnabledBindings(ctx context.Context) ([]RuntimeBinding, error)
+	ListEnabledDeliveriesBySchedule(ctx context.Context, scheduleID uint64) ([]ScheduleDelivery, error)
 	ListExpiredLeaseRunIDs(ctx context.Context, limit int32) ([][]byte, error)
 	ListFavorites(ctx context.Context, userID uint64) ([]uint64, error)
+	ListLatestOccurrencesForSchedules(ctx context.Context, ids []uint64) ([]ScheduleOccurrence, error)
 	ListMessagesByConversation(ctx context.Context, conversationID uint64) ([]Message, error)
+	ListOccurrencesBySchedule(ctx context.Context, arg ListOccurrencesByScheduleParams) ([]ScheduleOccurrence, error)
 	ListPendingOutbox(ctx context.Context, limit int32) ([]OutboxEvent, error)
 	ListQueuedRunIDs(ctx context.Context, arg ListQueuedRunIDsParams) ([][]byte, error)
 	ListRunArtifacts(ctx context.Context, runID []byte) ([]RunArtifact, error)
 	ListRunArtifactsByExternalID(ctx context.Context, arg ListRunArtifactsByExternalIDParams) (RunArtifact, error)
 	ListRunEventsAfter(ctx context.Context, arg ListRunEventsAfterParams) ([]RunEvent, error)
 	ListRunsByConversation(ctx context.Context, conversationID sql.NullInt64) ([]Run, error)
+	// status: all | running | paused | failed (UI filters).
+	ListSchedulesByOwner(ctx context.Context, arg ListSchedulesByOwnerParams) ([]Schedule, error)
+	// Occurrences stuck in pending longer than the grace period: their
+	// creating scheduler died between INSERT and the run-creating commit.
+	ListStuckPendingOccurrences(ctx context.Context, arg ListStuckPendingOccurrencesParams) ([]ScheduleOccurrence, error)
+	MarkOccurrenceQueued(ctx context.Context, arg MarkOccurrenceQueuedParams) (sql.Result, error)
+	// Run claim fan-out: the occurrence linked to this run enters 'running'.
+	MarkOccurrenceRunningByRun(ctx context.Context, runID sql.NullString) (sql.Result, error)
+	MarkOccurrenceStatus(ctx context.Context, arg MarkOccurrenceStatusParams) (sql.Result, error)
 	MarkOutboxPublished(ctx context.Context, id uint64) error
+	// Crash recovery: rows stuck in 'sending' (worker died before ACK/commit)
+	// return to pending when their lease lapsed.
+	ReclaimStuckDeliveries(ctx context.Context, updatedAt time.Time) (sql.Result, error)
+	RequeueDelivery(ctx context.Context, arg RequeueDeliveryParams) (sql.Result, error)
 	RequeueRun(ctx context.Context, id []byte) error
+	RevokeConversationShare(ctx context.Context, arg RevokeConversationShareParams) error
 	RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) error
+	SetApplicationEnabled(ctx context.Context, arg SetApplicationEnabledParams) error
 	SetAttachmentUploaded(ctx context.Context, arg SetAttachmentUploadedParams) error
 	SetDefaultAgent(ctx context.Context, id uint64) error
+	// Lazy binding for conversation_policy=reuse on first run.
+	SetScheduleConversation(ctx context.Context, arg SetScheduleConversationParams) (sql.Result, error)
+	SetScheduleEnabled(ctx context.Context, arg SetScheduleEnabledParams) (sql.Result, error)
+	// run-now bookkeeping: last_run_at moves, next_run_at stays untouched.
+	SetScheduleLastRun(ctx context.Context, arg SetScheduleLastRunParams) (sql.Result, error)
+	SetScheduleNextRun(ctx context.Context, arg SetScheduleNextRunParams) (sql.Result, error)
+	TouchScheduleRunTimes(ctx context.Context, arg TouchScheduleRunTimesParams) (sql.Result, error)
 	UnbindConversationAttachments(ctx context.Context, conversationID sql.NullInt64) error
 	UpdateApplication(ctx context.Context, arg UpdateApplicationParams) (sql.Result, error)
 	UpdateApplicationAvatar(ctx context.Context, arg UpdateApplicationAvatarParams) error
@@ -123,11 +190,14 @@ type Querier interface {
 	UpdateFeishuIdentityLogin(ctx context.Context, arg UpdateFeishuIdentityLoginParams) error
 	// Set-once semantic guarded in Go (only write when empty).
 	UpdateRunExternalID(ctx context.Context, arg UpdateRunExternalIDParams) error
+	UpdateSchedule(ctx context.Context, arg UpdateScheduleParams) (sql.Result, error)
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (sql.Result, error)
 	// Guarded by unique (run_id, external_artifact_id); empty external ids get
 	// their own row keyed by the generated PK.
 	UpsertRunArtifact(ctx context.Context, arg UpsertRunArtifactParams) error
+	// ─────────────────────────────────────────────────── schedule_deliveries ──
+	UpsertScheduleDelivery(ctx context.Context, arg UpsertScheduleDeliveryParams) (sql.Result, error)
 	UserUsageByApplication(ctx context.Context, userID sql.NullInt64) ([]UserUsageByApplicationRow, error)
 	UsernameExists(ctx context.Context, username string) (int64, error)
 }

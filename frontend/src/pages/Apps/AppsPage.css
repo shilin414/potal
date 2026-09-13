@@ -121,3 +121,41 @@
 .app-card:hover .app-card-open {
   color: var(--color-primary);
 }
+
+/* 停用的应用保留在管理员视图中以便重新启用，但视觉上明确降级 */
+.app-card--disabled {
+  opacity: 0.62;
+}
+
+.app-card--disabled .app-card-thumb {
+  filter: grayscale(0.6);
+}
+
+/* 卡片名内联的状态徽标 */
+.app-card-state {
+  margin-left: 8px;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 4px;
+  background: var(--color-bg-elevated);
+  color: var(--color-text-sec);
+}
+
+.app-card-state--off {
+  background: color-mix(in srgb, var(--color-error) 12%, transparent);
+  color: var(--color-error);
+}
+
+/* 管理员卡片操作：启用 / 公开 开关 */
+.app-card-admin {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+}
+
+.app-card-switch {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+}

@@ -16,6 +16,7 @@ const NAV_ITEMS = [
   { key: '/agents', label: '智能体', icon: '🤖' },
   { key: '/apps', label: '应用', icon: '🧩' },
   { key: '/workflows', label: '工作流', icon: '🔀' },
+  { key: '/schedules', label: '定时任务', icon: '⏰' },
   { key: '/enterprise', label: '企业控制台', icon: '🏢' },
 ];
 

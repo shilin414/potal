@@ -56,6 +56,10 @@ export interface V2Application {
   /** False for fixed pages that have no runtime binding. */
   is_bound?: boolean;
   is_favorite?: boolean;
+  /** 是否公开到市场：私有（仅自己可见）只有管理员能看到。 */
+  is_public?: boolean;
+  /** 应用中心开关：停用的应用对普通用户完全隐藏（管理员仍可管理）。 */
+  enabled?: boolean;
   /** Marked as the workspace's default main agent (§38). */
   is_default_agent?: boolean;
   /** True when the caller may edit / delete / re-avatar this application. */
@@ -153,6 +157,7 @@ export interface ManagedAgent {
   color?: string;
   kind: string;
   is_public: boolean;
+  enabled?: boolean;
   category_slug: string;
   category_name: string;
   is_default_agent: boolean;
@@ -241,7 +246,8 @@ export function createAgentApplication(
 
 export function updateAgentApplication(
   applicationId: number,
-  payload: Partial<AgentApplicationPayload>,
+  // `enabled`（应用中心开关）只存在于更新：创建时固定为启用。
+  payload: Partial<AgentApplicationPayload> & { enabled?: boolean },
 ): Promise<ManagedAgent> {
   return api.patch<ManagedAgent>(`/v2/applications/${applicationId}`, payload);
 }

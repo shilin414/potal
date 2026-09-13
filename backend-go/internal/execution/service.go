@@ -25,6 +25,11 @@ type Service struct {
 	Redis   *redisx.Client
 	Log     *slog.Logger
 	Metrics *telemetry.Metrics
+
+	// OnRunSucceeded fires after a winning terminal transition to
+	// succeeded for scheduled runs; used for delivery fan-out. It must
+	// not block on external IO and must not panic (guarded).
+	OnRunSucceeded func(ctx context.Context, run *Run, output map[string]any)
 }
 
 func NewService(d *sql.DB, r *redisx.Client, log *slog.Logger, m *telemetry.Metrics) *Service {
@@ -51,11 +56,45 @@ type CreateRunInput struct {
 	ConversationTitle string
 	RuntimeSnapshot   map[string]any
 	MaxAttempts       int64
+	// Scheduling provenance: zero values mean an interactive run.
+	TriggerType string // "interactive_user" | "scheduled" | ...
+	TriggerID   int64  // schedule_occurrences.id for scheduled runs
+	Priority    string // "interactive_user" | "scheduled_normal" | ...
+	AvailableAt time.Time
 }
+
+// DefaultTriggerType is used when a run input omits trigger info.
+const DefaultTriggerType = "interactive_user"
+
+// TriggerTypeScheduled marks runs created by the scheduler (kept local to
+// avoid an execution → automation import cycle).
+const TriggerTypeScheduled = "scheduled"
+
+// DefaultPriority keeps queue fairness explicit at the call sites.
+const DefaultPriority = "interactive_user"
 
 // CreateRun atomically persists user message + run + outbox event
 // (§22). The outbox row guarantees dispatch even if Redis is down.
 func (s *Service) CreateRun(ctx context.Context, in *CreateRunInput) (*Run, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	runID, err := s.CreateRunInTx(ctx, tx, in)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.GetRun(ctx, runID)
+}
+
+// CreateRunInTx writes message + run + outbox inside a caller-owned
+// transaction so composite units (e.g. scheduler occurrence + run) commit
+// atomically. The caller owns commit/rollback.
+func (s *Service) CreateRunInTx(ctx context.Context, tx *sql.Tx, in *CreateRunInput) (ids.ID, error) {
 	runID := ids.New()
 
 	contentItems := in.ContentItems
@@ -82,11 +121,6 @@ func (s *Service) CreateRun(ctx context.Context, in *CreateRunInput) (*Run, erro
 	inputJSON, _ := json.Marshal(input)
 	snapshotJSON, _ := json.Marshal(defaultMap(in.RuntimeSnapshot))
 
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
 	q := db.New(tx)
 
 	if _, err := q.CreateMessage(ctx, db.CreateMessageParams{
@@ -95,11 +129,23 @@ func (s *Service) CreateRun(ctx context.Context, in *CreateRunInput) (*Run, erro
 		Content:        in.Content,
 		Metadata:       dbtypes.JSONText(userMessageMetadata(runID, in.AttachmentIDs)),
 	}); err != nil {
-		return nil, fmt.Errorf("insert message: %w", err)
+		return runID, fmt.Errorf("insert message: %w", err)
 	}
 	maxAttempts := in.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 3
+	}
+	triggerType := in.TriggerType
+	if triggerType == "" {
+		triggerType = DefaultTriggerType
+	}
+	priority := in.Priority
+	if priority == "" {
+		priority = DefaultPriority
+	}
+	var availableAt sql.NullTime
+	if !in.AvailableAt.IsZero() {
+		availableAt = sql.NullTime{Time: in.AvailableAt, Valid: true}
 	}
 	if _, err := q.CreateRun(ctx, db.CreateRunParams{
 		ID:               runID.Bytes(),
@@ -112,8 +158,12 @@ func (s *Service) CreateRun(ctx context.Context, in *CreateRunInput) (*Run, erro
 		Input:            dbtypes.JSONText(inputJSON),
 		RuntimeSnapshot:  dbtypes.JSONText(snapshotJSON),
 		MaxAttempts:      uint32(maxAttempts),
+		TriggerType:      triggerType,
+		TriggerID:        nullInt64NZ(in.TriggerID),
+		Priority:         priority,
+		AvailableAt:      availableAt,
 	}); err != nil {
-		return nil, fmt.Errorf("insert run: %w", err)
+		return runID, fmt.Errorf("insert run: %w", err)
 	}
 	if _, err := q.CreateOutboxEvent(ctx, db.CreateOutboxEventParams{
 		Aggregate:   "run",
@@ -121,12 +171,9 @@ func (s *Service) CreateRun(ctx context.Context, in *CreateRunInput) (*Run, erro
 		EventType:   "run.dispatch",
 		Payload:     dbtypes.JSONText(outboxJSON),
 	}); err != nil {
-		return nil, fmt.Errorf("insert outbox: %w", err)
+		return runID, fmt.Errorf("insert outbox: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	return s.GetRun(ctx, runID)
+	return runID, nil
 }
 
 func userMessageMetadata(runID ids.ID, attachmentIDs []string) json.RawMessage {
@@ -201,6 +248,22 @@ func runFromRow(row db.Run) *Run {
 		t := row.FinishedAt.Time
 		out.FinishedAt = &t
 	}
+	out.TriggerType = row.TriggerType
+	if out.TriggerType == "" {
+		out.TriggerType = DefaultTriggerType
+	}
+	if row.TriggerID.Valid {
+		v := row.TriggerID.Int64
+		out.TriggerID = &v
+	}
+	out.Priority = row.Priority
+	if out.Priority == "" {
+		out.Priority = DefaultPriority
+	}
+	if row.AvailableAt.Valid {
+		t := row.AvailableAt.Time
+		out.AvailableAt = &t
+	}
 	_ = json.Unmarshal(row.Input, &out.Input)
 	_ = json.Unmarshal(row.Output, &out.Output)
 	_ = json.Unmarshal(row.RuntimeSnapshot, &out.RuntimeSnapshot)
@@ -232,6 +295,11 @@ func (s *Service) CASClaim(ctx context.Context, runID ids.ID) (bool, error) {
 		return false, err
 	}
 	n, err := res.RowsAffected()
+	if n == 1 {
+		// Best-effort fan-out: a scheduled run's occurrence follows the
+		// run into 'running'. Interactive runs have no occurrence row.
+		_, _ = s.q(ctx).MarkOccurrenceRunningByRun(ctx, sql.NullString{String: string(runID.Bytes()), Valid: true})
+	}
 	return n == 1, err
 }
 
@@ -411,6 +479,32 @@ func (s *Service) Finish(ctx context.Context, run *Run, in *FinishInput) error {
 				Observe(time.Since(*run.StartedAt).Seconds())
 		}
 	}
+	// Occurrence convergence: the scheduled run's occurrence follows the
+	// run into a terminal state (delivery state stays separate). The CAS
+	// loser (already terminal elsewhere) is a no-op.
+	if run.TriggerType == TriggerTypeScheduled && run.TriggerID != nil {
+		occStatus := StatusFailed
+		if in.Status == StatusSucceeded {
+			occStatus = StatusSucceeded
+		}
+		_, _ = s.q(ctx).CASFinishOccurrenceByRun(ctx, db.CASFinishOccurrenceByRunParams{
+			Status: occStatus,
+			RunID:  sql.NullString{String: string(run.ID.Bytes()), Valid: true},
+		})
+	}
+	// Delivery fan-out: only the CAS winner triggers, only scheduled runs
+	// have deliveries, and a hook panic must never fail the run.
+	if in.Status == StatusSucceeded && s.OnRunSucceeded != nil &&
+		run.TriggerType == "scheduled" && run.TriggerID != nil && run.UserID != nil {
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					s.Log.Error("run succeeded hook panicked", slogKey("run_id"), run.ID.String(), slogKey("panic"), rec)
+				}
+			}()
+			s.OnRunSucceeded(ctx, run, output)
+		}()
+	}
 	return nil
 }
 
@@ -523,6 +617,14 @@ func nullInt64(v *int64) sql.NullInt64 {
 		return sql.NullInt64{}
 	}
 	return sql.NullInt64{Int64: *v, Valid: true}
+}
+
+// nullInt64NZ maps 0 to SQL NULL (no trigger row reference).
+func nullInt64NZ(v int64) sql.NullInt64 {
+	if v == 0 {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: v, Valid: true}
 }
 
 func nullText(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }

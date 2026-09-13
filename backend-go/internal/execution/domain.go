@@ -78,6 +78,10 @@ type Run struct {
 	ErrorMessage         string
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
+	TriggerType          string
+	TriggerID            *int64
+	Priority             string
+	AvailableAt          *time.Time
 }
 
 // InputContent returns the user content items sent to the provider.

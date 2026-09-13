@@ -14,20 +14,23 @@ type Provider struct {
 
 // Application is the product-level business app.
 type Application struct {
-	ID             int64
-	Slug           string
-	Name           string
-	Description    string
-	Icon           string
-	AvatarKey      string
-	Color          string
-	Kind           string
-	RendererKey    string
-	ExecutorKey    string
-	CategoryID     *int64
-	CategorySlug   string
-	CategoryName   string
-	IsPublic       bool
+	ID           int64
+	Slug         string
+	Name         string
+	Description  string
+	Icon         string
+	AvatarKey    string
+	Color        string
+	Kind         string
+	RendererKey  string
+	ExecutorKey  string
+	CategoryID   *int64
+	CategorySlug string
+	CategoryName string
+	IsPublic     bool
+	// Enabled is the 应用中心 switch (§21): disabled applications are hidden
+	// from every non-admin surface; admins keep management visibility.
+	Enabled        bool
 	IsDefaultAgent bool
 	UsageCount     int64
 	CreatedBy      *int64

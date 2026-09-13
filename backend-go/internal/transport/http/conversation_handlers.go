@@ -181,6 +181,7 @@ func (s *Server) DeleteConversation(w http.ResponseWriter, r *http.Request, conv
 	}
 	_ = q.DeleteConversationMessages(ctx, uint64(conversationId))
 	_ = q.DeleteThreadByConversation(ctx, uint64(conversationId))
+	_ = q.DeleteSharesByConversation(ctx, uint64(conversationId))
 	_ = q.UnbindConversationAttachments(ctx, sql.NullInt64{Int64: int64(conversationId), Valid: true})
 	_ = q.DeleteConversation(ctx, uint64(conversationId))
 	writeJSON(w, http.StatusOK, map[string]string{"detail": "会话已删除"})

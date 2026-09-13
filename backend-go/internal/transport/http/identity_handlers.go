@@ -6,6 +6,7 @@ import (
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -42,6 +43,13 @@ func (s *Server) OauthExchange(w http.ResponseWriter, r *http.Request, params ge
 		s.Log.Error("oauth exchange failed", "err", err)
 		writeSimpleError(w, http.StatusBadGateway, "oauth exchange failed")
 		return
+	}
+	// A re-authorization grants the scopes requested at authorize time; a
+	// cached user access token (2h TTL) predating it would keep failing with
+	// the old scope set — drop it so the next provider call re-refreshes.
+	if s.Redis != nil {
+		_ = s.Redis.Del(r.Context(), s.Redis.Key(
+			"provider", "aily", "uat", fmt.Sprintf("%d", result.User.ID))).Err()
 	}
 	s.setSessionCookie(w, r, result.User)
 	writeJSON(w, http.StatusOK, map[string]any{

@@ -225,8 +225,9 @@ const createRun = `-- name: CreateRun :execresult
 
 INSERT INTO runs (id, user_id, application_id, conversation_id, runtime_binding_id,
     provider, runtime_type, external_run_id, status, provider_status, provider_finish_reason,
-    input, output, runtime_snapshot, attempt, max_attempts, error_code, error_message)
-VALUES (?, ?, ?, ?, ?, ?, ?, '', 'queued', '', '', ?, NULL, ?, 0, ?, '', '')
+    input, output, runtime_snapshot, attempt, max_attempts, trigger_type, trigger_id,
+    priority, available_at, error_code, error_message)
+VALUES (?, ?, ?, ?, ?, ?, ?, '', 'queued', '', '', ?, NULL, ?, 0, ?, ?, ?, ?, ?, '', '')
 `
 
 type CreateRunParams struct {
@@ -240,6 +241,10 @@ type CreateRunParams struct {
 	Input            dbtypes.JSONText
 	RuntimeSnapshot  dbtypes.JSONText
 	MaxAttempts      uint32
+	TriggerType      string
+	TriggerID        sql.NullInt64
+	Priority         string
+	AvailableAt      sql.NullTime
 }
 
 // ─────────────────────────────────────────────────────────── execution ──
@@ -255,6 +260,10 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (sql.Resul
 		arg.Input,
 		arg.RuntimeSnapshot,
 		arg.MaxAttempts,
+		arg.TriggerType,
+		arg.TriggerID,
+		arg.Priority,
+		arg.AvailableAt,
 	)
 }
 
@@ -521,7 +530,8 @@ const getRunByID = `-- name: GetRunByID :one
 SELECT id, user_id, application_id, conversation_id, runtime_binding_id, organization_id,
        provider, runtime_type, external_run_id, status, provider_status, provider_finish_reason,
        input, output, runtime_snapshot, attempt, max_attempts, queued_at, started_at,
-       finished_at, error_code, error_message, created_at, updated_at
+       finished_at, error_code, error_message, created_at, updated_at,
+       trigger_type, trigger_id, priority, available_at
 FROM runs WHERE id = ?
 `
 
@@ -553,6 +563,10 @@ func (q *Queries) GetRunByID(ctx context.Context, id []byte) (Run, error) {
 		&i.ErrorMessage,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.TriggerType,
+		&i.TriggerID,
+		&i.Priority,
+		&i.AvailableAt,
 	)
 	return i, err
 }
@@ -878,7 +892,8 @@ const listRunsByConversation = `-- name: ListRunsByConversation :many
 SELECT id, user_id, application_id, conversation_id, runtime_binding_id, organization_id,
        provider, runtime_type, external_run_id, status, provider_status, provider_finish_reason,
        input, output, runtime_snapshot, attempt, max_attempts, queued_at, started_at,
-       finished_at, error_code, error_message, created_at, updated_at
+       finished_at, error_code, error_message, created_at, updated_at,
+       trigger_type, trigger_id, priority, available_at
 FROM runs WHERE conversation_id = ?
 ORDER BY created_at DESC
 `
@@ -917,6 +932,10 @@ func (q *Queries) ListRunsByConversation(ctx context.Context, conversationID sql
 			&i.ErrorMessage,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.TriggerType,
+			&i.TriggerID,
+			&i.Priority,
+			&i.AvailableAt,
 		); err != nil {
 			return nil, err
 		}

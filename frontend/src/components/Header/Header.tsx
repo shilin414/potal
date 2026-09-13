@@ -15,6 +15,7 @@ const navItems = [
   { key: '/templates', label: '📚 案例库' },
   { key: '/apps', label: '🧩 应用' },
   { key: '/workflows', label: '🔀 工作流' },
+  { key: '/schedules', label: '⏰ 定时任务' },
   { key: '/enterprise', label: '🏢 企业控制台' },
 ];
 

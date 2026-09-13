@@ -8,7 +8,7 @@
 OAPI  := $(shell go env GOPATH)/bin/oapi-codegen
 SQLC  := $(shell go env GOPATH)/bin/sqlc
 
-.PHONY: gen gen-api gen-db build vet test test-race migrate-up run-api run-stream run-worker lint
+.PHONY: gen gen-api gen-db build vet test test-race migrate-up run-api run-stream run-worker run-scheduler lint
 
 gen: gen-api gen-db
 
@@ -45,3 +45,6 @@ run-worker:
 
 lint:
 	golangci-lint run
+
+run-scheduler:
+	go run ./cmd/scheduler

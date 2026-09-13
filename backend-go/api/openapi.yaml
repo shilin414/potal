@@ -307,7 +307,7 @@ paths:
     post:
       operationId: createApplication
       tags: [applications]
-      summary: Create an application (agent marketplace "new Aily agent")
+      summary: Create an application (admin only — agent marketplace "new Aily agent")
       requestBody:
         required: true
         content:
@@ -324,6 +324,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/FieldErrors" }
+        "403":
+          description: only admins may add agents
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
 
   /api/v2/applications/{id}:
     parameters:
@@ -553,6 +558,235 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/SimpleError" }
+
+  # ───────────────────────────────────────────────────────── schedules ──
+  /api/v2/schedules:
+    get:
+      operationId: listSchedules
+      tags: [schedules]
+      summary: List the caller's schedules (keyset pagination)
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [all, running, paused, failed], default: all }
+        - name: before_id
+          in: query
+          schema: { type: integer }
+          description: Keyset cursor — return schedules with id < before_id.
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 100 }
+      responses:
+        "200":
+          description: Schedule page (bare array; empty means no more)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Schedule" }
+        "401":
+          description: not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+    post:
+      operationId: createSchedule
+      tags: [schedules]
+      summary: Create a schedule (owner = caller; enabled by default)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ScheduleUpsertRequest" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Schedule" }
+        "400":
+          description: field errors
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldErrors" }
+        "401":
+          description: not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/schedules/preview:
+    post:
+      operationId: previewScheduleRuns
+      tags: [schedules]
+      summary: Compute the next trigger times for a candidate trigger (no side effects)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ScheduleUpsertRequest" }
+      responses:
+        "200":
+          description: Next trigger times (UTC ISO-8601), at most 3
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  next_runs:
+                    type: array
+                    items: { type: string, format: date-time }
+        "400":
+          description: invalid trigger
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldErrors" }
+
+  /api/v2/schedules/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ScheduleId"
+    get:
+      operationId: getSchedule
+      tags: [schedules]
+      summary: Schedule detail
+      responses:
+        "200":
+          description: Schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Schedule" }
+        "404":
+          description: unknown or foreign schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+    patch:
+      operationId: updateSchedule
+      tags: [schedules]
+      summary: Update a schedule (next_run_at recomputed from now)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ScheduleUpsertRequest" }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Schedule" }
+        "400":
+          description: field errors
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FieldErrors" }
+        "404":
+          description: unknown or foreign schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+    delete:
+      operationId: deleteSchedule
+      tags: [schedules]
+      summary: Delete a schedule (occurrence/run/delivery history is kept)
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: unknown or foreign schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/schedules/{id}/enable:
+    parameters:
+      - $ref: "#/components/parameters/ScheduleId"
+    post:
+      operationId: enableSchedule
+      tags: [schedules]
+      summary: Enable a schedule (next_run_at recomputed from now; missed slots are not replayed)
+      responses:
+        "200":
+          description: Updated schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Schedule" }
+        "404":
+          description: unknown or foreign schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/schedules/{id}/disable:
+    parameters:
+      - $ref: "#/components/parameters/ScheduleId"
+    post:
+      operationId: disableSchedule
+      tags: [schedules]
+      summary: Disable a schedule (no new occurrences; already queued runs are kept)
+      responses:
+        "200":
+          description: Updated schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Schedule" }
+        "404":
+          description: unknown or foreign schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/schedules/{id}/run-now:
+    parameters:
+      - $ref: "#/components/parameters/ScheduleId"
+    post:
+      operationId: runScheduleNow
+      tags: [schedules]
+      summary: Trigger one real occurrence now (overlap policy applies; next_run_at untouched)
+      responses:
+        "202":
+          description: Occurrence created and run queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ScheduleOccurrence" }
+        "404":
+          description: unknown or foreign schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "409":
+          description: overlap policy skip and a previous run is still active
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/schedules/{id}/occurrences:
+    parameters:
+      - $ref: "#/components/parameters/ScheduleId"
+    get:
+      operationId: listScheduleOccurrences
+      tags: [schedules]
+      summary: Execution history (keyset pagination, newest first)
+      parameters:
+        - name: before_id
+          in: query
+          schema: { type: integer }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 100 }
+      responses:
+        "200":
+          description: Occurrence page (bare array)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/ScheduleOccurrence" }
+        "404":
+          description: unknown or foreign schedule
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
 
   # ─────────────────────────────────────────────────────────── runtimes ──
   /api/v2/runtimes:
@@ -941,6 +1175,222 @@ paths:
                 properties:
                   detail: { type: string }
 
+  # ──────────────────────────────────────────────── conversation shares ──
+  /api/v2/conversations/{conversationId}/shares:
+    parameters:
+      - name: conversationId
+        in: path
+        required: true
+        schema: { type: integer }
+    post:
+      operationId: createConversationShare
+      tags: [runs]
+      summary: Create a read-only share snapshot of selected messages (owner only)
+      description: |
+        Server-side snapshot: the selected message ids are persisted with a
+        random unguessable token. The public read endpoint
+        (GET /api/v2/public/shares/{token}) returns ONLY those messages —
+        filtering never happens on the client, so a shared link cannot be
+        stripped down to reveal the rest of the conversation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message_ids]
+              properties:
+                message_ids:
+                  type: array
+                  minItems: 1
+                  description: Ids of the messages to include (must belong to this conversation).
+                  items: { type: integer }
+      responses:
+        "200":
+          description: Share created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ConversationShare" }
+        "400":
+          description: empty list or ids outside this conversation
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "404":
+          description: conversation not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/conversations/{conversationId}/shares/{shareToken}:
+    parameters:
+      - name: conversationId
+        in: path
+        required: true
+        schema: { type: integer }
+      - name: shareToken
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      operationId: revokeConversationShare
+      tags: [runs]
+      summary: Revoke a share (owner only); public links stop resolving immediately
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  detail: { type: string }
+        "404":
+          description: conversation or share not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/public/shares/{shareToken}:
+    parameters:
+      - name: shareToken
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: getPublicShare
+      tags: [runs]
+      summary: Public read-only share payload (no authentication)
+      description: Returns the conversation title and ONLY the snapshotted
+        messages (with their artifact references). Revoked or unknown tokens
+        resolve to 404.
+      responses:
+        "200":
+          description: Shared messages (snapshot only)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublicShareDetail" }
+        "404":
+          description: share not found or revoked
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/public/shares/{shareToken}/artifacts/{artifactId}/open:
+    parameters:
+      - name: shareToken
+        in: path
+        required: true
+        schema: { type: string }
+      - name: artifactId
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      operationId: openPublicShareArtifact
+      tags: [runs]
+      summary: Resolve an artifact of a share snapshot (no authentication) and 302 to the provider URL
+      description: |
+        Token-scoped variant of the artifact /open resolver: the artifact must
+        be referenced by one of the snapshotted messages, otherwise 404. The
+        image bytes are fetched by the receiver's browser straight from the
+        provider's signed URL — this service never stores or proxies them.
+      responses:
+        "302":
+          description: Redirect to provider URL
+          headers:
+            Location:
+              schema: { type: string }
+        "404":
+          description: share/artifact not found or not part of the snapshot
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "502":
+          description: resolution failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+
+  # ────────────────────────────────────────────── feishu forwarding ──
+  /api/v2/feishu/forward/targets:
+    get:
+      operationId: listFeishuForwardTargets
+      tags: [runs]
+      summary: Feishu forward targets (contacts or groups) for the caller
+      parameters:
+        - name: type
+          in: query
+          required: true
+          schema: { type: string, enum: [user, chat] }
+          description: user = org directory search, chat = the caller's groups.
+        - name: query
+          in: query
+          schema: { type: string }
+          description: Name search (user type only).
+      responses:
+        "200":
+          description: Bare array of targets
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/FeishuForwardTarget" }
+        "400":
+          description: caller has no bound Feishu identity / bad type
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "401":
+          description: not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/feishu/forward:
+    post:
+      operationId: forwardShareToFeishu
+      tags: [runs]
+      summary: Deliver a share snapshot card to Feishu users/groups (owner only)
+      description: Sends an interactive card carrying the share link. The link
+        origin comes from the request Origin header. Per-target results are
+        returned; a failing user-token send falls back to the app token.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [share_token, targets]
+              properties:
+                share_token: { type: string }
+                targets:
+                  type: array
+                  minItems: 1
+                  maxItems: 20
+                  items:
+                    type: object
+                    required: [target_type, id]
+                    properties:
+                      target_type: { type: string, enum: [user, chat] }
+                      id: { type: string }
+      responses:
+        "200":
+          description: Per-target delivery results
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FeishuForwardResult" }
+        "400":
+          description: invalid body / share not owned by caller
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "401":
+          description: not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
   # ─────────────────────────────────────────────────────────────── auth ──
   /api/auth/register/:
     post:
@@ -1033,6 +1483,11 @@ components:
       in: path
       required: true
       schema: { type: string, format: uuid }
+    ScheduleId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
 
   schemas:
     ConversationSummary:
@@ -1077,6 +1532,64 @@ components:
                 nullable: true
                 type: object
                 additionalProperties: true
+
+    ConversationShare:
+      type: object
+      required: [share_token, message_count, created_at]
+      properties:
+        share_token: { type: string }
+        message_count: { type: integer }
+        created_at: { type: string, format: date-time }
+
+    FeishuForwardTarget:
+      type: object
+      required: [id, name, target_type]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        avatar_url: { type: string }
+        target_type: { type: string, enum: [user, chat] }
+
+    FeishuForwardResult:
+      type: object
+      required: [results, success_count, fail_count]
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            required: [target_id, ok]
+            properties:
+              target_id: { type: string }
+              ok: { type: boolean }
+              error: { type: string }
+        success_count: { type: integer }
+        fail_count: { type: integer }
+
+    PublicShareDetail:
+      type: object
+      required: [title, shared_at, messages]
+      properties:
+        title: { type: string }
+        shared_at: { type: string, format: date-time }
+        messages:
+          type: array
+          items:
+            type: object
+            required: [role, content, created_at]
+            properties:
+              role: { type: string, enum: [user, assistant, system] }
+              content: { type: string }
+              created_at: { type: string, format: date-time }
+              artifacts:
+                type: array
+                description: Artifact references (metadata only) for resolving inline files.
+                items:
+                  type: object
+                  required: [artifact_id, name]
+                  properties:
+                    artifact_id: { type: string }
+                    name: { type: string }
 
     DetailError:
       type: object
@@ -1149,6 +1662,7 @@ components:
         - category_slug
         - category_name
         - is_public
+        - enabled
         - runtime_type
         - provider_key
         - external_resource_id
@@ -1176,6 +1690,7 @@ components:
         category_slug: { type: string }
         category_name: { type: string }
         is_public: { type: boolean }
+        enabled: { type: boolean }
         runtime_type: { type: string }
         provider_key: { type: string }
         external_resource_id: { type: string }
@@ -1208,6 +1723,7 @@ components:
         - color
         - kind
         - is_public
+        - enabled
         - category_slug
         - category_name
         - is_default_agent
@@ -1229,6 +1745,7 @@ components:
         color: { type: string }
         kind: { type: string, enum: [chat, task, custom] }
         is_public: { type: boolean }
+        enabled: { type: boolean }
         category_slug: { type: string }
         category_name: { type: string }
         is_default_agent: { type: boolean }
@@ -1291,6 +1808,7 @@ components:
         icon: { type: string }
         color: { type: string }
         is_public: { type: boolean }
+        enabled: { type: boolean }
         category_slug: { type: string }
         category_name: { type: string }
         runtime: { $ref: "#/components/schemas/RuntimeBindingInput" }
@@ -1534,3 +2052,92 @@ components:
         resolution_status: { type: string, enum: [pending, resolved, expired, failed, mirrored] }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    # ─────────────────────────────────────────────────────── schedules ──
+    ScheduleUpsertRequest:
+      type: object
+      description: Structured trigger only — the UI never submits raw cron.
+      required:
+        - name
+        - application_id
+        - prompt
+        - schedule_type
+      properties:
+        name: { type: string, maxLength: 200 }
+        description: { type: string }
+        application_id: { type: integer }
+        prompt: { type: string, description: User message sent on every run }
+        schedule_type: { type: string, enum: [once, daily, weekly, monthly] }
+        timezone: { type: string, default: Asia/Shanghai, description: IANA name }
+        run_at: { type: string, format: date-time, description: Required for schedule_type=once }
+        trigger:
+          type: object
+          properties:
+            time: { type: string, description: "HH:MM in the schedule timezone" }
+            days_of_week:
+              type: array
+              items: { type: integer, minimum: 0, maximum: 6 }
+              description: 0=Sunday … 6=Saturday (weekly)
+            day_of_month: { type: integer, minimum: 1, maximum: 31, description: Short months clamp to the last day (monthly) }
+        conversation_policy: { type: string, enum: [new_each_run, reuse], default: new_each_run }
+        overlap_policy: { type: string, enum: [skip, queue], default: queue }
+        misfire_policy: { type: string, enum: [fire_once, skip], default: fire_once }
+        deadline_policy: { type: string, enum: [skip, execute_anyway], default: execute_anyway }
+        execution_window_seconds: { type: integer, default: 0, maximum: 86400 }
+        deliveries:
+          type: array
+          maxItems: 20
+          description: Feishu targets; omitted/empty means no delivery
+          items:
+            type: object
+            required: [target_type, target_id]
+            properties:
+              target_type: { type: string, enum: [user, chat] }
+              target_id: { type: string }
+              target_name: { type: string, description: Display snapshot captured at save time }
+              content_mode: { type: string, enum: [summary], default: summary }
+
+    Schedule:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        description: { type: string }
+        application_id: { type: integer }
+        prompt: { type: string }
+        schedule_type: { type: string, enum: [once, daily, weekly, monthly] }
+        cron_expression: { type: string, description: Informational — derived from the trigger }
+        timezone: { type: string }
+        run_at: { type: string, format: date-time, nullable: true }
+        trigger:
+          type: object
+          properties:
+            time: { type: string }
+            days_of_week: { type: array, items: { type: integer } }
+            day_of_month: { type: integer }
+        enabled: { type: boolean }
+        conversation_policy: { type: string }
+        overlap_policy: { type: string }
+        misfire_policy: { type: string }
+        deadline_policy: { type: string }
+        execution_window_seconds: { type: integer }
+        next_run_at: { type: string, format: date-time, nullable: true }
+        last_run_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        last_occurrence: { $ref: "#/components/schemas/ScheduleOccurrence" }
+
+    ScheduleOccurrence:
+      type: object
+      description: One scheduled time slot of a schedule and its run linkage.
+      properties:
+        id: { type: integer }
+        schedule_id: { type: integer }
+        scheduled_at: { type: string, format: date-time }
+        enqueued_at: { type: string, format: date-time, nullable: true }
+        admitted_at: { type: string, format: date-time, nullable: true }
+        run_id: { type: string, format: uuid, description: Empty when the occurrence never reached a run }
+        status: { type: string, enum: [pending, queued, running, succeeded, failed, skipped] }
+        triggered_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }

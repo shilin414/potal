@@ -3,6 +3,7 @@ import { useApplicationCatalogStore, resolveDefaultApplication } from '@/stores/
 import { useRunChatStore } from '@/stores/useRunChatStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import AgentCategoriesSidebar from './AgentCategoriesSidebar';
+import AppCategoriesSidebar from './AppCategoriesSidebar';
 import TemplateHistorySidebar from './TemplateHistorySidebar';
 import AppHistorySidebar from './AppHistorySidebar';
 import ProjectListSidebar from './ProjectListSidebar';
@@ -38,6 +39,10 @@ const Sidebar = () => {
     }
     if (path.startsWith('/templates')) {
       return <TemplateHistorySidebar />;
+    }
+    if (path === '/apps' || path === '/apps/') {
+      // 应用中心：与智能体市场同构的分类栏。
+      return <AppCategoriesSidebar />;
     }
     if (path.startsWith('/apps')) {
       return <AppHistorySidebar />;

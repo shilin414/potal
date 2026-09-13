@@ -58,6 +58,19 @@ const (
 	CreateRunCommandRequestCommandTypeResume  CreateRunCommandRequestCommandType = "resume"
 )
 
+// Defines values for FeishuForwardTargetTargetType.
+const (
+	FeishuForwardTargetTargetTypeChat FeishuForwardTargetTargetType = "chat"
+	FeishuForwardTargetTargetTypeUser FeishuForwardTargetTargetType = "user"
+)
+
+// Defines values for PublicShareDetailMessagesRole.
+const (
+	PublicShareDetailMessagesRoleAssistant PublicShareDetailMessagesRole = "assistant"
+	PublicShareDetailMessagesRoleSystem    PublicShareDetailMessagesRole = "system"
+	PublicShareDetailMessagesRoleUser      PublicShareDetailMessagesRole = "user"
+)
+
 // Defines values for RunStatus.
 const (
 	RunStatusCancelled       RunStatus = "cancelled"
@@ -174,6 +187,67 @@ const (
 	Lazy  RuntimeBindingInputSessionPolicy = "lazy"
 )
 
+// Defines values for ScheduleScheduleType.
+const (
+	ScheduleScheduleTypeDaily   ScheduleScheduleType = "daily"
+	ScheduleScheduleTypeMonthly ScheduleScheduleType = "monthly"
+	ScheduleScheduleTypeOnce    ScheduleScheduleType = "once"
+	ScheduleScheduleTypeWeekly  ScheduleScheduleType = "weekly"
+)
+
+// Defines values for ScheduleOccurrenceStatus.
+const (
+	ScheduleOccurrenceStatusFailed    ScheduleOccurrenceStatus = "failed"
+	ScheduleOccurrenceStatusPending   ScheduleOccurrenceStatus = "pending"
+	ScheduleOccurrenceStatusQueued    ScheduleOccurrenceStatus = "queued"
+	ScheduleOccurrenceStatusRunning   ScheduleOccurrenceStatus = "running"
+	ScheduleOccurrenceStatusSkipped   ScheduleOccurrenceStatus = "skipped"
+	ScheduleOccurrenceStatusSucceeded ScheduleOccurrenceStatus = "succeeded"
+)
+
+// Defines values for ScheduleUpsertRequestConversationPolicy.
+const (
+	NewEachRun ScheduleUpsertRequestConversationPolicy = "new_each_run"
+	Reuse      ScheduleUpsertRequestConversationPolicy = "reuse"
+)
+
+// Defines values for ScheduleUpsertRequestDeadlinePolicy.
+const (
+	ScheduleUpsertRequestDeadlinePolicyExecuteAnyway ScheduleUpsertRequestDeadlinePolicy = "execute_anyway"
+	ScheduleUpsertRequestDeadlinePolicySkip          ScheduleUpsertRequestDeadlinePolicy = "skip"
+)
+
+// Defines values for ScheduleUpsertRequestDeliveriesContentMode.
+const (
+	Summary ScheduleUpsertRequestDeliveriesContentMode = "summary"
+)
+
+// Defines values for ScheduleUpsertRequestDeliveriesTargetType.
+const (
+	ScheduleUpsertRequestDeliveriesTargetTypeChat ScheduleUpsertRequestDeliveriesTargetType = "chat"
+	ScheduleUpsertRequestDeliveriesTargetTypeUser ScheduleUpsertRequestDeliveriesTargetType = "user"
+)
+
+// Defines values for ScheduleUpsertRequestMisfirePolicy.
+const (
+	ScheduleUpsertRequestMisfirePolicyFireOnce ScheduleUpsertRequestMisfirePolicy = "fire_once"
+	ScheduleUpsertRequestMisfirePolicySkip     ScheduleUpsertRequestMisfirePolicy = "skip"
+)
+
+// Defines values for ScheduleUpsertRequestOverlapPolicy.
+const (
+	Queue ScheduleUpsertRequestOverlapPolicy = "queue"
+	Skip  ScheduleUpsertRequestOverlapPolicy = "skip"
+)
+
+// Defines values for ScheduleUpsertRequestScheduleType.
+const (
+	ScheduleUpsertRequestScheduleTypeDaily   ScheduleUpsertRequestScheduleType = "daily"
+	ScheduleUpsertRequestScheduleTypeMonthly ScheduleUpsertRequestScheduleType = "monthly"
+	ScheduleUpsertRequestScheduleTypeOnce    ScheduleUpsertRequestScheduleType = "once"
+	ScheduleUpsertRequestScheduleTypeWeekly  ScheduleUpsertRequestScheduleType = "weekly"
+)
+
 // Defines values for ListApplicationsParamsKind.
 const (
 	ListApplicationsParamsKindAll    ListApplicationsParamsKind = "all"
@@ -197,12 +271,32 @@ const (
 	UploadApplicationAttachmentMultipartBodyTypeImage     UploadApplicationAttachmentMultipartBodyType = "image"
 )
 
+// Defines values for ForwardShareToFeishuJSONBodyTargetsTargetType.
+const (
+	ForwardShareToFeishuJSONBodyTargetsTargetTypeChat ForwardShareToFeishuJSONBodyTargetsTargetType = "chat"
+	ForwardShareToFeishuJSONBodyTargetsTargetTypeUser ForwardShareToFeishuJSONBodyTargetsTargetType = "user"
+)
+
+// Defines values for ListFeishuForwardTargetsParamsType.
+const (
+	ListFeishuForwardTargetsParamsTypeChat ListFeishuForwardTargetsParamsType = "chat"
+	ListFeishuForwardTargetsParamsTypeUser ListFeishuForwardTargetsParamsType = "user"
+)
+
 // Defines values for UploadRunAttachmentMultipartBodyType.
 const (
 	Bitable   UploadRunAttachmentMultipartBodyType = "bitable"
 	FeishuDoc UploadRunAttachmentMultipartBodyType = "feishu_doc"
 	File      UploadRunAttachmentMultipartBodyType = "file"
 	Image     UploadRunAttachmentMultipartBodyType = "image"
+)
+
+// Defines values for ListSchedulesParamsStatus.
+const (
+	ListSchedulesParamsStatusAll     ListSchedulesParamsStatus = "all"
+	ListSchedulesParamsStatusFailed  ListSchedulesParamsStatus = "failed"
+	ListSchedulesParamsStatusPaused  ListSchedulesParamsStatus = "paused"
+	ListSchedulesParamsStatusRunning ListSchedulesParamsStatus = "running"
 )
 
 // ApplicationCreateRequest defines model for ApplicationCreateRequest.
@@ -232,6 +326,7 @@ type ApplicationDetail struct {
 	CategorySlug       string                `json:"category_slug"`
 	Color              string                `json:"color"`
 	Description        string                `json:"description"`
+	Enabled            bool                  `json:"enabled"`
 	ExecutionMode      string                `json:"execution_mode"`
 	ExternalResourceId string                `json:"external_resource_id"`
 	Icon               string                `json:"icon"`
@@ -260,6 +355,7 @@ type ApplicationListItem struct {
 	CategorySlug       string                  `json:"category_slug"`
 	Color              string                  `json:"color"`
 	Description        string                  `json:"description"`
+	Enabled            bool                    `json:"enabled"`
 	ExecutionMode      string                  `json:"execution_mode"`
 	ExecutorKey        string                  `json:"executor_key"`
 	ExternalResourceId string                  `json:"external_resource_id"`
@@ -290,6 +386,7 @@ type ApplicationUpdateRequest struct {
 	CategorySlug    *string              `json:"category_slug,omitempty"`
 	Color           *string              `json:"color,omitempty"`
 	Description     *string              `json:"description,omitempty"`
+	Enabled         *bool                `json:"enabled,omitempty"`
 	Icon            *string              `json:"icon,omitempty"`
 	IsPublic        *bool                `json:"is_public,omitempty"`
 	Name            *string              `json:"name,omitempty"`
@@ -316,6 +413,13 @@ type ConversationDetail struct {
 
 // ConversationDetailMessagesRole defines model for ConversationDetail.Messages.Role.
 type ConversationDetailMessagesRole string
+
+// ConversationShare defines model for ConversationShare.
+type ConversationShare struct {
+	CreatedAt    time.Time `json:"created_at"`
+	MessageCount int       `json:"message_count"`
+	ShareToken   string    `json:"share_token"`
+}
 
 // ConversationSummary defines model for ConversationSummary.
 type ConversationSummary struct {
@@ -363,8 +467,49 @@ type FavoriteResult struct {
 	IsFavorite    bool `json:"is_favorite"`
 }
 
+// FeishuForwardResult defines model for FeishuForwardResult.
+type FeishuForwardResult struct {
+	FailCount int `json:"fail_count"`
+	Results   []struct {
+		Error    *string `json:"error,omitempty"`
+		Ok       bool    `json:"ok"`
+		TargetId string  `json:"target_id"`
+	} `json:"results"`
+	SuccessCount int `json:"success_count"`
+}
+
+// FeishuForwardTarget defines model for FeishuForwardTarget.
+type FeishuForwardTarget struct {
+	AvatarUrl  *string                       `json:"avatar_url,omitempty"`
+	Id         string                        `json:"id"`
+	Name       string                        `json:"name"`
+	TargetType FeishuForwardTargetTargetType `json:"target_type"`
+}
+
+// FeishuForwardTargetTargetType defines model for FeishuForwardTarget.TargetType.
+type FeishuForwardTargetTargetType string
+
 // FieldErrors map of field name -> list of messages
 type FieldErrors map[string][]string
+
+// PublicShareDetail defines model for PublicShareDetail.
+type PublicShareDetail struct {
+	Messages []struct {
+		// Artifacts Artifact references (metadata only) for resolving inline files.
+		Artifacts *[]struct {
+			ArtifactId string `json:"artifact_id"`
+			Name       string `json:"name"`
+		} `json:"artifacts,omitempty"`
+		Content   string                        `json:"content"`
+		CreatedAt time.Time                     `json:"created_at"`
+		Role      PublicShareDetailMessagesRole `json:"role"`
+	} `json:"messages"`
+	SharedAt time.Time `json:"shared_at"`
+	Title    string    `json:"title"`
+}
+
+// PublicShareDetailMessagesRole defines model for PublicShareDetail.Messages.Role.
+type PublicShareDetailMessagesRole string
 
 // Run defines model for Run.
 type Run struct {
@@ -531,6 +676,124 @@ type RuntimeValidationResult struct {
 	Ok      bool   `json:"ok"`
 }
 
+// Schedule defines model for Schedule.
+type Schedule struct {
+	ApplicationId      *int       `json:"application_id,omitempty"`
+	ConversationPolicy *string    `json:"conversation_policy,omitempty"`
+	CreatedAt          *time.Time `json:"created_at,omitempty"`
+
+	// CronExpression Informational — derived from the trigger
+	CronExpression         *string `json:"cron_expression,omitempty"`
+	DeadlinePolicy         *string `json:"deadline_policy,omitempty"`
+	Description            *string `json:"description,omitempty"`
+	Enabled                *bool   `json:"enabled,omitempty"`
+	ExecutionWindowSeconds *int    `json:"execution_window_seconds,omitempty"`
+	Id                     *int    `json:"id,omitempty"`
+
+	// LastOccurrence One scheduled time slot of a schedule and its run linkage.
+	LastOccurrence *ScheduleOccurrence   `json:"last_occurrence,omitempty"`
+	LastRunAt      *time.Time            `json:"last_run_at"`
+	MisfirePolicy  *string               `json:"misfire_policy,omitempty"`
+	Name           *string               `json:"name,omitempty"`
+	NextRunAt      *time.Time            `json:"next_run_at"`
+	OverlapPolicy  *string               `json:"overlap_policy,omitempty"`
+	Prompt         *string               `json:"prompt,omitempty"`
+	RunAt          *time.Time            `json:"run_at"`
+	ScheduleType   *ScheduleScheduleType `json:"schedule_type,omitempty"`
+	Timezone       *string               `json:"timezone,omitempty"`
+	Trigger        *struct {
+		DayOfMonth *int    `json:"day_of_month,omitempty"`
+		DaysOfWeek *[]int  `json:"days_of_week,omitempty"`
+		Time       *string `json:"time,omitempty"`
+	} `json:"trigger,omitempty"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+}
+
+// ScheduleScheduleType defines model for Schedule.ScheduleType.
+type ScheduleScheduleType string
+
+// ScheduleOccurrence One scheduled time slot of a schedule and its run linkage.
+type ScheduleOccurrence struct {
+	AdmittedAt *time.Time `json:"admitted_at"`
+	CreatedAt  *time.Time `json:"created_at,omitempty"`
+	EnqueuedAt *time.Time `json:"enqueued_at"`
+	FinishedAt *time.Time `json:"finished_at"`
+	Id         *int       `json:"id,omitempty"`
+
+	// RunId Empty when the occurrence never reached a run
+	RunId       *openapi_types.UUID       `json:"run_id,omitempty"`
+	ScheduleId  *int                      `json:"schedule_id,omitempty"`
+	ScheduledAt *time.Time                `json:"scheduled_at,omitempty"`
+	Status      *ScheduleOccurrenceStatus `json:"status,omitempty"`
+	TriggeredAt *time.Time                `json:"triggered_at"`
+}
+
+// ScheduleOccurrenceStatus defines model for ScheduleOccurrence.Status.
+type ScheduleOccurrenceStatus string
+
+// ScheduleUpsertRequest Structured trigger only — the UI never submits raw cron.
+type ScheduleUpsertRequest struct {
+	ApplicationId      int                                      `json:"application_id"`
+	ConversationPolicy *ScheduleUpsertRequestConversationPolicy `json:"conversation_policy,omitempty"`
+	DeadlinePolicy     *ScheduleUpsertRequestDeadlinePolicy     `json:"deadline_policy,omitempty"`
+
+	// Deliveries Feishu targets; omitted/empty means no delivery
+	Deliveries *[]struct {
+		ContentMode *ScheduleUpsertRequestDeliveriesContentMode `json:"content_mode,omitempty"`
+		TargetId    string                                      `json:"target_id"`
+
+		// TargetName Display snapshot captured at save time
+		TargetName *string                                   `json:"target_name,omitempty"`
+		TargetType ScheduleUpsertRequestDeliveriesTargetType `json:"target_type"`
+	} `json:"deliveries,omitempty"`
+	Description            *string                             `json:"description,omitempty"`
+	ExecutionWindowSeconds *int                                `json:"execution_window_seconds,omitempty"`
+	MisfirePolicy          *ScheduleUpsertRequestMisfirePolicy `json:"misfire_policy,omitempty"`
+	Name                   string                              `json:"name"`
+	OverlapPolicy          *ScheduleUpsertRequestOverlapPolicy `json:"overlap_policy,omitempty"`
+
+	// Prompt User message sent on every run
+	Prompt string `json:"prompt"`
+
+	// RunAt Required for schedule_type=once
+	RunAt        *time.Time                        `json:"run_at,omitempty"`
+	ScheduleType ScheduleUpsertRequestScheduleType `json:"schedule_type"`
+
+	// Timezone IANA name
+	Timezone *string `json:"timezone,omitempty"`
+	Trigger  *struct {
+		// DayOfMonth Short months clamp to the last day (monthly)
+		DayOfMonth *int `json:"day_of_month,omitempty"`
+
+		// DaysOfWeek 0=Sunday … 6=Saturday (weekly)
+		DaysOfWeek *[]int `json:"days_of_week,omitempty"`
+
+		// Time HH:MM in the schedule timezone
+		Time *string `json:"time,omitempty"`
+	} `json:"trigger,omitempty"`
+}
+
+// ScheduleUpsertRequestConversationPolicy defines model for ScheduleUpsertRequest.ConversationPolicy.
+type ScheduleUpsertRequestConversationPolicy string
+
+// ScheduleUpsertRequestDeadlinePolicy defines model for ScheduleUpsertRequest.DeadlinePolicy.
+type ScheduleUpsertRequestDeadlinePolicy string
+
+// ScheduleUpsertRequestDeliveriesContentMode defines model for ScheduleUpsertRequest.Deliveries.ContentMode.
+type ScheduleUpsertRequestDeliveriesContentMode string
+
+// ScheduleUpsertRequestDeliveriesTargetType defines model for ScheduleUpsertRequest.Deliveries.TargetType.
+type ScheduleUpsertRequestDeliveriesTargetType string
+
+// ScheduleUpsertRequestMisfirePolicy defines model for ScheduleUpsertRequest.MisfirePolicy.
+type ScheduleUpsertRequestMisfirePolicy string
+
+// ScheduleUpsertRequestOverlapPolicy defines model for ScheduleUpsertRequest.OverlapPolicy.
+type ScheduleUpsertRequestOverlapPolicy string
+
+// ScheduleUpsertRequestScheduleType defines model for ScheduleUpsertRequest.ScheduleType.
+type ScheduleUpsertRequestScheduleType string
+
 // SessionUser defines model for SessionUser.
 type SessionUser struct {
 	AuthSource  *string `json:"auth_source,omitempty"`
@@ -572,6 +835,9 @@ type ApplicationId = int
 
 // RunId defines model for RunId.
 type RunId = openapi_types.UUID
+
+// ScheduleId defines model for ScheduleId.
+type ScheduleId = int
 
 // AuthLoginJSONBody defines parameters for AuthLogin.
 type AuthLoginJSONBody struct {
@@ -658,6 +924,36 @@ type UploadApplicationAvatarMultipartBody struct {
 	File openapi_types.File `json:"file"`
 }
 
+// CreateConversationShareJSONBody defines parameters for CreateConversationShare.
+type CreateConversationShareJSONBody struct {
+	// MessageIds Ids of the messages to include (must belong to this conversation).
+	MessageIds []int `json:"message_ids"`
+}
+
+// ForwardShareToFeishuJSONBody defines parameters for ForwardShareToFeishu.
+type ForwardShareToFeishuJSONBody struct {
+	ShareToken string `json:"share_token"`
+	Targets    []struct {
+		Id         string                                        `json:"id"`
+		TargetType ForwardShareToFeishuJSONBodyTargetsTargetType `json:"target_type"`
+	} `json:"targets"`
+}
+
+// ForwardShareToFeishuJSONBodyTargetsTargetType defines parameters for ForwardShareToFeishu.
+type ForwardShareToFeishuJSONBodyTargetsTargetType string
+
+// ListFeishuForwardTargetsParams defines parameters for ListFeishuForwardTargets.
+type ListFeishuForwardTargetsParams struct {
+	// Type user = org directory search, chat = the caller's groups.
+	Type ListFeishuForwardTargetsParamsType `form:"type" json:"type"`
+
+	// Query Name search (user type only).
+	Query *string `form:"query,omitempty" json:"query,omitempty"`
+}
+
+// ListFeishuForwardTargetsParamsType defines parameters for ListFeishuForwardTargets.
+type ListFeishuForwardTargetsParamsType string
+
 // UploadRunAttachmentMultipartBody defines parameters for UploadRunAttachment.
 type UploadRunAttachmentMultipartBody struct {
 	DocUrl *string                               `json:"doc_url,omitempty"`
@@ -680,6 +976,24 @@ type ValidateRuntimeJSONBody struct {
 	IdentityMode       *string `json:"identity_mode,omitempty"`
 	ProviderKey        string  `json:"provider_key"`
 	RuntimeType        string  `json:"runtime_type"`
+}
+
+// ListSchedulesParams defines parameters for ListSchedules.
+type ListSchedulesParams struct {
+	Status *ListSchedulesParamsStatus `form:"status,omitempty" json:"status,omitempty"`
+
+	// BeforeId Keyset cursor — return schedules with id < before_id.
+	BeforeId *int `form:"before_id,omitempty" json:"before_id,omitempty"`
+	Limit    *int `form:"limit,omitempty" json:"limit,omitempty"`
+}
+
+// ListSchedulesParamsStatus defines parameters for ListSchedules.
+type ListSchedulesParamsStatus string
+
+// ListScheduleOccurrencesParams defines parameters for ListScheduleOccurrences.
+type ListScheduleOccurrencesParams struct {
+	BeforeId *int `form:"before_id,omitempty" json:"before_id,omitempty"`
+	Limit    *int `form:"limit,omitempty" json:"limit,omitempty"`
 }
 
 // AuthLoginJSONRequestBody defines body for AuthLogin for application/json ContentType.
@@ -709,6 +1023,12 @@ type UploadApplicationAttachmentMultipartRequestBody UploadApplicationAttachment
 // UploadApplicationAvatarMultipartRequestBody defines body for UploadApplicationAvatar for multipart/form-data ContentType.
 type UploadApplicationAvatarMultipartRequestBody UploadApplicationAvatarMultipartBody
 
+// CreateConversationShareJSONRequestBody defines body for CreateConversationShare for application/json ContentType.
+type CreateConversationShareJSONRequestBody CreateConversationShareJSONBody
+
+// ForwardShareToFeishuJSONRequestBody defines body for ForwardShareToFeishu for application/json ContentType.
+type ForwardShareToFeishuJSONRequestBody ForwardShareToFeishuJSONBody
+
 // CreateRunJSONRequestBody defines body for CreateRun for application/json ContentType.
 type CreateRunJSONRequestBody = CreateRunRequest
 
@@ -720,6 +1040,15 @@ type CreateRunCommandJSONRequestBody = CreateRunCommandRequest
 
 // ValidateRuntimeJSONRequestBody defines body for ValidateRuntime for application/json ContentType.
 type ValidateRuntimeJSONRequestBody ValidateRuntimeJSONBody
+
+// CreateScheduleJSONRequestBody defines body for CreateSchedule for application/json ContentType.
+type CreateScheduleJSONRequestBody = ScheduleUpsertRequest
+
+// PreviewScheduleRunsJSONRequestBody defines body for PreviewScheduleRuns for application/json ContentType.
+type PreviewScheduleRunsJSONRequestBody = ScheduleUpsertRequest
+
+// UpdateScheduleJSONRequestBody defines body for UpdateSchedule for application/json ContentType.
+type UpdateScheduleJSONRequestBody = ScheduleUpsertRequest
 
 // ServerInterface represents all server handlers.
 type ServerInterface interface {
@@ -777,7 +1106,7 @@ type ServerInterface interface {
 	// List openable applications (bare array, no pagination envelope)
 	// (GET /api/v2/applications)
 	ListApplications(w http.ResponseWriter, r *http.Request, params ListApplicationsParams)
-	// Create an application (agent marketplace "new Aily agent")
+	// Create an application (admin only — agent marketplace "new Aily agent")
 	// (POST /api/v2/applications)
 	CreateApplication(w http.ResponseWriter, r *http.Request)
 	// Delete an application (409 when referenced by conversations/runs)
@@ -819,6 +1148,24 @@ type ServerInterface interface {
 	// Runs of a conversation (newest first, owner only)
 	// (GET /api/v2/conversations/{conversationId}/runs)
 	ListConversationRuns(w http.ResponseWriter, r *http.Request, conversationId int)
+	// Create a read-only share snapshot of selected messages (owner only)
+	// (POST /api/v2/conversations/{conversationId}/shares)
+	CreateConversationShare(w http.ResponseWriter, r *http.Request, conversationId int)
+	// Revoke a share (owner only); public links stop resolving immediately
+	// (DELETE /api/v2/conversations/{conversationId}/shares/{shareToken})
+	RevokeConversationShare(w http.ResponseWriter, r *http.Request, conversationId int, shareToken string)
+	// Deliver a share snapshot card to Feishu users/groups (owner only)
+	// (POST /api/v2/feishu/forward)
+	ForwardShareToFeishu(w http.ResponseWriter, r *http.Request)
+	// Feishu forward targets (contacts or groups) for the caller
+	// (GET /api/v2/feishu/forward/targets)
+	ListFeishuForwardTargets(w http.ResponseWriter, r *http.Request, params ListFeishuForwardTargetsParams)
+	// Public read-only share payload (no authentication)
+	// (GET /api/v2/public/shares/{shareToken})
+	GetPublicShare(w http.ResponseWriter, r *http.Request, shareToken string)
+	// Resolve an artifact of a share snapshot (no authentication) and 302 to the provider URL
+	// (GET /api/v2/public/shares/{shareToken}/artifacts/{artifactId}/open)
+	OpenPublicShareArtifact(w http.ResponseWriter, r *http.Request, shareToken string, artifactId openapi_types.UUID)
 	// Create a run (lazily creates the conversation when conversation_id is absent)
 	// (POST /api/v2/runs)
 	CreateRun(w http.ResponseWriter, r *http.Request)
@@ -846,6 +1193,36 @@ type ServerInterface interface {
 	// Validate resource id format + remote visibility (best-effort)
 	// (POST /api/v2/runtimes/validate)
 	ValidateRuntime(w http.ResponseWriter, r *http.Request)
+	// List the caller's schedules (keyset pagination)
+	// (GET /api/v2/schedules)
+	ListSchedules(w http.ResponseWriter, r *http.Request, params ListSchedulesParams)
+	// Create a schedule (owner = caller; enabled by default)
+	// (POST /api/v2/schedules)
+	CreateSchedule(w http.ResponseWriter, r *http.Request)
+	// Compute the next trigger times for a candidate trigger (no side effects)
+	// (POST /api/v2/schedules/preview)
+	PreviewScheduleRuns(w http.ResponseWriter, r *http.Request)
+	// Delete a schedule (occurrence/run/delivery history is kept)
+	// (DELETE /api/v2/schedules/{id})
+	DeleteSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId)
+	// Schedule detail
+	// (GET /api/v2/schedules/{id})
+	GetSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId)
+	// Update a schedule (next_run_at recomputed from now)
+	// (PATCH /api/v2/schedules/{id})
+	UpdateSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId)
+	// Disable a schedule (no new occurrences; already queued runs are kept)
+	// (POST /api/v2/schedules/{id}/disable)
+	DisableSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId)
+	// Enable a schedule (next_run_at recomputed from now; missed slots are not replayed)
+	// (POST /api/v2/schedules/{id}/enable)
+	EnableSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId)
+	// Execution history (keyset pagination, newest first)
+	// (GET /api/v2/schedules/{id}/occurrences)
+	ListScheduleOccurrences(w http.ResponseWriter, r *http.Request, id ScheduleId, params ListScheduleOccurrencesParams)
+	// Trigger one real occurrence now (overlap policy applies; next_run_at untouched)
+	// (POST /api/v2/schedules/{id}/run-now)
+	RunScheduleNow(w http.ResponseWriter, r *http.Request, id ScheduleId)
 }
 
 // Unimplemented server implementation that returns http.StatusNotImplemented for each endpoint.
@@ -960,7 +1337,7 @@ func (_ Unimplemented) ListApplications(w http.ResponseWriter, r *http.Request, 
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
-// Create an application (agent marketplace "new Aily agent")
+// Create an application (admin only — agent marketplace "new Aily agent")
 // (POST /api/v2/applications)
 func (_ Unimplemented) CreateApplication(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNotImplemented)
@@ -1044,6 +1421,42 @@ func (_ Unimplemented) ListConversationRuns(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
+// Create a read-only share snapshot of selected messages (owner only)
+// (POST /api/v2/conversations/{conversationId}/shares)
+func (_ Unimplemented) CreateConversationShare(w http.ResponseWriter, r *http.Request, conversationId int) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Revoke a share (owner only); public links stop resolving immediately
+// (DELETE /api/v2/conversations/{conversationId}/shares/{shareToken})
+func (_ Unimplemented) RevokeConversationShare(w http.ResponseWriter, r *http.Request, conversationId int, shareToken string) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Deliver a share snapshot card to Feishu users/groups (owner only)
+// (POST /api/v2/feishu/forward)
+func (_ Unimplemented) ForwardShareToFeishu(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Feishu forward targets (contacts or groups) for the caller
+// (GET /api/v2/feishu/forward/targets)
+func (_ Unimplemented) ListFeishuForwardTargets(w http.ResponseWriter, r *http.Request, params ListFeishuForwardTargetsParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Public read-only share payload (no authentication)
+// (GET /api/v2/public/shares/{shareToken})
+func (_ Unimplemented) GetPublicShare(w http.ResponseWriter, r *http.Request, shareToken string) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Resolve an artifact of a share snapshot (no authentication) and 302 to the provider URL
+// (GET /api/v2/public/shares/{shareToken}/artifacts/{artifactId}/open)
+func (_ Unimplemented) OpenPublicShareArtifact(w http.ResponseWriter, r *http.Request, shareToken string, artifactId openapi_types.UUID) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
 // Create a run (lazily creates the conversation when conversation_id is absent)
 // (POST /api/v2/runs)
 func (_ Unimplemented) CreateRun(w http.ResponseWriter, r *http.Request) {
@@ -1095,6 +1508,66 @@ func (_ Unimplemented) ListRuntimes(w http.ResponseWriter, r *http.Request) {
 // Validate resource id format + remote visibility (best-effort)
 // (POST /api/v2/runtimes/validate)
 func (_ Unimplemented) ValidateRuntime(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// List the caller's schedules (keyset pagination)
+// (GET /api/v2/schedules)
+func (_ Unimplemented) ListSchedules(w http.ResponseWriter, r *http.Request, params ListSchedulesParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Create a schedule (owner = caller; enabled by default)
+// (POST /api/v2/schedules)
+func (_ Unimplemented) CreateSchedule(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Compute the next trigger times for a candidate trigger (no side effects)
+// (POST /api/v2/schedules/preview)
+func (_ Unimplemented) PreviewScheduleRuns(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Delete a schedule (occurrence/run/delivery history is kept)
+// (DELETE /api/v2/schedules/{id})
+func (_ Unimplemented) DeleteSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Schedule detail
+// (GET /api/v2/schedules/{id})
+func (_ Unimplemented) GetSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Update a schedule (next_run_at recomputed from now)
+// (PATCH /api/v2/schedules/{id})
+func (_ Unimplemented) UpdateSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Disable a schedule (no new occurrences; already queued runs are kept)
+// (POST /api/v2/schedules/{id}/disable)
+func (_ Unimplemented) DisableSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Enable a schedule (next_run_at recomputed from now; missed slots are not replayed)
+// (POST /api/v2/schedules/{id}/enable)
+func (_ Unimplemented) EnableSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Execution history (keyset pagination, newest first)
+// (GET /api/v2/schedules/{id}/occurrences)
+func (_ Unimplemented) ListScheduleOccurrences(w http.ResponseWriter, r *http.Request, id ScheduleId, params ListScheduleOccurrencesParams) {
+	w.WriteHeader(http.StatusNotImplemented)
+}
+
+// Trigger one real occurrence now (overlap policy applies; next_run_at untouched)
+// (POST /api/v2/schedules/{id}/run-now)
+func (_ Unimplemented) RunScheduleNow(w http.ResponseWriter, r *http.Request, id ScheduleId) {
 	w.WriteHeader(http.StatusNotImplemented)
 }
 
@@ -1821,6 +2294,180 @@ func (siw *ServerInterfaceWrapper) ListConversationRuns(w http.ResponseWriter, r
 	handler.ServeHTTP(w, r)
 }
 
+// CreateConversationShare operation middleware
+func (siw *ServerInterfaceWrapper) CreateConversationShare(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "conversationId" -------------
+	var conversationId int
+
+	err = runtime.BindStyledParameterWithOptions("simple", "conversationId", chi.URLParam(r, "conversationId"), &conversationId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "conversationId", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateConversationShare(w, r, conversationId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RevokeConversationShare operation middleware
+func (siw *ServerInterfaceWrapper) RevokeConversationShare(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "conversationId" -------------
+	var conversationId int
+
+	err = runtime.BindStyledParameterWithOptions("simple", "conversationId", chi.URLParam(r, "conversationId"), &conversationId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "conversationId", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "shareToken" -------------
+	var shareToken string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "shareToken", chi.URLParam(r, "shareToken"), &shareToken, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "shareToken", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RevokeConversationShare(w, r, conversationId, shareToken)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ForwardShareToFeishu operation middleware
+func (siw *ServerInterfaceWrapper) ForwardShareToFeishu(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ForwardShareToFeishu(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListFeishuForwardTargets operation middleware
+func (siw *ServerInterfaceWrapper) ListFeishuForwardTargets(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListFeishuForwardTargetsParams
+
+	// ------------- Required query parameter "type" -------------
+
+	if paramValue := r.URL.Query().Get("type"); paramValue != "" {
+
+	} else {
+		siw.ErrorHandlerFunc(w, r, &RequiredParamError{ParamName: "type"})
+		return
+	}
+
+	err = runtime.BindQueryParameter("form", true, true, "type", r.URL.Query(), &params.Type)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "type", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "query" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "query", r.URL.Query(), &params.Query)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "query", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListFeishuForwardTargets(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetPublicShare operation middleware
+func (siw *ServerInterfaceWrapper) GetPublicShare(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "shareToken" -------------
+	var shareToken string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "shareToken", chi.URLParam(r, "shareToken"), &shareToken, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "shareToken", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetPublicShare(w, r, shareToken)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// OpenPublicShareArtifact operation middleware
+func (siw *ServerInterfaceWrapper) OpenPublicShareArtifact(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "shareToken" -------------
+	var shareToken string
+
+	err = runtime.BindStyledParameterWithOptions("simple", "shareToken", chi.URLParam(r, "shareToken"), &shareToken, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "shareToken", Err: err})
+		return
+	}
+
+	// ------------- Path parameter "artifactId" -------------
+	var artifactId openapi_types.UUID
+
+	err = runtime.BindStyledParameterWithOptions("simple", "artifactId", chi.URLParam(r, "artifactId"), &artifactId, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "artifactId", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.OpenPublicShareArtifact(w, r, shareToken, artifactId)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
 // CreateRun operation middleware
 func (siw *ServerInterfaceWrapper) CreateRun(w http.ResponseWriter, r *http.Request) {
 
@@ -2015,6 +2662,271 @@ func (siw *ServerInterfaceWrapper) ValidateRuntime(w http.ResponseWriter, r *htt
 
 	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		siw.Handler.ValidateRuntime(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListSchedules operation middleware
+func (siw *ServerInterfaceWrapper) ListSchedules(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListSchedulesParams
+
+	// ------------- Optional query parameter "status" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "status", r.URL.Query(), &params.Status)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "status", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "before_id" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "before_id", r.URL.Query(), &params.BeforeId)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "before_id", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "limit", r.URL.Query(), &params.Limit)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListSchedules(w, r, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// CreateSchedule operation middleware
+func (siw *ServerInterfaceWrapper) CreateSchedule(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.CreateSchedule(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// PreviewScheduleRuns operation middleware
+func (siw *ServerInterfaceWrapper) PreviewScheduleRuns(w http.ResponseWriter, r *http.Request) {
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.PreviewScheduleRuns(w, r)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DeleteSchedule operation middleware
+func (siw *ServerInterfaceWrapper) DeleteSchedule(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id ScheduleId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DeleteSchedule(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// GetSchedule operation middleware
+func (siw *ServerInterfaceWrapper) GetSchedule(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id ScheduleId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.GetSchedule(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// UpdateSchedule operation middleware
+func (siw *ServerInterfaceWrapper) UpdateSchedule(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id ScheduleId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.UpdateSchedule(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// DisableSchedule operation middleware
+func (siw *ServerInterfaceWrapper) DisableSchedule(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id ScheduleId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.DisableSchedule(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// EnableSchedule operation middleware
+func (siw *ServerInterfaceWrapper) EnableSchedule(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id ScheduleId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.EnableSchedule(w, r, id)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// ListScheduleOccurrences operation middleware
+func (siw *ServerInterfaceWrapper) ListScheduleOccurrences(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id ScheduleId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	// Parameter object where we will unmarshal all parameters from the context
+	var params ListScheduleOccurrencesParams
+
+	// ------------- Optional query parameter "before_id" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "before_id", r.URL.Query(), &params.BeforeId)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "before_id", Err: err})
+		return
+	}
+
+	// ------------- Optional query parameter "limit" -------------
+
+	err = runtime.BindQueryParameter("form", true, false, "limit", r.URL.Query(), &params.Limit)
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "limit", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.ListScheduleOccurrences(w, r, id, params)
+	}))
+
+	for _, middleware := range siw.HandlerMiddlewares {
+		handler = middleware(handler)
+	}
+
+	handler.ServeHTTP(w, r)
+}
+
+// RunScheduleNow operation middleware
+func (siw *ServerInterfaceWrapper) RunScheduleNow(w http.ResponseWriter, r *http.Request) {
+
+	var err error
+
+	// ------------- Path parameter "id" -------------
+	var id ScheduleId
+
+	err = runtime.BindStyledParameterWithOptions("simple", "id", chi.URLParam(r, "id"), &id, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationPath, Explode: false, Required: true})
+	if err != nil {
+		siw.ErrorHandlerFunc(w, r, &InvalidParamFormatError{ParamName: "id", Err: err})
+		return
+	}
+
+	handler := http.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		siw.Handler.RunScheduleNow(w, r, id)
 	}))
 
 	for _, middleware := range siw.HandlerMiddlewares {
@@ -2234,6 +3146,24 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 		r.Get(options.BaseURL+"/api/v2/conversations/{conversationId}/runs", wrapper.ListConversationRuns)
 	})
 	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v2/conversations/{conversationId}/shares", wrapper.CreateConversationShare)
+	})
+	r.Group(func(r chi.Router) {
+		r.Delete(options.BaseURL+"/api/v2/conversations/{conversationId}/shares/{shareToken}", wrapper.RevokeConversationShare)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v2/feishu/forward", wrapper.ForwardShareToFeishu)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/api/v2/feishu/forward/targets", wrapper.ListFeishuForwardTargets)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/api/v2/public/shares/{shareToken}", wrapper.GetPublicShare)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/api/v2/public/shares/{shareToken}/artifacts/{artifactId}/open", wrapper.OpenPublicShareArtifact)
+	})
+	r.Group(func(r chi.Router) {
 		r.Post(options.BaseURL+"/api/v2/runs", wrapper.CreateRun)
 	})
 	r.Group(func(r chi.Router) {
@@ -2259,6 +3189,36 @@ func HandlerWithOptions(si ServerInterface, options ChiServerOptions) http.Handl
 	})
 	r.Group(func(r chi.Router) {
 		r.Post(options.BaseURL+"/api/v2/runtimes/validate", wrapper.ValidateRuntime)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/api/v2/schedules", wrapper.ListSchedules)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v2/schedules", wrapper.CreateSchedule)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v2/schedules/preview", wrapper.PreviewScheduleRuns)
+	})
+	r.Group(func(r chi.Router) {
+		r.Delete(options.BaseURL+"/api/v2/schedules/{id}", wrapper.DeleteSchedule)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/api/v2/schedules/{id}", wrapper.GetSchedule)
+	})
+	r.Group(func(r chi.Router) {
+		r.Patch(options.BaseURL+"/api/v2/schedules/{id}", wrapper.UpdateSchedule)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v2/schedules/{id}/disable", wrapper.DisableSchedule)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v2/schedules/{id}/enable", wrapper.EnableSchedule)
+	})
+	r.Group(func(r chi.Router) {
+		r.Get(options.BaseURL+"/api/v2/schedules/{id}/occurrences", wrapper.ListScheduleOccurrences)
+	})
+	r.Group(func(r chi.Router) {
+		r.Post(options.BaseURL+"/api/v2/schedules/{id}/run-now", wrapper.RunScheduleNow)
 	})
 
 	return r
@@ -2725,6 +3685,15 @@ func (response CreateApplication400JSONResponse) VisitCreateApplicationResponse(
 	return json.NewEncoder(w).Encode(response)
 }
 
+type CreateApplication403JSONResponse DetailError
+
+func (response CreateApplication403JSONResponse) VisitCreateApplicationResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(403)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
 type DeleteApplicationRequestObject struct {
 	Id ApplicationId `json:"id"`
 }
@@ -3166,6 +4135,208 @@ func (response ListConversationRuns404JSONResponse) VisitListConversationRunsRes
 	return json.NewEncoder(w).Encode(response)
 }
 
+type CreateConversationShareRequestObject struct {
+	ConversationId int `json:"conversationId"`
+	Body           *CreateConversationShareJSONRequestBody
+}
+
+type CreateConversationShareResponseObject interface {
+	VisitCreateConversationShareResponse(w http.ResponseWriter) error
+}
+
+type CreateConversationShare200JSONResponse ConversationShare
+
+func (response CreateConversationShare200JSONResponse) VisitCreateConversationShareResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type CreateConversationShare400JSONResponse DetailError
+
+func (response CreateConversationShare400JSONResponse) VisitCreateConversationShareResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type CreateConversationShare404JSONResponse DetailError
+
+func (response CreateConversationShare404JSONResponse) VisitCreateConversationShareResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type RevokeConversationShareRequestObject struct {
+	ConversationId int    `json:"conversationId"`
+	ShareToken     string `json:"shareToken"`
+}
+
+type RevokeConversationShareResponseObject interface {
+	VisitRevokeConversationShareResponse(w http.ResponseWriter) error
+}
+
+type RevokeConversationShare200JSONResponse struct {
+	Detail *string `json:"detail,omitempty"`
+}
+
+func (response RevokeConversationShare200JSONResponse) VisitRevokeConversationShareResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type RevokeConversationShare404JSONResponse DetailError
+
+func (response RevokeConversationShare404JSONResponse) VisitRevokeConversationShareResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type ForwardShareToFeishuRequestObject struct {
+	Body *ForwardShareToFeishuJSONRequestBody
+}
+
+type ForwardShareToFeishuResponseObject interface {
+	VisitForwardShareToFeishuResponse(w http.ResponseWriter) error
+}
+
+type ForwardShareToFeishu200JSONResponse FeishuForwardResult
+
+func (response ForwardShareToFeishu200JSONResponse) VisitForwardShareToFeishuResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type ForwardShareToFeishu400JSONResponse DetailError
+
+func (response ForwardShareToFeishu400JSONResponse) VisitForwardShareToFeishuResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type ForwardShareToFeishu401JSONResponse DetailError
+
+func (response ForwardShareToFeishu401JSONResponse) VisitForwardShareToFeishuResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(401)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type ListFeishuForwardTargetsRequestObject struct {
+	Params ListFeishuForwardTargetsParams
+}
+
+type ListFeishuForwardTargetsResponseObject interface {
+	VisitListFeishuForwardTargetsResponse(w http.ResponseWriter) error
+}
+
+type ListFeishuForwardTargets200JSONResponse []FeishuForwardTarget
+
+func (response ListFeishuForwardTargets200JSONResponse) VisitListFeishuForwardTargetsResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type ListFeishuForwardTargets400JSONResponse DetailError
+
+func (response ListFeishuForwardTargets400JSONResponse) VisitListFeishuForwardTargetsResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type ListFeishuForwardTargets401JSONResponse DetailError
+
+func (response ListFeishuForwardTargets401JSONResponse) VisitListFeishuForwardTargetsResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(401)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type GetPublicShareRequestObject struct {
+	ShareToken string `json:"shareToken"`
+}
+
+type GetPublicShareResponseObject interface {
+	VisitGetPublicShareResponse(w http.ResponseWriter) error
+}
+
+type GetPublicShare200JSONResponse PublicShareDetail
+
+func (response GetPublicShare200JSONResponse) VisitGetPublicShareResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type GetPublicShare404JSONResponse DetailError
+
+func (response GetPublicShare404JSONResponse) VisitGetPublicShareResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type OpenPublicShareArtifactRequestObject struct {
+	ShareToken string             `json:"shareToken"`
+	ArtifactId openapi_types.UUID `json:"artifactId"`
+}
+
+type OpenPublicShareArtifactResponseObject interface {
+	VisitOpenPublicShareArtifactResponse(w http.ResponseWriter) error
+}
+
+type OpenPublicShareArtifact302ResponseHeaders struct {
+	Location string
+}
+
+type OpenPublicShareArtifact302Response struct {
+	Headers OpenPublicShareArtifact302ResponseHeaders
+}
+
+func (response OpenPublicShareArtifact302Response) VisitOpenPublicShareArtifactResponse(w http.ResponseWriter) error {
+	w.Header().Set("Location", fmt.Sprint(response.Headers.Location))
+	w.WriteHeader(302)
+	return nil
+}
+
+type OpenPublicShareArtifact404JSONResponse DetailError
+
+func (response OpenPublicShareArtifact404JSONResponse) VisitOpenPublicShareArtifactResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type OpenPublicShareArtifact502JSONResponse SimpleError
+
+func (response OpenPublicShareArtifact502JSONResponse) VisitOpenPublicShareArtifactResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(502)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
 type CreateRunRequestObject struct {
 	Body *CreateRunJSONRequestBody
 }
@@ -3441,6 +4612,296 @@ func (response ValidateRuntime400JSONResponse) VisitValidateRuntimeResponse(w ht
 	return json.NewEncoder(w).Encode(response)
 }
 
+type ListSchedulesRequestObject struct {
+	Params ListSchedulesParams
+}
+
+type ListSchedulesResponseObject interface {
+	VisitListSchedulesResponse(w http.ResponseWriter) error
+}
+
+type ListSchedules200JSONResponse []Schedule
+
+func (response ListSchedules200JSONResponse) VisitListSchedulesResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type ListSchedules401JSONResponse DetailError
+
+func (response ListSchedules401JSONResponse) VisitListSchedulesResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(401)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type CreateScheduleRequestObject struct {
+	Body *CreateScheduleJSONRequestBody
+}
+
+type CreateScheduleResponseObject interface {
+	VisitCreateScheduleResponse(w http.ResponseWriter) error
+}
+
+type CreateSchedule201JSONResponse Schedule
+
+func (response CreateSchedule201JSONResponse) VisitCreateScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type CreateSchedule400JSONResponse FieldErrors
+
+func (response CreateSchedule400JSONResponse) VisitCreateScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type CreateSchedule401JSONResponse DetailError
+
+func (response CreateSchedule401JSONResponse) VisitCreateScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(401)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type PreviewScheduleRunsRequestObject struct {
+	Body *PreviewScheduleRunsJSONRequestBody
+}
+
+type PreviewScheduleRunsResponseObject interface {
+	VisitPreviewScheduleRunsResponse(w http.ResponseWriter) error
+}
+
+type PreviewScheduleRuns200JSONResponse struct {
+	NextRuns *[]time.Time `json:"next_runs,omitempty"`
+}
+
+func (response PreviewScheduleRuns200JSONResponse) VisitPreviewScheduleRunsResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type PreviewScheduleRuns400JSONResponse FieldErrors
+
+func (response PreviewScheduleRuns400JSONResponse) VisitPreviewScheduleRunsResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type DeleteScheduleRequestObject struct {
+	Id ScheduleId `json:"id"`
+}
+
+type DeleteScheduleResponseObject interface {
+	VisitDeleteScheduleResponse(w http.ResponseWriter) error
+}
+
+type DeleteSchedule204Response struct {
+}
+
+func (response DeleteSchedule204Response) VisitDeleteScheduleResponse(w http.ResponseWriter) error {
+	w.WriteHeader(204)
+	return nil
+}
+
+type DeleteSchedule404JSONResponse DetailError
+
+func (response DeleteSchedule404JSONResponse) VisitDeleteScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type GetScheduleRequestObject struct {
+	Id ScheduleId `json:"id"`
+}
+
+type GetScheduleResponseObject interface {
+	VisitGetScheduleResponse(w http.ResponseWriter) error
+}
+
+type GetSchedule200JSONResponse Schedule
+
+func (response GetSchedule200JSONResponse) VisitGetScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type GetSchedule404JSONResponse DetailError
+
+func (response GetSchedule404JSONResponse) VisitGetScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type UpdateScheduleRequestObject struct {
+	Id   ScheduleId `json:"id"`
+	Body *UpdateScheduleJSONRequestBody
+}
+
+type UpdateScheduleResponseObject interface {
+	VisitUpdateScheduleResponse(w http.ResponseWriter) error
+}
+
+type UpdateSchedule200JSONResponse Schedule
+
+func (response UpdateSchedule200JSONResponse) VisitUpdateScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type UpdateSchedule400JSONResponse FieldErrors
+
+func (response UpdateSchedule400JSONResponse) VisitUpdateScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(400)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type UpdateSchedule404JSONResponse DetailError
+
+func (response UpdateSchedule404JSONResponse) VisitUpdateScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type DisableScheduleRequestObject struct {
+	Id ScheduleId `json:"id"`
+}
+
+type DisableScheduleResponseObject interface {
+	VisitDisableScheduleResponse(w http.ResponseWriter) error
+}
+
+type DisableSchedule200JSONResponse Schedule
+
+func (response DisableSchedule200JSONResponse) VisitDisableScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type DisableSchedule404JSONResponse DetailError
+
+func (response DisableSchedule404JSONResponse) VisitDisableScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type EnableScheduleRequestObject struct {
+	Id ScheduleId `json:"id"`
+}
+
+type EnableScheduleResponseObject interface {
+	VisitEnableScheduleResponse(w http.ResponseWriter) error
+}
+
+type EnableSchedule200JSONResponse Schedule
+
+func (response EnableSchedule200JSONResponse) VisitEnableScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type EnableSchedule404JSONResponse DetailError
+
+func (response EnableSchedule404JSONResponse) VisitEnableScheduleResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type ListScheduleOccurrencesRequestObject struct {
+	Id     ScheduleId `json:"id"`
+	Params ListScheduleOccurrencesParams
+}
+
+type ListScheduleOccurrencesResponseObject interface {
+	VisitListScheduleOccurrencesResponse(w http.ResponseWriter) error
+}
+
+type ListScheduleOccurrences200JSONResponse []ScheduleOccurrence
+
+func (response ListScheduleOccurrences200JSONResponse) VisitListScheduleOccurrencesResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type ListScheduleOccurrences404JSONResponse DetailError
+
+func (response ListScheduleOccurrences404JSONResponse) VisitListScheduleOccurrencesResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type RunScheduleNowRequestObject struct {
+	Id ScheduleId `json:"id"`
+}
+
+type RunScheduleNowResponseObject interface {
+	VisitRunScheduleNowResponse(w http.ResponseWriter) error
+}
+
+type RunScheduleNow202JSONResponse ScheduleOccurrence
+
+func (response RunScheduleNow202JSONResponse) VisitRunScheduleNowResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(202)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type RunScheduleNow404JSONResponse DetailError
+
+func (response RunScheduleNow404JSONResponse) VisitRunScheduleNowResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(404)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
+type RunScheduleNow409JSONResponse DetailError
+
+func (response RunScheduleNow409JSONResponse) VisitRunScheduleNowResponse(w http.ResponseWriter) error {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(409)
+
+	return json.NewEncoder(w).Encode(response)
+}
+
 // StrictServerInterface represents all server handlers.
 type StrictServerInterface interface {
 	// Local creative agents (legacy) — empty until G12
@@ -3497,7 +4958,7 @@ type StrictServerInterface interface {
 	// List openable applications (bare array, no pagination envelope)
 	// (GET /api/v2/applications)
 	ListApplications(ctx context.Context, request ListApplicationsRequestObject) (ListApplicationsResponseObject, error)
-	// Create an application (agent marketplace "new Aily agent")
+	// Create an application (admin only — agent marketplace "new Aily agent")
 	// (POST /api/v2/applications)
 	CreateApplication(ctx context.Context, request CreateApplicationRequestObject) (CreateApplicationResponseObject, error)
 	// Delete an application (409 when referenced by conversations/runs)
@@ -3539,6 +5000,24 @@ type StrictServerInterface interface {
 	// Runs of a conversation (newest first, owner only)
 	// (GET /api/v2/conversations/{conversationId}/runs)
 	ListConversationRuns(ctx context.Context, request ListConversationRunsRequestObject) (ListConversationRunsResponseObject, error)
+	// Create a read-only share snapshot of selected messages (owner only)
+	// (POST /api/v2/conversations/{conversationId}/shares)
+	CreateConversationShare(ctx context.Context, request CreateConversationShareRequestObject) (CreateConversationShareResponseObject, error)
+	// Revoke a share (owner only); public links stop resolving immediately
+	// (DELETE /api/v2/conversations/{conversationId}/shares/{shareToken})
+	RevokeConversationShare(ctx context.Context, request RevokeConversationShareRequestObject) (RevokeConversationShareResponseObject, error)
+	// Deliver a share snapshot card to Feishu users/groups (owner only)
+	// (POST /api/v2/feishu/forward)
+	ForwardShareToFeishu(ctx context.Context, request ForwardShareToFeishuRequestObject) (ForwardShareToFeishuResponseObject, error)
+	// Feishu forward targets (contacts or groups) for the caller
+	// (GET /api/v2/feishu/forward/targets)
+	ListFeishuForwardTargets(ctx context.Context, request ListFeishuForwardTargetsRequestObject) (ListFeishuForwardTargetsResponseObject, error)
+	// Public read-only share payload (no authentication)
+	// (GET /api/v2/public/shares/{shareToken})
+	GetPublicShare(ctx context.Context, request GetPublicShareRequestObject) (GetPublicShareResponseObject, error)
+	// Resolve an artifact of a share snapshot (no authentication) and 302 to the provider URL
+	// (GET /api/v2/public/shares/{shareToken}/artifacts/{artifactId}/open)
+	OpenPublicShareArtifact(ctx context.Context, request OpenPublicShareArtifactRequestObject) (OpenPublicShareArtifactResponseObject, error)
 	// Create a run (lazily creates the conversation when conversation_id is absent)
 	// (POST /api/v2/runs)
 	CreateRun(ctx context.Context, request CreateRunRequestObject) (CreateRunResponseObject, error)
@@ -3566,6 +5045,36 @@ type StrictServerInterface interface {
 	// Validate resource id format + remote visibility (best-effort)
 	// (POST /api/v2/runtimes/validate)
 	ValidateRuntime(ctx context.Context, request ValidateRuntimeRequestObject) (ValidateRuntimeResponseObject, error)
+	// List the caller's schedules (keyset pagination)
+	// (GET /api/v2/schedules)
+	ListSchedules(ctx context.Context, request ListSchedulesRequestObject) (ListSchedulesResponseObject, error)
+	// Create a schedule (owner = caller; enabled by default)
+	// (POST /api/v2/schedules)
+	CreateSchedule(ctx context.Context, request CreateScheduleRequestObject) (CreateScheduleResponseObject, error)
+	// Compute the next trigger times for a candidate trigger (no side effects)
+	// (POST /api/v2/schedules/preview)
+	PreviewScheduleRuns(ctx context.Context, request PreviewScheduleRunsRequestObject) (PreviewScheduleRunsResponseObject, error)
+	// Delete a schedule (occurrence/run/delivery history is kept)
+	// (DELETE /api/v2/schedules/{id})
+	DeleteSchedule(ctx context.Context, request DeleteScheduleRequestObject) (DeleteScheduleResponseObject, error)
+	// Schedule detail
+	// (GET /api/v2/schedules/{id})
+	GetSchedule(ctx context.Context, request GetScheduleRequestObject) (GetScheduleResponseObject, error)
+	// Update a schedule (next_run_at recomputed from now)
+	// (PATCH /api/v2/schedules/{id})
+	UpdateSchedule(ctx context.Context, request UpdateScheduleRequestObject) (UpdateScheduleResponseObject, error)
+	// Disable a schedule (no new occurrences; already queued runs are kept)
+	// (POST /api/v2/schedules/{id}/disable)
+	DisableSchedule(ctx context.Context, request DisableScheduleRequestObject) (DisableScheduleResponseObject, error)
+	// Enable a schedule (next_run_at recomputed from now; missed slots are not replayed)
+	// (POST /api/v2/schedules/{id}/enable)
+	EnableSchedule(ctx context.Context, request EnableScheduleRequestObject) (EnableScheduleResponseObject, error)
+	// Execution history (keyset pagination, newest first)
+	// (GET /api/v2/schedules/{id}/occurrences)
+	ListScheduleOccurrences(ctx context.Context, request ListScheduleOccurrencesRequestObject) (ListScheduleOccurrencesResponseObject, error)
+	// Trigger one real occurrence now (overlap policy applies; next_run_at untouched)
+	// (POST /api/v2/schedules/{id}/run-now)
+	RunScheduleNow(ctx context.Context, request RunScheduleNowRequestObject) (RunScheduleNowResponseObject, error)
 }
 
 type StrictHandlerFunc = strictnethttp.StrictHTTPHandlerFunc
@@ -4468,6 +5977,176 @@ func (sh *strictHandler) ListConversationRuns(w http.ResponseWriter, r *http.Req
 	}
 }
 
+// CreateConversationShare operation middleware
+func (sh *strictHandler) CreateConversationShare(w http.ResponseWriter, r *http.Request, conversationId int) {
+	var request CreateConversationShareRequestObject
+
+	request.ConversationId = conversationId
+
+	var body CreateConversationShareJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateConversationShare(ctx, request.(CreateConversationShareRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateConversationShare")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateConversationShareResponseObject); ok {
+		if err := validResponse.VisitCreateConversationShareResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RevokeConversationShare operation middleware
+func (sh *strictHandler) RevokeConversationShare(w http.ResponseWriter, r *http.Request, conversationId int, shareToken string) {
+	var request RevokeConversationShareRequestObject
+
+	request.ConversationId = conversationId
+	request.ShareToken = shareToken
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RevokeConversationShare(ctx, request.(RevokeConversationShareRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RevokeConversationShare")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RevokeConversationShareResponseObject); ok {
+		if err := validResponse.VisitRevokeConversationShareResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ForwardShareToFeishu operation middleware
+func (sh *strictHandler) ForwardShareToFeishu(w http.ResponseWriter, r *http.Request) {
+	var request ForwardShareToFeishuRequestObject
+
+	var body ForwardShareToFeishuJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ForwardShareToFeishu(ctx, request.(ForwardShareToFeishuRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ForwardShareToFeishu")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ForwardShareToFeishuResponseObject); ok {
+		if err := validResponse.VisitForwardShareToFeishuResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListFeishuForwardTargets operation middleware
+func (sh *strictHandler) ListFeishuForwardTargets(w http.ResponseWriter, r *http.Request, params ListFeishuForwardTargetsParams) {
+	var request ListFeishuForwardTargetsRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListFeishuForwardTargets(ctx, request.(ListFeishuForwardTargetsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListFeishuForwardTargets")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListFeishuForwardTargetsResponseObject); ok {
+		if err := validResponse.VisitListFeishuForwardTargetsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetPublicShare operation middleware
+func (sh *strictHandler) GetPublicShare(w http.ResponseWriter, r *http.Request, shareToken string) {
+	var request GetPublicShareRequestObject
+
+	request.ShareToken = shareToken
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetPublicShare(ctx, request.(GetPublicShareRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetPublicShare")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetPublicShareResponseObject); ok {
+		if err := validResponse.VisitGetPublicShareResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// OpenPublicShareArtifact operation middleware
+func (sh *strictHandler) OpenPublicShareArtifact(w http.ResponseWriter, r *http.Request, shareToken string, artifactId openapi_types.UUID) {
+	var request OpenPublicShareArtifactRequestObject
+
+	request.ShareToken = shareToken
+	request.ArtifactId = artifactId
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.OpenPublicShareArtifact(ctx, request.(OpenPublicShareArtifactRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "OpenPublicShareArtifact")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(OpenPublicShareArtifactResponseObject); ok {
+		if err := validResponse.VisitOpenPublicShareArtifactResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
 // CreateRun operation middleware
 func (sh *strictHandler) CreateRun(w http.ResponseWriter, r *http.Request) {
 	var request CreateRunRequestObject
@@ -4725,122 +6404,445 @@ func (sh *strictHandler) ValidateRuntime(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// ListSchedules operation middleware
+func (sh *strictHandler) ListSchedules(w http.ResponseWriter, r *http.Request, params ListSchedulesParams) {
+	var request ListSchedulesRequestObject
+
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListSchedules(ctx, request.(ListSchedulesRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListSchedules")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListSchedulesResponseObject); ok {
+		if err := validResponse.VisitListSchedulesResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// CreateSchedule operation middleware
+func (sh *strictHandler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
+	var request CreateScheduleRequestObject
+
+	var body CreateScheduleJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.CreateSchedule(ctx, request.(CreateScheduleRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "CreateSchedule")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(CreateScheduleResponseObject); ok {
+		if err := validResponse.VisitCreateScheduleResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// PreviewScheduleRuns operation middleware
+func (sh *strictHandler) PreviewScheduleRuns(w http.ResponseWriter, r *http.Request) {
+	var request PreviewScheduleRunsRequestObject
+
+	var body PreviewScheduleRunsJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.PreviewScheduleRuns(ctx, request.(PreviewScheduleRunsRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "PreviewScheduleRuns")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(PreviewScheduleRunsResponseObject); ok {
+		if err := validResponse.VisitPreviewScheduleRunsResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DeleteSchedule operation middleware
+func (sh *strictHandler) DeleteSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId) {
+	var request DeleteScheduleRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DeleteSchedule(ctx, request.(DeleteScheduleRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DeleteSchedule")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DeleteScheduleResponseObject); ok {
+		if err := validResponse.VisitDeleteScheduleResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// GetSchedule operation middleware
+func (sh *strictHandler) GetSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId) {
+	var request GetScheduleRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.GetSchedule(ctx, request.(GetScheduleRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "GetSchedule")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(GetScheduleResponseObject); ok {
+		if err := validResponse.VisitGetScheduleResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// UpdateSchedule operation middleware
+func (sh *strictHandler) UpdateSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId) {
+	var request UpdateScheduleRequestObject
+
+	request.Id = id
+
+	var body UpdateScheduleJSONRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		sh.options.RequestErrorHandlerFunc(w, r, fmt.Errorf("can't decode JSON body: %w", err))
+		return
+	}
+	request.Body = &body
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.UpdateSchedule(ctx, request.(UpdateScheduleRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "UpdateSchedule")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(UpdateScheduleResponseObject); ok {
+		if err := validResponse.VisitUpdateScheduleResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// DisableSchedule operation middleware
+func (sh *strictHandler) DisableSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId) {
+	var request DisableScheduleRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.DisableSchedule(ctx, request.(DisableScheduleRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "DisableSchedule")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(DisableScheduleResponseObject); ok {
+		if err := validResponse.VisitDisableScheduleResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// EnableSchedule operation middleware
+func (sh *strictHandler) EnableSchedule(w http.ResponseWriter, r *http.Request, id ScheduleId) {
+	var request EnableScheduleRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.EnableSchedule(ctx, request.(EnableScheduleRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "EnableSchedule")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(EnableScheduleResponseObject); ok {
+		if err := validResponse.VisitEnableScheduleResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// ListScheduleOccurrences operation middleware
+func (sh *strictHandler) ListScheduleOccurrences(w http.ResponseWriter, r *http.Request, id ScheduleId, params ListScheduleOccurrencesParams) {
+	var request ListScheduleOccurrencesRequestObject
+
+	request.Id = id
+	request.Params = params
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.ListScheduleOccurrences(ctx, request.(ListScheduleOccurrencesRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "ListScheduleOccurrences")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(ListScheduleOccurrencesResponseObject); ok {
+		if err := validResponse.VisitListScheduleOccurrencesResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
+// RunScheduleNow operation middleware
+func (sh *strictHandler) RunScheduleNow(w http.ResponseWriter, r *http.Request, id ScheduleId) {
+	var request RunScheduleNowRequestObject
+
+	request.Id = id
+
+	handler := func(ctx context.Context, w http.ResponseWriter, r *http.Request, request interface{}) (interface{}, error) {
+		return sh.ssi.RunScheduleNow(ctx, request.(RunScheduleNowRequestObject))
+	}
+	for _, middleware := range sh.middlewares {
+		handler = middleware(handler, "RunScheduleNow")
+	}
+
+	response, err := handler(r.Context(), w, r, request)
+
+	if err != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, err)
+	} else if validResponse, ok := response.(RunScheduleNowResponseObject); ok {
+		if err := validResponse.VisitRunScheduleNowResponse(w); err != nil {
+			sh.options.ResponseErrorHandlerFunc(w, r, err)
+		}
+	} else if response != nil {
+		sh.options.ResponseErrorHandlerFunc(w, r, fmt.Errorf("unexpected response type: %T", response))
+	}
+}
+
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
-	"/07mlwAA",
+	"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",
+	"ALpW37l73AAA",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

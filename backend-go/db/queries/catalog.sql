@@ -34,7 +34,7 @@ VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, 0, NULL, NULL, ?, NULL);
 
 -- name: GetApplicationByID :one
 SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
-       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent,
+       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled,
        a.usage_count, a.tags, a.default_config, a.created_by, a.organization_id,
        a.created_at, a.updated_at,
        c.slug AS category_slug, c.name AS category_name
@@ -44,7 +44,7 @@ WHERE a.id = ?;
 
 -- name: GetApplicationBySlug :one
 SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
-       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent,
+       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled,
        a.usage_count, a.tags, a.default_config, a.created_by, a.organization_id,
        a.created_at, a.updated_at,
        c.slug AS category_slug, c.name AS category_name
@@ -64,6 +64,9 @@ WHERE id = ?;
 -- name: UpdateApplicationAvatar :exec
 UPDATE applications SET avatar_key = ? WHERE id = ?;
 
+-- name: SetApplicationEnabled :exec
+UPDATE applications SET enabled = ? WHERE id = ?;
+
 -- name: IncrementApplicationUsage :exec
 UPDATE applications SET usage_count = usage_count + 1 WHERE id = ?;
 
@@ -75,7 +78,7 @@ UPDATE applications SET is_default_agent = 1 WHERE id = ?;
 
 -- name: GetDefaultAgent :one
 SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
-       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent,
+       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled,
        a.usage_count, a.tags, a.default_config, a.created_by, a.organization_id,
        a.created_at, a.updated_at,
        c.slug AS category_slug, c.name AS category_name
@@ -163,10 +166,12 @@ GROUP BY application_id;
 -- name: ListApplicationsByVisibility :many
 -- show_all lets staff bypass the SQL pre-filter; the authoritative
 -- scope check still happens in Go (visible()).
-SELECT id, slug, name, description, icon, avatar_key, color, kind, renderer_key,
-       executor_key, category_id, is_public, is_default_agent, usage_count, tags,
-       default_config, created_by, organization_id, created_at, updated_at
-FROM applications
-WHERE (sqlc.arg('show_all') OR is_public = ? OR created_by = ?)
-ORDER BY created_at
+SELECT a.id, a.slug, a.name, a.description, a.icon, a.avatar_key, a.color, a.kind, a.renderer_key,
+       a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled, a.usage_count, a.tags,
+       a.default_config, a.created_by, a.organization_id, a.created_at, a.updated_at,
+       c.slug AS category_slug, c.name AS category_name
+FROM applications a
+LEFT JOIN application_categories c ON c.id = a.category_id
+WHERE (sqlc.arg('show_all') OR a.is_public = ? OR a.created_by = ?)
+ORDER BY a.created_at
 LIMIT ?;

@@ -95,9 +95,12 @@ interface CatalogState {
   isLoading: boolean;
   error: string | null;
   loadedAt: number;
+  /** 应用中心的分类筛选（侧栏与卡片网格共享）。 */
+  fixedCategory: string | null;
 
   load: (force?: boolean) => Promise<V2Application[]>;
   toggleFavorite: (applicationId: number) => Promise<void>;
+  setFixedCategory: (category: string | null) => void;
   applicationById: (applicationId: number | null | undefined) => V2Application | undefined;
   applicationBySlug: (slug: string | undefined) => V2Application | undefined;
   /** Slug-or-id lookup, used by the legacy `/apps/:id/run` redirect. */
@@ -114,6 +117,7 @@ export const useApplicationCatalogStore = create<CatalogState>()((set, get) => (
   isLoading: false,
   error: null,
   loadedAt: 0,
+  fixedCategory: null,
 
   load: async (force = false) => {
     if (!force && get().loadedAt) return get().applications;
@@ -168,6 +172,8 @@ export const useApplicationCatalogStore = create<CatalogState>()((set, get) => (
     applicationId == null
       ? undefined
       : get().applications.find((app) => app.id === applicationId)),
+
+  setFixedCategory: (fixedCategory) => set({ fixedCategory }),
 
   applicationBySlug: (slug) => (
     slug ? get().applications.find((app) => app.slug === slug) : undefined),

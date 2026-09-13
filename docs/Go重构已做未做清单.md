@@ -1,9 +1,81 @@
 # Creation Agent Studio · Go 重构已做/未做清单
 
-> 快照时间：2026-09-13 凌晨（第五轮会话收尾）
+> 快照时间：2026-09-13（第六轮会话：应用平台 + 权限收紧）
 > 详细实测记录见 `docs/开发进度清单.md` 第六章；架构红线见
 > `docs/Creation Agent Studio Go 后端目标架构.md`；阶段门槛见
 > `docs/Creation Agent Studio Go 重构执行计划.md`（G0–G15）。
+
+---
+
+## 〇、第六轮新增 ✅（2026-09-13：应用平台优先 + 智能体权限收紧）
+
+### 固定应用 / 应用中心（§3.2/§70/§71，本轮主线）
+
+| 项 | 内容 | 状态 |
+|---|---|---|
+| 迁移 0005 | `applications.enabled` 列（应用中心开关）+ 种子 4 个固定应用（条码信息查询/条码查询页、OA账号解锁/表单、修改OA密码/表单、物料信息查询/页面，全部 公开+启用，分类 `apps/应用`） | ✅ |
+| 可见性新语义 | `visible()`：staff 全可见；`enabled=0` 对普通用户全隐藏；`is_public=0`（仅自己可见）只有管理员看得到 | ✅ |
+| enabled 开关 | PATCH `/api/v2/applications/{id}` 接受 `enabled`；列表/详情 payload 增 `enabled` 字段（契约先行，openapi + oapi-codegen + sqlc 均已再生） | ✅ |
+| 修复隐藏缺陷 | `scope=manage` 的 SQL 预过滤此前会把其他用户的公开应用滤掉（无固定应用时不可见）；`ListApplicationsByVisibility` 改为 JOIN 分类表 + manage 侧保留 is_public 行，`visible()` 仍是权威判定 | ✅ |
+| 应用中心重构 | `AppsPage` 弃用 legacy `/apps/` 接口（原 404），改用 v2 目录（kind=all + scope=manage）：搜索、分类侧栏（`AppCategoriesSidebar`，与智能体市场同构）、卡片直开 `/app/:slug`；管理员卡片内 启用/公开 开关，停用卡降级显示 | ✅ |
+| PageRenderer 重写 | 弃用 legacy `useAppStore`/`ApplicationRuntime` 链路（原固定应用渲染必然空），改 v2 渲染器注册表 `FIXED_RENDERERS`（renderer_key → 页面组件）；四个种子应用先接 `FixedAppPlaceholder` 占位页，业务页就绪后逐键替换 | ✅ |
+| 丝滑返回（§80） | workspaceStore 增 `previousApplicationId`（openApplication 换应用时记录来源）；固定应用「返回工作台」回来源工作区（chat → `/chat/:slug` 恢复会话/草稿/滚动），无来源才回首页 | ✅ |
+| 浏览器 E2E | `gui-test-screenshots/e2e_apps.py`：18 项断言（首页常用应用、占位页、Shell 不刷新、@mention 进应用、§80 返回、应用中心管理员开关、停用/恢复、普通用户视角）+ 3 张截图 | ✅ |
+
+### 智能体权限收紧
+
+- **仅管理员可新建**：`POST /api/v2/applications` 非 staff → 403「只有管理员可以添加智能体」；市场「新建智能体」按钮仅 `is_staff` 渲染（auth store 增 `is_staff`，`syncSessionUser` 同步）
+- **公开语义**：`is_public=true` 所有用户可见可用（能否真正调用仍由 Worker 用本人 UAT 做 Aily 可见性校验，运行时既有逻辑）；`is_public=false`（仅自己可见）只有管理员可见——普通用户连自己名下的旧私有应用也不再见（编辑弹窗已有说明文案）
+- **数据**：飞书用户「吴志彬」已提为 `is_staff=1`（平台管理员，否则 UI 无法自测管理功能）；编辑弹窗新建默认仍是 仅自己可见（安全默认）
+- 测试：`internal/catalog/repo_test.go` 新增 10 例可见性语义单测；Go 全包 + tsc + vitest 92/92 + 真实 Aily 聊天 E2E 基线（会话 49）全过，零回归
+
+
+## 〇、第七轮新增 ✅（2026-09-13：定时任务 Schedule Core + 飞书投递）
+
+> 依据《未来演进完整架构文档》当前阶段核心（Schedule → Delivery），本环节不引入
+> Workflow、不恢复 Legacy Job；Scheduler 不调 Aily、不发飞书，后台执行一律 owner UAT。
+
+### 数据层
+
+| 项 | 内容 | 状态 |
+|---|---|---|
+| 迁移 0006 | `runs` 增 `trigger_type/trigger_id/priority/available_at`（TiDB 约束：ALTER 的 AFTER 不可引用同批新列，故列/索引分两个 migration 批次） | ✅ |
+| 迁移 0007 | `runs` claim 索引 `(status, available_at, priority, created_at)` + trigger 索引 | ✅ |
+| 迁移 0008 | `schedules` / `schedule_occurrences`（UNIQUE(schedule_id, scheduled_at) 幂等屏障）/ `schedule_deliveries` / `delivery_executions`（UNIQUE(occurrence_id, schedule_delivery_id) 投递幂等） | ✅ |
+| 契约决策 | once/daily/weekly/monthly 结构化触发（无裸 Cron）；IANA 时区；monthly 29-31 短月顺延月末；misfire fire_once/skip（默认 fire_once）；overlap queue/skip（默认 queue，v1 无 parallel）；deadline=scheduled_at+execution_window_seconds；run-now 建真实 occurrence 且不动 next_run_at；删除硬删配置保留历史；投递 v1 仅飞书 owner_user + summary 模式，重试上限 5 次指数退避 + 429 长冷却 | ✅ |
+
+### 后端（四角色拓扑成型：api / stream / worker / scheduler）
+
+| 项 | 内容 | 状态 |
+|---|---|---|
+| schedule 域 | `internal/automation/schedule`：CRUD + next-run 计算（自研，避 cron 依赖）+ 权威 next-runs 预览 + 可调度应用校验（chat + enabled + 有绑定） | ✅ |
+| scheduler | `internal/automation/scheduler` + `cmd/scheduler`：每秒扫描 due（纯 SELECT，MySQL 5.7 兼容无 SKIP LOCKED）→ 单事务 原子提交 occurrence+conversation+message+run+outbox+next_run_at（崩溃无孤儿）→ overlap/misfire/execution_window 策略判定（skipped/failed occurrence 原子落库） | ✅ |
+| run 扩展 | `CreateRunInput` 增 TriggerType/TriggerID/Priority/AvailableAt + `CreateRunInTx` 事务变体；execution.Service 增 `OnRunSucceeded` CAS-赢家钩子（panic 隔离） | ✅ |
+| delivery | `internal/delivery`：Dispatcher（成功终态后 fan-out，UNIQUE 吸收重复）+ FeishuSender（owner UAT 发 IM，复用 FeishuClient/AuthResolver）+ 独立 GCRA 限流 `rate/feishu/im` + Worker 池（XReadGroup + due-scan 双兜底 + sending 租约回收 + XAutoClaim 同款恢复） | ✅ |
+| API | OpenAPI 3.0.3 增 10 个端点（CRUD/enable/disable/run-now/occurrences/preview），owner 鉴权防伪造，keyset 分页，字段级 400 | ✅ |
+| 指标 | trigger/queue delay、misfire、overlap_skipped、delivery duration/failures | ✅ |
+| 测试 | TiDB 集成：双 Scheduler 同槽只产 1 occurrence+1 run、overlap skip 不产生 run、run-now 不动 next_run_at、同 occurrence 同 target 只 fan-out 一次；纯单测：next-run（时区/周/月末顺延/闰日/once）+ 投递文本截断 + 目标类型路由 | ✅ |
+
+### 前端（定时任务中心）
+
+- 顶级入口 `/schedules`（fullWidthConsole）+ 桌面 Header「⏰ 定时任务」+ 移动 Drawer；路由/导航/Shell 均不卸载
+- `SchedulesPage`：状态筛选（全部/运行中/已暂停/失败）+ 搜索 + 桌面表格/移动卡片（768px 断点切换）+ 空态引导 CTA / 错误重试 / 行级 mutation 锁
+- `ScheduleEditorModal`：三区块结构化表单（基本信息/执行时间/策略与会话 + 飞书投递区块），智能体选择器过滤不可调度应用，`POST /schedules/preview` 权威预览未来执行时间（`aria-live`）
+- `ScheduleDetailDrawer` 执行历史（状态 Tag 时间线 + run id）、`ScheduleStatusTag` 状态语义（文字+图标）
+- 测试：`scheduleFormat.test.ts`（payload↔表单互转/字段清理/中文摘要）+ `scheduleApi.test.ts`（请求契约钉死）；tsc + vitest 全绿（112/112）
+
+### 遗留 / 已知边界（下轮候选）
+
+- `cmd/worker --provider=feishu_delivery` 为独立投递消费进程（与 runs worker 同 binary 不同 pool）；部署脚本需补 scheduler + delivery 两进程
+- 投递 v1 未做 external_message_id 回填（SendIMMessage 不返回 message_id）与飞书 429 的 Retry-After 精确解析（按 code 99991400 启发式识别 + 2x 冷却）
+- overlap=queue 的「排队」实现为被动等待：上一轮未 terminal 时本轮 slot 每秒重扫、不创建 run，上一轮结束即补跑（scheduled_at 保持原槽位）；严格的 pending-occurrence 持久化排队未做
+- execution_window=0 语义 = 无窗口限制（deadline 检查跳过）；misfire 宽限 5 分钟为常量未配置化
+- occurrence `running` 状态经 run claim 回写（best-effort），不影响终态收敛正确性
+- 「运行中」列表筛选 = enabled=1（Schedule 的「运行中/已暂停」即启用/停用语义，与卡片状态 Tag 一致）
+- 执行历史 keyset 分页仅后端就绪，前端「加载更多」按钮待补（当前首页 50 条）
+- `reuse` 会话策略后端已支持（首跑惰性绑定 conversation_id），UI 已暴露开关但未提供指定历史会话入口
+- `content.snapshot` 250-500ms coalesce 仍未做（G11 前置小债）
+- Enterprise 自动化 Tab 仍指遗留接口（与 Schedule 无关，待迁移决策）
 
 ---
 

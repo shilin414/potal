@@ -9,15 +9,33 @@
  * validation of the provider's official limits.
  */
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Alert, Spin, message as antdMessage } from 'antd';
-import { PaperClipOutlined, SendOutlined } from '@ant-design/icons';
-import ReactMarkdown from 'react-markdown';
+import {
+  Alert,
+  Button,
+  Input,
+  Modal,
+  Spin,
+  Tooltip,
+  message as antdMessage,
+} from 'antd';
+import {
+  CheckOutlined,
+  CopyOutlined,
+  PaperClipOutlined,
+  SendOutlined,
+  ShareAltOutlined,
+  TeamOutlined,
+} from '@ant-design/icons';
 import Avatar from 'antd/es/avatar';
 import {
   ATTACHMENT_LIMITS,
   uploadAttachment,
   validateAttachment,
 } from '@/services/runApi';
+import {
+  buildShareUrl,
+  createConversationShare,
+} from '@/services/shareApi';
 import {
   resolveDefaultApplication,
   useApplicationCatalogStore,
@@ -36,120 +54,10 @@ import {
 import type { V2Application } from '@/services/runApi';
 import AgentAvatar from '@/components/Agents/AgentAvatar';
 import ArtifactCard from './ArtifactCard';
+import { MarkdownWithArtifacts } from './ArtifactMarkdown';
+import FeishuForwardModal from './FeishuForwardModal';
 import './chatSurface.css';
 import './RunChatPanel.css';
-
-const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
-
-/**
- * Stable chat image. A provider artifact URL goes through the /open 302
- * resolver (24h URL, then CDN), which is slow on first load and must not be
- * re-fetched on every store update — the parent re-renders the whole message
- * on each content.delta. Keying by src and keeping load state here means a
- * re-render only recomputes the frame, never restarts the download; the
- * placeholder avoids the browser's broken-image icon while the 302 resolves.
- */
-const ChatImage: React.FC<{
-  src: string;
-  alt?: string;
-}> = ({ src, alt }) => {
-  const [loaded, setLoaded] = useState(false);
-  const [failed, setFailed] = useState(false);
-  if (failed) {
-    return <span className="chat-img chat-img--broken" title={alt}>{alt || '图片加载失败'}</span>;
-  }
-  return (
-    <span className="chat-img">
-      {!loaded && <span className="chat-img__loading"><Spin size="small" /></span>}
-      <img
-        src={src}
-        alt={alt || ''}
-        loading="lazy"
-        onLoad={() => setLoaded(true)}
-        onError={() => setFailed(true)}
-      />
-    </span>
-  );
-};
-
-/**
- * Render assistant markdown with provider-relative artifact refs rewritten
- * to our 302 resolver. Aily embeds generated files as
- * `artifacts/<artifactName>/<...>/<filename>` (sandbox-relative); the
- * browser resolves that against the SPA origin and 404s. The first path
- * segment after `artifacts/` is the provider artifact name, so we match it
- * against the run's artifacts (name or filename) and rewrite to /open,
- * which resolves a fresh 24h provider URL.
- *
- * The delta carrying the markdown arrives BEFORE artifact.discovered, so an
- * as-yet-unmatched ref must render a placeholder instead of a broken <img>
- * that 404s against the SPA origin and then "repairs" when the artifact
- * lands — that repair cycle is the 裂开再展示/闪烁 symptom.
- */
-const MarkdownWithArtifacts: React.FC<{
-  content: string;
-  artifacts?: { artifactId: string; name: string }[];
-}> = ({ content, artifacts }) => {
-  /** Matched /open URL, or null when the ref is still unresolved. */
-  const resolveArtifactSrc = useCallback((src: string): string | null => {
-    const path = src.replace(/^\.?\/?/, '').split(/[?#]/)[0];
-    const match = path.match(/^artifacts?\/([^/]+)(?:\/.*)?$/i);
-    if (match) {
-      const refName = decodeURIComponent(match[1]);
-      const hit = (artifacts || []).find((a) => {
-        const names = [a.name, (a.name || '').split(/[\\/]/).pop() || ''];
-        return names.includes(refName) || (a.name || '').startsWith(refName);
-      });
-      if (hit) return `${API_BASE}/v2/artifacts/${hit.artifactId}/open`;
-    }
-    // Also tolerate a bare filename that matches an artifact name exactly.
-    const bare = (artifacts || []).find(
-      (a) => a.name && a.name === path.split('/').pop());
-    if (bare) return `${API_BASE}/v2/artifacts/${bare.artifactId}/open`;
-    return null;
-  }, [artifacts]);
-
-  // Stable component identities: ReactMarkdown's `components` prop is a
-  // render-time lookup table, and an inline object would give every <img> a
-  // NEW component type on each parent render — unmounting and remounting the
-  // ChatImage subtree, restarting the 302 → CDN download on every content
-  // delta. Memoized on artifacts only, so streaming text updates never
-  // change it.
-  const components = useMemo(() => ({
-    img: ({ src, alt }: { src?: string; alt?: string }) => {
-      if (typeof src !== 'string') {
-        return <img src={src} alt={alt || ''} loading="lazy" />;
-      }
-      if (/^(https?:|data:|blob:)/i.test(src)) {
-        return <ChatImage src={src} alt={alt} />;
-      }
-      const resolved = resolveArtifactSrc(src);
-      // Unknown artifact ref: placeholder, never a broken <img> that
-      // flickers into place once artifact.discovered lands.
-      return resolved
-        ? <ChatImage src={resolved} alt={alt} />
-        : <span className="chat-img chat-img--pending" title={src}>{alt || '生成产物'}</span>;
-    },
-    a: ({ href, children, ...rest }: any) => (
-      <a
-        href={typeof href === 'string'
-          ? (resolveArtifactSrc(href) ?? href)
-          : href}
-        target="_blank"
-        rel="noreferrer"
-        {...rest}
-      >
-        {children}
-      </a>
-    ),
-  }), [resolveArtifactSrc]);
-
-  return (
-    <ReactMarkdown components={components}>
-      {content}
-    </ReactMarkdown>
-  );
-};
 
 interface PendingUpload {
   key: string;
@@ -241,6 +149,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
     initialScrollTop && initialScrollTop > 0 ? initialScrollTop : null);
   // Guided drafts arrive as a prop change; only adopt them once per value.
   const lastDraftRef = useRef<string | undefined>(undefined);
+
   useEffect(() => {
     if (draftText && draftText !== lastDraftRef.current) {
       setInputValue(draftText);
@@ -282,6 +191,107 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
     : null;
   const messages = activeConversation?.messages || [];
   const streaming = activeConversation?.activeRunId != null;
+
+  // ── 转发/分享（多选模式）─────────────────────────────────────────────
+  // 服务端快照式分享：选中若干消息后创建分享，后端固化消息 ID 并返回随机
+  // token；公开页只回显快照内的消息。参考实现把 ?msg=id1,id2 拼在 URL 上、
+  // 由前端过滤，去掉后缀即可看到整段对话——这里从服务端杜绝。
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [creatingShare, setCreatingShare] = useState(false);
+  const [shareResult, setShareResult] = useState<
+    { url: string; count: number; token: string } | null
+  >(null);
+  const [copied, setCopied] = useState(false);
+  const [forwardOpen, setForwardOpen] = useState(false);
+
+  /** Only persisted messages (numeric server ids) can be shared. */
+  const isShareable = useCallback(
+    (msg: ChatMessage) => /^\d+$/.test(msg.id) && msg.status !== 'streaming',
+    [],
+  );
+
+  // Switching conversations must reset the selection (no cross-conversation
+  // accidental forwarding — same guard the reference implementation added).
+  useEffect(() => {
+    setSelectMode(false);
+    setSelectedIds([]);
+  }, [displayConversationId]);
+
+  /**
+   * Enter select mode, optionally pre-selecting one message (bubble hover
+   * icon). Freshly streamed bubbles still carry temp ids (`run-{runId}`), so
+   * reload the conversation first to swap in the server ids — blocked while
+   * a run is active (a reload there would drop live deltas).
+   */
+  const startSelect = async (initialIndex?: number) => {
+    if (streaming) {
+      antdMessage.warning('回复生成中，请稍后再转发');
+      return;
+    }
+    const cid = displayConversationId;
+    if (cid == null) return;
+    let list = messages;
+    if (list.some((m) => !/^\d+$/.test(m.id))) {
+      await loadConversation(cid);
+      list = useRunChatStore.getState().conversations[cid]?.messages || list;
+    }
+    const picked: string[] = [];
+    if (initialIndex != null) {
+      const target = list[initialIndex];
+      if (target && /^\d+$/.test(target.id)) picked.push(target.id);
+    }
+    setSelectMode(true);
+    setSelectedIds(picked);
+  };
+
+  const toggleSelect = (msg: ChatMessage) => {
+    if (!isShareable(msg)) return;
+    setSelectedIds((current) => (
+      current.includes(msg.id)
+        ? current.filter((id) => id !== msg.id)
+        : [...current, msg.id]
+    ));
+  };
+
+  const exitSelect = () => {
+    setSelectMode(false);
+    setSelectedIds([]);
+  };
+
+  const handleCreateShare = async () => {
+    if (displayConversationId == null) return;
+    const ids = messages
+      .filter((m) => selectedIds.includes(m.id) && /^\d+$/.test(m.id))
+      .map((m) => Number(m.id));
+    if (!ids.length) return;
+    setCreatingShare(true);
+    try {
+      const share = await createConversationShare(displayConversationId, ids);
+      setShareResult({
+        url: buildShareUrl(share.share_token),
+        count: share.message_count,
+        token: share.share_token,
+      });
+      setCopied(false);
+      exitSelect();
+    } catch (e: any) {
+      antdMessage.error(e?.response?.data?.detail || '创建分享失败，请稍后重试');
+    } finally {
+      setCreatingShare(false);
+    }
+  };
+
+  const handleCopyShare = async () => {
+    if (!shareResult) return;
+    try {
+      await navigator.clipboard.writeText(shareResult.url);
+      setCopied(true);
+      antdMessage.success('链接已复制');
+    } catch {
+      antdMessage.error('复制失败，请手动复制');
+    }
+  };
 
   useEffect(() => {
     const el = messagesRef.current;
@@ -418,7 +428,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
     }
   };
 
-  const renderMessage = (msg: ChatMessage) => {
+  const renderMessage = (msg: ChatMessage, index: number) => {
     const isUser = msg.role === 'user';
     const isSystem = msg.role === 'system';
     // Both sides carry a face and a real name: the human as 姓名（user_id）,
@@ -432,6 +442,8 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
     const avatarText = isUser
       ? userAvatarFallback(user)
       : isSystem ? '系' : agentAvatarFallback(effectiveApplication);
+    const selectable = selectMode && isShareable(msg);
+    const checked = selectedIds.includes(msg.id);
     return (
       <div
         key={msg.id}
@@ -449,12 +461,38 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
         >
           {avatarText}
         </Avatar>
-        <div className={`run-chat-bubble ${isUser ? 'run-chat-bubble--user' : ''}`}>
-          <div className="run-chat-bubble__header">
-            <span className="font-medium chat-sender-name" title={senderLabel}>{senderLabel}</span>
-            {msg.status === 'streaming' && <span className="run-chat-dotting">生成中…</span>}
-            {msg.status === 'failed' && <span className="run-chat-error-tag">失败</span>}
-          </div>
+        <div
+          className={`run-chat-msg-body ${selectMode ? 'run-chat-msg-body--select' : ''} ${selectable ? 'run-chat-msg-body--selectable' : ''}`}
+          onClick={selectable ? () => toggleSelect(msg) : undefined}
+        >
+          {selectMode && (
+            <span
+              className={`run-chat-select-check ${checked ? 'run-chat-select-check--on' : ''} ${!isShareable(msg) ? 'run-chat-select-check--off' : ''}`}
+              aria-hidden
+            >
+              {checked && <CheckOutlined />}
+            </span>
+          )}
+          <div className={`run-chat-bubble ${isUser ? 'run-chat-bubble--user' : ''}`}>
+            <div className="run-chat-bubble__header">
+              <span className="font-medium chat-sender-name" title={senderLabel}>{senderLabel}</span>
+              {msg.status === 'streaming' && <span className="run-chat-dotting">生成中…</span>}
+              {msg.status === 'failed' && <span className="run-chat-error-tag">失败</span>}
+              {!selectMode && isShareable(msg) && (
+                <Tooltip title="转发这条消息">
+                  <button
+                    className="run-chat-msg-share"
+                    title="转发这条消息"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void startSelect(index);
+                    }}
+                  >
+                    <ShareAltOutlined />
+                  </button>
+                </Tooltip>
+              )}
+            </div>
           {isUser ? (
             <span>{msg.content}</span>
           ) : (
@@ -477,6 +515,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
               {msg.artifacts.map((a) => <ArtifactCard key={a.artifactId} artifact={a} />)}
             </div>
           ) : null}
+          </div>
         </div>
       </div>
     );
@@ -533,7 +572,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
           onScroll={(e) => onScrollTopChange?.(e.currentTarget.scrollTop)}
         >
           <div className="chat-messages-inner">
-            {messages.map(renderMessage)}
+            {messages.map((m, i) => renderMessage(m, i))}
             <div ref={messagesEndRef} />
           </div>
         </div>
@@ -541,6 +580,31 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
 
       <div className="chat-input-area">
         <div className="chat-input-wrapper">
+          {selectMode ? (
+            <div className="run-chat-select-bar">
+              <button className="run-chat-select-btn" onClick={exitSelect}>取消</button>
+              <button
+                className="run-chat-select-btn"
+                onClick={() => {
+                  const shareable = messages.filter(isShareable);
+                  const allSelected = shareable.length > 0
+                    && shareable.every((m) => selectedIds.includes(m.id));
+                  setSelectedIds(allSelected ? [] : shareable.map((m) => m.id));
+                }}
+              >
+                全选
+              </button>
+              <span className="run-chat-select-count">已选 {selectedIds.length} 条消息</span>
+              <Button
+                type="primary"
+                loading={creatingShare}
+                disabled={selectedIds.length === 0}
+                onClick={() => void handleCreateShare()}
+              >
+                生成分享链接
+              </Button>
+            </div>
+          ) : (
           <div className="run-chat-composer">
             {pendingUploads.length > 0 && (
               <div className="run-chat-upload-list">
@@ -606,8 +670,57 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
                     : 'Enter 发送 · Shift+Enter 换行'}
             </div>
           </div>
+          )}
         </div>
       </div>
+
+      <Modal
+        open={!!shareResult}
+        onCancel={() => setShareResult(null)}
+        footer={null}
+        title="分享对话"
+        width={520}
+        centered
+      >
+        {shareResult && (
+          <div className="run-chat-share-modal">
+            <p className="run-chat-share-lead">
+              已创建只读快照，仅包含所选 <b>{shareResult.count}</b> 条消息。
+              接收者打开链接即可查看，无需登录。
+            </p>
+            <div className="run-chat-share-link">
+              <Input
+                readOnly
+                value={shareResult.url}
+                onFocus={(e) => e.currentTarget.select()}
+              />
+              <Button
+                type="primary"
+                icon={<CopyOutlined />}
+                onClick={() => void handleCopyShare()}
+              >
+                {copied ? '已复制' : '复制链接'}
+              </Button>
+            </div>
+            <Button
+              block
+              icon={<TeamOutlined />}
+              onClick={() => setForwardOpen(true)}
+            >
+              转发到飞书（用户 / 群聊）
+            </Button>
+            <p className="run-chat-share-note">
+              链接指向服务端快照：只包含转发时选中的消息，之后的对话内容不会出现。
+            </p>
+          </div>
+        )}
+      </Modal>
+
+      <FeishuForwardModal
+        open={forwardOpen}
+        shareToken={shareResult?.token ?? null}
+        onClose={() => setForwardOpen(false)}
+      />
     </div>
   );
 };

@@ -12,6 +12,8 @@ import (
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 
+	"github.com/creation-agent-studio/backend-go/internal/automation/schedule"
+	"github.com/creation-agent-studio/backend-go/internal/automation/scheduler"
 	"github.com/creation-agent-studio/backend-go/internal/catalog"
 	"github.com/creation-agent-studio/backend-go/internal/execution"
 	genapi "github.com/creation-agent-studio/backend-go/internal/gen/api"
@@ -22,6 +24,12 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
 	"github.com/creation-agent-studio/backend-go/internal/transport/sse"
 )
+
+// FeishuUserTokenResolver is the subset of the provider auth machinery the
+// forwarding handlers need (aily.AuthResolver satisfies it).
+type FeishuUserTokenResolver interface {
+	UserAccessToken(ctx context.Context, userID int64) (string, error)
+}
 
 // Server implements genapi.ServerInterface. Every dependency is injected;
 // no globals.
@@ -37,6 +45,9 @@ type Server struct {
 	StateCodec   *identity.StateCodec
 	Oauth        *identity.ExchangeOrchestrator
 	Feishu       *identity.FeishuClient
+	// FeishuAuth supplies a cached/refreshed user access token for the
+	// caller (implemented by aily.AuthResolver).
+	FeishuAuth FeishuUserTokenResolver
 
 	Catalog     *catalog.Service
 	CatalogRepo *catalog.Repo
@@ -46,6 +57,10 @@ type Server struct {
 	Storage storage.Storage
 
 	RateLimitArtifacts *execution.RateLimiter
+
+	// Schedule automation.
+	Schedules *schedule.Service
+	Scheduler *scheduler.Scheduler
 
 	SSE *sse.Gateway
 
@@ -64,6 +79,7 @@ var publicRoutes = map[string]bool{
 	"GET /api/v2/applications/*/avatar": true,
 	"GET /api/v2/artifacts/*/open":      true,
 	"GET /api/v2/runs/*/stream":         true,
+	"GET /api/v2/public/shares/*":       true,
 }
 
 // isInfraPath allows health/metrics probes without authentication.
@@ -74,6 +90,14 @@ func isInfraPath(path string) bool {
 func isPublicRoute(method, path string) bool {
 	if ok, exists := publicRoutes[method+" "+path]; exists {
 		return ok
+	}
+	// Share artifact resolution: the share token is the capability, so any
+	// /open under a token is public (artifact membership is checked in the
+	// handler — it must be referenced by the snapshotted messages).
+	if method == http.MethodGet &&
+		strings.HasPrefix(path, "/api/v2/public/shares/") &&
+		strings.HasSuffix(path, "/open") {
+		return true
 	}
 	// Wildcard forms for parameterized paths.
 	prefix := ""
@@ -87,6 +111,8 @@ func isPublicRoute(method, path string) bool {
 		return strings.HasPrefix(path, "/api/v2/artifacts/") && strings.HasSuffix(path, "/open")
 	case "GET /api/v2/runs/*/stream":
 		return strings.HasPrefix(path, "/api/v2/runs/") && strings.HasSuffix(path, "/stream")
+	case "GET /api/v2/public/shares/*":
+		return strings.HasPrefix(path, "/api/v2/public/shares/")
 	}
 	return false
 }
@@ -197,8 +223,30 @@ func normalizeRoute(r *http.Request) string {
 			return "/api/v2/runs/{id}/artifacts"
 		}
 		return "/api/v2/runs/{id}"
+	case strings.HasPrefix(p, "/api/v2/schedules/"):
+		if strings.HasSuffix(p, "/run-now") {
+			return "/api/v2/schedules/{id}/run-now"
+		}
+		if strings.HasSuffix(p, "/enable") {
+			return "/api/v2/schedules/{id}/enable"
+		}
+		if strings.HasSuffix(p, "/disable") {
+			return "/api/v2/schedules/{id}/disable"
+		}
+		if strings.HasSuffix(p, "/occurrences") {
+			return "/api/v2/schedules/{id}/occurrences"
+		}
+		if strings.HasSuffix(p, "/preview") {
+			return "/api/v2/schedules/preview"
+		}
+		return "/api/v2/schedules/{id}"
 	case strings.HasPrefix(p, "/api/v2/artifacts/"):
 		return "/api/v2/artifacts/{id}/open"
+	case strings.HasPrefix(p, "/api/v2/public/shares/"):
+		if strings.HasSuffix(p, "/open") {
+			return "/api/v2/public/shares/{token}/artifacts/{id}/open"
+		}
+		return "/api/v2/public/shares/{token}"
 	}
 	return p
 }

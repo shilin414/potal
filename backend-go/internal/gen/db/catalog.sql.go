@@ -228,7 +228,7 @@ func (q *Queries) FindBinding(ctx context.Context, arg FindBindingParams) (Runti
 
 const getApplicationByID = `-- name: GetApplicationByID :one
 SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
-       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent,
+       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled,
        a.usage_count, a.tags, a.default_config, a.created_by, a.organization_id,
        a.created_at, a.updated_at,
        c.slug AS category_slug, c.name AS category_name
@@ -251,6 +251,7 @@ type GetApplicationByIDRow struct {
 	CategoryID     sql.NullInt64
 	IsPublic       bool
 	IsDefaultAgent bool
+	Enabled        bool
 	UsageCount     uint32
 	Tags           dbtypes.JSONText
 	DefaultConfig  dbtypes.JSONText
@@ -279,6 +280,7 @@ func (q *Queries) GetApplicationByID(ctx context.Context, id uint64) (GetApplica
 		&i.CategoryID,
 		&i.IsPublic,
 		&i.IsDefaultAgent,
+		&i.Enabled,
 		&i.UsageCount,
 		&i.Tags,
 		&i.DefaultConfig,
@@ -294,7 +296,7 @@ func (q *Queries) GetApplicationByID(ctx context.Context, id uint64) (GetApplica
 
 const getApplicationBySlug = `-- name: GetApplicationBySlug :one
 SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
-       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent,
+       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled,
        a.usage_count, a.tags, a.default_config, a.created_by, a.organization_id,
        a.created_at, a.updated_at,
        c.slug AS category_slug, c.name AS category_name
@@ -317,6 +319,7 @@ type GetApplicationBySlugRow struct {
 	CategoryID     sql.NullInt64
 	IsPublic       bool
 	IsDefaultAgent bool
+	Enabled        bool
 	UsageCount     uint32
 	Tags           dbtypes.JSONText
 	DefaultConfig  dbtypes.JSONText
@@ -345,6 +348,7 @@ func (q *Queries) GetApplicationBySlug(ctx context.Context, slug string) (GetApp
 		&i.CategoryID,
 		&i.IsPublic,
 		&i.IsDefaultAgent,
+		&i.Enabled,
 		&i.UsageCount,
 		&i.Tags,
 		&i.DefaultConfig,
@@ -438,7 +442,7 @@ func (q *Queries) GetCategoryBySlug(ctx context.Context, slug string) (Applicati
 
 const getDefaultAgent = `-- name: GetDefaultAgent :one
 SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
-       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent,
+       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled,
        a.usage_count, a.tags, a.default_config, a.created_by, a.organization_id,
        a.created_at, a.updated_at,
        c.slug AS category_slug, c.name AS category_name
@@ -462,6 +466,7 @@ type GetDefaultAgentRow struct {
 	CategoryID     sql.NullInt64
 	IsPublic       bool
 	IsDefaultAgent bool
+	Enabled        bool
 	UsageCount     uint32
 	Tags           dbtypes.JSONText
 	DefaultConfig  dbtypes.JSONText
@@ -490,6 +495,7 @@ func (q *Queries) GetDefaultAgent(ctx context.Context) (GetDefaultAgentRow, erro
 		&i.CategoryID,
 		&i.IsPublic,
 		&i.IsDefaultAgent,
+		&i.Enabled,
 		&i.UsageCount,
 		&i.Tags,
 		&i.DefaultConfig,
@@ -638,12 +644,14 @@ func (q *Queries) ListActiveProviders(ctx context.Context) ([]Provider, error) {
 }
 
 const listApplicationsByVisibility = `-- name: ListApplicationsByVisibility :many
-SELECT id, slug, name, description, icon, avatar_key, color, kind, renderer_key,
-       executor_key, category_id, is_public, is_default_agent, usage_count, tags,
-       default_config, created_by, organization_id, created_at, updated_at
-FROM applications
-WHERE (? OR is_public = ? OR created_by = ?)
-ORDER BY created_at
+SELECT a.id, a.slug, a.name, a.description, a.icon, a.avatar_key, a.color, a.kind, a.renderer_key,
+       a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled, a.usage_count, a.tags,
+       a.default_config, a.created_by, a.organization_id, a.created_at, a.updated_at,
+       c.slug AS category_slug, c.name AS category_name
+FROM applications a
+LEFT JOIN application_categories c ON c.id = a.category_id
+WHERE (? OR a.is_public = ? OR a.created_by = ?)
+ORDER BY a.created_at
 LIMIT ?
 `
 
@@ -654,9 +662,35 @@ type ListApplicationsByVisibilityParams struct {
 	Limit     int32
 }
 
+type ListApplicationsByVisibilityRow struct {
+	ID             uint64
+	Slug           string
+	Name           string
+	Description    sql.NullString
+	Icon           string
+	AvatarKey      string
+	Color          string
+	Kind           string
+	RendererKey    string
+	ExecutorKey    string
+	CategoryID     sql.NullInt64
+	IsPublic       bool
+	IsDefaultAgent bool
+	Enabled        bool
+	UsageCount     uint32
+	Tags           dbtypes.JSONText
+	DefaultConfig  dbtypes.JSONText
+	CreatedBy      sql.NullInt64
+	OrganizationID sql.NullInt64
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	CategorySlug   sql.NullString
+	CategoryName   sql.NullString
+}
+
 // show_all lets staff bypass the SQL pre-filter; the authoritative
 // scope check still happens in Go (visible()).
-func (q *Queries) ListApplicationsByVisibility(ctx context.Context, arg ListApplicationsByVisibilityParams) ([]Application, error) {
+func (q *Queries) ListApplicationsByVisibility(ctx context.Context, arg ListApplicationsByVisibilityParams) ([]ListApplicationsByVisibilityRow, error) {
 	rows, err := q.db.QueryContext(ctx, listApplicationsByVisibility,
 		arg.ShowAll,
 		arg.IsPublic,
@@ -667,9 +701,9 @@ func (q *Queries) ListApplicationsByVisibility(ctx context.Context, arg ListAppl
 		return nil, err
 	}
 	defer rows.Close()
-	items := []Application{}
+	items := []ListApplicationsByVisibilityRow{}
 	for rows.Next() {
-		var i Application
+		var i ListApplicationsByVisibilityRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Slug,
@@ -684,6 +718,7 @@ func (q *Queries) ListApplicationsByVisibility(ctx context.Context, arg ListAppl
 			&i.CategoryID,
 			&i.IsPublic,
 			&i.IsDefaultAgent,
+			&i.Enabled,
 			&i.UsageCount,
 			&i.Tags,
 			&i.DefaultConfig,
@@ -691,6 +726,8 @@ func (q *Queries) ListApplicationsByVisibility(ctx context.Context, arg ListAppl
 			&i.OrganizationID,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.CategorySlug,
+			&i.CategoryName,
 		); err != nil {
 			return nil, err
 		}
@@ -834,6 +871,20 @@ func (q *Queries) ListFavorites(ctx context.Context, userID uint64) ([]uint64, e
 		return nil, err
 	}
 	return items, nil
+}
+
+const setApplicationEnabled = `-- name: SetApplicationEnabled :exec
+UPDATE applications SET enabled = ? WHERE id = ?
+`
+
+type SetApplicationEnabledParams struct {
+	Enabled bool
+	ID      uint64
+}
+
+func (q *Queries) SetApplicationEnabled(ctx context.Context, arg SetApplicationEnabledParams) error {
+	_, err := q.db.ExecContext(ctx, setApplicationEnabled, arg.Enabled, arg.ID)
+	return err
 }
 
 const setDefaultAgent = `-- name: SetDefaultAgent :exec

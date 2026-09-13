@@ -63,6 +63,7 @@ describe('syncSessionUser', () => {
     expect(user.display_id).toBe('19127920');
     expect(user.avatar_url).toBe('https://example.test/a.png');
     expect(user.auth_source).toBe('feishu');
+    expect(user.is_staff).toBe(false);
   });
 
   it('keeps the previous display values when the session omits them', async () => {

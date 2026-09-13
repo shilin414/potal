@@ -24,11 +24,16 @@ const HomeShortcuts: React.FC<Props> = ({
   applications, onOpen, onToggleFavorite,
 }) => {
   const recentApplicationIds = useWorkspaceStore((state) => state.recentApplicationIds);
-  const groups = useMemo(() => buildShortcutGroups(applications), [applications]);
+  // 停用的应用（应用中心开关）对普通用户已被服务端过滤；这里兜底过滤掉
+  // 管理员视角下混入目录的停用应用，保持首页快捷入口干净。
+  const enabledApplications = useMemo(
+    () => applications.filter((app) => app.enabled !== false),
+    [applications]);
+  const groups = useMemo(() => buildShortcutGroups(enabledApplications), [enabledApplications]);
 
   const recent = useMemo(() => {
     const local = recentApplicationIds
-      .map((id) => applications.find((app) => app.id === id))
+      .map((id) => enabledApplications.find((app) => app.id === id))
       .filter((app): app is V2Application => app != null && app.kind === 'chat');
     const merged: V2Application[] = [];
     const seen = new Set<number>();
@@ -38,11 +43,11 @@ const HomeShortcuts: React.FC<Props> = ({
       merged.push(app);
     }
     return merged.slice(0, RECENT_LIMIT);
-  }, [recentApplicationIds, applications, groups.recent]);
+  }, [recentApplicationIds, enabledApplications, groups.recent]);
 
   const fixedApplications = useMemo(
-    () => applications.filter((app) => app.kind !== 'chat').slice(0, RECENT_LIMIT),
-    [applications]);
+    () => enabledApplications.filter((app) => app.kind !== 'chat').slice(0, RECENT_LIMIT),
+    [enabledApplications]);
 
   const sections = useMemo(() => [
     { key: 'favorites', label: '收藏', items: groups.favorites },
@@ -53,10 +58,10 @@ const HomeShortcuts: React.FC<Props> = ({
   ].filter((section) => section.items.length > 0),
   [fixedApplications, groups.favorites, groups.frequent, groups.recommended, recent]);
 
-  if (!applications.length) {
+  if (!enabledApplications.length) {
     return (
       <div className="home-shortcuts home-shortcuts--empty">
-        <p>还没有可用的智能体，先到应用中心添加一个吧。</p>
+        <p>暂无可用的智能体与应用，请联系管理员在智能体市场或应用中心配置。</p>
       </div>
     );
   }
