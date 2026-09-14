@@ -15,8 +15,8 @@ import (
 	"github.com/go-sql-driver/mysql"
 
 	"github.com/creation-agent-studio/backend-go/internal/automation/schedule"
-	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/execution"
+	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
 )
 
@@ -645,9 +645,18 @@ func (s *Scheduler) admitOne(ctx context.Context, occRow db.ScheduleOccurrence) 
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	// Re-check under the transaction: another admission/scan may have
-	// raced us to a queued occurrence for the same schedule.
 	q := db.New(tx)
+	// Admission lock (修复计划 §34-37): serialize concurrent admissions
+	// for the SAME schedule. Two schedulers each holding a pending
+	// occurrence could otherwise both count zero active occurrences and
+	// create two parallel runs (write skew) — the schedules row lock
+	// closes that window: the second transaction re-checks AFTER the
+	// first one committed.
+	if _, err := q.GetScheduleRowForUpdate(ctx, occRow.ScheduleID); err != nil {
+		return err
+	}
+	// Re-check under the lock: another admission/scan may have raced us
+	// to a queued occurrence for the same schedule.
 	active2, err := q.CountActiveOccurrencesExcluding(ctx, db.CountActiveOccurrencesExcludingParams{
 		ScheduleID: occRow.ScheduleID, ID: occRow.ID,
 	})

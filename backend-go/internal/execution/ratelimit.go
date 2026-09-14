@@ -1,10 +1,10 @@
 package execution
 
 import (
-	"sync"
-	"sync/atomic"
 	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"

@@ -8,7 +8,33 @@ package gendb
 import (
 	"context"
 	"database/sql"
+
+	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
 )
+
+const createAuditLog = `-- name: CreateAuditLog :exec
+INSERT INTO audit_logs (user_id, action, resource, resource_id, detail)
+VALUES (?, ?, 'auth', ?, ?)
+`
+
+type CreateAuditLogParams struct {
+	UserID     sql.NullInt64
+	Action     string
+	ResourceID string
+	Detail     dbtypes.JSONText
+}
+
+// Admin login auditing (修复计划 §41): records success/failure without
+// ever storing credentials.
+func (q *Queries) CreateAuditLog(ctx context.Context, arg CreateAuditLogParams) error {
+	_, err := q.db.ExecContext(ctx, createAuditLog,
+		arg.UserID,
+		arg.Action,
+		arg.ResourceID,
+		arg.Detail,
+	)
+	return err
+}
 
 const createFeishuIdentity = `-- name: CreateFeishuIdentity :execresult
 INSERT INTO feishu_identities (user_id, open_id, union_id, feishu_user_id, display_name, avatar_url, refresh_token_enc, refresh_token_expires_at, last_login_at)

@@ -26,6 +26,20 @@ VALUES (?, ?, ?, '', 'idle', ?, ?, NULL);
 -- name: BindAgentThreadSession :exec
 UPDATE agent_threads SET remote_id = ?, status = 'active' WHERE id = ?;
 
+-- name: BindAgentThreadSessionOwned :execresult
+-- Set-once session bind (修复计划 §27-28): binding succeeds when the
+-- remote_id is empty OR already equals the value (idempotent re-bind by
+-- the same session). 0 rows = a DIFFERENT session owns the thread — the
+-- caller must treat that as a conflict, never overwrite.
+UPDATE agent_threads
+SET remote_id = ?, status = 'active'
+WHERE id = ? AND (remote_id = '' OR remote_id = ?);
+
+-- name: GetAgentThreadByID :one
+SELECT id, conversation_id, provider, remote_id, status, auth_mode, auth_subject_key,
+       config, created_at, updated_at
+FROM agent_threads WHERE id = ?;
+
 -- name: CreateMessage :execresult
 INSERT INTO messages (conversation_id, role, content, metadata) VALUES (?, ?, ?, ?);
 

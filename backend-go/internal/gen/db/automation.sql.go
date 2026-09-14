@@ -395,6 +395,17 @@ func (q *Queries) GetScheduleOccurrenceBySlot(ctx context.Context, arg GetSchedu
 	return i, err
 }
 
+const getScheduleRowForUpdate = `-- name: GetScheduleRowForUpdate :execresult
+SELECT id FROM schedules WHERE id = ? FOR UPDATE
+`
+
+// Admission lock (修复计划 §35): serializes concurrent admissions for the
+// same schedule so two schedulers can never both observe "no active
+// occurrence" and create parallel runs (write-skew guard).
+func (q *Queries) GetScheduleRowForUpdate(ctx context.Context, id uint64) (sql.Result, error) {
+	return q.db.ExecContext(ctx, getScheduleRowForUpdate, id)
+}
+
 const hasActiveOccurrence = `-- name: HasActiveOccurrence :one
 SELECT COUNT(*) AS n FROM schedule_occurrences
 WHERE schedule_id = ? AND status IN ('pending', 'queued', 'running')
@@ -439,12 +450,13 @@ SELECT id, schedule_id, scheduled_at, enqueued_at, admitted_at, run_id, status,
        triggered_at, finished_at, created_at, updated_at
 FROM schedule_occurrences
 WHERE status = 'pending'
-ORDER BY id
+ORDER BY scheduled_at, id
 LIMIT ?
 `
 
 // Occurrence admission queue (overlap=queue semantics): pending rows are
 // converted into runs once the schedule has no active execution.
+// FIFO per schedule: scheduled_at first, id as the tiebreaker.
 func (q *Queries) ListAdmissiblePendingOccurrences(ctx context.Context, limit int32) ([]ScheduleOccurrence, error) {
 	rows, err := q.db.QueryContext(ctx, listAdmissiblePendingOccurrences, limit)
 	if err != nil {

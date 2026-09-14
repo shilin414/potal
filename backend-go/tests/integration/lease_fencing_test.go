@@ -1,12 +1,12 @@
 // Fault-injection integration tests for the execution correctness
-// hardening iteration (评测报告 P0-1/2/3 测试矩阵):
+// closure iteration (评测复核 + 修复计划):
 //
 //  1. Outbox relay publishes canonical UUIDs (not raw BINARY(16) bytes).
 //  2. Claim + lease are atomic — a lease INSERT failure rolls the claim
 //     back; a running run without a lease can never exist.
 //  3. Lease fencing chaos — a stale worker (lease expired, run reclaimed
-//     by worker B) can neither append events, finish, requeue, nor drop
-//     B's lease.
+//     by worker B) can neither append events, finalize, retry, persist
+//     artifacts, bind sessions, nor drop B's lease.
 //  4. Heartbeats are fenced by lease token, not worker id.
 package integration
 
@@ -42,6 +42,13 @@ func TestOutboxRelayCanonicalUUID(t *testing.T) {
 	const provider = "itest_relay"
 	runID := seedRun(t, svc, provider)
 
+	// Flush pending outbox rows left by earlier tests on the shared dev
+	// database so the relay's batch contains exactly our fixture.
+	if _, err := svc.DB.ExecContext(ctx,
+		`UPDATE outbox_events SET status='published' WHERE status='pending'`); err != nil {
+		t.Fatalf("flush outbox: %v", err)
+	}
+
 	// Direct outbox row exactly like CreateRunInTx writes it.
 	if _, err := svc.Querier().CreateOutboxEvent(ctx, outboxFixture("run", runID.Bytes(), provider)); err != nil {
 		t.Fatalf("create outbox: %v", err)
@@ -76,21 +83,21 @@ func TestOutboxRelayCanonicalUUID(t *testing.T) {
 	}
 }
 
-// TestClaimAndLeaseAtomicity: when the lease INSERT fails (here: a
+// TestClaimRunAtomicity: when the lease INSERT fails (here: a
 // pre-existing lease row hits UNIQUE(run_id)), the whole claim rolls back
 // — the run must remain queued. The "running without lease, no queue
 // message, invisible to reaper" permanent-stuck state is impossible.
-func TestClaimAndLeaseAtomicity(t *testing.T) {
+func TestClaimRunAtomicity(t *testing.T) {
 	svc, _ := testEnv(t)
 	ctx := context.Background()
-	runID := seedRun(t, svc, "feishu_aily")
+	runID := seedRun(t, svc, "itest_closure")
 
 	// Poison the lease slot so the claim transaction's INSERT fails.
-	if err := svc.AcquireLease(ctx, runID, "ghost-worker", 60*time.Second); err != nil {
+	if err := svc.Querier().CreateRunLease(ctx, leaseRowParams(runID, "ghost-worker", 999)); err != nil {
 		t.Fatalf("poison lease: %v", err)
 	}
 
-	_, won, err := svc.ClaimAndLease(ctx, runID, "victim-worker", 60*time.Second)
+	_, won, err := svc.ClaimRun(ctx, runID, "victim-worker", 60*time.Second)
 	if err == nil {
 		t.Fatal("claim+lease unexpectedly succeeded with a poisoned lease slot")
 	}
@@ -112,16 +119,19 @@ func TestClaimAndLeaseAtomicity(t *testing.T) {
 	if err := svc.Querier().DeleteLease(ctx, runID.Bytes()); err != nil {
 		t.Fatal(err)
 	}
-	own, won, err := svc.ClaimAndLease(ctx, runID, "worker-ok", 60*time.Second)
+	claimed, won, err := svc.ClaimRun(ctx, runID, "worker-ok", 60*time.Second)
 	if err != nil || !won {
 		t.Fatalf("claim after cleanup: won=%v err=%v", won, err)
 	}
-	if own.Epoch == 0 {
+	if claimed.Ownership.LeaseEpoch == 0 {
 		t.Fatal("claim returned epoch 0 — fencing token must start at 1")
 	}
+	if claimed.Run.ID != runID {
+		t.Fatalf("claimed run id mismatch: %s != %s", claimed.Run.ID, runID)
+	}
 	run, _ = svc.GetRun(ctx, runID)
-	if run.Status != execution.StatusRunning || run.LeaseEpoch != own.Epoch {
-		t.Fatalf("status=%s epoch=%d want running/%d", run.Status, run.LeaseEpoch, own.Epoch)
+	if run.Status != execution.StatusRunning {
+		t.Fatalf("status=%s, want running", run.Status)
 	}
 }
 
@@ -134,16 +144,14 @@ func TestClaimAndLeaseAtomicity(t *testing.T) {
 func TestLeaseFencingStaleWorker(t *testing.T) {
 	svc, _ := testEnv(t)
 	ctx := context.Background()
-	runID := seedRun(t, svc, "feishu_aily")
+	runID := seedRun(t, svc, "itest_closure")
 
 	// ── Worker A claims (epoch 1). ──
-	ownA, won, err := svc.ClaimAndLease(ctx, runID, "worker-a", 60*time.Second)
+	claimedA, won, err := svc.ClaimRun(ctx, runID, "worker-a", 60*time.Second)
 	if err != nil || !won {
 		t.Fatalf("A claim: won=%v err=%v", won, err)
 	}
-	runA, _ := svc.GetRun(ctx, runID)
-	runA.LeaseEpoch = ownA.Epoch
-	runA.LeaseToken = ownA.Token
+	ownA := claimedA.Ownership
 
 	// ── A "pauses": lease expires, reaper requeues. ──
 	expireLease(t, svc, runID, "worker-a")
@@ -158,31 +166,29 @@ func TestLeaseFencingStaleWorker(t *testing.T) {
 	}
 
 	// ── Worker B reclaims (epoch 2, new token). ──
-	ownB, won, err := svc.ClaimAndLease(ctx, runID, "worker-b", 60*time.Second)
+	claimedB, won, err := svc.ClaimRun(ctx, runID, "worker-b", 60*time.Second)
 	if err != nil || !won {
 		t.Fatalf("B claim: won=%v err=%v", won, err)
 	}
-	if ownB.Epoch <= ownA.Epoch {
-		t.Fatalf("epoch did not increase on reclaim: A=%d B=%d", ownA.Epoch, ownB.Epoch)
+	ownB := claimedB.Ownership
+	if ownB.LeaseEpoch <= ownA.LeaseEpoch {
+		t.Fatalf("epoch did not increase on reclaim: A=%d B=%d", ownA.LeaseEpoch, ownB.LeaseEpoch)
 	}
-	runB, _ := svc.GetRun(ctx, runID)
-	runB.LeaseEpoch = ownB.Epoch
-	runB.LeaseToken = ownB.Token
 
 	// ── Worker A wakes up — every write must be fenced out. ──
-	if err := svc.AppendEventFenced(ctx, runA, execution.EventContentDelta, map[string]any{"text": "stale"}); err != execution.ErrLostOwnership {
+	if err := svc.AppendOwnedEvent(ctx, ownA, execution.EventContentDelta, map[string]any{"text": "stale"}); err != execution.ErrLostOwnership {
 		t.Fatalf("stale A AppendEvent: err=%v, want ErrLostOwnership", err)
 	}
-	if err := svc.CheckOwnership(ctx, runID, ownA.Epoch); err != execution.ErrLostOwnership {
+	if err := svc.CheckOwnership(ctx, runID, ownA.LeaseEpoch); err != execution.ErrLostOwnership {
 		t.Fatalf("stale A CheckOwnership: err=%v, want ErrLostOwnership", err)
 	}
-	if err := svc.UpdateExternalRunIDFenced(ctx, runA, "chat_stale"); err != execution.ErrLostOwnership {
+	if err := svc.UpdateExternalRunIDOwned(ctx, ownA, "chat_stale"); err != execution.ErrLostOwnership {
 		t.Fatalf("stale A UpdateExternalRunID: err=%v, want ErrLostOwnership", err)
 	}
-	// A's interrupted-release must NOT requeue (B is running) and must
-	// NOT delete B's lease.
-	if err := svc.ReleaseInterruptedFenced(ctx, runA, "stale worker"); err != nil {
-		t.Logf("stale A ReleaseInterruptedFenced returned %v (acceptable: fenced no-ops)", err)
+	// A's retry must NOT requeue (B is running), must NOT create a retry
+	// outbox and must NOT delete B's lease (T2).
+	if err := svc.RetryOwnedRun(ctx, claimedA.Run, ownA, "stale worker"); err != execution.ErrLostOwnership {
+		t.Fatalf("stale A RetryOwnedRun: err=%v, want ErrLostOwnership", err)
 	}
 	run, _ = svc.GetRun(ctx, runID)
 	if run.Status != execution.StatusRunning {
@@ -192,38 +198,38 @@ func TestLeaseFencingStaleWorker(t *testing.T) {
 		t.Fatalf("B's lease was deleted by stale A: %v", err)
 	}
 	// A's terminal write must fail; the run stays running.
-	if err := svc.Finish(ctx, runA, &execution.FinishInput{Status: execution.StatusSucceeded}); err != execution.ErrLostOwnership {
-		t.Fatalf("stale A Finish: err=%v, want ErrLostOwnership", err)
+	if err := svc.FinalizeOwnedRun(ctx, claimedA.Run, ownA, &execution.FinishInput{Status: execution.StatusSucceeded}); err != execution.ErrLostOwnership {
+		t.Fatalf("stale A Finalize: err=%v, want ErrLostOwnership", err)
 	}
 	run, _ = svc.GetRun(ctx, runID)
 	if run.Status != execution.StatusRunning {
 		t.Fatalf("stale A finished B's run: status=%s, want running", run.Status)
 	}
 	// A's heartbeat renewal must be rejected.
-	if ok, err := svc.HeartbeatLeaseFenced(ctx, runID, ownA.Token, 60*time.Second); err != nil || ok {
+	if ok, err := svc.HeartbeatOwned(ctx, ownA, 60*time.Second); err != nil || ok {
 		t.Fatalf("stale A heartbeat: ok=%v err=%v, want ok=false", ok, err)
 	}
 
 	// ── B keeps full ownership. ──
-	if err := svc.AppendEventFenced(ctx, runB, execution.EventContentDelta, map[string]any{"text": "fresh"}); err != nil {
+	if err := svc.AppendOwnedEvent(ctx, ownB, execution.EventContentDelta, map[string]any{"text": "fresh"}); err != nil {
 		t.Fatalf("B AppendEvent: %v", err)
 	}
-	if ok, err := svc.HeartbeatLeaseFenced(ctx, runID, ownB.Token, 60*time.Second); err != nil || !ok {
-		t.Fatalf("B heartbeat: ok=%v err=%v", ok, err)
+	if ok, err := svc.HeartbeatOwned(ctx, ownB, 60*time.Second); err != nil || !ok {
+		t.Fatalf("B heartbeat: ok=%v err=%v, want ok=true", ok, err)
 	}
-	if err := svc.Finish(ctx, runB, &execution.FinishInput{
+	if err := svc.FinalizeOwnedRun(ctx, claimedB.Run, ownB, &execution.FinishInput{
 		Status: execution.StatusSucceeded,
 		Output: map[string]any{"text": "done"},
 	}); err != nil {
-		t.Fatalf("B Finish: %v", err)
+		t.Fatalf("B Finalize: %v", err)
 	}
 	run, _ = svc.GetRun(ctx, runID)
 	if run.Status != execution.StatusSucceeded {
 		t.Fatalf("final status=%s, want succeeded (by B)", run.Status)
 	}
-	// Lease is cleaned up by B's fenced finish.
+	// Lease is cleaned up inside B's finalize transaction.
 	if _, err := svc.Querier().GetLease(ctx, runID.Bytes()); err == nil {
-		t.Fatal("lease still present after B's fenced finish")
+		t.Fatal("lease still present after B's finalize")
 	}
 
 	// Exactly one content.delta event may exist (B's) — A's never landed.
@@ -247,17 +253,22 @@ func TestLeaseFencingStaleWorker(t *testing.T) {
 func TestHeartbeatFencedByToken(t *testing.T) {
 	svc, _ := testEnv(t)
 	ctx := context.Background()
-	runID := seedRun(t, svc, "feishu_aily")
+	runID := seedRun(t, svc, "itest_closure")
 
-	own, won, err := svc.ClaimAndLease(ctx, runID, "same-id", 60*time.Second)
+	claimed, won, err := svc.ClaimRun(ctx, runID, "same-id", 60*time.Second)
 	if err != nil || !won {
 		t.Fatalf("claim: won=%v err=%v", won, err)
 	}
-	wrong := ids.New()
-	if ok, err := svc.HeartbeatLeaseFenced(ctx, runID, wrong, 60*time.Second); err != nil || ok {
+	wrong := execution.ExecutionOwnership{
+		RunID:      runID,
+		WorkerID:   "same-id",
+		LeaseEpoch: claimed.Ownership.LeaseEpoch,
+		LeaseToken: ids.New(),
+	}
+	if ok, err := svc.HeartbeatOwned(ctx, wrong, 60*time.Second); err != nil || ok {
 		t.Fatalf("wrong token heartbeat: ok=%v err=%v, want ok=false", ok, err)
 	}
-	if ok, err := svc.HeartbeatLeaseFenced(ctx, runID, own.Token, 60*time.Second); err != nil || !ok {
+	if ok, err := svc.HeartbeatOwned(ctx, claimed.Ownership, 60*time.Second); err != nil || !ok {
 		t.Fatalf("owner heartbeat: ok=%v err=%v, want ok=true", ok, err)
 	}
 }

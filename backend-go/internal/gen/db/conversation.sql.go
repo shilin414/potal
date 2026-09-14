@@ -27,6 +27,26 @@ func (q *Queries) BindAgentThreadSession(ctx context.Context, arg BindAgentThrea
 	return err
 }
 
+const bindAgentThreadSessionOwned = `-- name: BindAgentThreadSessionOwned :execresult
+UPDATE agent_threads
+SET remote_id = ?, status = 'active'
+WHERE id = ? AND (remote_id = '' OR remote_id = ?)
+`
+
+type BindAgentThreadSessionOwnedParams struct {
+	RemoteID   string
+	ID         []byte
+	RemoteID_2 string
+}
+
+// Set-once session bind (修复计划 §27-28): binding succeeds when the
+// remote_id is empty OR already equals the value (idempotent re-bind by
+// the same session). 0 rows = a DIFFERENT session owns the thread — the
+// caller must treat that as a conflict, never overwrite.
+func (q *Queries) BindAgentThreadSessionOwned(ctx context.Context, arg BindAgentThreadSessionOwnedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, bindAgentThreadSessionOwned, arg.RemoteID, arg.ID, arg.RemoteID_2)
+}
+
 const countMessagesByConversation = `-- name: CountMessagesByConversation :one
 SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?
 `
@@ -206,6 +226,30 @@ FROM agent_threads WHERE conversation_id = ?
 
 func (q *Queries) GetAgentThreadByConversation(ctx context.Context, conversationID uint64) (AgentThread, error) {
 	row := q.db.QueryRowContext(ctx, getAgentThreadByConversation, conversationID)
+	var i AgentThread
+	err := row.Scan(
+		&i.ID,
+		&i.ConversationID,
+		&i.Provider,
+		&i.RemoteID,
+		&i.Status,
+		&i.AuthMode,
+		&i.AuthSubjectKey,
+		&i.Config,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const getAgentThreadByID = `-- name: GetAgentThreadByID :one
+SELECT id, conversation_id, provider, remote_id, status, auth_mode, auth_subject_key,
+       config, created_at, updated_at
+FROM agent_threads WHERE id = ?
+`
+
+func (q *Queries) GetAgentThreadByID(ctx context.Context, id []byte) (AgentThread, error) {
+	row := q.db.QueryRowContext(ctx, getAgentThreadByID, id)
 	var i AgentThread
 	err := row.Scan(
 		&i.ID,

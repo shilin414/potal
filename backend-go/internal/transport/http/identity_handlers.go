@@ -8,10 +8,47 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/creation-agent-studio/backend-go/internal/identity"
 )
+
+// loginAttemptLimiter is a small in-process sliding-window throttle for
+// the local admin login (修复计划 §41): max N attempts per key
+// (username+IP) per window. Good enough for a single-instance admin
+// entry point; a distributed limiter is unnecessary for staff-only
+// low-volume traffic.
+type loginAttemptLimiter struct {
+	mu       sync.Mutex
+	attempts map[string][]time.Time
+	window   time.Duration
+	max      int
+}
+
+func newLoginAttemptLimiter(max int, window time.Duration) *loginAttemptLimiter {
+	return &loginAttemptLimiter{attempts: map[string][]time.Time{}, window: window, max: max}
+}
+
+func (l *loginAttemptLimiter) allow(key string) bool {
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	hist := l.attempts[key]
+	kept := hist[:0]
+	for _, t := range hist {
+		if now.Sub(t) < l.window {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= l.max {
+		l.attempts[key] = kept
+		return false
+	}
+	l.attempts[key] = append(kept, now)
+	return true
+}
 
 // ──────────────────────────────────────────────────── OAuth endpoints ──
 
@@ -68,6 +105,32 @@ func (s *Server) GetSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, identity.SessionPayload(user.User, user.Identity))
 }
 
+// adminLoginMaxAttempts / adminLoginWindow: 5 failed attempts per
+// username+IP within 5 minutes lock that combination out (修复计划 §41).
+const (
+	adminLoginMaxAttempts = 5
+	adminLoginWindow      = 5 * time.Minute
+)
+
+// clientIP extracts the peer address for login throttling (proxy headers
+// are NOT trusted — this is a throttle key, not an identity claim).
+func clientIP(r *http.Request) string {
+	host := r.RemoteAddr
+	if i := strings.LastIndex(host, ":"); i > 0 {
+		host = host[:i]
+	}
+	return host
+}
+
+// allowAdminLogin enforces the per username+IP attempt budget. The
+// limiter initializes lazily so every Server construction path gets it.
+func (s *Server) allowAdminLogin(username string, r *http.Request) bool {
+	s.adminLimiterOnce.Do(func() {
+		s.adminLoginLimiter = newLoginAttemptLimiter(adminLoginMaxAttempts, adminLoginWindow)
+	})
+	return s.adminLoginLimiter.allow(username + "|" + clientIP(r))
+}
+
 func (s *Server) AdminLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeSimpleError(w, http.StatusMethodNotAllowed, "POST required")
@@ -81,11 +144,23 @@ func (s *Server) AdminLogin(w http.ResponseWriter, r *http.Request) {
 		writeSimpleError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
+	if !s.allowAdminLogin(body.Username, r) {
+		w.Header().Set("Retry-After", "300")
+		writeSimpleError(w, http.StatusTooManyRequests, "too many failed attempts, retry later")
+		return
+	}
 	user, err := s.IdentityRepo.VerifyLocalAdmin(r.Context(), body.Username, body.Password)
 	if err != nil {
+		// Audit failure (never credentials) + throttle accounting.
+		s.IdentityRepo.WriteAuditLog(r.Context(), nil, "admin.login.failed", body.Username, map[string]any{
+			"ip": clientIP(r),
+		})
 		writeSimpleError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
+	s.IdentityRepo.WriteAuditLog(r.Context(), &user.ID, "admin.login.success", body.Username, map[string]any{
+		"ip": clientIP(r),
+	})
 	s.setSessionCookie(w, r, user)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":           user.ID,
@@ -99,7 +174,16 @@ func (s *Server) AdminLogin(w http.ResponseWriter, r *http.Request) {
 
 // ───────────────────────────────────────────── legacy auth endpoints ──
 
+// AuthLogin is the LEGACY local login kept only as a deprecated
+// transition endpoint (修复计划 §40). Policy:
+//   - staff-only: VerifyLocalAdmin rejects non-staff accounts, so normal
+//     users can never enter the Studio with a local password (Feishu SSO
+//     only).
+//   - deprecated: sunset header + audit, same throttle as the admin page.
+//     The current frontend never calls it — removal is a follow-up.
 func (s *Server) AuthLogin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Deprecation", "true")
+	w.Header().Set("Sunset", "Sat, 31 Dec 2026 23:59:59 GMT")
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -108,11 +192,24 @@ func (s *Server) AuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeDetail(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	if !s.allowAdminLogin(body.Username, r) {
+		w.Header().Set("Retry-After", "300")
+		writeDetail(w, http.StatusTooManyRequests, "尝试过于频繁，请稍后再试")
+		return
+	}
 	user, err := s.IdentityRepo.VerifyLocalAdmin(r.Context(), body.Username, body.Password)
 	if err != nil {
+		s.IdentityRepo.WriteAuditLog(r.Context(), nil, "admin.login.failed", body.Username, map[string]any{
+			"ip":     clientIP(r),
+			"legacy": true,
+		})
 		writeDetail(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
+	s.IdentityRepo.WriteAuditLog(r.Context(), &user.ID, "admin.login.success", body.Username, map[string]any{
+		"ip":     clientIP(r),
+		"legacy": true,
+	})
 	s.setSessionCookie(w, r, user)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"user":   identity.SessionPayload(user, nil),

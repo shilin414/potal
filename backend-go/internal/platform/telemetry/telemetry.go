@@ -49,6 +49,10 @@ type Metrics struct {
 	OverlapSkippedTotal   prometheus.Counter
 	DeliveryDuration      *prometheus.HistogramVec
 	DeliveryFailuresTotal *prometheus.CounterVec
+
+	// Execution Correctness Closure (修复计划 §42-51).
+	InvariantViolation      *prometheus.CounterVec // {type}
+	ProviderLimiterDegraded prometheus.Gauge
 }
 
 func NewMetrics(service string) *Metrics {
@@ -142,6 +146,14 @@ func NewMetrics(service string) *Metrics {
 			Name: "studio_schedule_delivery_failures_total",
 			Help: "Delivery failures by channel and error code.",
 		}, []string{"channel", "code"}),
+		InvariantViolation: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "studio_execution_invariant_violation_total",
+			Help: "Execution invariant violations detected by the checker (detect-only, never auto-repaired).",
+		}, []string{"type"}),
+		ProviderLimiterDegraded: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "studio_provider_limiter_degraded",
+			Help: "1 while the provider rate limiter runs on its local (Redis-unreachable) fallback.",
+		}),
 	}
 	reg.MustRegister(
 		m.HTTPDuration, m.HTTPRequests, m.SSEActive, m.QueueDepth,
@@ -149,6 +161,7 @@ func NewMetrics(service string) *Metrics {
 		m.ProviderCalls, m.Provider429, m.Reconciles, m.DBLatency, m.RedisLatency,
 		m.ScheduleTriggerDelay, m.ScheduleQueueDelay, m.ScheduleMisfireTotal,
 		m.OverlapSkippedTotal, m.DeliveryDuration, m.DeliveryFailuresTotal,
+		m.InvariantViolation, m.ProviderLimiterDegraded,
 	)
 	return m
 }

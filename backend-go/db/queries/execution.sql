@@ -112,8 +112,31 @@ SELECT id, run_id, command_type, payload, status, created_by, created_at, resolv
 FROM run_commands WHERE id = ?;
 
 -- name: CreateRunLease :exec
-INSERT INTO run_leases (run_id, worker_id, lease_token, heartbeat_at, expires_at)
-VALUES (?, ?, ?, CURRENT_TIMESTAMP(3), ?);
+-- lease_epoch mirrors runs.lease_epoch at claim time (migration 0010):
+-- the reaper verifies an expired lease really belongs to the run's
+-- CURRENT epoch before recovering it.
+INSERT INTO run_leases (run_id, worker_id, lease_token, lease_epoch, heartbeat_at, expires_at)
+VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(3), ?);
+
+-- name: GetExpiredLeaseForUpdate :one
+-- Reaper row lock: the lease is re-validated under lock inside the
+-- recovery transaction — a heartbeat that lands first wins the row.
+SELECT id, run_id, worker_id, lease_token, lease_epoch, acquired_at, heartbeat_at, expires_at
+FROM run_leases
+WHERE run_id = ? AND expires_at <= CURRENT_TIMESTAMP(3)
+FOR UPDATE;
+
+-- name: GetRunForUpdate :one
+-- Lock the run row inside an ownership-verified transaction (finalize /
+-- retry / recovery). Returns the lease_epoch so the caller can verify
+-- the fence under the lock.
+SELECT id, status, lease_epoch, attempt, max_attempts, trigger_type, trigger_id, conversation_id
+FROM runs WHERE id = ? FOR UPDATE;
+
+-- name: DeleteLeaseByToken :execresult
+-- Delete exactly one lease row, identified by token (used inside
+-- finalize/retry/recovery transactions; RowsAffected proves ownership).
+DELETE FROM run_leases WHERE run_id = ? AND lease_token = ?;
 
 -- name: HeartbeatLease :execresult
 UPDATE run_leases
@@ -142,6 +165,56 @@ DELETE FROM run_leases WHERE run_id = ? AND expires_at <= CURRENT_TIMESTAMP(3);
 SELECT run_id FROM run_leases
 WHERE expires_at <= CURRENT_TIMESTAMP(3)
 LIMIT ?;
+
+-- ──────────────────────────────────────────────── invariant checks ──
+-- Execution invariant checker queries (修复计划 §43-49): detect only,
+-- never auto-repair.
+
+-- name: CountRunningWithoutLease :one
+-- Invariant A: a running run MUST have a lease row.
+SELECT COUNT(*) AS n FROM runs r
+LEFT JOIN run_leases l ON l.run_id = r.id
+WHERE r.status = 'running' AND l.run_id IS NULL;
+
+-- name: CountQueuedWithLease :one
+-- Invariant B: a queued run must NOT hold a lease.
+SELECT COUNT(*) AS n FROM runs r
+JOIN run_leases l ON l.run_id = r.id
+WHERE r.status = 'queued';
+
+-- name: CountTerminalWithLease :one
+-- Invariant C: a terminal run must NOT hold a lease.
+SELECT COUNT(*) AS n FROM runs r
+JOIN run_leases l ON l.run_id = r.id
+WHERE r.status IN ('succeeded', 'failed', 'cancelled');
+
+-- name: CountTerminalWithoutTerminalEvent :one
+-- Invariant D: a terminal run MUST have exactly one terminal RunEvent.
+SELECT COUNT(*) AS n FROM runs r
+LEFT JOIN run_events e ON e.run_id = r.id AND e.event_type IN ('run.completed', 'run.failed', 'run.cancelled')
+WHERE r.status IN ('succeeded', 'failed', 'cancelled') AND e.id IS NULL;
+
+-- name: CountRunningLeaseEpochMismatch :one
+-- Invariant E: a running run's lease_epoch must equal its lease row's.
+SELECT COUNT(*) AS n FROM runs r
+JOIN run_leases l ON l.run_id = r.id
+WHERE r.status = 'running' AND r.lease_epoch != l.lease_epoch;
+
+-- name: CountScheduleOverlapViolations :many
+-- Invariant F: overlap=queue schedules must never run in parallel.
+-- Returns one row per violating schedule.
+SELECT o.schedule_id, COUNT(*) AS n
+FROM schedule_occurrences o
+JOIN schedules s ON s.id = o.schedule_id
+WHERE s.overlap_policy = 'queue' AND o.status IN ('queued', 'running')
+GROUP BY o.schedule_id
+HAVING COUNT(*) > 1;
+
+-- name: OldestPendingOutboxAgeSeconds :one
+-- Invariant G: the outbox relay must not lag (pending events older than
+-- the threshold mean dispatch is stuck).
+SELECT CAST(COALESCE(TIMESTAMPDIFF(SECOND, MIN(available_at), CURRENT_TIMESTAMP(3)), 0) AS SIGNED) AS n
+FROM outbox_events WHERE status = 'pending';
 
 -- name: GetLease :one
 SELECT id, run_id, worker_id, lease_token, acquired_at, heartbeat_at, expires_at

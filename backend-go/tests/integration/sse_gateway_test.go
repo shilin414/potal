@@ -67,7 +67,7 @@ func TestSSEReplayThenLiveThenClose(t *testing.T) {
 	ctx := context.Background()
 	runID := seedRun(t, svc, "feishu_aily")
 	// Queued (non-terminal) run: claim so the replay happens, stream stays open.
-	if won, err := svc.CASClaim(ctx, runID); err != nil || !won {
+	if _, won, err := svc.ClaimRun(ctx, runID, "sse-test", time.Minute); err != nil || !won {
 		t.Fatalf("claim: %v %v", won, err)
 	}
 	appendTestEvent(t, svc, runID, 1, execution.EventContentDelta, "replayed-delta")

@@ -16,6 +16,11 @@ type Querier interface {
 	AppendUserAttachmentToRunInput(ctx context.Context, arg AppendUserAttachmentToRunInputParams) (sql.Result, error)
 	ApplicationSlugExists(ctx context.Context, slug string) (int64, error)
 	BindAgentThreadSession(ctx context.Context, arg BindAgentThreadSessionParams) error
+	// Set-once session bind (修复计划 §27-28): binding succeeds when the
+	// remote_id is empty OR already equals the value (idempotent re-bind by
+	// the same session). 0 rows = a DIFFERENT session owns the thread — the
+	// caller must treat that as a conflict, never overwrite.
+	BindAgentThreadSessionOwned(ctx context.Context, arg BindAgentThreadSessionOwnedParams) (sql.Result, error)
 	BindAttachmentToRun(ctx context.Context, arg BindAttachmentToRunParams) error
 	// CAS claim: one delivery worker wins; 0 rows = someone else got it.
 	// Only pending→sending: a duplicate stream message can never re-claim a
@@ -43,12 +48,31 @@ type Querier interface {
 	CountConversationByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
 	CountMessagesByConversation(ctx context.Context, conversationID uint64) (int64, error)
 	CountPendingOutbox(ctx context.Context) (int64, error)
+	// Invariant B: a queued run must NOT hold a lease.
+	CountQueuedWithLease(ctx context.Context) (int64, error)
 	CountRunByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
 	CountRunEvents(ctx context.Context, runID []byte) (int64, error)
+	// Invariant E: a running run's lease_epoch must equal its lease row's.
+	CountRunningLeaseEpochMismatch(ctx context.Context) (int64, error)
+	// ──────────────────────────────────────────────── invariant checks ──
+	// Execution invariant checker queries (修复计划 §43-49): detect only,
+	// never auto-repair.
+	// Invariant A: a running run MUST have a lease row.
+	CountRunningWithoutLease(ctx context.Context) (int64, error)
+	// Invariant F: overlap=queue schedules must never run in parallel.
+	// Returns one row per violating schedule.
+	CountScheduleOverlapViolations(ctx context.Context) ([]CountScheduleOverlapViolationsRow, error)
 	CountSkippedOccurrencesForSlot(ctx context.Context, arg CountSkippedOccurrencesForSlotParams) (int64, error)
+	// Invariant C: a terminal run must NOT hold a lease.
+	CountTerminalWithLease(ctx context.Context) (int64, error)
+	// Invariant D: a terminal run MUST have exactly one terminal RunEvent.
+	CountTerminalWithoutTerminalEvent(ctx context.Context) (int64, error)
 	CreateAgentThread(ctx context.Context, arg CreateAgentThreadParams) (sql.Result, error)
 	CreateApplication(ctx context.Context, arg CreateApplicationParams) (sql.Result, error)
 	CreateAttachment(ctx context.Context, arg CreateAttachmentParams) (sql.Result, error)
+	// Admin login auditing (修复计划 §41): records success/failure without
+	// ever storing credentials.
+	CreateAuditLog(ctx context.Context, arg CreateAuditLogParams) error
 	CreateBinding(ctx context.Context, arg CreateBindingParams) (sql.Result, error)
 	CreateCategory(ctx context.Context, arg CreateCategoryParams) (sql.Result, error)
 	// ───────────────────────────────────────────────────────── conversation ──
@@ -67,6 +91,9 @@ type Querier interface {
 	CreateRun(ctx context.Context, arg CreateRunParams) (sql.Result, error)
 	CreateRunArtifact(ctx context.Context, arg CreateRunArtifactParams) error
 	CreateRunCommand(ctx context.Context, arg CreateRunCommandParams) (sql.Result, error)
+	// lease_epoch mirrors runs.lease_epoch at claim time (migration 0010):
+	// the reaper verifies an expired lease really belongs to the run's
+	// CURRENT epoch before recovering it.
 	CreateRunLease(ctx context.Context, arg CreateRunLeaseParams) error
 	// ─────────────────────────────────────────────────────────── automation ──
 	// Schedule / Occurrence / Delivery queries (0006_schedule_automation).
@@ -85,6 +112,9 @@ type Querier interface {
 	DeleteConversationRuns(ctx context.Context, conversationID sql.NullInt64) ([][]byte, error)
 	DeleteFavorite(ctx context.Context, arg DeleteFavoriteParams) error
 	DeleteLease(ctx context.Context, runID []byte) error
+	// Delete exactly one lease row, identified by token (used inside
+	// finalize/retry/recovery transactions; RowsAffected proves ownership).
+	DeleteLeaseByToken(ctx context.Context, arg DeleteLeaseByTokenParams) (sql.Result, error)
 	// A worker may only delete its own lease; a stale worker can never drop
 	// the new owner's lease row.
 	DeleteLeaseFenced(ctx context.Context, arg DeleteLeaseFencedParams) error
@@ -104,6 +134,7 @@ type Querier interface {
 	FailStuckDeliveries(ctx context.Context, arg FailStuckDeliveriesParams) (sql.Result, error)
 	FindBinding(ctx context.Context, arg FindBindingParams) (RuntimeBinding, error)
 	GetAgentThreadByConversation(ctx context.Context, conversationID uint64) (AgentThread, error)
+	GetAgentThreadByID(ctx context.Context, id []byte) (AgentThread, error)
 	GetApplicationByID(ctx context.Context, id uint64) (GetApplicationByIDRow, error)
 	GetApplicationBySlug(ctx context.Context, slug string) (GetApplicationBySlugRow, error)
 	GetAttachmentByID(ctx context.Context, id []byte) (RuntimeAttachment, error)
@@ -115,10 +146,13 @@ type Querier interface {
 	GetDefaultAgent(ctx context.Context) (GetDefaultAgentRow, error)
 	GetDeliveryExecutionByID(ctx context.Context, id []byte) (DeliveryExecution, error)
 	GetEnabledBinding(ctx context.Context, applicationID uint64) (RuntimeBinding, error)
+	// Reaper row lock: the lease is re-validated under lock inside the
+	// recovery transaction — a heartbeat that lands first wins the row.
+	GetExpiredLeaseForUpdate(ctx context.Context, runID []byte) (GetExpiredLeaseForUpdateRow, error)
 	GetFeishuIdentityByFeishuUserID(ctx context.Context, feishuUserID sql.NullString) (FeishuIdentity, error)
 	GetFeishuIdentityByLocalUser(ctx context.Context, userID uint64) (FeishuIdentity, error)
 	GetFeishuIdentityByOpenID(ctx context.Context, openID sql.NullString) (FeishuIdentity, error)
-	GetLease(ctx context.Context, runID []byte) (RunLease, error)
+	GetLease(ctx context.Context, runID []byte) (GetLeaseRow, error)
 	// Ownership + state check happens per id in Go (≤8 per run, Aily limit).
 	GetPendingOwnedAttachment(ctx context.Context, arg GetPendingOwnedAttachmentParams) (RuntimeAttachment, error)
 	// ───────────────────────────────────────────────────────────── catalog ──
@@ -126,12 +160,20 @@ type Querier interface {
 	GetRunArtifactByID(ctx context.Context, id []byte) (RunArtifact, error)
 	GetRunByID(ctx context.Context, id []byte) (Run, error)
 	GetRunCommandByID(ctx context.Context, id []byte) (RunCommand, error)
+	// Lock the run row inside an ownership-verified transaction (finalize /
+	// retry / recovery). Returns the lease_epoch so the caller can verify
+	// the fence under the lock.
+	GetRunForUpdate(ctx context.Context, id []byte) (GetRunForUpdateRow, error)
 	GetRunLeaseEpoch(ctx context.Context, id []byte) (uint64, error)
 	GetRunStatus(ctx context.Context, id []byte) (string, error)
 	GetScheduleByID(ctx context.Context, id uint64) (Schedule, error)
 	GetScheduleDeliveryByID(ctx context.Context, id uint64) (ScheduleDelivery, error)
 	GetScheduleOccurrenceByID(ctx context.Context, id uint64) (ScheduleOccurrence, error)
 	GetScheduleOccurrenceBySlot(ctx context.Context, arg GetScheduleOccurrenceBySlotParams) (ScheduleOccurrence, error)
+	// Admission lock (修复计划 §35): serializes concurrent admissions for the
+	// same schedule so two schedulers can never both observe "no active
+	// occurrence" and create parallel runs (write-skew guard).
+	GetScheduleRowForUpdate(ctx context.Context, id uint64) (sql.Result, error)
 	GetUserByID(ctx context.Context, id uint64) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	HasActiveOccurrence(ctx context.Context, scheduleID uint64) (int64, error)
@@ -144,6 +186,7 @@ type Querier interface {
 	ListActiveProviders(ctx context.Context) ([]Provider, error)
 	// Occurrence admission queue (overlap=queue semantics): pending rows are
 	// converted into runs once the schedule has no active execution.
+	// FIFO per schedule: scheduled_at first, id as the tiebreaker.
 	ListAdmissiblePendingOccurrences(ctx context.Context, limit int32) ([]ScheduleOccurrence, error)
 	ListAllRunEvents(ctx context.Context, runID []byte) ([]RunEvent, error)
 	// show_all lets staff bypass the SQL pre-filter; the authoritative
@@ -186,6 +229,9 @@ type Querier interface {
 	MarkOccurrenceRunningByRun(ctx context.Context, runID sql.NullString) (sql.Result, error)
 	MarkOccurrenceStatus(ctx context.Context, arg MarkOccurrenceStatusParams) (sql.Result, error)
 	MarkOutboxPublished(ctx context.Context, id uint64) error
+	// Invariant G: the outbox relay must not lag (pending events older than
+	// the threshold mean dispatch is stuck).
+	OldestPendingOutboxAgeSeconds(ctx context.Context) (int64, error)
 	// Crash recovery: rows stuck in 'sending' (worker died before ACK/commit)
 	// return to pending when their lease lapsed.
 	ReclaimStuckDeliveries(ctx context.Context, updatedAt time.Time) (sql.Result, error)

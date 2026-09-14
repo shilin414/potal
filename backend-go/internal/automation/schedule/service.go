@@ -246,14 +246,14 @@ func (s *Service) replaceDeliveries(ctx context.Context, q db.Querier, scheduleI
 			contentMode = "summary"
 		}
 		if _, err := q.UpsertScheduleDelivery(ctx, db.UpsertScheduleDeliveryParams{
-			ScheduleID:          uint64(scheduleID),
-			Channel:             "feishu",
-			SenderIdentityMode:  "owner_user",
-			TargetType:          d.TargetType,
-			TargetID:            d.TargetID,
-			TargetName:          d.TargetName,
-			ContentMode:         contentMode,
-			Enabled:             true,
+			ScheduleID:         uint64(scheduleID),
+			Channel:            "feishu",
+			SenderIdentityMode: "owner_user",
+			TargetType:         d.TargetType,
+			TargetID:           d.TargetID,
+			TargetName:         d.TargetName,
+			ContentMode:        contentMode,
+			Enabled:            true,
 		}); err != nil {
 			return fmt.Errorf("upsert delivery: %w", err)
 		}

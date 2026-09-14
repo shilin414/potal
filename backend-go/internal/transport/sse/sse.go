@@ -114,13 +114,43 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 	if err != nil {
 		return
 	}
+	replayedTerminal := false
 	for _, ev := range events {
 		if !writeFrame(ev.Sequence, ev.EventType, ev.Payload, false) {
 			return
 		}
 		lastReplayed = ev.Sequence
+		if execution.IsTerminalEventName(ev.EventType) {
+			replayedTerminal = true
+		}
 	}
-	if execution.IsTerminal(run.Status) || msgCh == nil {
+	if execution.IsTerminal(run.Status) {
+		// Belt-and-suspenders (修复计划 §19 fallback): the finalize
+		// transaction guarantees terminal CAS + terminal event together;
+		// if a LEGACY row predating that transaction is terminal without
+		// a terminal event, synthesize the frame from the run status so
+		// reconnecting clients still terminate their stream instead of
+		// hammering a stream that closes immediately.
+		if !replayedTerminal {
+			synthetic := map[string]any{"status": run.Status}
+			if t, ok := run.Output["text"].(string); ok && t != "" {
+				synthetic["text"] = t
+			}
+			if run.ErrorCode != "" {
+				synthetic["error_code"] = run.ErrorCode
+			}
+			if run.ErrorMessage != "" {
+				synthetic["error_message"] = run.ErrorMessage
+			}
+			eventType := execution.EventRunCompleted
+			if run.Status == execution.StatusFailed || run.Status == execution.StatusInterrupted {
+				eventType = execution.EventRunFailed
+			}
+			writeFrame(0, eventType, synthetic, true)
+		}
+		return
+	}
+	if msgCh == nil {
 		return
 	}
 

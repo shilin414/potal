@@ -105,6 +105,27 @@ func main() {
 		}()
 	}
 
+	// Provider limiter degraded metric (修复计划 §51): expose the Redis
+	// GCRA fallback state so a Redis outage is visible on the dashboard.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-runCtx.Done():
+				return
+			case <-ticker.C:
+				degraded := 0.0
+				if a.AilyExecutor.ChatsL.Degraded() || a.AilyExecutor.PollsL.Degraded() || a.AilyExecutor.ArtifactsL.Degraded() {
+					degraded = 1.0
+				}
+				a.Metrics.ProviderLimiterDegraded.Set(degraded)
+			}
+		}
+	}()
+
 	<-runCtx.Done()
 	logger.Info("worker shutting down (in-flight runs keep their leases; the reaper recovers orphans)")
 	wg.Wait()

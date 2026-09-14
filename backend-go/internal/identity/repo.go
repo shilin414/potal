@@ -3,12 +3,14 @@ package identity
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
 
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/crypto"
+	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
 )
 
 // Repo persists users and Feishu identities through sqlc.
@@ -197,7 +199,10 @@ func (r *Repo) UpdatePassword(ctx context.Context, userID int64, hash string) er
 	return r.q.UpdateUserPassword(ctx, db.UpdateUserPasswordParams{PasswordHash: hash, ID: uint64(userID)})
 }
 
-// VerifyLocalAdmin checks username + Argon2id password.
+// VerifyLocalAdmin checks username + Argon2id password AND requires the
+// account to be staff (修复计划 §39-40: a non-staff local account must
+// never reach the admin login, nor the legacy transition endpoint —
+// Feishu SSO is the only entry for normal users).
 func (r *Repo) VerifyLocalAdmin(ctx context.Context, username, password string) (*User, error) {
 	row, err := r.q.GetUserByUsername(ctx, username)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -207,6 +212,12 @@ func (r *Repo) VerifyLocalAdmin(ctx context.Context, username, password string) 
 		return nil, err
 	}
 	u := userFromRow(row)
+	if !u.IsStaff {
+		// Local password login is admin-only (staff); normal users are
+		// Feishu OAuth only — reject before touching the hash so timing
+		// also cannot distinguish staff from non-staff accounts.
+		return nil, ErrNotFound
+	}
 	if !u.PasswordSet {
 		return nil, ErrNotFound
 	}
@@ -227,7 +238,26 @@ func (r *Repo) VerifyLocalAdmin(ctx context.Context, username, password string) 
 	return u, nil
 }
 
+// WriteAuditLog records an admin-auth audit event (修复计划 §41). It
+// never stores credentials and never fails the caller's request: auditing
+// is observability, not an auth dependency.
+func (r *Repo) WriteAuditLog(ctx context.Context, userID *int64, action, resourceID string, detail map[string]any) {
+	raw, _ := json.Marshal(detail)
+	_ = r.q.CreateAuditLog(ctx, db.CreateAuditLogParams{
+		UserID:     nullInt64(userID),
+		Action:     action,
+		ResourceID: resourceID,
+		Detail:     dbtypes.JSONText(raw),
+	})
+}
+
 func nullString(s string) sql.NullString { return sql.NullString{String: s, Valid: s != ""} }
+func nullInt64(v *int64) sql.NullInt64 {
+	if v == nil {
+		return sql.NullInt64{}
+	}
+	return sql.NullInt64{Int64: *v, Valid: true}
+}
 func nullTime(t *time.Time) sql.NullTime {
 	if t == nil {
 		return sql.NullTime{}

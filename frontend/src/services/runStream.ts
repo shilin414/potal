@@ -4,8 +4,10 @@
  * SSE is transport only (architecture doc §61/§63): the stream closes or
  * breaks without implying run failure. On reconnect the gateway replays
  * persisted events from TiDB first, so the consumer can safely re-render
- * from sequence 0. Terminal events (run.completed/failed/interrupted)
- * end the subscription.
+ * from sequence 0. Terminal events (run.completed/failed/cancelled) end
+ * the subscription — run.retrying is deliberately NON-terminal: a
+ * requeued attempt keeps the same stream alive (Execution Correctness
+ * Closure).
  */
 import type { RunEventRecord } from '@/services/runApi';
 
@@ -17,7 +19,7 @@ export interface RunStreamHandlers {
 }
 
 const TERMINAL_EVENTS = new Set([
-  'run.completed', 'run.failed', 'run.interrupted',
+  'run.completed', 'run.failed', 'run.cancelled',
 ]);
 
 export function openRunStream(

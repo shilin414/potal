@@ -8,9 +8,9 @@ import (
 	"sort"
 	"strings"
 
+	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
 	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
-	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	openapi_types "github.com/oapi-codegen/runtime/types"
 )
 

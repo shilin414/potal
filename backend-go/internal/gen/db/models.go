@@ -267,6 +267,7 @@ type RunLease struct {
 	AcquiredAt  time.Time
 	HeartbeatAt sql.NullTime
 	ExpiresAt   time.Time
+	LeaseEpoch  uint64
 }
 
 type RuntimeAttachment struct {

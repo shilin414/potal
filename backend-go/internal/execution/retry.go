@@ -1,0 +1,102 @@
+package execution
+
+import (
+	"context"
+	"encoding/json"
+
+	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
+	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+)
+
+// RetryOwnedRun requeues a running run for another attempt as ONE TiDB
+// transaction (修复计划 §19-20, Phase 2):
+//
+//  1. verify ownership (run row locked FOR UPDATE, epoch checked)
+//  2. CAS runs running → queued
+//  3. append run.retrying (NON-terminal — SSE stays open, the frontend
+//     keeps streaming; 评测 §八 lifecycle semantics)
+//  4. INSERT outbox run.dispatch (wakes a worker for the next attempt)
+//  5. DELETE the caller's own lease row
+//     COMMIT
+//
+// Idempotency: a run already requeued by the same owner (duplicate
+// dispatch) or already terminal is a no-op returning nil. A run owned by
+// someone else returns ErrLostOwnership — a stale worker can never
+// requeue the new owner's run, never create a duplicate dispatch and
+// never drop the new owner's lease (评测 §九).
+func (s *Service) RetryOwnedRun(ctx context.Context, run *Run, own ExecutionOwnership, reason string) error {
+	if !own.Valid() {
+		return ErrLostOwnership
+	}
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := db.New(tx)
+
+	// 1. Ownership verification under the row lock.
+	row, terminal, err := verifyOwnershipTx(ctx, tx, own)
+	if err != nil {
+		return err
+	}
+	if terminal {
+		return nil // already finalized — nothing to retry
+	}
+	if row.Status == StatusQueued {
+		// Already requeued (this owner retried before, duplicate message):
+		// the outbox row from the first retry still dispatches it.
+		return nil
+	}
+
+	// 2. Requeue CAS (fenced by the verified epoch).
+	if _, err := q.RequeueRunFenced(ctx, db.RequeueRunFencedParams{
+		ID:         own.RunID.Bytes(),
+		LeaseEpoch: own.LeaseEpoch,
+	}); err != nil {
+		return err
+	}
+
+	// 3. run.retrying — deliberately NOT terminal (修复计划 §15-18).
+	// Epoch 0: ownership was verified under the row lock in step 1; the
+	// requeue below flips status to queued so the fenced lock predicate
+	// (status='running') must NOT be re-applied here.
+	sequence, err := appendEventTx(ctx, tx, own.RunID, 0, EventRunRetrying, map[string]any{
+		"attempt":      row.Attempt,
+		"max_attempts": row.MaxAttempts,
+		"reason":       reason,
+		"worker_id":    own.WorkerID,
+	})
+	if err != nil {
+		return err
+	}
+
+	// 4. Re-dispatch through the outbox so the queue wakes a worker.
+	payload, _ := json.Marshal(map[string]any{"run_id": own.RunID.String(), "provider": run.Provider})
+	if _, err := q.CreateOutboxEvent(ctx, db.CreateOutboxEventParams{
+		Aggregate:   "run",
+		AggregateID: own.RunID.Bytes(),
+		EventType:   "run.dispatch",
+		Payload:     dbtypes.JSONText(payload),
+	}); err != nil {
+		return err
+	}
+
+	// 5. Lease cleanup — same transaction.
+	_, _ = q.DeleteLeaseByToken(ctx, db.DeleteLeaseByTokenParams{
+		RunID: own.RunID.Bytes(), LeaseToken: own.LeaseToken.Bytes(),
+	})
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	s.publishLive(ctx, own.RunID, sequence, EventRunRetrying, map[string]any{
+		"attempt":      row.Attempt,
+		"max_attempts": row.MaxAttempts,
+		"reason":       reason,
+		"worker_id":    own.WorkerID,
+	})
+	return nil
+}

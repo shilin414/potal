@@ -1,0 +1,83 @@
+name: backend
+
+on:
+  push:
+    branches: [dev, main]
+    paths: ['backend-go/**', '.github/workflows/backend.yml']
+  pull_request:
+    paths: ['backend-go/**', '.github/workflows/backend.yml']
+
+defaults:
+  run:
+    working-directory: backend-go
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend-go/go.mod
+          cache-dependency-path: backend-go/go.sum
+
+      - name: gofmt check
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test (unit; integration gated by env)
+        run: go test ./... -count=1
+
+  # Integration gate: real TiDB + Redis via Docker (修复计划 §78).
+  # STUDIO_TEST_TIDB / STUDIO_TEST_REDIS opt the integration suite in.
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      tidb:
+        image: pingcap/tidb:v8.0.0
+        ports: ['4000:4000']
+        options: >-
+          --health-cmd "curl -f http://localhost:8301/status || exit 1"
+          --health-interval 10s --health-timeout 5s --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      STUDIO_TEST_TIDB: '1'
+      STUDIO_TEST_REDIS: '1'
+      DB_HOST: 127.0.0.1
+      DB_PORT: 4000
+      DB_NAME: xiaoan3_go
+      DB_USER: root
+      DB_PASSWORD: ''
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: 6379
+      REDIS_DB: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: backend-go/go.mod
+          cache-dependency-path: backend-go/go.sum
+      - name: wait for tidb
+        run: |
+          for i in $(seq 1 60); do
+            if mysql -h 127.0.0.1 -P 4000 -u root -e "SELECT 1" >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          mysql -h 127.0.0.1 -P 4000 -u root -e "CREATE DATABASE IF NOT EXISTS xiaoan3_go"
+      - name: apply migrations
+        working-directory: backend-go
+        run: go run ./cmd/api -migrate
+      - name: integration tests
+        working-directory: backend-go
+        run: go test ./tests/integration/... -count=1 -v

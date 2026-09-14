@@ -81,30 +81,30 @@ type Delivery struct {
 // DeliveryExecution is the per-target send state of one occurrence
 // (independent of the Run's AI outcome — Run ≠ Delivery).
 type DeliveryExecution struct {
-	ID           string     `json:"id"`
-	OccurrenceID int64      `json:"occurrence_id"`
-	ScheduleDeliveryID int64 `json:"schedule_delivery_id"`
-	TargetType   string     `json:"target_type"`
-	TargetID     string     `json:"target_id"`
-	Status       string     `json:"status"`
-	Attempt      int        `json:"attempt"`
-	ErrorCode    string     `json:"error_code,omitempty"`
-	ErrorMessage string     `json:"error_message,omitempty"`
-	SentAt       *time.Time `json:"sent_at"`
+	ID                 string     `json:"id"`
+	OccurrenceID       int64      `json:"occurrence_id"`
+	ScheduleDeliveryID int64      `json:"schedule_delivery_id"`
+	TargetType         string     `json:"target_type"`
+	TargetID           string     `json:"target_id"`
+	Status             string     `json:"status"`
+	Attempt            int        `json:"attempt"`
+	ErrorCode          string     `json:"error_code,omitempty"`
+	ErrorMessage       string     `json:"error_message,omitempty"`
+	SentAt             *time.Time `json:"sent_at"`
 }
 
 // Occurrence is one scheduled time slot of a schedule.
 type Occurrence struct {
-	ID          int64      `json:"id"`
-	ScheduleID  int64      `json:"schedule_id"`
-	ScheduledAt time.Time  `json:"scheduled_at"`
-	EnqueuedAt  *time.Time `json:"enqueued_at"`
-	AdmittedAt  *time.Time `json:"admitted_at"`
-	RunID       string     `json:"run_id,omitempty"`
-	Status      string     `json:"status"`
-	TriggeredAt *time.Time `json:"triggered_at"`
-	FinishedAt  *time.Time `json:"finished_at"`
-	CreatedAt   time.Time  `json:"created_at"`
+	ID          int64               `json:"id"`
+	ScheduleID  int64               `json:"schedule_id"`
+	ScheduledAt time.Time           `json:"scheduled_at"`
+	EnqueuedAt  *time.Time          `json:"enqueued_at"`
+	AdmittedAt  *time.Time          `json:"admitted_at"`
+	RunID       string              `json:"run_id,omitempty"`
+	Status      string              `json:"status"`
+	TriggeredAt *time.Time          `json:"triggered_at"`
+	FinishedAt  *time.Time          `json:"finished_at"`
+	CreatedAt   time.Time           `json:"created_at"`
 	Deliveries  []DeliveryExecution `json:"deliveries,omitempty"`
 }
 

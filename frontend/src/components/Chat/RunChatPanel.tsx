@@ -476,7 +476,8 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
           <div className={`run-chat-bubble ${isUser ? 'run-chat-bubble--user' : ''}`}>
             <div className="run-chat-bubble__header">
               <span className="font-medium chat-sender-name" title={senderLabel}>{senderLabel}</span>
-              {msg.status === 'streaming' && <span className="run-chat-dotting">生成中…</span>}
+              {msg.status === 'streaming' && !msg.retryNotice && <span className="run-chat-dotting">生成中…</span>}
+              {msg.status === 'streaming' && msg.retryNotice && <span className="run-chat-dotting">{msg.retryNotice}</span>}
               {msg.status === 'failed' && <span className="run-chat-error-tag">失败</span>}
               {!selectMode && isShareable(msg) && (
                 <Tooltip title="转发这条消息">

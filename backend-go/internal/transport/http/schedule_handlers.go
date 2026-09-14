@@ -23,28 +23,28 @@ type deliveryRecord struct {
 }
 
 type scheduleRecord struct {
-	ID                     int64                    `json:"id"`
-	Name                   string                   `json:"name"`
-	Description            string                   `json:"description"`
-	ApplicationID          int64                    `json:"application_id"`
-	Prompt                 string                   `json:"prompt"`
-	ScheduleType           string                   `json:"schedule_type"`
-	CronExpression         string                   `json:"cron_expression"`
-	Timezone               string                   `json:"timezone"`
-	RunAt                  *string                  `json:"run_at"`
-	Trigger                schedule.TriggerConfig   `json:"trigger"`
-	Enabled                bool                     `json:"enabled"`
-	ConversationPolicy     string                   `json:"conversation_policy"`
-	OverlapPolicy          string                   `json:"overlap_policy"`
-	MisfirePolicy          string                   `json:"misfire_policy"`
-	DeadlinePolicy         string                   `json:"deadline_policy"`
-	ExecutionWindowSeconds int                      `json:"execution_window_seconds"`
-	NextRunAt              *string                  `json:"next_run_at"`
-	LastRunAt              *string                  `json:"last_run_at"`
-	CreatedAt              string                   `json:"created_at"`
-	UpdatedAt              string                   `json:"updated_at"`
-	LastOccurrence         *schedule.Occurrence `json:"last_occurrence,omitempty"`
-	Deliveries             []deliveryRecord     `json:"deliveries,omitempty"`
+	ID                     int64                  `json:"id"`
+	Name                   string                 `json:"name"`
+	Description            string                 `json:"description"`
+	ApplicationID          int64                  `json:"application_id"`
+	Prompt                 string                 `json:"prompt"`
+	ScheduleType           string                 `json:"schedule_type"`
+	CronExpression         string                 `json:"cron_expression"`
+	Timezone               string                 `json:"timezone"`
+	RunAt                  *string                `json:"run_at"`
+	Trigger                schedule.TriggerConfig `json:"trigger"`
+	Enabled                bool                   `json:"enabled"`
+	ConversationPolicy     string                 `json:"conversation_policy"`
+	OverlapPolicy          string                 `json:"overlap_policy"`
+	MisfirePolicy          string                 `json:"misfire_policy"`
+	DeadlinePolicy         string                 `json:"deadline_policy"`
+	ExecutionWindowSeconds int                    `json:"execution_window_seconds"`
+	NextRunAt              *string                `json:"next_run_at"`
+	LastRunAt              *string                `json:"last_run_at"`
+	CreatedAt              string                 `json:"created_at"`
+	UpdatedAt              string                 `json:"updated_at"`
+	LastOccurrence         *schedule.Occurrence   `json:"last_occurrence,omitempty"`
+	Deliveries             []deliveryRecord       `json:"deliveries,omitempty"`
 }
 
 func toScheduleRecord(s *schedule.Schedule, last *schedule.Occurrence) scheduleRecord {
@@ -80,20 +80,20 @@ func toScheduleRecord(s *schedule.Schedule, last *schedule.Occurrence) scheduleR
 
 // scheduleUpsertBody mirrors ScheduleUpsertRequest in the contract.
 type scheduleUpsertBody struct {
-	Name                   *string               `json:"name"`
-	Description            *string               `json:"description"`
-	ApplicationID          *int64                `json:"application_id"`
-	Prompt                 *string               `json:"prompt"`
-	ScheduleType           *string               `json:"schedule_type"`
-	Timezone               *string               `json:"timezone"`
-	RunAt                  *time.Time            `json:"run_at"`
+	Name                   *string                 `json:"name"`
+	Description            *string                 `json:"description"`
+	ApplicationID          *int64                  `json:"application_id"`
+	Prompt                 *string                 `json:"prompt"`
+	ScheduleType           *string                 `json:"schedule_type"`
+	Timezone               *string                 `json:"timezone"`
+	RunAt                  *time.Time              `json:"run_at"`
 	Trigger                *schedule.TriggerConfig `json:"trigger"`
-	ConversationPolicy     *string               `json:"conversation_policy"`
-	OverlapPolicy          *string               `json:"overlap_policy"`
-	MisfirePolicy          *string               `json:"misfire_policy"`
-	DeadlinePolicy         *string               `json:"deadline_policy"`
-	ExecutionWindowSeconds *int                  `json:"execution_window_seconds"`
-	Deliveries             *[]deliveryInput      `json:"deliveries"`
+	ConversationPolicy     *string                 `json:"conversation_policy"`
+	OverlapPolicy          *string                 `json:"overlap_policy"`
+	MisfirePolicy          *string                 `json:"misfire_policy"`
+	DeadlinePolicy         *string                 `json:"deadline_policy"`
+	ExecutionWindowSeconds *int                    `json:"execution_window_seconds"`
+	Deliveries             *[]deliveryInput        `json:"deliveries"`
 }
 
 type deliveryInput struct {

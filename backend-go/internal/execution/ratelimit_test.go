@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	goredis "github.com/redis/go-redis/v9"
+
 	"github.com/creation-agent-studio/backend-go/internal/platform/config"
 	"github.com/creation-agent-studio/backend-go/internal/platform/redisx"
 )
@@ -77,5 +79,59 @@ func TestQueueStreamKeyNamespacing(t *testing.T) {
 	}
 	if got := rdb.RunEventsChannel("abc"); got != "xiaoan3:run:abc:events" {
 		t.Fatalf("pubsub channel = %q (must match the reference implementation)", got)
+	}
+}
+
+// TestLimiterRedisOutageLocalFallback (T13, 修复计划 §65): with Redis
+// unreachable the limiter must degrade to the in-process GCRA — never
+// fail open — and report degraded=true.
+func TestLimiterRedisOutageLocalFallback(t *testing.T) {
+	// A client pointed at an address with (almost certainly) nothing
+	// listening on it. Built without the Open() ping so the outage is
+	// discovered lazily by the limiter itself — exactly the production
+	// failure shape (Redis dies mid-flight).
+	dead := goredis.NewClient(&goredis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: 100 * time.Millisecond,
+		MaxRetries:  1,
+	})
+	defer func() { _ = dead.Close() }()
+	rdb := redisx.NewWithPrefix("itest_outage")
+	rdb.Client = dead
+
+	limiter := NewRateLimiter(rdb, "itest:outage:gcra", 5, time.Second)
+	// 20 CONCURRENT Allow() calls (T13 spec): they all fail their Redis
+	// dial at (nearly) the same instant and fall back to the in-process
+	// GCRA — which must admit at most the burst capacity of 5.
+	const attempts = 20
+	var allowed atomic.Int64
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < attempts; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			ok, _, err := limiter.Allow(context.Background())
+			if err != nil {
+				t.Errorf("Allow must not error on Redis outage (local fallback): %v", err)
+				return
+			}
+			if ok {
+				allowed.Add(1)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if n := allowed.Load(); n > 5 {
+		t.Fatalf("local fallback admitted %d/%d instantly, want <= 5 (fail-open regression)", n, attempts)
+	}
+	if n := allowed.Load(); n == 0 {
+		t.Fatal("local fallback admitted nothing — GCRA burst capacity broken")
+	}
+	if !limiter.Degraded() {
+		t.Fatal("Degraded() = false during a Redis outage")
 	}
 }

@@ -52,11 +52,11 @@ type App struct {
 	AilyExecutor *aily.Executor
 
 	// Schedule automation (fourth role: studio-scheduler).
-	Schedules         *schedule.Service
-	Scheduler         *scheduler.Scheduler
-	DeliveryDispatch  *delivery.Dispatcher
-	DeliverySender    delivery.Sender
-	DeliveryLimiter   *execution.RateLimiter
+	Schedules        *schedule.Service
+	Scheduler        *scheduler.Scheduler
+	DeliveryDispatch *delivery.Dispatcher
+	DeliverySender   delivery.Sender
+	DeliveryLimiter  *execution.RateLimiter
 }
 
 // Build constructs the graph; ctx bounds connection setup.
@@ -136,7 +136,10 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 	registry.Register(ailyAdapter)
 
 	ailyExecutor := &aily.Executor{
-		Svc:     runs,
+		// Owned: the ONLY write surface the executor holds — every
+		// canonical write is ownership-fenced (Execution Correctness
+		// Closure; there is no unfenced path reachable from the executor).
+		Owned:   runs.WorkerOwned(),
 		Adapter: ailyAdapter,
 		Auth:    ailyAuth,
 		ChatsL: execution.NewRateLimiter(rdb, rdb.Key("rate", "aily", "chats"),
@@ -146,7 +149,6 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 		PollBackoff: cfg.Aily.PollBackoff,
 		Log:         log,
 		Metrics:     metrics,
-		DB:          dbh,
 	}
 
 	// Schedule automation wiring: scheduler domain + delivery fan-out.

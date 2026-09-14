@@ -49,3 +49,9 @@ WHERE id = ?;
 
 -- name: RotateRefreshToken :exec
 UPDATE feishu_identities SET refresh_token_enc = ?, refresh_token_expires_at = ? WHERE id = ?;
+
+-- name: CreateAuditLog :exec
+-- Admin login auditing (修复计划 §41): records success/failure without
+-- ever storing credentials.
+INSERT INTO audit_logs (user_id, action, resource, resource_id, detail)
+VALUES (?, ?, 'auth', ?, ?);

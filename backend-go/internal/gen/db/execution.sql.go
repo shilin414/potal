@@ -178,12 +178,125 @@ func (q *Queries) CountPendingOutbox(ctx context.Context) (int64, error) {
 	return n, err
 }
 
+const countQueuedWithLease = `-- name: CountQueuedWithLease :one
+SELECT COUNT(*) AS n FROM runs r
+JOIN run_leases l ON l.run_id = r.id
+WHERE r.status = 'queued'
+`
+
+// Invariant B: a queued run must NOT hold a lease.
+func (q *Queries) CountQueuedWithLease(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countQueuedWithLease)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
 const countRunEvents = `-- name: CountRunEvents :one
 SELECT COUNT(*) AS n FROM run_events WHERE run_id = ?
 `
 
 func (q *Queries) CountRunEvents(ctx context.Context, runID []byte) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countRunEvents, runID)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
+const countRunningLeaseEpochMismatch = `-- name: CountRunningLeaseEpochMismatch :one
+SELECT COUNT(*) AS n FROM runs r
+JOIN run_leases l ON l.run_id = r.id
+WHERE r.status = 'running' AND r.lease_epoch != l.lease_epoch
+`
+
+// Invariant E: a running run's lease_epoch must equal its lease row's.
+func (q *Queries) CountRunningLeaseEpochMismatch(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countRunningLeaseEpochMismatch)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
+const countRunningWithoutLease = `-- name: CountRunningWithoutLease :one
+
+SELECT COUNT(*) AS n FROM runs r
+LEFT JOIN run_leases l ON l.run_id = r.id
+WHERE r.status = 'running' AND l.run_id IS NULL
+`
+
+// ──────────────────────────────────────────────── invariant checks ──
+// Execution invariant checker queries (修复计划 §43-49): detect only,
+// never auto-repair.
+// Invariant A: a running run MUST have a lease row.
+func (q *Queries) CountRunningWithoutLease(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countRunningWithoutLease)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
+const countScheduleOverlapViolations = `-- name: CountScheduleOverlapViolations :many
+SELECT o.schedule_id, COUNT(*) AS n
+FROM schedule_occurrences o
+JOIN schedules s ON s.id = o.schedule_id
+WHERE s.overlap_policy = 'queue' AND o.status IN ('queued', 'running')
+GROUP BY o.schedule_id
+HAVING COUNT(*) > 1
+`
+
+type CountScheduleOverlapViolationsRow struct {
+	ScheduleID uint64
+	N          int64
+}
+
+// Invariant F: overlap=queue schedules must never run in parallel.
+// Returns one row per violating schedule.
+func (q *Queries) CountScheduleOverlapViolations(ctx context.Context) ([]CountScheduleOverlapViolationsRow, error) {
+	rows, err := q.db.QueryContext(ctx, countScheduleOverlapViolations)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CountScheduleOverlapViolationsRow{}
+	for rows.Next() {
+		var i CountScheduleOverlapViolationsRow
+		if err := rows.Scan(&i.ScheduleID, &i.N); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const countTerminalWithLease = `-- name: CountTerminalWithLease :one
+SELECT COUNT(*) AS n FROM runs r
+JOIN run_leases l ON l.run_id = r.id
+WHERE r.status IN ('succeeded', 'failed', 'cancelled')
+`
+
+// Invariant C: a terminal run must NOT hold a lease.
+func (q *Queries) CountTerminalWithLease(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countTerminalWithLease)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
+const countTerminalWithoutTerminalEvent = `-- name: CountTerminalWithoutTerminalEvent :one
+SELECT COUNT(*) AS n FROM runs r
+LEFT JOIN run_events e ON e.run_id = r.id AND e.event_type IN ('run.completed', 'run.failed', 'run.cancelled')
+WHERE r.status IN ('succeeded', 'failed', 'cancelled') AND e.id IS NULL
+`
+
+// Invariant D: a terminal run MUST have exactly one terminal RunEvent.
+func (q *Queries) CountTerminalWithoutTerminalEvent(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countTerminalWithoutTerminalEvent)
 	var n int64
 	err := row.Scan(&n)
 	return n, err
@@ -356,22 +469,27 @@ func (q *Queries) CreateRunCommand(ctx context.Context, arg CreateRunCommandPara
 }
 
 const createRunLease = `-- name: CreateRunLease :exec
-INSERT INTO run_leases (run_id, worker_id, lease_token, heartbeat_at, expires_at)
-VALUES (?, ?, ?, CURRENT_TIMESTAMP(3), ?)
+INSERT INTO run_leases (run_id, worker_id, lease_token, lease_epoch, heartbeat_at, expires_at)
+VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(3), ?)
 `
 
 type CreateRunLeaseParams struct {
 	RunID      []byte
 	WorkerID   string
 	LeaseToken []byte
+	LeaseEpoch uint64
 	ExpiresAt  time.Time
 }
 
+// lease_epoch mirrors runs.lease_epoch at claim time (migration 0010):
+// the reaper verifies an expired lease really belongs to the run's
+// CURRENT epoch before recovering it.
 func (q *Queries) CreateRunLease(ctx context.Context, arg CreateRunLeaseParams) error {
 	_, err := q.db.ExecContext(ctx, createRunLease,
 		arg.RunID,
 		arg.WorkerID,
 		arg.LeaseToken,
+		arg.LeaseEpoch,
 		arg.ExpiresAt,
 	)
 	return err
@@ -393,6 +511,21 @@ DELETE FROM run_leases WHERE run_id = ?
 func (q *Queries) DeleteLease(ctx context.Context, runID []byte) error {
 	_, err := q.db.ExecContext(ctx, deleteLease, runID)
 	return err
+}
+
+const deleteLeaseByToken = `-- name: DeleteLeaseByToken :execresult
+DELETE FROM run_leases WHERE run_id = ? AND lease_token = ?
+`
+
+type DeleteLeaseByTokenParams struct {
+	RunID      []byte
+	LeaseToken []byte
+}
+
+// Delete exactly one lease row, identified by token (used inside
+// finalize/retry/recovery transactions; RowsAffected proves ownership).
+func (q *Queries) DeleteLeaseByToken(ctx context.Context, arg DeleteLeaseByTokenParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, deleteLeaseByToken, arg.RunID, arg.LeaseToken)
 }
 
 const deleteLeaseFenced = `-- name: DeleteLeaseFenced :exec
@@ -509,14 +642,60 @@ func (q *Queries) GetAttachmentByID(ctx context.Context, id []byte) (RuntimeAtta
 	return i, err
 }
 
+const getExpiredLeaseForUpdate = `-- name: GetExpiredLeaseForUpdate :one
+SELECT id, run_id, worker_id, lease_token, lease_epoch, acquired_at, heartbeat_at, expires_at
+FROM run_leases
+WHERE run_id = ? AND expires_at <= CURRENT_TIMESTAMP(3)
+FOR UPDATE
+`
+
+type GetExpiredLeaseForUpdateRow struct {
+	ID          uint64
+	RunID       []byte
+	WorkerID    string
+	LeaseToken  []byte
+	LeaseEpoch  uint64
+	AcquiredAt  time.Time
+	HeartbeatAt sql.NullTime
+	ExpiresAt   time.Time
+}
+
+// Reaper row lock: the lease is re-validated under lock inside the
+// recovery transaction — a heartbeat that lands first wins the row.
+func (q *Queries) GetExpiredLeaseForUpdate(ctx context.Context, runID []byte) (GetExpiredLeaseForUpdateRow, error) {
+	row := q.db.QueryRowContext(ctx, getExpiredLeaseForUpdate, runID)
+	var i GetExpiredLeaseForUpdateRow
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.WorkerID,
+		&i.LeaseToken,
+		&i.LeaseEpoch,
+		&i.AcquiredAt,
+		&i.HeartbeatAt,
+		&i.ExpiresAt,
+	)
+	return i, err
+}
+
 const getLease = `-- name: GetLease :one
 SELECT id, run_id, worker_id, lease_token, acquired_at, heartbeat_at, expires_at
 FROM run_leases WHERE run_id = ?
 `
 
-func (q *Queries) GetLease(ctx context.Context, runID []byte) (RunLease, error) {
+type GetLeaseRow struct {
+	ID          uint64
+	RunID       []byte
+	WorkerID    string
+	LeaseToken  []byte
+	AcquiredAt  time.Time
+	HeartbeatAt sql.NullTime
+	ExpiresAt   time.Time
+}
+
+func (q *Queries) GetLease(ctx context.Context, runID []byte) (GetLeaseRow, error) {
 	row := q.db.QueryRowContext(ctx, getLease, runID)
-	var i RunLease
+	var i GetLeaseRow
 	err := row.Scan(
 		&i.ID,
 		&i.RunID,
@@ -664,6 +843,41 @@ func (q *Queries) GetRunCommandByID(ctx context.Context, id []byte) (RunCommand,
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.ResolvedAt,
+	)
+	return i, err
+}
+
+const getRunForUpdate = `-- name: GetRunForUpdate :one
+SELECT id, status, lease_epoch, attempt, max_attempts, trigger_type, trigger_id, conversation_id
+FROM runs WHERE id = ? FOR UPDATE
+`
+
+type GetRunForUpdateRow struct {
+	ID             []byte
+	Status         string
+	LeaseEpoch     uint64
+	Attempt        uint32
+	MaxAttempts    uint32
+	TriggerType    string
+	TriggerID      sql.NullInt64
+	ConversationID sql.NullInt64
+}
+
+// Lock the run row inside an ownership-verified transaction (finalize /
+// retry / recovery). Returns the lease_epoch so the caller can verify
+// the fence under the lock.
+func (q *Queries) GetRunForUpdate(ctx context.Context, id []byte) (GetRunForUpdateRow, error) {
+	row := q.db.QueryRowContext(ctx, getRunForUpdate, id)
+	var i GetRunForUpdateRow
+	err := row.Scan(
+		&i.ID,
+		&i.Status,
+		&i.LeaseEpoch,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.TriggerType,
+		&i.TriggerID,
+		&i.ConversationID,
 	)
 	return i, err
 }
@@ -1063,6 +1277,20 @@ UPDATE outbox_events SET status = 'published', published_at = CURRENT_TIMESTAMP(
 func (q *Queries) MarkOutboxPublished(ctx context.Context, id uint64) error {
 	_, err := q.db.ExecContext(ctx, markOutboxPublished, id)
 	return err
+}
+
+const oldestPendingOutboxAgeSeconds = `-- name: OldestPendingOutboxAgeSeconds :one
+SELECT CAST(COALESCE(TIMESTAMPDIFF(SECOND, MIN(available_at), CURRENT_TIMESTAMP(3)), 0) AS SIGNED) AS n
+FROM outbox_events WHERE status = 'pending'
+`
+
+// Invariant G: the outbox relay must not lag (pending events older than
+// the threshold mean dispatch is stuck).
+func (q *Queries) OldestPendingOutboxAgeSeconds(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, oldestPendingOutboxAgeSeconds)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
 }
 
 const requeueRun = `-- name: RequeueRun :exec

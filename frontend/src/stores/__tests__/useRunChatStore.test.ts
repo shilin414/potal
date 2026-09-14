@@ -127,6 +127,42 @@ describe('applyEvent (unified event protocol rendering)', () => {
     expect(msg.error).toBe('no uat');
   });
 
+  // Execution Correctness Closure (T3 前端侧): retry 是非终态 ——
+  // run.retrying 不得关闭流、不得清 activeRunId、不得改 status。
+  it('run.retrying keeps the run active and streaming', () => {
+    let state = stateWithStream();
+    state = reduce(state, event('content.delta', { text: '部分回答' }));
+    state = reduce(state, event('run.retrying', {
+      attempt: 1, max_attempts: 3, reason: 'aily_rate_limit',
+    }));
+    const conv = state.conversations[42];
+    const msg = conv.messages[1];
+    expect(msg.status).toBe('streaming'); // NOT done / failed
+    expect(conv.activeRunId).toBe(runId); // stream stays attached
+    expect(msg.content).toBe('部分回答'); // accumulated content preserved
+    expect(msg.retryNotice).toBeTruthy();
+  });
+
+  it('run.retrying followed by run.completed converges normally', () => {
+    let state = stateWithStream();
+    state = reduce(state, event('run.retrying', { attempt: 1, max_attempts: 3 }));
+    state = reduce(state, event('content.chunk', { text: '重试后的回答', snapshot: '重试后的回答' }));
+    state = reduce(state, event('run.completed', { status: 'succeeded', text: '重试后的回答' }));
+    const conv = state.conversations[42];
+    expect(conv.messages[1].status).toBe('done');
+    expect(conv.activeRunId).toBeNull();
+  });
+
+  it('legacy run.interrupted (historical replay) renders as failure', () => {
+    const state = reduce(
+      stateWithStream(),
+      event('run.interrupted', { reason: 'lease_expired' }),
+    );
+    const msg = state.conversations[42].messages[1];
+    expect(msg.status).toBe('failed');
+    expect(state.conversations[42].activeRunId).toBeNull();
+  });
+
   it('re-seeds the streaming bubble when a history reload wiped it', () => {
     // Simulate: send created conversation 42, then a detail load replaced
     // the store's copy with only the persisted user message.

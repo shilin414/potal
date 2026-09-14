@@ -35,6 +35,18 @@ func dbForceExpireParams(runID []byte) db.HeartbeatLeaseParams {
 	return db.HeartbeatLeaseParams{ExpiresAt: past, RunID: runID, WorkerID: "dead-worker"}
 }
 
+// leaseRowParams builds a raw lease row (fixture for poisoning the
+// UNIQUE(run_id) slot); the epoch is arbitrary for that purpose.
+func leaseRowParams(runID ids.ID, workerID string, epoch uint64) db.CreateRunLeaseParams {
+	return db.CreateRunLeaseParams{
+		RunID:      runID.Bytes(),
+		WorkerID:   workerID,
+		LeaseToken: ids.New().Bytes(),
+		LeaseEpoch: epoch,
+		ExpiresAt:  time.Now().UTC().Add(60 * time.Second),
+	}
+}
+
 // heartbeatExpireParams pushes a specific worker's lease into the past.
 func heartbeatExpireParams(past time.Time, runID []byte, workerID string) db.HeartbeatLeaseParams {
 	return db.HeartbeatLeaseParams{ExpiresAt: past, RunID: runID, WorkerID: workerID}

@@ -157,12 +157,19 @@ WHERE schedule_id = ? AND id != ? AND status IN ('queued', 'running');
 -- name: ListAdmissiblePendingOccurrences :many
 -- Occurrence admission queue (overlap=queue semantics): pending rows are
 -- converted into runs once the schedule has no active execution.
+-- FIFO per schedule: scheduled_at first, id as the tiebreaker.
 SELECT id, schedule_id, scheduled_at, enqueued_at, admitted_at, run_id, status,
        triggered_at, finished_at, created_at, updated_at
 FROM schedule_occurrences
 WHERE status = 'pending'
-ORDER BY id
+ORDER BY scheduled_at, id
 LIMIT ?;
+
+-- name: GetScheduleRowForUpdate :execresult
+-- Admission lock (修复计划 §35): serializes concurrent admissions for the
+-- same schedule so two schedulers can never both observe "no active
+-- occurrence" and create parallel runs (write-skew guard).
+SELECT id FROM schedules WHERE id = ? FOR UPDATE;
 
 -- name: CountSkippedOccurrencesForSlot :one
 SELECT COUNT(*) AS n FROM schedule_occurrences

@@ -65,11 +65,11 @@ func seedRun(t *testing.T, svc *execution.Service, provider string) ids.ID {
 	return runID
 }
 
-// TestCASRaceSingleWinner: 100 concurrent workers CAS-claim the same
-// queued run — exactly one may win (no double execution, ever).
+// TestCASRaceSingleWinner: 100 concurrent workers claim the same queued
+// run — exactly one may win (no double execution, ever).
 func TestCASRaceSingleWinner(t *testing.T) {
 	svc, _ := testEnv(t)
-	runID := seedRun(t, svc, "feishu_aily")
+	runID := seedRun(t, svc, "itest_closure")
 
 	const workers = 100
 	var wins atomic.Int64
@@ -78,7 +78,7 @@ func TestCASRaceSingleWinner(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			won, err := svc.CASClaim(context.Background(), runID)
+			_, won, err := svc.ClaimRun(context.Background(), runID, "racer", time.Second)
 			if err != nil {
 				return
 			}
@@ -209,9 +209,9 @@ type countingHandler struct {
 	svc   *execution.Service
 }
 
-func (h countingHandler) Execute(ctx context.Context, run *execution.Run) error {
+func (h countingHandler) Execute(ctx context.Context, claimed *execution.ClaimedRun) error {
 	h.calls.Add(1)
-	return h.svc.Finish(ctx, run, &execution.FinishInput{
+	return h.svc.FinalizeOwnedRun(ctx, claimed.Run, claimed.Ownership, &execution.FinishInput{
 		Status: execution.StatusSucceeded,
 		Output: map[string]any{"text": "done"},
 	})
@@ -223,13 +223,10 @@ func (h countingHandler) Execute(ctx context.Context, run *execution.Run) error 
 func TestLeaseExpiryAndReaper(t *testing.T) {
 	svc, _ := testEnv(t)
 	ctx := context.Background()
-	runID := seedRun(t, svc, "feishu_aily")
+	runID := seedRun(t, svc, "itest_closure")
 
-	if won, err := svc.CASClaim(ctx, runID); err != nil || !won {
+	if _, won, err := svc.ClaimRun(ctx, runID, "dead-worker", 120*time.Second); err != nil || !won {
 		t.Fatalf("claim: won=%v err=%v", won, err)
-	}
-	if err := svc.AcquireLease(ctx, runID, "dead-worker", 120*time.Second); err != nil {
-		t.Fatal(err)
 	}
 	// Simulate the worker dying: force the lease into the past.
 	if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
@@ -240,8 +237,11 @@ func TestLeaseExpiryAndReaper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovered != 1 {
-		t.Fatalf("reaper recovered %d, want 1", recovered)
+	// Other tests / the shared dev environment may leave additional
+	// expired leases behind — the reaper sweeps them all; this run's own
+	// recovery is asserted via the status below.
+	if recovered < 1 {
+		t.Fatalf("reaper recovered %d, want >= 1", recovered)
 	}
 	run, err := svc.GetRun(ctx, runID)
 	if err != nil {
@@ -256,12 +256,8 @@ func TestLeaseExpiryAndReaper(t *testing.T) {
 
 	// Exhaust attempts: claim + expire twice more → third expiry fails it.
 	for i := 0; i < 2; i++ {
-		won, err := svc.CASClaim(ctx, runID)
-		if err != nil || !won {
+		if _, won, err := svc.ClaimRun(ctx, runID, "dead-worker", 120*time.Second); err != nil || !won {
 			t.Fatalf("reclaim %d: won=%v err=%v", i, won, err)
-		}
-		if err := svc.AcquireLease(ctx, runID, "dead-worker", 120*time.Second); err != nil {
-			t.Fatal(err)
 		}
 		if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
 			t.Fatal(err)

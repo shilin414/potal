@@ -47,8 +47,15 @@ const (
 	EventInputRequired      = "input.required"
 	EventRunCompleted       = "run.completed"
 	EventRunFailed          = "run.failed"
-	EventRunInterrupted     = "run.interrupted"
+	EventRunCancelled       = "run.cancelled"
+	EventRunRetrying        = "run.retrying"
 	EventRunPoll            = "run.poll"
+
+	// EventRunInterrupted is the LEGACY terminal event emitted by the old
+	// retry path. It is kept only so historical replayed events still
+	// resolve; new code never emits it (retry uses run.retrying, terminal
+	// failure uses run.failed — 修复计划 §14-16).
+	EventRunInterrupted = "run.interrupted"
 )
 
 // IsTerminal reports whether a status ends a run.
@@ -84,15 +91,11 @@ type Run struct {
 	Priority             string
 	AvailableAt          *time.Time
 
-	// Lease fencing (claim-time capture, never persisted/reloaded from the
-	// DB): LeaseEpoch is the runs.lease_epoch value this worker bumped when
-	// it won the claim; LeaseToken identifies its run_leases row. Both are
-	// set by the worker right after a successful claim and MUST NOT be
-	// refreshed from the database — a stale worker would otherwise pick up
-	// the new owner's epoch and defeat the fence. Zero values mark an
-	// unfenced (system/reaper) caller.
-	LeaseEpoch uint64
-	LeaseToken ids.ID
+	// NOTE(修复计划 §4/§13): lease fencing deliberately does NOT live on
+	// Run. Ownership is a separate immutable ExecutionOwnership value
+	// produced by ClaimRun — reloading a Run from the database must never
+	// be able to change (or silently drop, as the lease token) the write
+	// fence. See ownership.go.
 }
 
 // InputContent returns the user content items sent to the provider.
@@ -177,9 +180,13 @@ func (r *Run) SnapshotInt(key string, def int) int {
 }
 
 // IsTerminalEventName reports whether an event closes the SSE stream.
+// Terminal events correspond one-to-one with terminal run statuses
+// (修复计划 §16-17): run.retrying is deliberately NOT terminal — a
+// requeued run keeps streaming; run.interrupted is legacy-only and no
+// longer closes a live stream (retry must not break the SSE lifecycle).
 func IsTerminalEventName(eventType string) bool {
 	switch eventType {
-	case EventRunCompleted, EventRunFailed, EventRunInterrupted:
+	case EventRunCompleted, EventRunFailed, EventRunCancelled:
 		return true
 	}
 	return false

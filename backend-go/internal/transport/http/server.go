@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -63,6 +64,11 @@ type Server struct {
 	Scheduler *scheduler.Scheduler
 
 	SSE *sse.Gateway
+
+	// adminLoginLimiter throttles local admin logins (username+IP,
+	// 修复计划 §41); initialized lazily on first admin login.
+	adminLoginLimiter *loginAttemptLimiter
+	adminLimiterOnce  sync.Once
 
 	router chi.Router
 }

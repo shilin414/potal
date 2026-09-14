@@ -14,8 +14,8 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 
 	"github.com/creation-agent-studio/backend-go/internal/automation/schedule"
-	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/execution"
+	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
 	"github.com/creation-agent-studio/backend-go/internal/platform/redisx"
 	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"

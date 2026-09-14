@@ -55,6 +55,8 @@ export interface ChatMessage {
   runId?: string;
   status?: 'streaming' | 'done' | 'failed';
   error?: string;
+  /** Non-terminal retry hint (run.retrying keeps the stream alive). */
+  retryNotice?: string;
   attachments?: { id: string; name: string }[];
   artifacts?: ChatArtifact[];
 }
@@ -86,8 +88,14 @@ export interface RunChatState {
   clearError: () => void;
 }
 
-/** Events that reveal the run reached a terminal state. */
-const TERMINAL = new Set(['run.completed', 'run.failed', 'run.interrupted']);
+/**
+ * Events that reveal the run reached a terminal state. run.retrying is
+ * deliberately excluded: a requeued attempt keeps streaming (the run
+ * stays active; Execution Correctness Closure). run.interrupted is
+ * legacy-only (historical replay) — the retry path now emits
+ * run.retrying, terminal failures emit run.failed.
+ */
+const TERMINAL = new Set(['run.completed', 'run.failed', 'run.cancelled']);
 
 function emptyConversation(id: number, title = ''): ConversationChat {
   return { id, title, messages: [], activeRunId: null };
@@ -288,9 +296,22 @@ export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<
         message.error = event.payload?.error_message
           || event.payload?.error_code || '执行失败';
         break;
+      case 'run.retrying':
+        // Non-terminal: the run was requeued for another attempt. Keep
+        // streaming — activeRunId stays, status stays 'streaming'.
+        if (message.status === 'streaming') {
+          const attempt = Number(event.payload?.attempt ?? 0);
+          const reason = event.payload?.reason || '';
+          message.retryNotice = attempt > 0
+            ? `执行中断（${reason}），正在进行第 ${attempt + 1} 次尝试…`
+            : '执行中断，正在重试…';
+        }
+        break;
       case 'run.interrupted':
+        // Legacy historical event (pre-closure data): displayed as a
+        // failure only when it actually terminated the run.
         message.status = 'failed';
-        message.error = '执行被中断，已重新排队';
+        message.error = '执行被中断';
         break;
       default:
         break;
