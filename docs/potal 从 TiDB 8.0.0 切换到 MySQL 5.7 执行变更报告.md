@@ -4,7 +4,8 @@
 **基线分支：** `dev`
 **执行依据：** `docs/potal 从 TiDB 8.0.0 切换到 MySQL 5.7 执行指南.md`
 **文档日期：** 2026-09-14
-**执行范围：** 代码改造（2 个 commit）+ 目标库 migration + TiDB→MySQL 数据迁移与校验 + 真实 MySQL/Redis 集成闸门
+**执行范围：** 代码改造（2 个 commit）+ 目标库 migration + TiDB→MySQL 数据迁移与校验 + 真实 MySQL/Redis 集成闸门 + CI 验证
+**推送状态：** 已推送至 `shilin414/potal` 的 `dev`，远端 HEAD `c53f934`
 
 ---
 
@@ -28,7 +29,33 @@
 | Go 单元测试 | ✅ 全绿 |
 | 真实 MySQL 5.7 + Redis 集成测试 | ✅ 68/68 PASS，0 FAIL，0 SKIP |
 | DB 时钟门槛（P0-3） | ✅ `session time_zone = +00:00` |
-| GitHub CI | ⏳ 需 push 后触发（本地已等价执行全部门槛） |
+| GitHub CI | ✅ **run 34852157912 全绿**（`check` + `integration` 两个 job 全部 success） |
+
+### 1.1 提交与 CI
+
+```text
+c53f934 chore(memory): record the MySQL 5.7 switch outcome
+0f43800 docs(database): record the TiDB 8.0.0 -> MySQL 5.7 switch
+28632f6 ci(database): replace the TiDB integration gate with MySQL 5.7
+64fbf80 refactor(database): make MySQL 5.7 the primary database backend
+```
+
+推送到 `origin/dev` 后 CI 首次运行即全绿，新 CI 结构（两个 job）得到真实验证：
+
+```text
+check        actionlint / gofmt / vet / build / unit / race            ✅
+integration  MySQL 5.7 + Redis 容器                                    ✅
+             ...wait for mysql 5.7                                    ✅
+             ...apply migrations                                      ✅
+             ...apply migrations (second run must be a clean no-op)    ✅
+             ...database-backed package tests (real MySQL/Redis)       ✅
+             ...integration tests                                     ✅
+```
+
+> 本机 git 引用写入缺陷再次出现：`git push` 实际成功（`git ls-remote` 确认远端已是 `c53f934`），
+> 但本地 `refs/remotes/origin/dev` 停留在旧 sha、`git status` 误报 `[ahead 9]`。
+> 已按既有办法写 loose ref + 双写 `packed-refs` 修复，现为 `## dev...origin/dev`（0 0）。
+> **结论：本机 push 后一律用 `git ls-remote` 核验，不要相信 git 打印的成功信息。**
 
 ---
 
