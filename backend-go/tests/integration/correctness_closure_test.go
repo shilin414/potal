@@ -550,8 +550,13 @@ func TestDualSchedulerPendingAdmissionNoParallel(t *testing.T) {
 	// admissible, then let two schedulers race to admit them. With the
 	// schedules-row admission lock, at most ONE occurrence may be active.
 	if _, err := env.db.Exec(
+		// run_id is BINARY(16) holding the raw 16 bytes, so it can be
+		// compared to runs.id directly. Wrapping it in UNHEX() — as this
+		// test used to — works on TiDB but is a hard error on MySQL 5.7
+		// (Error 1411: Incorrect string value for function unhex), which
+		// is exactly the engine the mysql57 gate runs.
 		`UPDATE runs SET status='failed', error_code='killed', finished_at=CURRENT_TIMESTAMP(3)
-		 WHERE id IN (SELECT UNHEX(run_id) FROM schedule_occurrences WHERE schedule_id = ? AND run_id IS NOT NULL)`,
+		 WHERE id IN (SELECT run_id FROM schedule_occurrences WHERE schedule_id = ? AND run_id IS NOT NULL)`,
 		schedID); err != nil {
 		t.Fatal(err)
 	}
