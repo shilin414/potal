@@ -232,6 +232,55 @@ func TestRetryRunAndOutboxShareRetryAt(t *testing.T) {
 	}
 }
 
+// TestReaperRequeueIsImmediatelyClaimableAndInSync: crash recovery must be
+// immediate (no retry backoff) and must keep Run.available_at and the
+// dispatch outbox row's available_at on the SAME instant. CI on MySQL
+// caught the previous shape (reaper used now+backoff) as a hard failure:
+// the run stayed unclaimable while the worker had already been woken.
+func TestReaperRequeueIsImmediatelyClaimableAndInSync(t *testing.T) {
+	svc, _ := testEnv(t)
+	ctx := context.Background()
+	runID := seedRun(t, svc, "itest_reaper_now")
+
+	if _, won, err := svc.ClaimRun(ctx, runID, "dead-worker", time.Minute); err != nil || !won {
+		t.Fatalf("claim: won=%v err=%v", won, err)
+	}
+	if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.RecoverExpiredLeases(ctx, 10); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. The recovered run is claimable right away.
+	if _, won, err := svc.ClaimRun(ctx, runID, "live-worker", time.Minute); err != nil || !won {
+		t.Fatalf("claim right after recovery: won=%v err=%v, want immediate claimability", won, err)
+	}
+	run, err := svc.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.AvailableAt == nil {
+		t.Fatal("recovered run has no available_at")
+	}
+	// 2. Run availability ≡ outbox availability (same DB clock).
+	var published time.Time
+	if err := svc.DB.QueryRowContext(ctx,
+		`SELECT available_at FROM outbox_events
+		 WHERE aggregate='run' AND aggregate_id=? AND event_type='run.dispatch'
+		 ORDER BY id DESC LIMIT 1`, runID.Bytes()).Scan(&published); err != nil {
+		t.Fatalf("load outbox: %v", err)
+	}
+	delta := run.AvailableAt.Sub(published)
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta > 50*time.Millisecond {
+		t.Fatalf("reaper run available_at=%s vs outbox available_at=%s differ by %s",
+			run.AvailableAt, published, delta)
+	}
+}
+
 // ── P1-1: priority admission routing ──
 
 // TestRelayRoutesRunDispatchByPriorityClass: run dispatches land in the

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"time"
 
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
@@ -117,14 +116,14 @@ func (s *Service) recoverExpiredLeaseTx(ctx context.Context, runID ids.ID) (bool
 	var eventType string
 	var eventPayload map[string]any
 	if row.Attempt < row.MaxAttempts {
-		// Retry: running → queued + run.retrying (non-terminal). The
-		// requeue instant is shared with the dispatch outbox row so the
-		// worker is woken exactly when the run becomes claimable (P1-2).
-		retryAt := time.Now().UTC().Add(s.requeueDelay())
-		if _, err := q.RequeueRunFenced(ctx, db.RequeueRunFencedParams{
-			AvailableAt: sql.NullTime{Time: retryAt, Valid: true},
-			ID:          runID.Bytes(),
-			LeaseEpoch:  row.LeaseEpoch,
+		// Retry: running → queued + run.retrying (non-terminal). Recovery
+		// is IMMEDIATE (a crashed worker must not stall the run behind a
+		// backoff) and both the run and its dispatch outbox row take their
+		// availability from the DB clock in the same transaction, so the
+		// run is claimable exactly when the relay can publish it (P1-2).
+		if _, err := q.RequeueRunFencedImmediate(ctx, db.RequeueRunFencedImmediateParams{
+			ID:         runID.Bytes(),
+			LeaseEpoch: row.LeaseEpoch,
 		}); err != nil {
 			return false, err
 		}
@@ -134,7 +133,6 @@ func (s *Service) recoverExpiredLeaseTx(ctx context.Context, runID ids.ID) (bool
 			"max_attempts": row.MaxAttempts,
 			"reason":       "lease_expired",
 			"worker_id":    lease.WorkerID,
-			"retry_at":     retryAt.Format(time.RFC3339Nano),
 		}
 		sequence, err = appendEventTx(ctx, tx, runID, 0, eventType, eventPayload)
 		if err != nil {
@@ -145,12 +143,11 @@ func (s *Service) recoverExpiredLeaseTx(ctx context.Context, runID ids.ID) (bool
 			"provider":       providerOfRun(ctx, q, runID),
 			"priority_class": PriorityClassRetry,
 		})
-		if _, err := q.CreateOutboxEventAt(ctx, db.CreateOutboxEventAtParams{
+		if _, err := q.CreateOutboxEvent(ctx, db.CreateOutboxEventParams{
 			Aggregate:   "run",
 			AggregateID: runID.Bytes(),
 			EventType:   "run.dispatch",
 			Payload:     dbtypes.JSONText(payloadRaw),
-			AvailableAt: retryAt,
 		}); err != nil {
 			return false, err
 		}

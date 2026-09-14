@@ -1437,6 +1437,26 @@ func (q *Queries) RequeueRunFenced(ctx context.Context, arg RequeueRunFencedPara
 	return q.db.ExecContext(ctx, requeueRunFenced, arg.AvailableAt, arg.ID, arg.LeaseEpoch)
 }
 
+const requeueRunFencedImmediate = `-- name: RequeueRunFencedImmediate :execresult
+UPDATE runs
+SET status = 'queued', priority = 'retry', available_at = CURRENT_TIMESTAMP(3)
+WHERE id = ? AND status = 'running' AND lease_epoch = ?
+`
+
+type RequeueRunFencedImmediateParams struct {
+	ID         []byte
+	LeaseEpoch uint64
+}
+
+// Reaper recovery requeue: a crashed worker's run becomes claimable AT
+// ONCE — crash recovery must not wait out a retry backoff. available_at
+// comes from the DB clock, exactly like the dispatch outbox row created
+// in the same transaction (CreateOutboxEvent), so Run.available_at ==
+// Outbox.available_at regardless of app/DB clock skew.
+func (q *Queries) RequeueRunFencedImmediate(ctx context.Context, arg RequeueRunFencedImmediateParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, requeueRunFencedImmediate, arg.ID, arg.LeaseEpoch)
+}
+
 const setAttachmentUploaded = `-- name: SetAttachmentUploaded :exec
 UPDATE runtime_attachments SET external_attachment_id = ?, status = 'uploaded' WHERE id = ?
 `

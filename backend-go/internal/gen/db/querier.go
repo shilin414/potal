@@ -267,6 +267,12 @@ type Querier interface {
 	// so a redispatched run was invisible to the CAS until the fallback scan
 	// found it ~20s later).
 	RequeueRunFenced(ctx context.Context, arg RequeueRunFencedParams) (sql.Result, error)
+	// Reaper recovery requeue: a crashed worker's run becomes claimable AT
+	// ONCE — crash recovery must not wait out a retry backoff. available_at
+	// comes from the DB clock, exactly like the dispatch outbox row created
+	// in the same transaction (CreateOutboxEvent), so Run.available_at ==
+	// Outbox.available_at regardless of app/DB clock skew.
+	RequeueRunFencedImmediate(ctx context.Context, arg RequeueRunFencedImmediateParams) (sql.Result, error)
 	RevokeConversationShare(ctx context.Context, arg RevokeConversationShareParams) error
 	RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) error
 	SetApplicationEnabled(ctx context.Context, arg SetApplicationEnabledParams) error

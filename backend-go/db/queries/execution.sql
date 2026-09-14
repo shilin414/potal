@@ -109,6 +109,16 @@ UPDATE runs
 SET status = 'queued', priority = 'retry', available_at = ?
 WHERE id = ? AND status = 'running' AND lease_epoch = ?;
 
+-- name: RequeueRunFencedImmediate :execresult
+-- Reaper recovery requeue: a crashed worker's run becomes claimable AT
+-- ONCE — crash recovery must not wait out a retry backoff. available_at
+-- comes from the DB clock, exactly like the dispatch outbox row created
+-- in the same transaction (CreateOutboxEvent), so Run.available_at ==
+-- Outbox.available_at regardless of app/DB clock skew.
+UPDATE runs
+SET status = 'queued', priority = 'retry', available_at = CURRENT_TIMESTAMP(3)
+WHERE id = ? AND status = 'running' AND lease_epoch = ?;
+
 -- name: FailExpiredRun :execresult
 UPDATE runs
 SET status = 'failed', error_code = 'lease_expired', error_message = ?,
