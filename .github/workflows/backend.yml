@@ -90,12 +90,31 @@ jobs:
       # would continue into app.Build + the HTTP server: without the
       # runtime secrets (TOKEN_ENCRYPTION_KEY is unset in CI) the build
       # fails, and with them it would block on the server.
+      #
+      # The failure path emits a ::error annotation carrying pwd + the
+      # migrated tool's own message, so a red run is diagnosable from the
+      # checks API without downloading logs.
       - name: apply migrations
-        working-directory: backend-go
-        run: go run ./cmd/migrate
+        run: |
+          set -uo pipefail
+          echo "pwd=$(pwd)"
+          if ! out=$(go run ./cmd/migrate 2>&1); then
+            printf '%s\n' "$out"
+            msg=$(printf '%s' "$out" | tr '\n' ' ' | tr -s ' ' | tail -c 500)
+            echo "::error title=migrate failed::pwd=$(pwd) :: $msg"
+            exit 1
+          fi
+          printf '%s\n' "$out"
       - name: integration tests
-        working-directory: backend-go
-        run: go test ./tests/integration/... -count=1 -v
+        run: |
+          set -uo pipefail
+          if ! out=$(go test ./tests/integration/... -count=1 -v 2>&1); then
+            printf '%s\n' "$out"
+            msg=$(printf '%s' "$out" | grep -E '^(--- FAIL|FAIL|panic:|\s+.*_test\.go:)' | tr '\n' ' ' | tr -s ' ' | tail -c 900)
+            echo "::error title=integration tests failed::$msg"
+            exit 1
+          fi
+          printf '%s\n' "$out" | tail -40
 
   # Primary compatibility floor required by the architecture document.
   mysql57:
@@ -134,8 +153,23 @@ jobs:
           done
           mysql -h 127.0.0.1 -P 3306 -u root -e "SELECT 1"
       - name: apply migrations
-        working-directory: backend-go
-        run: go run ./cmd/migrate
+        run: |
+          set -uo pipefail
+          echo "pwd=$(pwd)"
+          if ! out=$(go run ./cmd/migrate 2>&1); then
+            printf '%s\n' "$out"
+            msg=$(printf '%s' "$out" | tr '\n' ' ' | tr -s ' ' | tail -c 500)
+            echo "::error title=migrate failed (mysql57)::pwd=$(pwd) :: $msg"
+            exit 1
+          fi
+          printf '%s\n' "$out"
       - name: integration tests
-        working-directory: backend-go
-        run: go test ./tests/integration/... -count=1 -v
+        run: |
+          set -uo pipefail
+          if ! out=$(go test ./tests/integration/... -count=1 -v 2>&1); then
+            printf '%s\n' "$out"
+            msg=$(printf '%s' "$out" | grep -E '^(--- FAIL|FAIL|panic:|\s+.*_test\.go:)' | tr '\n' ' ' | tr -s ' ' | tail -c 900)
+            echo "::error title=integration tests failed (mysql57)::$msg"
+            exit 1
+          fi
+          printf '%s\n' "$out" | tail -40
