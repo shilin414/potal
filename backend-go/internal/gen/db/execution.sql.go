@@ -192,6 +192,19 @@ func (q *Queries) CacheArtifactURL(ctx context.Context, arg CacheArtifactURLPara
 	return err
 }
 
+const countActiveProviderSlots = `-- name: CountActiveProviderSlots :one
+SELECT COUNT(*) AS n FROM provider_execution_slots
+WHERE provider = ? AND expires_at > CURRENT_TIMESTAMP(3)
+`
+
+// Active = not past its DB-clock expiry.
+func (q *Queries) CountActiveProviderSlots(ctx context.Context, provider string) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countActiveProviderSlots, provider)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
 const countMissingDeliveryExecutions = `-- name: CountMissingDeliveryExecutions :one
 SELECT COUNT(*) AS n
 FROM schedule_occurrences o
@@ -209,6 +222,22 @@ WHERE o.status = 'succeeded' AND de.id IS NULL
 // occurrence finished was never supposed to receive it.
 func (q *Queries) CountMissingDeliveryExecutions(ctx context.Context) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countMissingDeliveryExecutions)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
+const countOrphanProviderSlots = `-- name: CountOrphanProviderSlots :one
+SELECT COUNT(*) AS n FROM provider_execution_slots s
+LEFT JOIN runs r
+  ON r.id = s.run_id AND r.status = 'running' AND r.lease_epoch = s.lease_epoch
+WHERE s.expires_at > CURRENT_TIMESTAMP(3) AND r.id IS NULL
+`
+
+// Invariant M: an ACTIVE provider slot must belong to a running run at the
+// matching lease epoch.
+func (q *Queries) CountOrphanProviderSlots(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countOrphanProviderSlots)
 	var n int64
 	err := row.Scan(&n)
 	return n, err
@@ -259,6 +288,26 @@ WHERE r.status = 'running' AND r.lease_epoch != l.lease_epoch
 // Invariant E: a running run's lease_epoch must equal its lease row's.
 func (q *Queries) CountRunningLeaseEpochMismatch(ctx context.Context) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countRunningLeaseEpochMismatch)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
+const countRunningRunAtEpoch = `-- name: CountRunningRunAtEpoch :one
+SELECT COUNT(*) AS n FROM runs
+WHERE id = ? AND status = 'running' AND lease_epoch = ?
+`
+
+type CountRunningRunAtEpochParams struct {
+	ID         []byte
+	LeaseEpoch uint64
+}
+
+// Ownership probe for provider slot Acquire: only the CURRENT owner of a
+// running run may hold provider capacity, so a stale worker that wakes up
+// after its run was reclaimed/reaped cannot pollute the semaphore.
+func (q *Queries) CountRunningRunAtEpoch(ctx context.Context, arg CountRunningRunAtEpochParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countRunningRunAtEpoch, arg.ID, arg.LeaseEpoch)
 	var n int64
 	err := row.Scan(&n)
 	return n, err
@@ -438,29 +487,60 @@ func (q *Queries) CreateOutboxEvent(ctx context.Context, arg CreateOutboxEventPa
 
 const createOutboxEventAt = `-- name: CreateOutboxEventAt :execresult
 INSERT INTO outbox_events (aggregate, aggregate_id, event_type, payload, status, available_at)
-VALUES (?, ?, ?, ?, 'pending', ?)
+VALUES (?, ?, ?, ?, 'pending', DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND))
 `
 
 type CreateOutboxEventAtParams struct {
-	Aggregate   string
-	AggregateID []byte
-	EventType   string
-	Payload     dbtypes.JSONText
-	AvailableAt time.Time
+	Aggregate        string
+	AggregateID      []byte
+	EventType        string
+	Payload          dbtypes.JSONText
+	RetryDelayMicros interface{}
 }
 
-// Delayed-publish variant: the row stays invisible to the relay until
-// retryAt. Run.available_at and outbox availability share one timestamp
-// so a retried run is dispatched exactly when it becomes claimable
-// (P1-2) — no earlier, no later.
+// Delayed-publish variant: the row stays invisible to the relay until the
+// DB clock passes the given microsecond delay. RetryOwnedRunAfter passes
+// the SAME delay to RequeueRunFenced, so a retried run is dispatched
+// exactly when it becomes claimable (P1-2) — no earlier, no later — with
+// the DB clock as the single authority for both (Phase 3).
 func (q *Queries) CreateOutboxEventAt(ctx context.Context, arg CreateOutboxEventAtParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, createOutboxEventAt,
 		arg.Aggregate,
 		arg.AggregateID,
 		arg.EventType,
 		arg.Payload,
-		arg.AvailableAt,
+		arg.RetryDelayMicros,
 	)
+}
+
+const createProviderSlot = `-- name: CreateProviderSlot :exec
+INSERT INTO provider_execution_slots
+    (provider, run_id, lease_epoch, lease_token, worker_id,
+     acquired_at, heartbeat_at, expires_at)
+VALUES (?, ?, ?, ?, ?,
+        CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3),
+        DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND))
+`
+
+type CreateProviderSlotParams struct {
+	Provider    string
+	RunID       []byte
+	LeaseEpoch  uint64
+	LeaseToken  []byte
+	WorkerID    string
+	LeaseMicros interface{}
+}
+
+func (q *Queries) CreateProviderSlot(ctx context.Context, arg CreateProviderSlotParams) error {
+	_, err := q.db.ExecContext(ctx, createProviderSlot,
+		arg.Provider,
+		arg.RunID,
+		arg.LeaseEpoch,
+		arg.LeaseToken,
+		arg.WorkerID,
+		arg.LeaseMicros,
+	)
+	return err
 }
 
 const createRun = `-- name: CreateRun :execresult
@@ -563,29 +643,47 @@ func (q *Queries) CreateRunCommand(ctx context.Context, arg CreateRunCommandPara
 
 const createRunLease = `-- name: CreateRunLease :exec
 INSERT INTO run_leases (run_id, worker_id, lease_token, lease_epoch, heartbeat_at, expires_at)
-VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(3), ?)
+VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(3),
+        DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND))
 `
 
 type CreateRunLeaseParams struct {
-	RunID      []byte
-	WorkerID   string
-	LeaseToken []byte
-	LeaseEpoch uint64
-	ExpiresAt  time.Time
+	RunID       []byte
+	WorkerID    string
+	LeaseToken  []byte
+	LeaseEpoch  uint64
+	LeaseMicros interface{}
 }
 
 // lease_epoch mirrors runs.lease_epoch at claim time (migration 0010):
 // the reaper verifies an expired lease really belongs to the run's
 // CURRENT epoch before recovering it.
+// expires_at is derived from the DB clock — the lease is acquired,
+// heartbeat and expired under ONE clock authority (Phase 3), never from
+// the worker's local clock.
 func (q *Queries) CreateRunLease(ctx context.Context, arg CreateRunLeaseParams) error {
 	_, err := q.db.ExecContext(ctx, createRunLease,
 		arg.RunID,
 		arg.WorkerID,
 		arg.LeaseToken,
 		arg.LeaseEpoch,
-		arg.ExpiresAt,
+		arg.LeaseMicros,
 	)
 	return err
+}
+
+const currentDBTime = `-- name: CurrentDBTime :one
+SELECT CURRENT_TIMESTAMP(3) AS now
+`
+
+// Authoritative clock read. State written in the same transaction derives
+// its timestamps from this value or from CURRENT_TIMESTAMP(3) directly —
+// never from the application clock (Phase 3).
+func (q *Queries) CurrentDBTime(ctx context.Context) (time.Time, error) {
+	row := q.db.QueryRowContext(ctx, currentDBTime)
+	var now time.Time
+	err := row.Scan(&now)
+	return now, err
 }
 
 const deleteAttachment = `-- name: DeleteAttachment :exec
@@ -595,6 +693,27 @@ DELETE FROM runtime_attachments WHERE id = ?
 func (q *Queries) DeleteAttachment(ctx context.Context, id []byte) error {
 	_, err := q.db.ExecContext(ctx, deleteAttachment, id)
 	return err
+}
+
+const deleteExpiredProviderSlots = `-- name: DeleteExpiredProviderSlots :execresult
+DELETE FROM provider_execution_slots
+WHERE provider = ? AND expires_at <= CURRENT_TIMESTAMP(3)
+`
+
+// Crash recovery inside Acquire: a worker that died without releasing must
+// not pin provider capacity beyond its DB-clock lease.
+func (q *Queries) DeleteExpiredProviderSlots(ctx context.Context, provider string) (sql.Result, error) {
+	return q.db.ExecContext(ctx, deleteExpiredProviderSlots, provider)
+}
+
+const deleteExpiredProviderSlotsAll = `-- name: DeleteExpiredProviderSlotsAll :execresult
+DELETE FROM provider_execution_slots WHERE expires_at <= CURRENT_TIMESTAMP(3)
+`
+
+// Reaper hygiene sweep: expiry is already enforced on read; this only keeps
+// the table small.
+func (q *Queries) DeleteExpiredProviderSlotsAll(ctx context.Context) (sql.Result, error) {
+	return q.db.ExecContext(ctx, deleteExpiredProviderSlotsAll)
 }
 
 const deleteLease = `-- name: DeleteLease :exec
@@ -643,6 +762,64 @@ DELETE FROM run_leases WHERE run_id = ? AND expires_at <= CURRENT_TIMESTAMP(3)
 
 func (q *Queries) DeleteLeaseIfExpired(ctx context.Context, runID []byte) (sql.Result, error) {
 	return q.db.ExecContext(ctx, deleteLeaseIfExpired, runID)
+}
+
+const deleteProviderSlotByToken = `-- name: DeleteProviderSlotByToken :execresult
+DELETE FROM provider_execution_slots
+WHERE provider = ? AND run_id = ? AND lease_epoch = ? AND lease_token = ?
+`
+
+type DeleteProviderSlotByTokenParams struct {
+	Provider   string
+	RunID      []byte
+	LeaseEpoch uint64
+	LeaseToken []byte
+}
+
+// Release deletes exactly this ownership's slot: a stale worker's release
+// touches neither the new owner's slot nor any other attempt's.
+func (q *Queries) DeleteProviderSlotByToken(ctx context.Context, arg DeleteProviderSlotByTokenParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, deleteProviderSlotByToken,
+		arg.Provider,
+		arg.RunID,
+		arg.LeaseEpoch,
+		arg.LeaseToken,
+	)
+}
+
+const deleteProviderSlotsUpToEpoch = `-- name: DeleteProviderSlotsUpToEpoch :execresult
+DELETE FROM provider_execution_slots WHERE run_id = ? AND lease_epoch <= ?
+`
+
+type DeleteProviderSlotsUpToEpochParams struct {
+	RunID      []byte
+	LeaseEpoch uint64
+}
+
+// Ownership-transition cleanup: finalize / retry / reaper delete the run's
+// slots (current and older epochs) in the SAME transaction as the canonical
+// state write, so "run stopped running ⇒ no provider slot" holds.
+func (q *Queries) DeleteProviderSlotsUpToEpoch(ctx context.Context, arg DeleteProviderSlotsUpToEpochParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, deleteProviderSlotsUpToEpoch, arg.RunID, arg.LeaseEpoch)
+}
+
+const ensureProviderAdmissionLock = `-- name: EnsureProviderAdmissionLock :exec
+
+INSERT INTO provider_admission_locks (provider) VALUES (?)
+ON DUPLICATE KEY UPDATE provider = provider
+`
+
+// ───────────────────────────────────────── provider execution slots ──
+// Provider Inflight Durable Truth (Admission Fairness & Distributed Lease
+// Hardening, Phase 2): max_inflight is a safety capacity state and lives in
+// TiDB, not in a transient Redis semaphore. Every timestamp decision uses
+// the DB clock; Redis restart/flush can never raise real provider
+// concurrency above the configured limit.
+// Materializes the per-provider serialization row (seeded by migration
+// 0011; a provider registered later self-heals here).
+func (q *Queries) EnsureProviderAdmissionLock(ctx context.Context, provider string) error {
+	_, err := q.db.ExecContext(ctx, ensureProviderAdmissionLock, provider)
+	return err
 }
 
 const failExpiredRun = `-- name: FailExpiredRun :execresult
@@ -842,6 +1019,33 @@ func (q *Queries) GetPendingOwnedAttachment(ctx context.Context, arg GetPendingO
 	return i, err
 }
 
+const getProviderSlotForUpdate = `-- name: GetProviderSlotForUpdate :one
+SELECT id FROM provider_execution_slots
+WHERE provider = ? AND run_id = ? AND lease_epoch = ? AND lease_token = ?
+FOR UPDATE
+`
+
+type GetProviderSlotForUpdateParams struct {
+	Provider   string
+	RunID      []byte
+	LeaseEpoch uint64
+	LeaseToken []byte
+}
+
+// Idempotent re-acquire: the SAME ownership (run, claim epoch, token)
+// already holds a slot → refresh it instead of consuming a second one.
+func (q *Queries) GetProviderSlotForUpdate(ctx context.Context, arg GetProviderSlotForUpdateParams) (uint64, error) {
+	row := q.db.QueryRowContext(ctx, getProviderSlotForUpdate,
+		arg.Provider,
+		arg.RunID,
+		arg.LeaseEpoch,
+		arg.LeaseToken,
+	)
+	var id uint64
+	err := row.Scan(&id)
+	return id, err
+}
+
 const getRunArtifactByID = `-- name: GetRunArtifactByID :one
 SELECT id, run_id, provider, external_artifact_id, provider_artifact_type, name,
        normalized_type, storage_type, cached_external_url, cached_url_fetched_at,
@@ -1004,36 +1208,42 @@ func (q *Queries) GetRunStatus(ctx context.Context, id []byte) (string, error) {
 
 const heartbeatLease = `-- name: HeartbeatLease :execresult
 UPDATE run_leases
-SET heartbeat_at = CURRENT_TIMESTAMP(3), expires_at = ?
+SET heartbeat_at = CURRENT_TIMESTAMP(3),
+    expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND)
 WHERE run_id = ? AND worker_id = ?
 `
 
 type HeartbeatLeaseParams struct {
-	ExpiresAt time.Time
-	RunID     []byte
-	WorkerID  string
+	LeaseMicros interface{}
+	RunID       []byte
+	WorkerID    string
 }
 
+// Lease extension from the DB clock (Phase 3). A negative microsecond delay
+// expires the lease immediately — test fixtures use that instead of passing
+// an absolute app-clock instant.
 func (q *Queries) HeartbeatLease(ctx context.Context, arg HeartbeatLeaseParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, heartbeatLease, arg.ExpiresAt, arg.RunID, arg.WorkerID)
+	return q.db.ExecContext(ctx, heartbeatLease, arg.LeaseMicros, arg.RunID, arg.WorkerID)
 }
 
 const heartbeatLeaseFenced = `-- name: HeartbeatLeaseFenced :execresult
 UPDATE run_leases
-SET heartbeat_at = CURRENT_TIMESTAMP(3), expires_at = ?
+SET heartbeat_at = CURRENT_TIMESTAMP(3),
+    expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND)
 WHERE run_id = ? AND lease_token = ?
 `
 
 type HeartbeatLeaseFencedParams struct {
-	ExpiresAt  time.Time
-	RunID      []byte
-	LeaseToken []byte
+	LeaseMicros interface{}
+	RunID       []byte
+	LeaseToken  []byte
 }
 
 // Ownership-checked by lease token (not worker_id): a recycled worker id
-// cannot renew a lease it no longer owns.
+// cannot renew a lease it no longer owns. Extension is DB-clock based, so a
+// skewed worker clock can neither extend nor shorten the lease.
 func (q *Queries) HeartbeatLeaseFenced(ctx context.Context, arg HeartbeatLeaseFencedParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, heartbeatLeaseFenced, arg.ExpiresAt, arg.RunID, arg.LeaseToken)
+	return q.db.ExecContext(ctx, heartbeatLeaseFenced, arg.LeaseMicros, arg.RunID, arg.LeaseToken)
 }
 
 const listAllRunEvents = `-- name: ListAllRunEvents :many
@@ -1384,6 +1594,19 @@ func (q *Queries) ListRunsByConversation(ctx context.Context, conversationID sql
 	return items, nil
 }
 
+const lockProviderAdmission = `-- name: LockProviderAdmission :one
+SELECT provider FROM provider_admission_locks WHERE provider = ? FOR UPDATE
+`
+
+// Acquire holds this row lock for the rest of its transaction, so
+// "delete expired → count active → insert" is atomic on TiDB and MySQL 5.7
+// without table locks. Row missing = error (owner recovers by requeue).
+func (q *Queries) LockProviderAdmission(ctx context.Context, provider string) (string, error) {
+	row := q.db.QueryRowContext(ctx, lockProviderAdmission, provider)
+	err := row.Scan(&provider)
+	return provider, err
+}
+
 const markOutboxPublished = `-- name: MarkOutboxPublished :exec
 UPDATE outbox_events SET status = 'published', published_at = CURRENT_TIMESTAMP(3) WHERE id = ?
 `
@@ -1418,23 +1641,26 @@ func (q *Queries) RequeueRun(ctx context.Context, id []byte) error {
 
 const requeueRunFenced = `-- name: RequeueRunFenced :execresult
 UPDATE runs
-SET status = 'queued', priority = 'retry', available_at = ?
+SET status = 'queued', priority = 'retry',
+    available_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND)
 WHERE id = ? AND status = 'running' AND lease_epoch = ?
 `
 
 type RequeueRunFencedParams struct {
-	AvailableAt sql.NullTime
-	ID          []byte
-	LeaseEpoch  uint64
+	RetryDelayMicros interface{}
+	ID               []byte
+	LeaseEpoch       uint64
 }
 
-// available_at is an explicit param: Run.available_at and the outbox
-// row's available_at MUST carry the same retryAt (P1-2: a hardcoded
-// INTERVAL here desynchronized run availability from outbox publishing,
-// so a redispatched run was invisible to the CAS until the fallback scan
-// found it ~20s later).
+// available_at comes from the DB clock plus the caller's retry delay in
+// microseconds. Run.available_at and the outbox row's available_at MUST
+// carry the same retry instant (P1-2: a hardcoded INTERVAL once
+// desynchronized run availability from outbox publishing, so a
+// redispatched run was invisible to the CAS until the fallback scan found
+// it ~20s later) and neither may depend on the app clock, whose skew
+// against TiDB has already caused a wakeup/claimability mismatch (Phase 3).
 func (q *Queries) RequeueRunFenced(ctx context.Context, arg RequeueRunFencedParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, requeueRunFenced, arg.AvailableAt, arg.ID, arg.LeaseEpoch)
+	return q.db.ExecContext(ctx, requeueRunFenced, arg.RetryDelayMicros, arg.ID, arg.LeaseEpoch)
 }
 
 const requeueRunFencedImmediate = `-- name: RequeueRunFencedImmediate :execresult
@@ -1469,6 +1695,33 @@ type SetAttachmentUploadedParams struct {
 func (q *Queries) SetAttachmentUploaded(ctx context.Context, arg SetAttachmentUploadedParams) error {
 	_, err := q.db.ExecContext(ctx, setAttachmentUploaded, arg.ExternalAttachmentID, arg.ID)
 	return err
+}
+
+const touchProviderSlot = `-- name: TouchProviderSlot :execresult
+UPDATE provider_execution_slots
+SET heartbeat_at = CURRENT_TIMESTAMP(3),
+    expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND)
+WHERE provider = ? AND run_id = ? AND lease_epoch = ? AND lease_token = ?
+`
+
+type TouchProviderSlotParams struct {
+	LeaseMicros interface{}
+	Provider    string
+	RunID       []byte
+	LeaseEpoch  uint64
+	LeaseToken  []byte
+}
+
+// Renew (XX-only): the slot must already exist. 0 rows = expired/released →
+// ErrProviderSlotLost; a lost slot is NEVER recreated by a renewal.
+func (q *Queries) TouchProviderSlot(ctx context.Context, arg TouchProviderSlotParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, touchProviderSlot,
+		arg.LeaseMicros,
+		arg.Provider,
+		arg.RunID,
+		arg.LeaseEpoch,
+		arg.LeaseToken,
+	)
 }
 
 const updateRunExternalID = `-- name: UpdateRunExternalID :exec

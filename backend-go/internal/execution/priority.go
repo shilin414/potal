@@ -5,21 +5,24 @@ package execution
 // read loop owns the Redis probes, this type only decides which class to
 // try next and how the credit accounting evolves.
 //
-// Rules:
+// Rules (Admission Fairness & Distributed Lease Hardening, Phase 1):
 //
-//  1. classes with remaining credit are probed first, highest weight
-//     first — interactive (7) outranks retry (1) and scheduled (2);
-//  2. once a class's credit is exhausted it yields to the others in the
-//     same round, so scheduled work gets its guaranteed share and cannot
-//     starve behind a continuous interactive flow;
-//  3. when every credit is exhausted a new round starts;
-//  4. if all credited classes are EMPTY, the remaining classes are
-//     borrowed (probed without consuming credit) — an idle class never
-//     wastes the worker's capacity.
+//  1. only classes with remaining credit participate in a round, highest
+//     weight first — interactive (7) outranks retry (1) and scheduled (2);
+//  2. a credited class whose queue is EMPTY forfeits the rest of its round
+//     credit (markEmpty). An idle class can never pin the round open: the
+//     previous policy refilled only when every credit reached 0, so an
+//     empty retry stream left the credits pinned at [0,1,0] forever and
+//     scheduled work starved behind continuous interactive traffic;
+//  3. once every credit is exhausted a new round starts;
+//  4. an active class keeps its full share: with all three classes busy a
+//     round serves exactly 7:1:2 before refilling, and with only one class
+//     busy that class receives 100% of the worker's capacity (the refill
+//     happens as soon as its quota and the idle classes' quotas are spent).
 //
-// A round of weights [7,1,2] therefore serves at most 7 interactive, 1
-// retry and 2 scheduled messages before refilling, i.e. a real 7:1:2
-// share instead of FIFO or strict priority.
+// The class order is [interactive, retry, scheduled] (see PriorityClasses);
+// weights are configurable via RUN_PRIORITY_WEIGHTS and validated to be
+// strictly positive, so a class can never be silently starved by weight 0.
 type classScheduler struct {
 	weights []int
 	credits []int
@@ -34,8 +37,10 @@ func newClassScheduler(weights []int) *classScheduler {
 }
 
 // order lists the class indexes to probe, in priority order, for the next
-// message: credited classes first, then the borrowed ones. An empty
-// result means there is nothing to probe (no classes configured).
+// message. Only classes with remaining credit are returned: a class without
+// credit either consumed its round share or was marked empty. An empty
+// result means there is nothing left to probe this round (no classes
+// configured, or no non-zero weights).
 func (s *classScheduler) order() []int {
 	if len(s.weights) == 0 {
 		return nil
@@ -49,18 +54,10 @@ func (s *classScheduler) order() []int {
 			out = append(out, i)
 		}
 	}
-	for i, credit := range s.credits {
-		if credit <= 0 {
-			out = append(out, i)
-		}
-	}
 	return out
 }
 
-// consume records that class idx served a message. Serving a class with
-// credit spends one credit; a borrowed class (credit already 0) spends
-// nothing — borrowing is bounded by the credited classes' emptiness, not
-// by a quota.
+// consume records that class idx served a message: one credit per message.
 func (s *classScheduler) consume(idx int) {
 	if idx < 0 || idx >= len(s.credits) {
 		return
@@ -68,6 +65,19 @@ func (s *classScheduler) consume(idx int) {
 	if s.credits[idx] > 0 {
 		s.credits[idx]--
 	}
+}
+
+// markEmpty records that class idx had NOTHING queued when probed: the class
+// forfeits whatever credit it had left for this round. Without this an idle
+// credited class keeps the round open forever (allExhausted never turns
+// true), which is exactly how an empty retry stream starved scheduled work.
+// The class becomes active again automatically after the next refill — no
+// state needs restoring.
+func (s *classScheduler) markEmpty(idx int) {
+	if idx < 0 || idx >= len(s.credits) {
+		return
+	}
+	s.credits[idx] = 0
 }
 
 func (s *classScheduler) allExhausted() bool {

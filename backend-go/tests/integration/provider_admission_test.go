@@ -66,11 +66,11 @@ func TestThreeAdmissionRequeuesStillLeavesAttemptZero(t *testing.T) {
 		if err != nil || !won {
 			t.Fatalf("claim %d: won=%v err=%v", i, won, err)
 		}
-		// Requeue immediately (retryAt in the past) so the loop can
-		// re-claim right away; the delay semantics themselves are covered
-		// by TestRetryRunAndOutboxShareRetryAt.
-		if err := svc.RetryOwnedRunAt(ctx, claimed.Run, claimed.Ownership,
-			"provider_inflight_limit", time.Now().UTC().Add(-time.Second)); err != nil {
+		// Requeue immediately (a negative delay makes the run claimable at
+		// once) so the loop can re-claim right away; the delay semantics
+		// themselves are covered by TestRetryRunAndOutboxShareRetryAt.
+		if err := svc.RetryOwnedRunAfter(ctx, claimed.Run, claimed.Ownership,
+			"provider_inflight_limit", -time.Second); err != nil {
 			t.Fatalf("requeue %d: %v", i, err)
 		}
 	}
@@ -159,9 +159,7 @@ func TestReaperBeforeProviderAttemptDoesNotExhaustRetries(t *testing.T) {
 		if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := svc.RecoverExpiredLeases(ctx, 10); err != nil {
-			t.Fatal(err)
-		}
+		recoverRun(t, svc, runID)
 	}
 	run, err := svc.GetRun(ctx, runID)
 	if err != nil {
@@ -248,9 +246,7 @@ func TestReaperRequeueIsImmediatelyClaimableAndInSync(t *testing.T) {
 	if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.RecoverExpiredLeases(ctx, 10); err != nil {
-		t.Fatal(err)
-	}
+	recoverRun(t, svc, runID)
 
 	// 1. The recovered run is claimable right away.
 	if _, won, err := svc.ClaimRun(ctx, runID, "live-worker", time.Minute); err != nil || !won {

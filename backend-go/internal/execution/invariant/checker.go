@@ -12,6 +12,7 @@
 //	E: running run's lease_epoch == its lease row's epoch
 //	F: overlap=queue schedules never hold >1 active occurrence
 //	G: pending outbox age stays below the threshold
+//	M: an active provider slot belongs to a running run at its epoch
 package invariant
 
 import (
@@ -35,6 +36,7 @@ const (
 	TypeOutboxBacklogAge               = "outbox_backlog_age"
 	TypeScheduledRunOccurrenceMismatch = "scheduled_run_occurrence_mismatch"
 	TypeMissingDeliveryExecution       = "missing_delivery_execution"
+	TypeOrphanProviderSlot             = "orphan_provider_slot"
 )
 
 // Checker scans the canonical state and reports invariant violations.
@@ -140,6 +142,15 @@ func (c *Checker) RunOnce(ctx context.Context) Result {
 		c.report(TypeMissingDeliveryExecution, n)
 	} else if err != nil {
 		c.Log.Warn("invariant check failed", "type", TypeMissingDeliveryExecution, "err", err)
+	}
+
+	// M. provider capacity slots must belong to a running run at the slot's
+	// lease epoch (Admission Fairness & Lease Hardening, Phase 2).
+	if n, err := q.CountOrphanProviderSlots(ctx); err == nil && n > 0 {
+		res.TotalViolations += int(n)
+		c.report(TypeOrphanProviderSlot, n)
+	} else if err != nil {
+		c.Log.Warn("invariant check failed", "type", TypeOrphanProviderSlot, "err", err)
 	}
 
 	return res

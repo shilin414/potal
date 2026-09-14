@@ -43,8 +43,6 @@ type Worker struct {
 	Limiter     *execution.RateLimiter
 	Log         *slog.Logger
 	Metrics     *telemetry.Metrics
-
-	nowFunc func() time.Time
 }
 
 func NewWorker(d *sql.DB, rdb *redisx.Client, workerID string, sender Sender, limiter *execution.RateLimiter, log *slog.Logger, m *telemetry.Metrics) *Worker {
@@ -52,7 +50,7 @@ func NewWorker(d *sql.DB, rdb *redisx.Client, workerID string, sender Sender, li
 		log = slog.Default()
 	}
 	return &Worker{DB: d, RDB: rdb, WorkerID: workerID, Concurrency: 4,
-		Sender: sender, Limiter: limiter, Log: log, Metrics: m, nowFunc: time.Now}
+		Sender: sender, Limiter: limiter, Log: log, Metrics: m}
 }
 
 func (w *Worker) stream() string { return w.RDB.Key("queue", ProviderKey) }
@@ -250,8 +248,10 @@ func (w *Worker) handleFailure(ctx context.Context, row db.DeliveryExecution, se
 	if backoff > 5*time.Minute {
 		backoff = 5 * time.Minute
 	}
+	// The delay is applied by the DB clock inside RequeueDelivery: the
+	// worker only contributes the duration, never an absolute instant.
 	if _, err := q.RequeueDelivery(ctx, db.RequeueDeliveryParams{
-		NextAttemptAt: sqlNullTime(w.nowFunc().UTC().Add(backoff)),
+		BackoffMicros: backoff.Microseconds(),
 		ErrorCode:     code,
 		ErrorMessage:  sqlNullString(msg),
 		ID:            row.ID,
@@ -273,10 +273,7 @@ func (w *Worker) dueScanLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			rows, err := w.q(ctx).ListDueDeliveries(ctx, db.ListDueDeliveriesParams{
-				NextAttemptAt: sqlNullTime(w.nowFunc().UTC()),
-				Limit:         50,
-			})
+			rows, err := w.q(ctx).ListDueDeliveries(ctx, 50)
 			if err != nil {
 				continue
 			}
@@ -298,13 +295,14 @@ func (w *Worker) reclaimLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			q := w.q(ctx)
-			cutoff := w.nowFunc().UTC().Add(-leaseSeconds)
-			if _, err := q.ReclaimStuckDeliveries(ctx, cutoff); err != nil {
+			// "Stuck" is measured from the DB clock: the worker passes only
+			// the lease duration (Phase 3).
+			if _, err := q.ReclaimStuckDeliveries(ctx, leaseSeconds.Microseconds()); err != nil {
 				w.Log.Warn("delivery reclaim failed", "err", err)
 			}
 			if _, err := q.FailStuckDeliveries(ctx, db.FailStuckDeliveriesParams{
 				ErrorMessage: sqlNullString("worker crashed before delivery completed"),
-				UpdatedAt:    cutoff,
+				LeaseMicros:  leaseSeconds.Microseconds(),
 			}); err != nil {
 				w.Log.Warn("delivery stuck fail failed", "err", err)
 			}
@@ -339,11 +337,4 @@ func sqlNullString(s string) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: s, Valid: true}
-}
-
-func sqlNullTime(t time.Time) sql.NullTime {
-	if t.IsZero() {
-		return sql.NullTime{}
-	}
-	return sql.NullTime{Time: t, Valid: true}
 }

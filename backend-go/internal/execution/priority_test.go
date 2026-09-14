@@ -4,6 +4,28 @@ import (
 	"testing"
 )
 
+// serveNext serves one message using the real scheduler policy: classes are
+// probed in the order the worker probes them, a class with queued work is
+// served (consume), and an idle class forfeits the rest of its round credit
+// (markEmpty) — exactly what Worker.readWeighted does. Returns the served
+// class index or -1 when every queue is empty.
+//
+// When the first probe pass only forfeits empty classes, the worker pauses
+// and probes again on a fresh round; the second pass models that refill.
+func serveNext(sched *classScheduler, left []int) int {
+	for pass := 0; pass < 2; pass++ {
+		for _, idx := range sched.order() {
+			if idx < len(left) && left[idx] > 0 {
+				left[idx]--
+				sched.consume(idx)
+				return idx
+			}
+			sched.markEmpty(idx)
+		}
+	}
+	return -1
+}
+
 // simulate serves n messages with the given per-class availability using
 // the real scheduler policy: a class can serve a message only while it
 // still has queued work.
@@ -13,18 +35,10 @@ func simulate(weights []int, available []int, n int) []int {
 	copy(left, available)
 	served := make([]int, 0, n)
 	for i := 0; i < n; i++ {
-		picked := -1
-		for _, idx := range sched.order() {
-			if idx < len(left) && left[idx] > 0 {
-				picked = idx
-				break
-			}
-		}
+		picked := serveNext(sched, left)
 		if picked < 0 {
 			break // nothing queued anywhere
 		}
-		left[picked]--
-		sched.consume(picked)
 		served = append(served, picked)
 	}
 	return served
@@ -130,66 +144,183 @@ func TestScheduledNeverStarvesUnderContinuousInteractive(t *testing.T) {
 	}
 }
 
-// TestIdleClassQuotaIsBorrowed: when the interactive class is empty its
-// capacity is handed to the other classes instead of being wasted.
-func TestIdleClassQuotaIsBorrowed(t *testing.T) {
+// TestScheduledNeverStarvesWhenRetryEmpty — the P0 starvation bug from the
+// code review: interactive and scheduled are continuously busy while the
+// retry stream is EMPTY. The old policy only refilled when every credit hit
+// 0, and an empty retry stream never consumed its credit — the credits got
+// pinned at [0,1,0] and scheduled was starved forever after the first two
+// messages. With markEmpty the empty class forfeits its credit and the round
+// refills, so scheduled keeps receiving ~2/9 of the worker's capacity.
+func TestScheduledNeverStarvesWhenRetryEmpty(t *testing.T) {
+	const n = 1000
+	served := simulate(DefaultPriorityWeights, []int{1000, 0, 1000}, n)
+	if len(served) != n {
+		t.Fatalf("served %d messages, want %d", len(served), n)
+	}
+	got := count(served, 2)
+	if got < 150 {
+		t.Fatalf("scheduled served only %d/%d while retry is empty (starvation regression)", got, n)
+	}
+	if got > 300 {
+		t.Fatalf("scheduled served %d/%d — more than its 2/9 share, interactive lost its priority", got, n)
+	}
+	if count(served, 1) != 0 {
+		t.Fatalf("retry (empty backlog) served %d messages", count(served, 1))
+	}
+	if count(served, 0) <= got {
+		t.Fatalf("interactive=%d scheduled=%d: interactive must keep priority", count(served, 0), got)
+	}
+}
+
+// TestRetryNeverStarvesWhenScheduledEmpty: the symmetric case — scheduled
+// is empty while interactive and retry are busy. Retry must keep its 1/9
+// share instead of being frozen out by the empty scheduled credits.
+func TestRetryNeverStarvesWhenScheduledEmpty(t *testing.T) {
+	const n = 1000
+	served := simulate(DefaultPriorityWeights, []int{1000, 1000, 0}, n)
+	got := count(served, 1)
+	if got < 80 {
+		t.Fatalf("retry served only %d/%d while scheduled is empty (starvation regression)", got, n)
+	}
+	if got > 180 {
+		t.Fatalf("retry served %d/%d — more than its 1/9 share", got, n)
+	}
+	if count(served, 2) != 0 {
+		t.Fatalf("scheduled (empty backlog) served %d messages", count(served, 2))
+	}
+}
+
+// TestEmptyCreditedClassCannotPinRound: the direct regression for the bug —
+// an empty credited class must not keep the round open. After interactive
+// exhausts its quota and retry is probed empty, the round must still offer
+// the scheduled class, and after scheduled spends its own quota the round
+// must refill instead of being pinned by retry's leftover credit.
+func TestEmptyCreditedClassCannotPinRound(t *testing.T) {
+	sched := newClassScheduler(DefaultPriorityWeights)
+	for i := 0; i < DefaultPriorityWeights[0]; i++ {
+		sched.consume(0) // interactive spends its whole quota
+	}
+	sched.markEmpty(1) // retry is empty
+	if sched.allExhausted() {
+		t.Fatal("empty retry credit pinned the round: allExhausted()=true with scheduled credit left")
+	}
+	order := sched.order()
+	if len(order) != 1 || order[0] != 2 {
+		t.Fatalf("order after interactive quota + empty retry = %v, want [scheduled]", order)
+	}
+	// Scheduled spends its quota: the round is now exhausted and refills.
+	sched.consume(2)
+	sched.consume(2)
+	if !sched.allExhausted() {
+		t.Fatal("round never exhausts after the active classes spent their quotas")
+	}
+	if next := sched.order(); next[0] != 0 {
+		t.Fatalf("after refill the first class = %s, want interactive", name(next[0]))
+	}
+}
+
+// TestTwoActiveClassesReceiveRelativeShare: with only interactive and
+// scheduled active (retry idle), the two classes share the capacity in
+// their configured 7:2 ratio — the idle class wastes nothing and skews
+// nothing.
+func TestTwoActiveClassesReceiveRelativeShare(t *testing.T) {
+	const n = 900
+	served := simulate(DefaultPriorityWeights, []int{1000, 0, 1000}, n)
+	interactive, scheduled := count(served, 0), count(served, 2)
+	if interactive+scheduled != n {
+		t.Fatalf("only two classes are active: served %d interactive + %d scheduled != %d",
+			interactive, scheduled, n)
+	}
+	// 7:2 over 900 messages → 700:200.
+	if interactive < 650 || interactive > 750 {
+		t.Fatalf("interactive share = %d/%d, want ~700 (7:2 with the idle class forfeiting)", interactive, n)
+	}
+	if scheduled < 150 || scheduled > 250 {
+		t.Fatalf("scheduled share = %d/%d, want ~200 (7:2 with the idle class forfeiting)", scheduled, n)
+	}
+}
+
+// TestClassBecomesActiveAgainAfterBeingMarkedEmpty: forfeiting credit is not
+// a permanent demotion — once work arrives the class is credited again on
+// the next round and is probed in its normal priority position.
+func TestClassBecomesActiveAgainAfterBeingMarkedEmpty(t *testing.T) {
+	sched := newClassScheduler(DefaultPriorityWeights)
+	sched.markEmpty(0) // interactive was idle
+	sched.markEmpty(1) // retry was idle
+	// Scheduled spends its quota: the round is exhausted and refills, which
+	// must credit interactive again — being marked empty is not a permanent
+	// demotion.
+	sched.consume(2)
+	sched.consume(2)
+	if order := sched.order(); len(order) == 0 || order[0] != 0 {
+		t.Fatalf("interactive did not return to the head of the round: order=%v", order)
+	}
+}
+
+// TestIdleClassQuotaIsNotWasted: when only one class has work it receives
+// 100% of the worker's capacity — the other classes' credits are forfeited
+// instead of being held (which used to split the capacity unevenly and, in
+// the retry-empty case, stall the round entirely).
+func TestIdleClassQuotaIsNotWasted(t *testing.T) {
 	const n = 60
 	served := simulate(DefaultPriorityWeights, []int{0, 0, 200}, n)
 	if got := count(served, 2); got != n {
-		t.Fatalf("with interactive/retry idle, scheduled served %d/%d — quota not borrowed", got, n)
+		t.Fatalf("with interactive/retry idle, scheduled served %d/%d — idle quota wasted", got, n)
 	}
 	if count(served, 0) != 0 || count(served, 1) != 0 {
 		t.Fatalf("served from empty classes: %v", served)
 	}
 }
 
-// TestBorrowReleasesWhenInteractiveReturns: borrowing must not create a
-// starvation debt — the moment interactive traffic arrives it takes its
-// full share again.
-func TestBorrowReleasesWhenInteractiveReturns(t *testing.T) {
+// TestInteractiveReclaimsShareWhenItReturns: a class that was idle (and got
+// marked empty) must take its full share the moment traffic returns — no
+// starvation debt in either direction.
+func TestInteractiveReclaimsShareWhenItReturns(t *testing.T) {
 	sched := newClassScheduler(DefaultPriorityWeights)
-	// Drain credits while only scheduled has work (borrowing).
 	left := []int{0, 0, 100}
 	for i := 0; i < 20; i++ {
-		for _, idx := range sched.order() {
-			if left[idx] > 0 {
-				left[idx]--
-				sched.consume(idx)
-				break
-			}
+		if got := serveNext(sched, left); got != 2 {
+			t.Fatalf("while only scheduled is active, served class %s, want scheduled", name(got))
 		}
 	}
-	// Interactive returns: it must be served first (its credits were never
-	// spent while it was idle).
-	if got := sched.order()[0]; got != 0 {
+	left[0] = 50 // interactive returns
+	if got := serveNext(sched, left); got != 0 {
 		t.Fatalf("first probed class after interactive returns = %s, want interactive", name(got))
 	}
 }
 
-// TestClassSchedulerRefillsAndBorrows documents the two edge cases the
-// worker relies on: refill on exhaustion, borrow without credit.
-func TestClassSchedulerRefillsAndBorrows(t *testing.T) {
+// TestZeroWeightClassIsNeverProbed: a zero-weight class is disabled — it is
+// never probed and never served. Production configuration rejects zero
+// weights (parseWeights), this pins the scheduler's own behaviour.
+func TestZeroWeightClassIsNeverProbed(t *testing.T) {
 	sched := newClassScheduler([]int{2, 0, 1})
-	got := sched.order()
-	want := []int{0, 2, 1} // credited [0 2] first, then the borrowed retry
-	if len(got) != len(want) {
-		t.Fatalf("order = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("order = %v, want %v", got, want)
+	left := []int{5, 5, 5}
+	for i := 0; i < 12; i++ {
+		if got := serveNext(sched, left); got == 1 {
+			t.Fatal("zero-weight class was probed and served")
 		}
 	}
-	sched.consume(0)
-	sched.consume(0)
-	sched.consume(2)
-	// All credits spent → the next order refills instead of returning only
-	// borrows.
-	if next := sched.order(); next[0] != 0 {
-		t.Fatalf("after exhaustion the first class = %s, want interactive (refilled)", name(next[0]))
+	if left[1] != 5 {
+		t.Fatalf("zero-weight class consumed %d messages", 5-left[1])
 	}
-	// A zero-weight class is borrowable but never accumulates credit.
-	if sched.credits[1] != 0 {
-		t.Fatalf("retry credit = %d, want 0", sched.credits[1])
+}
+
+// TestAllZeroWeightsIsANoOp: even with a (rejected) all-zero weight vector
+// the scheduler must not panic, loop or serve anything.
+func TestAllZeroWeightsIsANoOp(t *testing.T) {
+	sched := newClassScheduler([]int{0, 0, 0})
+	if got := serveNext(sched, []int{5, 5, 5}); got != -1 {
+		t.Fatalf("all-zero weights served class %s, want nothing", name(got))
+	}
+	if order := sched.order(); len(order) != 0 {
+		t.Fatalf("all-zero weights produced an order: %v", order)
+	}
+}
+
+// TestUnconfiguredSchedulerIsANoOp: no configured classes = nothing to do.
+func TestUnconfiguredSchedulerIsANoOp(t *testing.T) {
+	sched := newClassScheduler(nil)
+	if got := serveNext(sched, nil); got != -1 {
+		t.Fatalf("unconfigured scheduler served class %d", got)
 	}
 }

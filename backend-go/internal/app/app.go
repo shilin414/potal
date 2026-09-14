@@ -57,7 +57,9 @@ type App struct {
 	DeliveryDispatch *delivery.Dispatcher
 	DeliverySender   delivery.Sender
 	DeliveryLimiter  *execution.RateLimiter
-	ProviderInflight *execution.InflightLimiter
+	// ProviderSlots is the durable (TiDB) provider concurrency semaphore:
+	// ownership-scoped slots, DB-clock expiry, Redis independent.
+	ProviderSlots *execution.ProviderSlots
 }
 
 // Build constructs the graph; ctx bounds connection setup.
@@ -189,7 +191,7 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 		Runs: runs, ArtifactsRL: ailyExecutor.ArtifactsL, AilyExecutor: ailyExecutor,
 		Schedules: schedSvc, Scheduler: schedJob,
 		DeliveryDispatch: disp, DeliverySender: feishuSender, DeliveryLimiter: deliveryLimiter,
-		ProviderInflight: execution.NewInflightLimiter(rdb, "feishu_aily", maxInflight, cfg.Runner.LeaseSeconds),
+		ProviderSlots: execution.NewProviderSlots(dbh, "feishu_aily", maxInflight, cfg.Runner.LeaseSeconds),
 	}, nil
 }
 

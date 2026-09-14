@@ -55,6 +55,8 @@ type Querier interface {
 	// itself still hold the schedule's execution slot (queued/running)?
 	// A pending row does not block its own admission.
 	CountActiveOccurrencesExcluding(ctx context.Context, arg CountActiveOccurrencesExcludingParams) (int64, error)
+	// Active = not past its DB-clock expiry.
+	CountActiveProviderSlots(ctx context.Context, provider string) (int64, error)
 	CountConversationByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
 	CountMessagesByConversation(ctx context.Context, conversationID uint64) (int64, error)
 	// Invariant L: every enabled target of a succeeded occurrence has a
@@ -62,6 +64,9 @@ type Querier interface {
 	// positives on historical occurrences: a target enabled AFTER the
 	// occurrence finished was never supposed to receive it.
 	CountMissingDeliveryExecutions(ctx context.Context) (int64, error)
+	// Invariant M: an ACTIVE provider slot must belong to a running run at the
+	// matching lease epoch.
+	CountOrphanProviderSlots(ctx context.Context) (int64, error)
 	CountPendingOutbox(ctx context.Context) (int64, error)
 	// Invariant B: a queued run must NOT hold a lease.
 	CountQueuedWithLease(ctx context.Context) (int64, error)
@@ -69,6 +74,10 @@ type Querier interface {
 	CountRunEvents(ctx context.Context, runID []byte) (int64, error)
 	// Invariant E: a running run's lease_epoch must equal its lease row's.
 	CountRunningLeaseEpochMismatch(ctx context.Context) (int64, error)
+	// Ownership probe for provider slot Acquire: only the CURRENT owner of a
+	// running run may hold provider capacity, so a stale worker that wakes up
+	// after its run was reclaimed/reaped cannot pollute the semaphore.
+	CountRunningRunAtEpoch(ctx context.Context, arg CountRunningRunAtEpochParams) (int64, error)
 	// ──────────────────────────────────────────────── invariant checks ──
 	// Execution invariant checker queries (修复计划 §43-49): detect only,
 	// never auto-repair.
@@ -104,11 +113,13 @@ type Querier interface {
 	CreateFeishuIdentity(ctx context.Context, arg CreateFeishuIdentityParams) (sql.Result, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (sql.Result, error)
 	CreateOutboxEvent(ctx context.Context, arg CreateOutboxEventParams) (sql.Result, error)
-	// Delayed-publish variant: the row stays invisible to the relay until
-	// retryAt. Run.available_at and outbox availability share one timestamp
-	// so a retried run is dispatched exactly when it becomes claimable
-	// (P1-2) — no earlier, no later.
+	// Delayed-publish variant: the row stays invisible to the relay until the
+	// DB clock passes the given microsecond delay. RetryOwnedRunAfter passes
+	// the SAME delay to RequeueRunFenced, so a retried run is dispatched
+	// exactly when it becomes claimable (P1-2) — no earlier, no later — with
+	// the DB clock as the single authority for both (Phase 3).
 	CreateOutboxEventAt(ctx context.Context, arg CreateOutboxEventAtParams) (sql.Result, error)
+	CreateProviderSlot(ctx context.Context, arg CreateProviderSlotParams) error
 	// ─────────────────────────────────────────────────────────── execution ──
 	CreateRun(ctx context.Context, arg CreateRunParams) (sql.Result, error)
 	CreateRunArtifact(ctx context.Context, arg CreateRunArtifactParams) error
@@ -116,6 +127,9 @@ type Querier interface {
 	// lease_epoch mirrors runs.lease_epoch at claim time (migration 0010):
 	// the reaper verifies an expired lease really belongs to the run's
 	// CURRENT epoch before recovering it.
+	// expires_at is derived from the DB clock — the lease is acquired,
+	// heartbeat and expired under ONE clock authority (Phase 3), never from
+	// the worker's local clock.
 	CreateRunLease(ctx context.Context, arg CreateRunLeaseParams) error
 	// ─────────────────────────────────────────────────────────── automation ──
 	// Schedule / Occurrence / Delivery queries (0006_schedule_automation).
@@ -126,12 +140,22 @@ type Querier interface {
 	CreateScheduleOccurrence(ctx context.Context, arg CreateScheduleOccurrenceParams) (sql.Result, error)
 	// ─────────────────────────────────────────────────────────── identity ──
 	CreateUser(ctx context.Context, arg CreateUserParams) (sql.Result, error)
+	// Authoritative clock read. State written in the same transaction derives
+	// its timestamps from this value or from CURRENT_TIMESTAMP(3) directly —
+	// never from the application clock (Phase 3).
+	CurrentDBTime(ctx context.Context) (time.Time, error)
 	DeleteApplication(ctx context.Context, id uint64) error
 	DeleteAttachment(ctx context.Context, id []byte) error
 	DeleteConversation(ctx context.Context, id uint64) error
 	DeleteConversationMessages(ctx context.Context, conversationID uint64) error
 	// Returns run ids so the caller can purge their children in Go.
 	DeleteConversationRuns(ctx context.Context, conversationID sql.NullInt64) ([][]byte, error)
+	// Crash recovery inside Acquire: a worker that died without releasing must
+	// not pin provider capacity beyond its DB-clock lease.
+	DeleteExpiredProviderSlots(ctx context.Context, provider string) (sql.Result, error)
+	// Reaper hygiene sweep: expiry is already enforced on read; this only keeps
+	// the table small.
+	DeleteExpiredProviderSlotsAll(ctx context.Context) (sql.Result, error)
 	DeleteFavorite(ctx context.Context, arg DeleteFavoriteParams) error
 	DeleteLease(ctx context.Context, runID []byte) error
 	// Delete exactly one lease row, identified by token (used inside
@@ -141,6 +165,13 @@ type Querier interface {
 	// the new owner's lease row.
 	DeleteLeaseFenced(ctx context.Context, arg DeleteLeaseFencedParams) error
 	DeleteLeaseIfExpired(ctx context.Context, runID []byte) (sql.Result, error)
+	// Release deletes exactly this ownership's slot: a stale worker's release
+	// touches neither the new owner's slot nor any other attempt's.
+	DeleteProviderSlotByToken(ctx context.Context, arg DeleteProviderSlotByTokenParams) (sql.Result, error)
+	// Ownership-transition cleanup: finalize / retry / reaper delete the run's
+	// slots (current and older epochs) in the SAME transaction as the canonical
+	// state write, so "run stopped running ⇒ no provider slot" holds.
+	DeleteProviderSlotsUpToEpoch(ctx context.Context, arg DeleteProviderSlotsUpToEpochParams) (sql.Result, error)
 	DeleteRunArtifacts(ctx context.Context, runID []byte) error
 	DeleteRunCommands(ctx context.Context, runID []byte) error
 	DeleteRunEvents(ctx context.Context, runID []byte) error
@@ -150,6 +181,15 @@ type Querier interface {
 	DeleteScheduleDeliveries(ctx context.Context, scheduleID uint64) error
 	DeleteSharesByConversation(ctx context.Context, conversationID uint64) error
 	DeleteThreadByConversation(ctx context.Context, conversationID uint64) error
+	// ───────────────────────────────────────── provider execution slots ──
+	// Provider Inflight Durable Truth (Admission Fairness & Distributed Lease
+	// Hardening, Phase 2): max_inflight is a safety capacity state and lives in
+	// TiDB, not in a transient Redis semaphore. Every timestamp decision uses
+	// the DB clock; Redis restart/flush can never raise real provider
+	// concurrency above the configured limit.
+	// Materializes the per-provider serialization row (seeded by migration
+	// 0011; a provider registered later self-heals here).
+	EnsureProviderAdmissionLock(ctx context.Context, provider string) error
 	FailExpiredRun(ctx context.Context, arg FailExpiredRunParams) (sql.Result, error)
 	FailOutboxEvent(ctx context.Context, arg FailOutboxEventParams) error
 	FailRunFenced(ctx context.Context, arg FailRunFencedParams) (sql.Result, error)
@@ -179,6 +219,9 @@ type Querier interface {
 	GetPendingOwnedAttachment(ctx context.Context, arg GetPendingOwnedAttachmentParams) (RuntimeAttachment, error)
 	// ───────────────────────────────────────────────────────────── catalog ──
 	GetProviderByKey(ctx context.Context, providerKey string) (Provider, error)
+	// Idempotent re-acquire: the SAME ownership (run, claim epoch, token)
+	// already holds a slot → refresh it instead of consuming a second one.
+	GetProviderSlotForUpdate(ctx context.Context, arg GetProviderSlotForUpdateParams) (uint64, error)
 	GetRunArtifactByID(ctx context.Context, id []byte) (RunArtifact, error)
 	GetRunByID(ctx context.Context, id []byte) (Run, error)
 	GetRunCommandByID(ctx context.Context, id []byte) (RunCommand, error)
@@ -199,9 +242,13 @@ type Querier interface {
 	GetUserByID(ctx context.Context, id uint64) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	HasActiveOccurrence(ctx context.Context, scheduleID uint64) (int64, error)
+	// Lease extension from the DB clock (Phase 3). A negative microsecond delay
+	// expires the lease immediately — test fixtures use that instead of passing
+	// an absolute app-clock instant.
 	HeartbeatLease(ctx context.Context, arg HeartbeatLeaseParams) (sql.Result, error)
 	// Ownership-checked by lease token (not worker_id): a recycled worker id
-	// cannot renew a lease it no longer owns.
+	// cannot renew a lease it no longer owns. Extension is DB-clock based, so a
+	// skewed worker clock can neither extend nor shorten the lease.
 	HeartbeatLeaseFenced(ctx context.Context, arg HeartbeatLeaseFencedParams) (sql.Result, error)
 	IncrementApplicationUsage(ctx context.Context, id uint64) error
 	LatestOccurrenceBySchedule(ctx context.Context, scheduleID uint64) (ScheduleOccurrence, error)
@@ -226,7 +273,8 @@ type Querier interface {
 	// Batch fetch for the occurrences page (delivery results per slot).
 	ListDeliveryExecutionsByOccurrences(ctx context.Context, ids []uint64) ([]DeliveryExecution, error)
 	ListDeliveryExecutionsByRun(ctx context.Context, runID []byte) ([]DeliveryExecution, error)
-	ListDueDeliveries(ctx context.Context, arg ListDueDeliveriesParams) ([]DeliveryExecution, error)
+	// "Due" is decided by the DB clock, not by the caller's clock.
+	ListDueDeliveries(ctx context.Context, limit int32) ([]DeliveryExecution, error)
 	ListDueSchedules(ctx context.Context, arg ListDueSchedulesParams) ([]Schedule, error)
 	ListEnabledBindings(ctx context.Context) ([]RuntimeBinding, error)
 	ListEnabledDeliveriesBySchedule(ctx context.Context, scheduleID uint64) ([]ScheduleDelivery, error)
@@ -248,6 +296,10 @@ type Querier interface {
 	// Occurrences stuck in pending longer than the grace period: their
 	// creating scheduler died between INSERT and the run-creating commit.
 	ListStuckPendingOccurrences(ctx context.Context, arg ListStuckPendingOccurrencesParams) ([]ScheduleOccurrence, error)
+	// Acquire holds this row lock for the rest of its transaction, so
+	// "delete expired → count active → insert" is atomic on TiDB and MySQL 5.7
+	// without table locks. Row missing = error (owner recovers by requeue).
+	LockProviderAdmission(ctx context.Context, provider string) (string, error)
 	MarkOccurrenceQueued(ctx context.Context, arg MarkOccurrenceQueuedParams) (sql.Result, error)
 	// Run claim fan-out: the occurrence linked to this run enters 'running'.
 	MarkOccurrenceRunningByRun(ctx context.Context, runID sql.NullString) (sql.Result, error)
@@ -257,15 +309,20 @@ type Querier interface {
 	// the threshold mean dispatch is stuck).
 	OldestPendingOutboxAgeSeconds(ctx context.Context) (int64, error)
 	// Crash recovery: rows stuck in 'sending' (worker died before ACK/commit)
-	// return to pending when their lease lapsed.
-	ReclaimStuckDeliveries(ctx context.Context, updatedAt time.Time) (sql.Result, error)
+	// return to pending when their DB-clock lease lapsed.
+	ReclaimStuckDeliveries(ctx context.Context, leaseMicros interface{}) (sql.Result, error)
+	// Retry time = DB clock + the worker's backoff in microseconds (Clock
+	// Authority, Phase 3): the due-scan below compares against the DB clock, so
+	// a skewed worker clock can neither delay nor rush a delivery retry.
 	RequeueDelivery(ctx context.Context, arg RequeueDeliveryParams) (sql.Result, error)
 	RequeueRun(ctx context.Context, id []byte) error
-	// available_at is an explicit param: Run.available_at and the outbox
-	// row's available_at MUST carry the same retryAt (P1-2: a hardcoded
-	// INTERVAL here desynchronized run availability from outbox publishing,
-	// so a redispatched run was invisible to the CAS until the fallback scan
-	// found it ~20s later).
+	// available_at comes from the DB clock plus the caller's retry delay in
+	// microseconds. Run.available_at and the outbox row's available_at MUST
+	// carry the same retry instant (P1-2: a hardcoded INTERVAL once
+	// desynchronized run availability from outbox publishing, so a
+	// redispatched run was invisible to the CAS until the fallback scan found
+	// it ~20s later) and neither may depend on the app clock, whose skew
+	// against TiDB has already caused a wakeup/claimability mismatch (Phase 3).
 	RequeueRunFenced(ctx context.Context, arg RequeueRunFencedParams) (sql.Result, error)
 	// Reaper recovery requeue: a crashed worker's run becomes claimable AT
 	// ONCE — crash recovery must not wait out a retry backoff. available_at
@@ -284,6 +341,9 @@ type Querier interface {
 	// run-now bookkeeping: last_run_at moves, next_run_at stays untouched.
 	SetScheduleLastRun(ctx context.Context, arg SetScheduleLastRunParams) (sql.Result, error)
 	SetScheduleNextRun(ctx context.Context, arg SetScheduleNextRunParams) (sql.Result, error)
+	// Renew (XX-only): the slot must already exist. 0 rows = expired/released →
+	// ErrProviderSlotLost; a lost slot is NEVER recreated by a renewal.
+	TouchProviderSlot(ctx context.Context, arg TouchProviderSlotParams) (sql.Result, error)
 	TouchScheduleRunTimes(ctx context.Context, arg TouchScheduleRunTimesParams) (sql.Result, error)
 	UnbindConversationAttachments(ctx context.Context, conversationID sql.NullInt64) error
 	UpdateApplication(ctx context.Context, arg UpdateApplicationParams) (sql.Result, error)

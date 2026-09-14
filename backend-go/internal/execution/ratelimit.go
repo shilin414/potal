@@ -23,18 +23,24 @@ import (
 //
 // burst = limit (capacity); rate = limit per period.
 // Emission interval = period / limit.
+//
+// The reference clock is Redis TIME (Clock Authority, Phase 3): the shared
+// limiter state must not be expired or advanced by any single worker's local
+// clock — a fast worker clock would otherwise consume other workers' tokens
+// and a slow one would admit a burst. ARGV carries only the policy
+// parameters; "now" is owned by Redis.
 var gcraLua = goredis.NewScript(`
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000000 + tonumber(t[2])
 local tat = redis.call('GET', KEYS[1])
-local now = ARGV[1]
-local emission = ARGV[2]
-local burst_offset = ARGV[3]
-local ttl = ARGV[4]
+local emission = ARGV[1]
+local burst_offset = ARGV[2]
+local ttl = ARGV[3]
 if not tat then
   tat = 0
 else
   tat = tonumber(tat)
 end
-now = tonumber(now)
 emission = tonumber(emission)
 burst_offset = tonumber(burst_offset)
 if now < tat - burst_offset then
@@ -80,7 +86,6 @@ func (l *RateLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, e
 	if l.limit <= 0 {
 		return true, 0, nil
 	}
-	nowMicro := time.Now().UnixMicro()
 	emissionMicro := int64(l.period / time.Duration(l.limit) / time.Microsecond)
 	if emissionMicro <= 0 {
 		emissionMicro = 1
@@ -91,13 +96,17 @@ func (l *RateLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, e
 	burstOffset := emissionMicro * int64(l.limit-1)
 	ttlMillis := int64(l.period/time.Millisecond)*int64(l.limit) + 1000
 
+	// Redis owns "now" for the shared window (Phase 3).
 	res, err := gcraLua.Run(ctx, l.rdb.Client, []string{l.key},
-		nowMicro, emissionMicro, burstOffset, ttlMillis).Slice()
+		emissionMicro, burstOffset, ttlMillis).Slice()
 	if err != nil {
 		// Degraded mode: fall back to the in-process limiter with the
-		// same GCRA parameters. Never fail open (评测 P1).
+		// same GCRA parameters. Never fail open (评测 P1). The local
+		// fallback necessarily uses the local clock — it only guards this
+		// one worker while Redis is unreachable, and is reported through
+		// Degraded().
 		l.degraded.Store(true)
-		return l.allowLocal(nowMicro, emissionMicro, burstOffset)
+		return l.allowLocal(time.Now().UnixMicro(), emissionMicro, burstOffset)
 	}
 	l.degraded.Store(false)
 	allowed, _ := res[0].(int64)

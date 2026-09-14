@@ -85,19 +85,19 @@ func main() {
 	} else {
 		// Provider worker pool.
 		worker := &execution.Worker{
-			Svc:              a.Runs,
-			RDB:              a.Redis,
-			Provider:         *provider,
-			WorkerID:         cfg.Runner.WorkerID,
-			Group:            "workers",
-			Handler:          a.AilyExecutor,
-			Concurrency:      cfg.Runner.Concurrency,
-			Lease:            cfg.Runner.LeaseSeconds,
-			Heartbeat:        cfg.Runner.HeartbeatInterval,
-			ScanEvery:        cfg.Runner.ReaperInterval,
-			Log:              logger,
-			ProviderInflight: a.ProviderInflight,
-			PriorityWeights:  cfg.Runner.PriorityWeights,
+			Svc:             a.Runs,
+			RDB:             a.Redis,
+			Provider:        *provider,
+			WorkerID:        cfg.Runner.WorkerID,
+			Group:           "workers",
+			Handler:         a.AilyExecutor,
+			Concurrency:     cfg.Runner.Concurrency,
+			Lease:           cfg.Runner.LeaseSeconds,
+			Heartbeat:       cfg.Runner.HeartbeatInterval,
+			ScanEvery:       cfg.Runner.ReaperInterval,
+			Log:             logger,
+			ProviderSlots:   a.ProviderSlots,
+			PriorityWeights: cfg.Runner.PriorityWeights,
 		}
 		wg.Add(1)
 		go func() {
@@ -124,7 +124,7 @@ func main() {
 					degraded = 1.0
 				}
 				a.Metrics.ProviderLimiterDegraded.Set(degraded)
-				if depth, err := a.ProviderInflight.Depth(runCtx); err == nil {
+				if depth, err := a.ProviderSlots.Depth(runCtx); err == nil {
 					a.Metrics.ProviderInflight.WithLabelValues("feishu_aily").Set(float64(depth))
 				}
 			}

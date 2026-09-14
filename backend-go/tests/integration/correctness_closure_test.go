@@ -109,9 +109,7 @@ func TestReaperRecoveryAtomicRetry(t *testing.T) {
 		t.Fatalf("force expire: %v", err)
 	}
 
-	if _, err := svc.RecoverExpiredLeases(ctx, 10); err != nil {
-		t.Fatal(err)
-	}
+	recoverRun(t, svc, runID)
 
 	run, err := svc.GetRun(ctx, runID)
 	if err != nil {
@@ -164,9 +162,7 @@ func TestReaperRecoveryAtomicFail(t *testing.T) {
 		if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
 			t.Fatalf("force expire %d: %v", i, err)
 		}
-		if _, err := svc.RecoverExpiredLeases(ctx, 10); err != nil {
-			t.Fatal(err)
-		}
+		recoverRun(t, svc, runID)
 	}
 	run, err := svc.GetRun(ctx, runID)
 	if err != nil {
@@ -199,9 +195,7 @@ func TestStaleWorkerRetryFenced(t *testing.T) {
 	}
 	// A's lease lapses; reaper requeues; B takes over.
 	expireLease(t, svc, runID, "worker-a")
-	if _, err := svc.RecoverExpiredLeases(ctx, 100); err != nil {
-		t.Fatal(err)
-	}
+	recoverRun(t, svc, runID)
 	claimedB, _, err := svc.ClaimRun(ctx, runID, "worker-b", time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -307,9 +301,7 @@ func TestArtifactFencing(t *testing.T) {
 	}
 	// A's lease lapses; B takes over.
 	expireLease(t, svc, runID, "worker-a")
-	if _, err := svc.RecoverExpiredLeases(ctx, 100); err != nil {
-		t.Fatal(err)
-	}
+	recoverRun(t, svc, runID)
 	if _, _, err := svc.ClaimRun(ctx, runID, "worker-b", time.Minute); err != nil {
 		t.Fatal(err)
 	}
@@ -421,9 +413,7 @@ func TestProviderSessionFence(t *testing.T) {
 
 	// A loses the run; B takes over and binds session_B.
 	expireLease(t, svc, runID, "worker-a")
-	if _, err := svc.RecoverExpiredLeases(ctx, 100); err != nil {
-		t.Fatal(err)
-	}
+	recoverRun(t, svc, runID)
 	claimedB, _, err := svc.ClaimRun(ctx, runID, "worker-b", time.Minute)
 	if err != nil {
 		t.Fatal(err)

@@ -232,16 +232,18 @@ func (q *Queries) DeleteScheduleDeliveries(ctx context.Context, scheduleID uint6
 const failStuckDeliveries = `-- name: FailStuckDeliveries :execresult
 UPDATE delivery_executions
 SET status = 'failed', error_code = 'lease_expired', error_message = ?
-WHERE status = 'sending' AND updated_at < ? AND attempt >= max_attempts
+WHERE status = 'sending'
+  AND updated_at < DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND)
+  AND attempt >= max_attempts
 `
 
 type FailStuckDeliveriesParams struct {
 	ErrorMessage sql.NullString
-	UpdatedAt    time.Time
+	LeaseMicros  interface{}
 }
 
 func (q *Queries) FailStuckDeliveries(ctx context.Context, arg FailStuckDeliveriesParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, failStuckDeliveries, arg.ErrorMessage, arg.UpdatedAt)
+	return q.db.ExecContext(ctx, failStuckDeliveries, arg.ErrorMessage, arg.LeaseMicros)
 }
 
 const getDeliveryExecutionByID = `-- name: GetDeliveryExecutionByID :one
@@ -700,18 +702,15 @@ SELECT id, occurrence_id, run_id, schedule_delivery_id, sender_user_id, target_t
        target_id, status, external_message_id, attempt, max_attempts, next_attempt_at,
        error_code, error_message, created_at, sent_at, updated_at
 FROM delivery_executions
-WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+WHERE status = 'pending'
+  AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP(3))
 ORDER BY created_at
 LIMIT ?
 `
 
-type ListDueDeliveriesParams struct {
-	NextAttemptAt sql.NullTime
-	Limit         int32
-}
-
-func (q *Queries) ListDueDeliveries(ctx context.Context, arg ListDueDeliveriesParams) ([]DeliveryExecution, error) {
-	rows, err := q.db.QueryContext(ctx, listDueDeliveries, arg.NextAttemptAt, arg.Limit)
+// "Due" is decided by the DB clock, not by the caller's clock.
+func (q *Queries) ListDueDeliveries(ctx context.Context, limit int32) ([]DeliveryExecution, error) {
+	rows, err := q.db.QueryContext(ctx, listDueDeliveries, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1150,31 +1149,38 @@ func (q *Queries) MarkOccurrenceStatus(ctx context.Context, arg MarkOccurrenceSt
 const reclaimStuckDeliveries = `-- name: ReclaimStuckDeliveries :execresult
 UPDATE delivery_executions
 SET status = 'pending', next_attempt_at = CURRENT_TIMESTAMP(3)
-WHERE status = 'sending' AND updated_at < ? AND attempt < max_attempts
+WHERE status = 'sending'
+  AND updated_at < DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND)
+  AND attempt < max_attempts
 `
 
 // Crash recovery: rows stuck in 'sending' (worker died before ACK/commit)
-// return to pending when their lease lapsed.
-func (q *Queries) ReclaimStuckDeliveries(ctx context.Context, updatedAt time.Time) (sql.Result, error) {
-	return q.db.ExecContext(ctx, reclaimStuckDeliveries, updatedAt)
+// return to pending when their DB-clock lease lapsed.
+func (q *Queries) ReclaimStuckDeliveries(ctx context.Context, leaseMicros interface{}) (sql.Result, error) {
+	return q.db.ExecContext(ctx, reclaimStuckDeliveries, leaseMicros)
 }
 
 const requeueDelivery = `-- name: RequeueDelivery :execresult
 UPDATE delivery_executions
-SET status = 'pending', next_attempt_at = ?, error_code = ?, error_message = ?
+SET status = 'pending',
+    next_attempt_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND),
+    error_code = ?, error_message = ?
 WHERE id = ? AND status = 'sending'
 `
 
 type RequeueDeliveryParams struct {
-	NextAttemptAt sql.NullTime
+	BackoffMicros interface{}
 	ErrorCode     string
 	ErrorMessage  sql.NullString
 	ID            []byte
 }
 
+// Retry time = DB clock + the worker's backoff in microseconds (Clock
+// Authority, Phase 3): the due-scan below compares against the DB clock, so
+// a skewed worker clock can neither delay nor rush a delivery retry.
 func (q *Queries) RequeueDelivery(ctx context.Context, arg RequeueDeliveryParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, requeueDelivery,
-		arg.NextAttemptAt,
+		arg.BackoffMicros,
 		arg.ErrorCode,
 		arg.ErrorMessage,
 		arg.ID,

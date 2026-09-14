@@ -243,14 +243,10 @@ func TestLeaseExpiryAndReaper(t *testing.T) {
 		t.Fatalf("force expire: %v", err)
 	}
 
-	recovered, err := svc.RecoverExpiredLeases(ctx, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
 	// Other tests / the shared dev environment may leave additional
-	// expired leases behind — the reaper sweeps them all; this run's own
-	// recovery is asserted via the status below.
-	if recovered < 1 {
+	// expired leases behind — the reaper sweeps them in bounded batches
+	// until THIS run's own recovery is observed.
+	if recovered := recoverRun(t, svc, runID); recovered < 1 {
 		t.Fatalf("reaper recovered %d, want >= 1", recovered)
 	}
 	run, err := svc.GetRun(ctx, runID)
@@ -277,9 +273,7 @@ func TestLeaseExpiryAndReaper(t *testing.T) {
 		if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := svc.RecoverExpiredLeases(ctx, 10); err != nil {
-			t.Fatal(err)
-		}
+		recoverRun(t, svc, runID)
 	}
 	run, err = svc.GetRun(ctx, runID)
 	if err != nil {

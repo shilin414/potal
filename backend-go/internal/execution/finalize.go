@@ -143,6 +143,17 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 		return err
 	}
 
+	// 7. Provider capacity cleanup — same transaction: a terminal run holds
+	// no provider slot, so the invariant "active provider execution ⇔
+	// active provider_execution_slots row" holds without waiting for the
+	// worker's deferred release.
+	if _, err := q.DeleteProviderSlotsUpToEpoch(ctx, db.DeleteProviderSlotsUpToEpochParams{
+		RunID:      own.RunID.Bytes(),
+		LeaseEpoch: own.LeaseEpoch,
+	}); err != nil {
+		return err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return err
 	}

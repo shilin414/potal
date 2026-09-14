@@ -176,6 +176,23 @@ type Provider struct {
 	UpdatedAt             time.Time
 }
 
+type ProviderAdmissionLock struct {
+	Provider  string
+	CreatedAt time.Time
+}
+
+type ProviderExecutionSlot struct {
+	ID          uint64
+	Provider    string
+	RunID       []byte
+	LeaseEpoch  uint64
+	LeaseToken  []byte
+	WorkerID    string
+	AcquiredAt  time.Time
+	HeartbeatAt time.Time
+	ExpiresAt   time.Time
+}
+
 type QuotaPolicy struct {
 	ID         uint64
 	Scope      string

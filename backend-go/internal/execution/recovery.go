@@ -187,6 +187,17 @@ func (s *Service) recoverExpiredLeaseTx(ctx context.Context, runID ids.ID) (bool
 		return false, err
 	}
 
+	// Provider capacity cleanup — same transaction (§20): the crashed
+	// attempt's slot (and any stale epoch before it) must not pin provider
+	// capacity while the run is queued or failed. The slot's own lease is a
+	// backstop; this makes the invariant exact at recovery time.
+	if _, err := q.DeleteProviderSlotsUpToEpoch(ctx, db.DeleteProviderSlotsUpToEpochParams{
+		RunID:      runID.Bytes(),
+		LeaseEpoch: row.LeaseEpoch,
+	}); err != nil {
+		return false, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return false, err
 	}

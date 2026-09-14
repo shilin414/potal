@@ -20,11 +20,11 @@ import (
 )
 
 // expireLease pushes a worker's lease into the past (simulates a dead or
-// paused worker) using that worker's identity.
+// paused worker) using that worker's identity. The negative delay is applied
+// by the DB clock, so the lease is provably expired for the reaper.
 func expireLease(t *testing.T, svc *execution.Service, runID ids.ID, workerID string) {
 	t.Helper()
-	past := time.Now().UTC().Add(-1 * time.Second)
-	if _, err := svc.Querier().HeartbeatLease(context.Background(), heartbeatExpireParams(past, runID.Bytes(), workerID)); err != nil {
+	if _, err := svc.Querier().HeartbeatLease(context.Background(), heartbeatExpireParams(runID.Bytes(), workerID)); err != nil {
 		t.Fatalf("expire lease: %v", err)
 	}
 }
@@ -155,11 +155,9 @@ func TestLeaseFencingStaleWorker(t *testing.T) {
 
 	// ── A "pauses": lease expires, reaper requeues. ──
 	expireLease(t, svc, runID, "worker-a")
-	if _, err := svc.RecoverExpiredLeases(ctx, 100); err != nil {
-		t.Fatalf("reaper: %v", err)
-	}
-	// (Other tests may leave expired leases behind — the reaper sweeps
-	// them all; this run's own recovery is asserted via status below.)
+	// Other tests may leave expired leases behind — the reaper sweeps them
+	// all until this run's own recovery is observed.
+	_ = recoverRun(t, svc, runID)
 	run, _ := svc.GetRun(ctx, runID)
 	if run.Status != execution.StatusQueued {
 		t.Fatalf("after reaper status=%s, want queued", run.Status)

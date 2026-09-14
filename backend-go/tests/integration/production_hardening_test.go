@@ -82,7 +82,7 @@ func TestTerminalRunRejectsAllStaleWorkerWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	expireLease(t, svc, runID, "worker-a")
-	_, _ = svc.RecoverExpiredLeases(ctx, 10)
+	recoverRun(t, svc, runID)
 	claimedB, _, err := svc.ClaimRun(ctx, runID, "worker-b", time.Minute)
 	if err != nil {
 		t.Fatal(err)
@@ -192,9 +192,7 @@ func TestReaperFinalFailureConvergesOccurrence(t *testing.T) {
 	if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.RecoverExpiredLeases(ctx, 10); err != nil {
-		t.Fatal(err)
-	}
+	recoverRun(t, svc, runID)
 	row, err := svc.Querier().GetScheduleOccurrenceByID(ctx, occ.ID)
 	if err != nil {
 		t.Fatal(err)

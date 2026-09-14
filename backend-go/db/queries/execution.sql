@@ -100,13 +100,16 @@ WHERE id = ? AND status NOT IN ('cancelled', 'succeeded', 'failed');
 UPDATE runs SET status = 'queued' WHERE id = ? AND status = 'running';
 
 -- name: RequeueRunFenced :execresult
--- available_at is an explicit param: Run.available_at and the outbox
--- row's available_at MUST carry the same retryAt (P1-2: a hardcoded
--- INTERVAL here desynchronized run availability from outbox publishing,
--- so a redispatched run was invisible to the CAS until the fallback scan
--- found it ~20s later).
+-- available_at comes from the DB clock plus the caller's retry delay in
+-- microseconds. Run.available_at and the outbox row's available_at MUST
+-- carry the same retry instant (P1-2: a hardcoded INTERVAL once
+-- desynchronized run availability from outbox publishing, so a
+-- redispatched run was invisible to the CAS until the fallback scan found
+-- it ~20s later) and neither may depend on the app clock, whose skew
+-- against TiDB has already caused a wakeup/claimability mismatch (Phase 3).
 UPDATE runs
-SET status = 'queued', priority = 'retry', available_at = ?
+SET status = 'queued', priority = 'retry',
+    available_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(retry_delay_micros) MICROSECOND)
 WHERE id = ? AND status = 'running' AND lease_epoch = ?;
 
 -- name: RequeueRunFencedImmediate :execresult
@@ -163,8 +166,12 @@ FROM run_commands WHERE id = ?;
 -- lease_epoch mirrors runs.lease_epoch at claim time (migration 0010):
 -- the reaper verifies an expired lease really belongs to the run's
 -- CURRENT epoch before recovering it.
+-- expires_at is derived from the DB clock — the lease is acquired,
+-- heartbeat and expired under ONE clock authority (Phase 3), never from
+-- the worker's local clock.
 INSERT INTO run_leases (run_id, worker_id, lease_token, lease_epoch, heartbeat_at, expires_at)
-VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(3), ?);
+VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP(3),
+        DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(lease_micros) MICROSECOND));
 
 -- name: GetExpiredLeaseForUpdate :one
 -- Reaper row lock: the lease is re-validated under lock inside the
@@ -188,15 +195,21 @@ FROM runs WHERE id = ? FOR UPDATE;
 DELETE FROM run_leases WHERE run_id = ? AND lease_token = ?;
 
 -- name: HeartbeatLease :execresult
+-- Lease extension from the DB clock (Phase 3). A negative microsecond delay
+-- expires the lease immediately — test fixtures use that instead of passing
+-- an absolute app-clock instant.
 UPDATE run_leases
-SET heartbeat_at = CURRENT_TIMESTAMP(3), expires_at = ?
+SET heartbeat_at = CURRENT_TIMESTAMP(3),
+    expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(lease_micros) MICROSECOND)
 WHERE run_id = ? AND worker_id = ?;
 
 -- name: HeartbeatLeaseFenced :execresult
 -- Ownership-checked by lease token (not worker_id): a recycled worker id
--- cannot renew a lease it no longer owns.
+-- cannot renew a lease it no longer owns. Extension is DB-clock based, so a
+-- skewed worker clock can neither extend nor shorten the lease.
 UPDATE run_leases
-SET heartbeat_at = CURRENT_TIMESTAMP(3), expires_at = ?
+SET heartbeat_at = CURRENT_TIMESTAMP(3),
+    expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(lease_micros) MICROSECOND)
 WHERE run_id = ? AND lease_token = ?;
 
 -- name: DeleteLease :exec
@@ -214,6 +227,97 @@ DELETE FROM run_leases WHERE run_id = ? AND expires_at <= CURRENT_TIMESTAMP(3);
 SELECT run_id FROM run_leases
 WHERE expires_at <= CURRENT_TIMESTAMP(3)
 LIMIT ?;
+
+-- ───────────────────────────────────────── provider execution slots ──
+-- Provider Inflight Durable Truth (Admission Fairness & Distributed Lease
+-- Hardening, Phase 2): max_inflight is a safety capacity state and lives in
+-- TiDB, not in a transient Redis semaphore. Every timestamp decision uses
+-- the DB clock; Redis restart/flush can never raise real provider
+-- concurrency above the configured limit.
+
+-- name: EnsureProviderAdmissionLock :exec
+-- Materializes the per-provider serialization row (seeded by migration
+-- 0011; a provider registered later self-heals here).
+INSERT INTO provider_admission_locks (provider) VALUES (?)
+ON DUPLICATE KEY UPDATE provider = provider;
+
+-- name: LockProviderAdmission :one
+-- Acquire holds this row lock for the rest of its transaction, so
+-- "delete expired → count active → insert" is atomic on TiDB and MySQL 5.7
+-- without table locks. Row missing = error (owner recovers by requeue).
+SELECT provider FROM provider_admission_locks WHERE provider = ? FOR UPDATE;
+
+-- name: CurrentDBTime :one
+-- Authoritative clock read. State written in the same transaction derives
+-- its timestamps from this value or from CURRENT_TIMESTAMP(3) directly —
+-- never from the application clock (Phase 3).
+SELECT CURRENT_TIMESTAMP(3) AS now;
+
+-- name: CountRunningRunAtEpoch :one
+-- Ownership probe for provider slot Acquire: only the CURRENT owner of a
+-- running run may hold provider capacity, so a stale worker that wakes up
+-- after its run was reclaimed/reaped cannot pollute the semaphore.
+SELECT COUNT(*) AS n FROM runs
+WHERE id = ? AND status = 'running' AND lease_epoch = ?;
+
+-- name: DeleteExpiredProviderSlots :execresult
+-- Crash recovery inside Acquire: a worker that died without releasing must
+-- not pin provider capacity beyond its DB-clock lease.
+DELETE FROM provider_execution_slots
+WHERE provider = ? AND expires_at <= CURRENT_TIMESTAMP(3);
+
+-- name: GetProviderSlotForUpdate :one
+-- Idempotent re-acquire: the SAME ownership (run, claim epoch, token)
+-- already holds a slot → refresh it instead of consuming a second one.
+SELECT id FROM provider_execution_slots
+WHERE provider = ? AND run_id = ? AND lease_epoch = ? AND lease_token = ?
+FOR UPDATE;
+
+-- name: TouchProviderSlot :execresult
+-- Renew (XX-only): the slot must already exist. 0 rows = expired/released →
+-- ErrProviderSlotLost; a lost slot is NEVER recreated by a renewal.
+UPDATE provider_execution_slots
+SET heartbeat_at = CURRENT_TIMESTAMP(3),
+    expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(lease_micros) MICROSECOND)
+WHERE provider = ? AND run_id = ? AND lease_epoch = ? AND lease_token = ?;
+
+-- name: CountActiveProviderSlots :one
+-- Active = not past its DB-clock expiry.
+SELECT COUNT(*) AS n FROM provider_execution_slots
+WHERE provider = ? AND expires_at > CURRENT_TIMESTAMP(3);
+
+-- name: CreateProviderSlot :exec
+INSERT INTO provider_execution_slots
+    (provider, run_id, lease_epoch, lease_token, worker_id,
+     acquired_at, heartbeat_at, expires_at)
+VALUES (?, ?, ?, ?, ?,
+        CURRENT_TIMESTAMP(3), CURRENT_TIMESTAMP(3),
+        DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(lease_micros) MICROSECOND));
+
+-- name: DeleteProviderSlotByToken :execresult
+-- Release deletes exactly this ownership's slot: a stale worker's release
+-- touches neither the new owner's slot nor any other attempt's.
+DELETE FROM provider_execution_slots
+WHERE provider = ? AND run_id = ? AND lease_epoch = ? AND lease_token = ?;
+
+-- name: DeleteProviderSlotsUpToEpoch :execresult
+-- Ownership-transition cleanup: finalize / retry / reaper delete the run's
+-- slots (current and older epochs) in the SAME transaction as the canonical
+-- state write, so "run stopped running ⇒ no provider slot" holds.
+DELETE FROM provider_execution_slots WHERE run_id = ? AND lease_epoch <= ?;
+
+-- name: DeleteExpiredProviderSlotsAll :execresult
+-- Reaper hygiene sweep: expiry is already enforced on read; this only keeps
+-- the table small.
+DELETE FROM provider_execution_slots WHERE expires_at <= CURRENT_TIMESTAMP(3);
+
+-- name: CountOrphanProviderSlots :one
+-- Invariant M: an ACTIVE provider slot must belong to a running run at the
+-- matching lease epoch.
+SELECT COUNT(*) AS n FROM provider_execution_slots s
+LEFT JOIN runs r
+  ON r.id = s.run_id AND r.status = 'running' AND r.lease_epoch = s.lease_epoch
+WHERE s.expires_at > CURRENT_TIMESTAMP(3) AND r.id IS NULL;
 
 -- ──────────────────────────────────────────────── invariant checks ──
 -- Execution invariant checker queries (修复计划 §43-49): detect only,
@@ -299,12 +403,13 @@ INSERT INTO outbox_events (aggregate, aggregate_id, event_type, payload, status,
 VALUES (?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP(3));
 
 -- name: CreateOutboxEventAt :execresult
--- Delayed-publish variant: the row stays invisible to the relay until
--- retryAt. Run.available_at and outbox availability share one timestamp
--- so a retried run is dispatched exactly when it becomes claimable
--- (P1-2) — no earlier, no later.
+-- Delayed-publish variant: the row stays invisible to the relay until the
+-- DB clock passes the given microsecond delay. RetryOwnedRunAfter passes
+-- the SAME delay to RequeueRunFenced, so a retried run is dispatched
+-- exactly when it becomes claimable (P1-2) — no earlier, no later — with
+-- the DB clock as the single authority for both (Phase 3).
 INSERT INTO outbox_events (aggregate, aggregate_id, event_type, payload, status, available_at)
-VALUES (?, ?, ?, ?, 'pending', ?);
+VALUES (?, ?, ?, ?, 'pending', DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(retry_delay_micros) MICROSECOND));
 
 -- name: ListPendingOutbox :many
 SELECT id, aggregate, aggregate_id, event_type, payload, status, available_at,

@@ -273,27 +273,38 @@ SET status = ?, external_message_id = ?, error_code = ?, error_message = ?,
 WHERE id = ? AND status = 'sending';
 
 -- name: RequeueDelivery :execresult
+-- Retry time = DB clock + the worker's backoff in microseconds (Clock
+-- Authority, Phase 3): the due-scan below compares against the DB clock, so
+-- a skewed worker clock can neither delay nor rush a delivery retry.
 UPDATE delivery_executions
-SET status = 'pending', next_attempt_at = ?, error_code = ?, error_message = ?
+SET status = 'pending',
+    next_attempt_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(backoff_micros) MICROSECOND),
+    error_code = ?, error_message = ?
 WHERE id = ? AND status = 'sending';
 
 -- name: ListDueDeliveries :many
+-- "Due" is decided by the DB clock, not by the caller's clock.
 SELECT id, occurrence_id, run_id, schedule_delivery_id, sender_user_id, target_type,
        target_id, status, external_message_id, attempt, max_attempts, next_attempt_at,
        error_code, error_message, created_at, sent_at, updated_at
 FROM delivery_executions
-WHERE status = 'pending' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+WHERE status = 'pending'
+  AND (next_attempt_at IS NULL OR next_attempt_at <= CURRENT_TIMESTAMP(3))
 ORDER BY created_at
 LIMIT ?;
 
 -- name: ReclaimStuckDeliveries :execresult
 -- Crash recovery: rows stuck in 'sending' (worker died before ACK/commit)
--- return to pending when their lease lapsed.
+-- return to pending when their DB-clock lease lapsed.
 UPDATE delivery_executions
 SET status = 'pending', next_attempt_at = CURRENT_TIMESTAMP(3)
-WHERE status = 'sending' AND updated_at < ? AND attempt < max_attempts;
+WHERE status = 'sending'
+  AND updated_at < DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(lease_micros) MICROSECOND)
+  AND attempt < max_attempts;
 
 -- name: FailStuckDeliveries :execresult
 UPDATE delivery_executions
 SET status = 'failed', error_code = 'lease_expired', error_message = ?
-WHERE status = 'sending' AND updated_at < ? AND attempt >= max_attempts;
+WHERE status = 'sending'
+  AND updated_at < DATE_SUB(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(lease_micros) MICROSECOND)
+  AND attempt >= max_attempts;

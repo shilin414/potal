@@ -41,6 +41,14 @@ jobs:
       - name: go test (unit; integration gated by env)
         run: go test ./... -count=1
 
+      # Race gate for the concurrency-critical execution plane (§31): the
+      # worker, heartbeat, execution control, weighted scheduler and delivery
+      # worker all mutate shared state across goroutines.
+      - name: go test -race (execution plane)
+        run: >-
+          go test -race ./internal/execution/... ./internal/delivery/...
+          ./internal/automation/... -count=1
+
   # Integration gate: real TiDB + Redis via Docker (修复计划 §78).
   # STUDIO_TEST_TIDB / STUDIO_TEST_REDIS opt the integration suite in.
   #
@@ -81,11 +89,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y mysql-client curl
       - name: wait for tidb (host-side readiness)
         run: |
+          ready=0
           for (( attempt = 0; attempt < 90; attempt++ )); do
-            if mysql -h 127.0.0.1 -P 4000 -u root -e "SELECT 1" >/dev/null 2>&1; then break; fi
+            if mysql -h 127.0.0.1 -P 4000 -u root -e "SELECT 1" >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
             sleep 2
           done
-          echo "::error title=tidb not ready::readiness timed out after 180s"
+          if [ "$ready" -ne 1 ]; then
+            echo "::error title=tidb not ready::readiness timed out after 180s"
+            exit 1
+          fi
           mysql -h 127.0.0.1 -P 4000 -u root -e "CREATE DATABASE IF NOT EXISTS xiaoan3_go"
       # studio-migrate applies migrations and EXITS. `cmd/api -migrate`
       # would continue into app.Build + the HTTP server: without the
@@ -106,6 +121,19 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$out"
+      # Redis-backed / TiDB-backed suites that live in the internal packages
+      # (provider slots, GCRA, delivery) — these are REAL integration gates,
+      # not optional local checks (§29-31): STUDIO_TEST_TIDB/REDIS are set.
+      - name: execution + delivery package tests (real TiDB/Redis)
+        run: |
+          set -uo pipefail
+          if ! out=$(go test ./internal/execution/... ./internal/delivery/... -count=1 -v 2>&1); then
+            printf '%s\n' "$out"
+            msg=$(printf '%s' "$out" | grep -E '^(--- FAIL|FAIL|panic:|\s+.*_test\.go:)' | tr '\n' ' ' | tr -s ' ' | tail -c 900)
+            echo "::error title=execution package tests failed::$msg"
+            exit 1
+          fi
+          printf '%s\n' "$out" | tail -40
       - name: integration tests
         run: |
           set -uo pipefail
@@ -148,12 +176,18 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y mysql-client curl
       - name: wait for mysql 5.7
         run: |
+          ready=0
           for (( attempt = 0; attempt < 60; attempt++ )); do
-            if mysql -h 127.0.0.1 -P 3306 -u root -e "SELECT 1" >/dev/null 2>&1; then exit 0; fi
+            if mysql -h 127.0.0.1 -P 3306 -u root -e "SELECT 1" >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
             sleep 2
           done
-          echo "::error title=mysql 5.7 not ready::readiness timed out after 120s"
-          mysql -h 127.0.0.1 -P 3306 -u root -e "SELECT 1"
+          if [ "$ready" -ne 1 ]; then
+            echo "::error title=mysql 5.7 not ready::readiness timed out after 120s"
+            exit 1
+          fi
       - name: apply migrations
         run: |
           set -uo pipefail

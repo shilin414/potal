@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -57,7 +58,7 @@ func PriorityClassOf(priority string) string {
 }
 
 // executionControl couples an in-flight run with its ownership fence, its
-// attempt-scoped provider slot and a local cancellation handle. Losing
+// ownership-scoped provider slot and a local cancellation handle. Losing
 // the lease (heartbeat rejected by the fence) cancels the local execution
 // context and releases the attempt's provider slot: the provider stream /
 // poll loop stops and the handler must stop writing canonical state.
@@ -91,9 +92,10 @@ type Worker struct {
 	// duplicates). Zero defaults to 60s.
 	ReclaimAfter time.Duration
 	Log          *slog.Logger
-	// ProviderInflight caps provider-wide concurrent runs across worker
-	// instances. Slots are attempt-scoped (ownership-derived members).
-	ProviderInflight *InflightLimiter
+	// ProviderSlots caps provider-wide concurrent runs across worker
+	// instances. Slots are durable in TiDB and ownership-scoped, so the cap
+	// survives Redis restarts and worker clock skew (Phase 2).
+	ProviderSlots *ProviderSlots
 	// PriorityWeights per class [interactive, retry, scheduled]; zero
 	// value falls back to DefaultPriorityWeights.
 	PriorityWeights []int
@@ -195,9 +197,10 @@ func (w *Worker) loop(ctx context.Context, consumer int) {
 }
 
 // readWeighted applies weighted fair scheduling across the class streams
-// (policy in classScheduler): credited classes in weight order first, then
-// idle-capacity borrowing so a queue never starves while the worker is
-// free.
+// (policy in classScheduler): credited classes are probed in weight order,
+// and an EMPTY class immediately forfeits the rest of its round credit so
+// an idle stream (e.g. retry with no failures) can never pin the round open
+// and starve another class (Admission Fairness, Phase 1).
 func (w *Worker) readWeighted(ctx context.Context, name string, sched *classScheduler) (streamMessage, bool) {
 	streams := w.classStreams()
 	for _, idx := range sched.order() {
@@ -208,6 +211,7 @@ func (w *Worker) readWeighted(ctx context.Context, name string, sched *classSche
 			sched.consume(idx)
 			return sm, true
 		}
+		sched.markEmpty(idx)
 	}
 	return streamMessage{}, false
 }
@@ -311,13 +315,21 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun) {
 	w.trackInflight(claimed.Ownership, cancel)
 	defer w.trackInflight(claimed.Ownership, nil)
 
-	if w.ProviderInflight != nil {
-		// Attempt-scoped acquire (P0-1): the slot member is derived from
-		// the ownership, so this attempt can never collide with or delete
-		// another attempt's slot.
-		slot, ok, depth, err := w.ProviderInflight.Acquire(ctx, claimed.Ownership)
+	if w.ProviderSlots != nil {
+		// Ownership-scoped, durable acquire: the row is keyed by the
+		// immutable ownership, so this attempt can never collide with or
+		// delete another attempt's slot, and the cap survives Redis loss.
+		slot, ok, depth, err := w.ProviderSlots.Acquire(ctx, claimed.Ownership)
+		if errors.Is(err, ErrLostOwnership) {
+			// The run was reclaimed between the claim and the acquire: this
+			// worker must stop without requeueing — the reaper/new owner
+			// already owns recovery.
+			w.Log.Warn("provider slot acquire rejected: run ownership lost",
+				"run_id", claimed.Run.ID.String())
+			return
+		}
 		if err != nil {
-			w.Log.Warn("provider inflight limiter unavailable; requeueing run",
+			w.Log.Warn("provider slot store unavailable; requeueing run",
 				"run_id", claimed.Run.ID.String(), "err", err)
 			w.recordProviderAdmission("provider_inflight_unavailable")
 			w.requeueForAdmission(claimed, "provider_inflight_unavailable")
@@ -332,8 +344,8 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun) {
 		}
 		w.attachProviderSlot(claimed.Ownership, slot)
 		defer func() {
-			if err := w.ProviderInflight.Release(context.Background(), slot); err != nil {
-				w.Log.Warn("provider inflight release failed", "run_id", claimed.Run.ID.String(), "err", err)
+			if err := w.ProviderSlots.Release(context.Background(), slot); err != nil {
+				w.Log.Warn("provider slot release failed", "run_id", claimed.Run.ID.String(), "err", err)
 			}
 		}()
 	}
@@ -377,9 +389,10 @@ func (w *Worker) requeueForAdmission(claimed *ClaimedRun, reason string) {
 	// the run is made claimable again after a short pause (long enough to
 	// avoid hot-looping against the saturated provider, short enough that
 	// a freed slot is used immediately). Provider-failure retries keep
-	// their own backoff (Service.RequeueDelay).
-	retryAt := time.Now().UTC().Add(AdmissionRequeueDelay)
-	if err := w.Svc.RetryOwnedRunAt(context.Background(), claimed.Run, claimed.Ownership, reason, retryAt); err != nil && err != ErrLostOwnership {
+	// their own backoff (Service.RequeueDelay). The delay is applied by the
+	// DB clock in the same transaction as the dispatch outbox row.
+	if err := w.Svc.RetryOwnedRunAfter(context.Background(), claimed.Run, claimed.Ownership,
+		reason, AdmissionRequeueDelay); err != nil && err != ErrLostOwnership {
 		w.Log.Error("requeue after provider admission failed",
 			"run_id", claimed.Run.ID.String(), "reason", reason, "err", err)
 	}
@@ -421,6 +434,13 @@ func (w *Worker) scanLoop(ctx context.Context) {
 			// Reaper: recover crashed workers' leases (atomic per run).
 			if n, err := w.Svc.RecoverExpiredLeases(ctx, 100); err == nil && n > 0 {
 				w.Log.Info("reaper recovered runs", "count", n)
+			}
+			// Provider slot hygiene: expired slots are already ignored on
+			// every read; this bounds table growth.
+			if w.ProviderSlots != nil {
+				if n, err := w.ProviderSlots.CleanupExpired(ctx); err == nil && n > 0 {
+					w.Log.Info("reaper cleaned expired provider slots", "count", n)
+				}
 			}
 		}
 	}
@@ -509,6 +529,28 @@ func (w *Worker) attachProviderSlot(own ExecutionOwnership, slot *ProviderSlot) 
 	}
 }
 
+// heartbeatOwned renews the run lease and (when the caller holds one) the
+// provider slot. With a slot attached both happen in ONE TiDB transaction
+// (§20), so "Run Ownership alive ⇔ Provider Slot alive" is an invariant
+// rather than two independently drifting leases. The returned error is
+// non-nil only when the run-lease heartbeat itself failed (nothing was
+// committed); a lost slot merely reports slotOK=false.
+func (w *Worker) heartbeatOwned(ctx context.Context, ctl *executionControl, slot *ProviderSlot) (leaseOK, slotOK bool, err error) {
+	if w.ProviderSlots != nil && slot != nil {
+		return w.Svc.HeartbeatOwnedWithSlot(ctx, ctl.own, w.Lease, slot, w.ProviderSlots.Lease)
+	}
+	leaseOK, err = w.Svc.HeartbeatOwned(ctx, ctl.own, w.Lease)
+	return leaseOK, true, err
+}
+
+// inflightSnapshot is the lock-protected copy of one in-flight control: the
+// slot pointer is read while w.mu is held (attachProviderSlot writes it
+// under the same lock), so the heartbeat loop never races with the executor.
+type inflightSnapshot struct {
+	ctl  *executionControl
+	slot *ProviderSlot
+}
+
 func (w *Worker) heartbeatLoop(ctx context.Context) {
 	ticker := time.NewTicker(w.Heartbeat)
 	defer ticker.Stop()
@@ -518,18 +560,15 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			w.mu.Lock()
-			snapshot := make(map[ids.ID]*executionControl, len(w.inflight))
+			snapshot := make(map[ids.ID]inflightSnapshot, len(w.inflight))
 			for id, ctl := range w.inflight {
-				snapshot[id] = ctl
+				snapshot[id] = inflightSnapshot{ctl: ctl, slot: ctl.slot}
 			}
 			w.mu.Unlock()
-			for id, ctl := range snapshot {
-				// Order is mandatory (P0-1): the RUN lease first, the
-				// provider slot second. Renewing the slot before checking
-				// ownership would let an already-fenced attempt refresh
-				// capacity accounting for a run it no longer owns.
-				ok, err := w.Svc.HeartbeatOwned(ctx, ctl.own, w.Lease)
-				if err != nil || !ok {
+			for id, snap := range snapshot {
+				ctl := snap.ctl
+				leaseOK, slotOK, err := w.heartbeatOwned(ctx, ctl, snap.slot)
+				if err != nil || !leaseOK {
 					// Ownership lost: stop the local execution immediately
 					// (the provider call cannot be cancelled remotely, but
 					// this worker loses the right to write canonical state —
@@ -545,10 +584,10 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 					}
 					w.mu.Unlock()
 					// Release this attempt's own provider slot (never the
-					// new owner's — the member is attempt-scoped).
-					if ctl.slot != nil && w.ProviderInflight != nil {
-						if rerr := w.ProviderInflight.Release(context.Background(), ctl.slot); rerr != nil && rerr != ErrProviderSlotLost {
-							w.Log.Warn("provider inflight release after lease loss failed",
+					// new owner's — the row is ownership-scoped).
+					if snap.slot != nil && w.ProviderSlots != nil {
+						if rerr := w.ProviderSlots.Release(context.Background(), snap.slot); rerr != nil && rerr != ErrProviderSlotLost {
+							w.Log.Warn("provider slot release after lease loss failed",
 								"run_id", id.String(), "err", rerr)
 						}
 					}
@@ -557,20 +596,12 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 					}
 					continue
 				}
-				// Run lease still held: renew the attempt-scoped slot.
-				// XX-only — a lost slot is never recreated here.
-				if w.ProviderInflight != nil && ctl.slot != nil {
-					if rerr := w.ProviderInflight.Renew(ctx, ctl.slot); rerr != nil {
-						if rerr == ErrProviderSlotLost {
-							// The slot expired (worker stalled longer than
-							// the slot lease). The run ownership fence is
-							// unaffected; capacity accounting self-heals
-							// when the attempt finishes.
-							w.recordProviderAdmission("provider_slot_lost")
-						} else {
-							w.Log.Warn("provider inflight renew failed", "run_id", id.String(), "err", rerr)
-						}
-					}
+				if !slotOK {
+					// The slot was released or expired (worker stalled longer
+					// than the slot lease). The run ownership fence is
+					// unaffected; capacity accounting self-heals when this
+					// attempt finishes (release is idempotent).
+					w.recordProviderAdmission("provider_slot_lost")
 				}
 			}
 		}

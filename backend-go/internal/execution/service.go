@@ -378,11 +378,11 @@ func (s *Service) ClaimRun(ctx context.Context, runID ids.ID, workerID string, l
 	}
 	token := ids.New()
 	if err := q.CreateRunLease(ctx, db.CreateRunLeaseParams{
-		RunID:      runID.Bytes(),
-		WorkerID:   workerID,
-		LeaseToken: token.Bytes(),
-		LeaseEpoch: epoch,
-		ExpiresAt:  time.Now().UTC().Add(leaseSeconds),
+		RunID:       runID.Bytes(),
+		WorkerID:    workerID,
+		LeaseToken:  token.Bytes(),
+		LeaseEpoch:  epoch,
+		LeaseMicros: leaseSeconds.Microseconds(),
 	}); err != nil {
 		// Rollback: the run returns to 'queued' (lease INSERT failure can
 		// never strand a running run without a lease).
@@ -474,18 +474,112 @@ func (s *Service) BeginProviderAttemptOwned(ctx context.Context, own ExecutionOw
 
 // HeartbeatOwned extends the lease; the WHERE carries the lease token so
 // only the owning worker (even after a worker-id recycle) can renew it.
-// Returns false when ownership is gone.
+// Expiry comes from the DB clock (Phase 3), so a skewed worker clock can
+// neither extend nor shorten the lease. Returns false when ownership is gone.
 func (s *Service) HeartbeatOwned(ctx context.Context, own ExecutionOwnership, leaseSeconds time.Duration) (bool, error) {
 	res, err := s.q(ctx).HeartbeatLeaseFenced(ctx, db.HeartbeatLeaseFencedParams{
-		ExpiresAt:  time.Now().UTC().Add(leaseSeconds),
-		RunID:      own.RunID.Bytes(),
-		LeaseToken: own.LeaseToken.Bytes(),
+		LeaseMicros: leaseSeconds.Microseconds(),
+		RunID:       own.RunID.Bytes(),
+		LeaseToken:  own.LeaseToken.Bytes(),
 	})
 	if err != nil {
 		return false, err
 	}
 	n, err := res.RowsAffected()
 	return n == 1, err
+}
+
+// HeartbeatOwnedWithSlot extends the run lease and, when the caller still
+// holds it, renews the ownership-scoped provider slot in the SAME TiDB
+// transaction (Admission Fairness & Lease Hardening §20): Run Ownership
+// alive ⇔ Provider Slot alive becomes an invariant instead of two
+// independently drifting leases.
+//
+// Contract:
+//
+//	err != nil      → nothing committed; the caller must treat the
+//	                  heartbeat as failed (retry next tick)
+//	leaseOK == false → ownership is gone; the caller must stop executing
+//	slotOK == false  → the slot expired or was released; the lease still
+//	                  stands, the slot is never recreated (XX-only) and
+//	                  capacity self-heals when the attempt finishes
+func (s *Service) HeartbeatOwnedWithSlot(ctx context.Context, own ExecutionOwnership, leaseSeconds time.Duration, slot *ProviderSlot, slotLease time.Duration) (bool, bool, error) {
+	if !own.Valid() {
+		return false, false, ErrLostOwnership
+	}
+	if slot == nil {
+		ok, err := s.HeartbeatOwned(ctx, own, leaseSeconds)
+		return ok, true, err
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return false, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := db.New(tx)
+
+	res, err := q.HeartbeatLeaseFenced(ctx, db.HeartbeatLeaseFencedParams{
+		LeaseMicros: leaseSeconds.Microseconds(),
+		RunID:       own.RunID.Bytes(),
+		LeaseToken:  own.LeaseToken.Bytes(),
+	})
+	if err != nil {
+		return false, false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, false, err
+	}
+	if n != 1 {
+		// Ownership lost: do NOT touch the slot — it belongs to the
+		// recovered attempt's accounting now and expires on its own
+		// (or was already cleaned by the reaper in the same transaction
+		// that requeued the run).
+		return false, false, nil
+	}
+
+	if slot.Provider == "" {
+		// Malformed slot descriptor: never guess a provider, report it as
+		// lost instead of touching another provider's accounting.
+		if err := tx.Commit(); err != nil {
+			return false, false, err
+		}
+		return true, false, nil
+	}
+	slotLease = slotLeaseOrDefault(slotLease)
+	sres, serr := q.TouchProviderSlot(ctx, db.TouchProviderSlotParams{
+		LeaseMicros: slotLease.Microseconds(),
+		Provider:    slot.Provider,
+		RunID:       slot.RunID.Bytes(),
+		LeaseEpoch:  slot.LeaseEpoch,
+		LeaseToken:  slot.LeaseToken.Bytes(),
+	})
+	slotOK := false
+	switch {
+	case serr != nil:
+		// The lease renewal stands; only the slot accounting could not be
+		// refreshed. Log it without failing the heartbeat — the run must
+		// keep executing and the slot self-heals when the attempt ends.
+		s.Log.Warn("provider slot renew failed in merged heartbeat",
+			slogKey("run_id"), own.RunID.String(), slogKey("err"), serr)
+	default:
+		if sn, nerr := sres.RowsAffected(); nerr == nil && sn == 1 {
+			slotOK = true
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, false, err
+	}
+	return true, slotOK, nil
+}
+
+// slotLeaseOrDefault guarantees a positive slot TTL for the merged heartbeat
+// when the caller passes an unset lease.
+func slotLeaseOrDefault(d time.Duration) time.Duration {
+	if d > 0 {
+		return d
+	}
+	return DefaultProviderSlotLease
 }
 
 // CheckOwnership verifies the caller still holds the run at the given

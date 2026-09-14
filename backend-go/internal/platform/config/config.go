@@ -383,8 +383,13 @@ func parseBackoff(s string) []time.Duration {
 }
 
 // parseWeights parses "interactive,retry,scheduled" shares (RUN_PRIORITY_WEIGHTS)
-// in execution.Worker's class order. Invalid input falls back to 7/1/2 so a
-// typo can never disable weighted scheduling.
+// in execution.Worker's class order.
+//
+// Every class must keep a STRICTLY POSITIVE share. The platform invariant is
+// that scheduled work can never starve and interactive work always leads, so
+// a zero weight (a class silently disabled by a typo or a "0,1,2" copy/paste)
+// is rejected exactly like non-numeric input and falls back to 7/1/2.
+// Disabling a class deliberately is a future feature, not a config accident.
 func parseWeights(s string) []int {
 	parts := strings.Split(s, ",")
 	if len(parts) != 3 {
@@ -393,13 +398,10 @@ func parseWeights(s string) []int {
 	out := make([]int, 0, 3)
 	for _, part := range parts {
 		n, err := strconv.Atoi(strings.TrimSpace(part))
-		if err != nil || n < 0 {
+		if err != nil || n < 1 {
 			return []int{7, 1, 2}
 		}
 		out = append(out, n)
-	}
-	if out[0]+out[1]+out[2] == 0 {
-		return []int{7, 1, 2}
 	}
 	return out
 }
