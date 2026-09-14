@@ -81,10 +81,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y mysql-client curl
       - name: wait for tidb (host-side readiness)
         run: |
-          for i in $(seq 1 90); do
+          for (( attempt = 0; attempt < 90; attempt++ )); do
             if mysql -h 127.0.0.1 -P 4000 -u root -e "SELECT 1" >/dev/null 2>&1; then break; fi
             sleep 2
           done
+          echo "::error title=tidb not ready::readiness timed out after 180s"
           mysql -h 127.0.0.1 -P 4000 -u root -e "CREATE DATABASE IF NOT EXISTS xiaoan3_go"
       # studio-migrate applies migrations and EXITS. `cmd/api -migrate`
       # would continue into app.Build + the HTTP server: without the
@@ -147,10 +148,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y mysql-client curl
       - name: wait for mysql 5.7
         run: |
-          for i in $(seq 1 60); do
+          for (( attempt = 0; attempt < 60; attempt++ )); do
             if mysql -h 127.0.0.1 -P 3306 -u root -e "SELECT 1" >/dev/null 2>&1; then exit 0; fi
             sleep 2
           done
+          echo "::error title=mysql 5.7 not ready::readiness timed out after 120s"
           mysql -h 127.0.0.1 -P 3306 -u root -e "SELECT 1"
       - name: apply migrations
         run: |
