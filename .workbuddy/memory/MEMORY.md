@@ -70,6 +70,22 @@
 - CI：`.github/workflows/backend.yml`（actionlint + gofmt/vet/build/unit + 真实 MySQL 5.7/Redis integration）、
   `.github/workflows/frontend.yml`（tsc/vitest/vite build）
 
+## 运行/部署关键事实（2026-09-14 冒烟测试实测）
+
+- **delivery 是独立队列**：`studio-worker --provider=feishu_aily | feishu_delivery`。
+  **只起 aily worker 时投递会永远停在 `pending`**——delivery 由 `feishu_delivery` 消费者处理
+- **worker 按 provider 分片**：`ClaimCandidates(ctx, provider)`，所以 `--provider=feishu_aily` 的
+  worker 看不见 `itest_*` 的 run（这也是迁移后能安全起进程的前提之一）
+- **Redis Streams 携带跨环境遗留工作**：`REDIS_KEY_PREFIX` 不变时新部署会继承旧环境的
+  `queue:*`。实测启动 delivery worker 后立刻消费了 98 条切换前的投递消息。
+  上线前必须清 `queue:*` / 换前缀 / 换 Redis DB
+- **不变量检查器可作为迁移对比工具**：`cmd/invariant-checker -once` 用同一份二进制分别指向
+  源库/目标库跑，两边计数相同即证明违规是数据自带的（potal：406 == 406）
+- 冒烟测试的无泄漏判据：`running=0 / run_leases=0 / provider_execution_slots=0 /
+  outbox(pending)=0 / delivery(pending)=0 / schedule_occurrences(pending)=0`
+- 临时排障脚本连 DB 时**没有**应用 DSN 的 `time_zone='+00:00'`，拿它比较 UTC 存储的
+  `created_at` 会整体差 8 小时；要比时间就用应用侧连接或显式 `SET time_zone`
+
 ## 本地验证注意事项
 
 - 集成测试前先确认没有遗留的 studio-worker / studio-scheduler / studio-api 进程在共享 dev 库/Redis 上抢跑；

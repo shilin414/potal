@@ -30,6 +30,7 @@
 | 真实 MySQL 5.7 + Redis 集成测试 | ✅ 68/68 PASS，0 FAIL，0 SKIP |
 | DB 时钟门槛（P0-3） | ✅ `session time_zone = +00:00` |
 | GitHub CI | ✅ **run 34852157912 全绿**（`check` + `integration` 两个 job 全部 success） |
+| Smoke Test（§34） | ✅ 四进程跑通完整链路：真实 Aily 执行 + 真实飞书投递成功（见 §14） |
 
 ### 1.1 提交与 CI
 
@@ -358,6 +359,14 @@ STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_A
 
 400 < 1000，余量充足，**无需调整连接池，也无需扩大 `max_connections`**。若后续 worker 副本数大幅增加，按 `进程数 × 40` 重新核算。
 
+## P1-3 Redis Streams 携带跨环境遗留工作（**上线前必须处理**，§14.6 有新证据）
+
+`REDIS_KEY_PREFIX` 不变时，新部署会继承旧环境的队列。实测：启动 `feishu_delivery` worker 后
+立即消费了 98 条切换前遗留的投递消息（全部指向合成目标，已正确失败，未打扰真人）。
+
+上线前必须三选一：① 清空 `queue:*` 及其 consumer group；② 更换 `REDIS_KEY_PREFIX`；
+③ 使用独立 Redis DB。**不能默认「Redis 原样沿用即可」。**
+
 ## P2 共享 dev 库带入的测试残留
 
 从 TiDB 搬过来的数据里包含集成测试产生的垃圾行（**已与源库核对一致，属于“忠实迁移”而非迁移失误**）：
@@ -398,7 +407,7 @@ messages.conversation_id = 0     26 行
 | 16 | `max_connections` 完成容量核算 | ✅ | §10 P1-2 |
 | 17 | README 当前架构已改为 MySQL | ✅ | 根 README + backend-go/README |
 | 18 | 运行时代码不存在 TiDB/TiProxy 专属逻辑 | ✅ | 扫描零命中（README 中保留“TiDB 已退出运行架构”的说明性文字） |
-| 19 | 正式 Smoke Test 全部通过 | ⏳ | 需启动 studio-api/stream/worker/scheduler 后按指南 §34 执行 |
+| 19 | 正式 Smoke Test 全部通过 | ✅ 除 2 项 | 已执行，见 §14；未覆盖：飞书浏览器登录、运行中杀 worker（后者由集成测试覆盖） |
 
 另有 3 项超出指南但已完成的验证：**逐表字节级校验和比对**、**JSON 文档语义比对**、**26 条引用完整性检查（含源库基线的对照）**。
 
@@ -438,3 +447,142 @@ cd backend-go && go run ./cmd/migrate
 #    SELECT COUNT(*), SUM(CRC32(CONCAT_WS(0x1f, <非 JSON 列>))), BIT_XOR(CRC32(...)) FROM <t>
 #    JSON 列：取回后在客户端解析并按有序键重新编码后比对
 ```
+
+---
+
+# 14. Smoke Test（指南 §34）执行结果
+
+**结论：四个进程在 MySQL 5.7 上跑通了完整业务链路，包括一次真实的 Aily 执行和一次真实的飞书投递。**
+
+## 14.1 执行前的关键发现：迁移把「可执行 backlog」一起搬过来了
+
+第一次准备启动 worker/scheduler 时先做了只读勘察，结果**不能直接起**——库里带着 dev 环境的待执行工作：
+
+| 对象 | 数量 | 一起进程会立刻发生什么 |
+|---|---|---|
+| `runs` queued（provider 可见范围） | 404（`feishu_aily`） | worker 是**按 provider 分片**的（`ClaimCandidates(ctx, provider)`），会真的调 Aily 执行 |
+| `runs` running | 34（`feishu_aily`） | 过期 lease 被 reaper 恢复/重排 |
+| `schedules` enabled 且已过期 | 287 | scheduler 瞬间触发，创建 occurrence → run |
+| `schedule_occurrences` pending | 3 | scheduler 直接 admit 成 run |
+| `delivery_executions` pending | 98 | 投递 worker 尝试真实发消息 |
+
+飞书身份只有一条，且是**用户本人**（`user_id=30001`，refresh token 有效到 2026-09-20）——那 404 个 run 会用本人账号与额度执行。
+
+> 这就是指南 §24「停写窗口」的实际形态：不是代码问题，而是**迁移必须连同 backlog 一起处理**。
+
+## 14.2 排空（用户确认后执行，每步记录影响行数）
+
+| 步骤 | 操作 | 行数 |
+|---|---|---|
+| 1 | 为待取消的 run 补写 `run.cancelled` 终态事件（保证不变量 D：终态 run 必有终态事件） | +438 |
+| 2 | `runs`（queued+running, provider=feishu_aily）→ `cancelled` | 438 |
+| 3 | 删除这些 run 的 lease（不变量 C：终态不得持有 lease） | 0（这些 run 本就没有 lease） |
+| 4 | `schedule_occurrences` pending → `skipped` | 3 |
+| 5 | `schedules` enabled 且已过期 → `enabled=0` | 287 |
+| 6 | 收尾：把被取消的 **scheduled** run 的 occurrence 收敛为 `failed`（不变量 H） | 274 |
+
+**故意没动**：`outbox_events`（relay 的真实准入条件是 `status='pending'`，只有 2 条，属正常待投递）、`itest_*` 的 run（对 `--provider=feishu_aily` 的 worker 不可见）、以及源库自带的历史不变量违规。
+
+### 不变量检查器（`cmd/invariant-checker`）前后对比
+
+用**同一份代码**对源 TiDB 和目标 MySQL 各跑一遍，这是本轮最有力的证据之一：
+
+| 不变量 | 源 TiDB | 目标（排空前） | 目标（排空后） | 说明 |
+|---|---|---|---|---|
+| running_without_lease | 34 | 34 | **0** | 排空改善 |
+| terminal_without_terminal_event | 241 | 241 | 241 | 保持不变（补写的事件起作用了） |
+| outbox_backlog_age | 15556s | 15556s | **0** | relay 投递后消失 |
+| scheduled_run_occurrence_mismatch | 130 | 130 | 173 | 见下 |
+
+- **源库与目标库初始违规数完全相同（406 = 406）** → 这些违规是数据自带的，不是迁移引入；同时说明这 11 条不变量查询在 TiDB 与 MySQL 5.7 上结果一致，本身就是一次迁移正确性交叉验证。
+- H 的 +43 **不是新制造的不一致**：源库就有 64 个「`trigger_type='scheduled'` 但没有 occurrence 行」的 run，其中 43 个非终态（H 不统计）、21 个终态（H 统计）。排空把 43 个变成终态后 H 才看见它们。**不一致总数两库相同（64 = 64）。**
+
+## 14.3 启动（指南 §33 顺序：api → stream → worker → scheduler）
+
+启动过程**完全安静**，这正是排空的目的：
+
+```text
+studio-api     :8080   /health/live 200   /health/ready "ok"   (真实 MySQL 5.7 + Redis 连通)
+studio-stream  :8081   监听正常
+studio-worker  --provider=feishu_aily      "worker consuming"
+               第一轮扫描即 "reaper recovered runs count=40"   (恰好是那 40 条过期 lease)
+               之后无任何 claim、无异常
+studio-worker  --provider=feishu_delivery  "delivery worker consuming"
+studio-scheduler                            "scheduler started"  无任何 schedule 触发
+```
+
+另有一处值得记录：**delivery 由独立的 `feishu_delivery` 队列消费者处理**（`--provider=feishu_aily | feishu_delivery`）。只起 aily worker 时投递会一直停在 `pending`。
+
+## 14.4 定向 run：一次真实 Aily 执行
+
+```text
+POST /api/v2/runs {application_id:1, content:"请只回复两个字：收到"}  -> 201, status=queued
+queued 14:27:46.283 -> started 14:27:46.581 -> finished 14:28:05.889      (19.3s)
+output : {"text":"收到","status":"Completed"}          <- 真实 Aily 执行成功
+events : 1 run.started -> 2 content.chunk -> 3 run.completed
+SSE    : 实收 3 帧 (run.started / content.chunk / run.completed)
+finalize 后 leases=0 slots=0，全 provider 开放 slot=0            <- 无泄漏
+outbox  : run.dispatch published, retry_count=0
+```
+
+覆盖指南清单：创建 Conversation ✔ 发送 Message ✔ 创建 Run ✔ **Worker Claim** ✔ **Provider Slot 占用** ✔ **Aily 执行成功** ✔ **Run Finalize** ✔ **SSE 收到事件** ✔ Conversation History ✔
+
+## 14.5 定向 Schedule：创建 → 触发 → 投递
+
+```text
+POST /api/v2/schedules  (once, run_at = now+40s, delivery -> 本人 open_id)   -> 201
+t+41.0s  occurrence running   run running
+t+61.5s  occurrence succeeded run succeeded   delivery pending
+         run output {"text":"收到","status":"Completed"}    trigger_type=scheduled  trigger_id=<occurrence>
+         delivery_executions: status=succeeded, attempt=1   <- 真的发出去了
+```
+
+覆盖指南清单：**Schedule 创建** ✔ **Schedule 触发** ✔ **Delivery 正常** ✔
+同时观察到投递失败路径：98 条历史投递各重试 5 次（指数退避）后置为永久失败——**Retry 机制在真实环境上得到验证** ✔
+
+## 14.6 新发现：Redis Streams 携带跨环境遗留工作（P1，上线前必须处理）
+
+指南 §2 把 Redis 定位为「继续独立承担」，隐含假设是 Redis 可以原样沿用。实际不是：
+
+- 启动 `feishu_delivery` worker 后，它**立即消费了 98 条来自切换前环境的投递消息**（旧环境已发布、但消费方在切换前就停了，消息留在 stream 里）。
+- 这 98 条全部指向**合成目标**（`ou_test` / `oc_test` / `clock_retry` / `oc_original` / `oc_replacement`），失败原因明确：
+  `delivery: owner uat: user has no feishu identity; re-login through Feishu OAuth`。
+- **指向真实身份的失败 = 0**；唯一成功的那条就是本次冒烟自己发的。
+- 另 23 条 `lease_expired`（"worker crashed"）是更早的历史遗留。
+
+这意味着：**`REDIS_KEY_PREFIX` 不变时，新部署会继承旧环境的队列**。对 Aily 队列而言，被取消的 run 让 CAS claim 失败、无害（本次正是靠取消 run 兜住了）；但投递队列没有这层保护，会真的尝试发送。
+
+**上线前建议三选一**：① 清空 `queue:*` 与对应 consumer group；② 更换 `REDIS_KEY_PREFIX`；③ 使用独立 Redis DB。绝不能默认「Redis 不用管」。
+
+## 14.7 日志与终态
+
+5 个进程日志在指南 §34 监控清单上**全部零命中**：
+
+```text
+1213 / 1205 / duplicate key / lock wait / connection refused
+too many connections / invalid JSON / incorrect datetime / panic      全部 0
+```
+
+> 注意：直接 `grep 1205` 会假阳性命中 backoff 毫秒值（如 `2.1205 38976`），需按结构化字段判断。
+
+终态快照（全部无泄漏）：
+
+| 指标 | 值 |
+|---|---|
+| runs | 4977（迁移 4975 + 冒烟 2） |
+| runs succeeded / cancelled / running | 764 / 438 / **0** |
+| run_leases / provider_execution_slots | **0 / 0** |
+| outbox pending | **0**（排空前 2，relay 已投递） |
+| delivery_executions pending / succeeded | **0** / 1（本次那条） |
+| schedules enabled / 其中已过期 | 265 / **0** |
+| schedule_occurrences pending | **0** |
+
+## 14.8 冒烟测试对库造成的净变更（可审计）
+
+新增 2 条 run（均 succeeded）、1 个一次性 schedule（已自动关闭）、1 条成功投递；排空相关：438 run 取消、274 occurrence 收敛、3 occurrence 跳过、287 schedule 关闭、98 条遗留投递耗尽重试后置失败、2 条 outbox 投递。
+
+**未执行的清单项**（需要交互式浏览器或另行安排）：
+
+- `飞书登录`：真实 OAuth 重定向需要浏览器操作，本次会话是用 `cmd/testsession` 直接签发的（已验证会话本身 + 其后的全部授权路径）。
+- `Worker 中途被杀后 Lease/Reaper 恢复`：本次只验证了**启动时** reaper 恢复 40 条过期 lease；「运行中杀 worker」的场景由 `TestLeaseExpiryAndReaper` / `TestReaperRecoveryAtomic*` 在真实 MySQL 5.7 上覆盖。
+
