@@ -28,7 +28,7 @@ const (
 //   - Studio sessions never double as provider credentials.
 //   - user identity (identity_mode=user) REQUIRES the user's UAT — the
 //     real agent rejects app identity (10009).
-//   - Refresh tokens live AES-256-GCM encrypted in TiDB; access tokens
+//   - Refresh tokens live AES-256-GCM encrypted in MySQL; access tokens
 //     only in the Redis TTL cache.
 type AuthResolver struct {
 	DB       *sql.DB

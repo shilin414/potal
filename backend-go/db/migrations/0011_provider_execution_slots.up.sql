@@ -2,7 +2,7 @@
 -- Hardening, Phase 2).
 --
 -- max_inflight is a SAFETY capacity state, so it belongs to the correctness
--- plane (TiDB), not to a transient Redis semaphore: a Redis restart / flush /
+-- plane (MySQL), not to a transient Redis semaphore: a Redis restart / flush /
 -- failover used to drop the whole inflight ZSET while real provider calls
 -- kept running, and the next workers admitted a fresh full batch — the real
 -- provider concurrency could reach 2× the configured limit.
@@ -27,9 +27,9 @@ CREATE TABLE provider_execution_slots (
     KEY idx_provider_slots_run (run_id, lease_epoch)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- Per-provider admission serialization row. Acquire locks it (SELECT ...
--- FOR UPDATE) for the rest of its transaction, so "count active slots →
--- insert" is atomic on both TiDB and MySQL 5.7 without table-level locks or
+-- Per-provider admission serialization row. Migration 0013 upgrades the
+-- serialization from a locking read to a CONFLICTING WRITE on this row, so
+-- "delete expired → count active → insert" is atomic without table-level or
 -- advisory locks. Rows are seeded for existing providers; unknown providers
 -- self-heal on first Acquire.
 CREATE TABLE provider_admission_locks (

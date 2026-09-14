@@ -55,7 +55,7 @@ type CreateInput struct {
 	Deliveries             []DeliveryInput
 }
 
-// Service implements schedule CRUD on TiDB.
+// Service implements schedule CRUD on MySQL.
 type Service struct {
 	DB      *sql.DB
 	Check   ApplicationChecker

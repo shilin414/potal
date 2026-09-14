@@ -52,8 +52,8 @@ SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?;
 
 -- name: ListConversationsForUser :many
 -- Sidebar history: latest message + count via correlated scalar subqueries
--- in the SELECT list. (TiDB rejects subqueries inside JOIN ... ON, and
--- window functions are MySQL 8 only — the project must stay 5.7-compatible.)
+-- in the SELECT list (window functions are MySQL 8 only — the project must
+-- stay 5.7-compatible).
 SELECT c.id, c.title, c.application_id, c.updated_at,
        (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count,
        (SELECT m2.role FROM messages m2 WHERE m2.conversation_id = c.id ORDER BY m2.id DESC LIMIT 1) AS last_role,

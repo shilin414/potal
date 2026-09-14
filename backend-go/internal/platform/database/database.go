@@ -1,4 +1,4 @@
-// Package database opens and tunes the TiDB/MySQL connection pool.
+// Package database opens and tunes the MySQL connection pool.
 package database
 
 import (
@@ -12,7 +12,7 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/platform/config"
 )
 
-// Open connects to TiDB (through TiProxy) with conservative pool defaults.
+// Open connects to MySQL 5.7 with conservative pool defaults.
 func Open(ctx context.Context, cfg config.DatabaseConfig) (*sql.DB, error) {
 	db, err := sql.Open("mysql", cfg.DSN())
 	if err != nil {

@@ -212,7 +212,7 @@ func (w *Worker) send(ctx context.Context, row db.DeliveryExecution) error {
 
 // handleFailure requeues with exponential backoff + jitter, or dead-ends
 // the delivery after max attempts. 429-style rate errors cool down longer;
-// all state lands in TiDB before the message is ACKed.
+// all state lands in MySQL before the message is ACKed.
 func (w *Worker) handleFailure(ctx context.Context, row db.DeliveryExecution, sendErr error) {
 	attempt := int(row.Attempt)
 	code := "send_failed"

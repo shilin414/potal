@@ -95,7 +95,7 @@ type OAuthResult struct {
 }
 
 // ExchangeOrchestrator wires the OAuth exchange to user mapping and token
-// encryption. Refresh token → AES-256-GCM → TiDB (never plaintext).
+// encryption. Refresh token → AES-256-GCM → MySQL (never plaintext).
 type ExchangeOrchestrator struct {
 	Repo        *Repo
 	DB          *sql.DB

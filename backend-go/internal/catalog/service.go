@@ -366,7 +366,7 @@ func (s *Service) Delete(ctx context.Context, appID, callerID int64, isStaff boo
 
 // SetDefaultAgent promotes a chat app with an enabled binding; the flag is
 // globally unique and enforced transactionally (no conditional unique
-// indexes in TiDB/MySQL).
+// indexes in MySQL).
 func (s *Service) SetDefaultAgent(ctx context.Context, appID, callerID int64, isStaff bool) error {
 	app, err := s.ApplicationByID(ctx, appID)
 	if err != nil {

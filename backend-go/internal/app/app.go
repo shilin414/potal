@@ -57,7 +57,7 @@ type App struct {
 	DeliveryDispatch *delivery.Dispatcher
 	DeliverySender   delivery.Sender
 	DeliveryLimiter  *execution.RateLimiter
-	// ProviderSlots is the durable (TiDB) provider concurrency semaphore:
+	// ProviderSlots is the durable (MySQL) provider concurrency semaphore:
 	// ownership-scoped slots, DB-clock expiry, Redis independent.
 	ProviderSlots *execution.ProviderSlots
 }

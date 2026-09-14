@@ -71,7 +71,7 @@ type executionControl struct {
 }
 
 // Worker consumes provider queues: Redis Streams wake it up (fast), then
-// the TiDB CAS claim makes it correct. A fallback scan (FallbackScan)
+// the MySQL CAS claim makes it correct. A fallback scan (FallbackScan)
 // covers messages lost to Redis restarts.
 //
 // Queue layout: one stream per priority class
@@ -95,7 +95,7 @@ type Worker struct {
 	ReclaimAfter time.Duration
 	Log          *slog.Logger
 	// ProviderSlots caps provider-wide concurrent runs across worker
-	// instances. Slots are durable in TiDB and ownership-scoped, so the cap
+	// instances. Slots are durable in MySQL and ownership-scoped, so the cap
 	// survives Redis restarts and worker clock skew (Phase 2).
 	ProviderSlots *ProviderSlots
 	// PriorityWeights per class [interactive, retry, scheduled]; zero
@@ -442,7 +442,7 @@ func (w *Worker) ack(ctx context.Context, stream, msgID string) {
 	}
 }
 
-// scanLoop sweeps queued runs directly from TiDB (recovery path) and
+// scanLoop sweeps queued runs directly from MySQL (recovery path) and
 // claims any that have waited too long without a queue message.
 func (w *Worker) scanLoop(ctx context.Context) {
 	ticker := time.NewTicker(w.ScanEvery)
@@ -477,7 +477,7 @@ func (w *Worker) scanLoop(ctx context.Context) {
 // reclaimLoop re-assigns long-pending stream entries. Messages published
 // before the consumer group existed (or delivered to a crashed worker)
 // would otherwise sit in the PEL forever — ">" only hands out new ones.
-// Re-delivery is safe: the TiDB CAS claim absorbs duplicates.
+// Re-delivery is safe: the MySQL CAS claim absorbs duplicates.
 func (w *Worker) reclaimLoop(ctx context.Context) {
 	reclaimAfter := w.ReclaimAfter
 	if reclaimAfter <= 0 {
@@ -562,7 +562,7 @@ func (w *Worker) attachProviderSlot(own ExecutionOwnership, slot *ProviderSlot) 
 }
 
 // heartbeatOwned renews the run lease and (when the caller holds one) the
-// provider slot. With a slot attached both happen in ONE TiDB transaction
+// provider slot. With a slot attached both happen in ONE database transaction
 // (§20), so "Run Ownership alive ⇔ Provider Slot alive" is an invariant
 // rather than two independently drifting leases. The returned error is
 // non-nil only when the run-lease heartbeat itself failed (nothing was

@@ -1,13 +1,13 @@
 # Creation Agent Studio · 创作智能体工作台
 
-Creation Agent Studio 是一个以 Application 为入口、以统一 Run 为执行协议的 AI 应用工作台。当前主链路由 React 前端、Go 控制面/流式面/执行面、TiDB、Redis 和飞书 Aily 自定义智能体组成。
+Creation Agent Studio 是一个以 Application 为入口、以统一 Run 为执行协议的 AI 应用工作台。当前主链路由 React 前端、Go 控制面/流式面/执行面、MySQL 5.7、Redis 和飞书 Aily 自定义智能体组成。
 
 ## 当前状态
 
 - **Go 后端**：[backend-go/](backend-go/)；G0–G10 已完成，Django 已退出运行架构。
 - **前端**：[frontend/](frontend/)；React 18 + TypeScript + Vite + Ant Design + Zustand。
 - **HTTP 契约**：[backend-go/api/openapi.yaml](backend-go/api/openapi.yaml) 是唯一 API Contract。
-- **数据库**：TiDB 是唯一 Source of Truth；SQL 保持 MySQL 5.7 兼容。
+- **数据库**：MySQL 5.7 是唯一 Source of Truth（TiDB 8.0.0 / TiProxy 已退出运行架构）。
 - **Redis**：仅用于 Opaque Session、UAT 缓存、GCRA 限流、Redis Streams 分发和 Run Pub/Sub。
 - **认证**：HttpOnly Opaque Session Cookie + CSRF double-submit；前端不保存 JWT。
 - **Provider**：当前已完成飞书 Aily Agent；Aily Workflow、Codex、GraphFlow、HTTP Adapter 属后续 G12。
@@ -26,7 +26,7 @@ Creation Agent Studio 是一个以 Application 为入口、以统一 Run 为执�
 React/Vite :3030
       │ /api
       ▼
-studio-api :8080 ─────────────── TiDB
+studio-api :8080 ─────────────── MySQL 5.7
       │                           Source of Truth
       ├── REST + 当前开发环境 SSE
       │
@@ -38,11 +38,11 @@ studio-api :8080 ─────────────── TiDB
 
 Run 的正确性边界：
 
-1. API 在一个 TiDB 事务内写入 Message、Run 和 Outbox。
+1. API 在一个 MySQL 事务内写入 Message、Run 和 Outbox。
 2. Outbox Relay 以 at-least-once 语义发布到 Redis Streams。
 3. Worker 只有 CAS Claim 成功时才能执行；RunLease、Heartbeat、Reaper 负责恢复。
 4. Aily 实时 delta 走 Redis Pub/Sub；Final Reconciliation 的 GET chat result 是终态唯一权威。
-5. 最终 Message、Run、Artifact 持久化到 TiDB；Redis 从不作为业务真相。
+5. 最终 Message、Run、Artifact 持久化到 MySQL；Redis 从不作为业务真相。
 
 ## 项目结构
 
@@ -57,7 +57,7 @@ creation_agent_studio/
 │   ├── db/migrations/           # golang-migrate；MySQL 5.7 兼容
 │   ├── db/queries/              # sqlc 显式 SQL
 │   ├── internal/                # identity/catalog/execution/integrations/platform/transport
-│   └── tests/                   # TiDB/Redis 集成测试 + 真实 Aily 浏览器 E2E
+│   └── tests/                   # MySQL/Redis 集成测试 + 真实 Aily 浏览器 E2E
 ├── frontend/                    # React + TypeScript + Vite
 └── docs/
     └── archive/django-reference # 只读历史行为参考，不参与运行
@@ -69,7 +69,7 @@ creation_agent_studio/
 
 - Go 1.27.x
 - Node.js 与 npm
-- 可访问已配置的 TiDB、Redis 和飞书/Aily 环境
+- 可访问已配置的 MySQL 5.7（:3306 或实例端口）、Redis 和飞书/Aily 环境
 - 真实凭据仅放在 gitignored 的 `backend-go/.env.local`
 - Go 模块代理不可达时使用 `GOPROXY=https://goproxy.cn,direct`
 
@@ -112,8 +112,8 @@ go build ./...
 go vet ./...
 go test ./... -count=1
 
-# 真实 TiDB + Redis 集成测试
-STUDIO_TEST_TIDB=1 STUDIO_TEST_REDIS=1 \
+# 真实 MySQL 5.7 + Redis 集成测试
+STUDIO_TEST_DB=1 STUDIO_TEST_REDIS=1 \
   go test ./tests/integration/ -count=1
 
 # 前端
@@ -124,7 +124,7 @@ npx vitest run
 
 ## 真实 Aily 浏览器 E2E
 
-E2E 需要 API、Worker、Vite 三个进程，并使用已经迁入 `xiaoan3_go` 的真实用户、Application、RuntimeBinding 和 UAT 身份数据。
+E2E 需要 API、Worker、Vite 三个进程，并使用已经迁入 `xiaoan`（MySQL 5.7）的真实用户、Application、RuntimeBinding 和 UAT 身份数据。
 
 ```bash
 python -m pip install -r backend-go/tests/requirements-e2e.txt
@@ -135,7 +135,7 @@ C:/software/miniconda3/envs/py311/python.exe backend-go/tests/e2e_go_chat.py
 
 ## 不得回归的架构红线
 
-- Domain 不依赖 chi、Redis driver 或 TiDB driver。
+- Domain 不依赖 chi、Redis driver 或 MySQL driver。
 - Provider 差异只进入 RuntimeAdapter；业务层禁止散落 `if provider == ...`。
 - Redis 只是分发、实时、缓存与会话，不是 Source of Truth。
 - Worker 必须 CAS Claim；Redis 重复消息不得造成重复执行。

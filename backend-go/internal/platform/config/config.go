@@ -164,8 +164,8 @@ func Load(searchPaths ...string) (*Config, error) {
 		PPROFEnabled: getEnvBool("PPROF_ENABLED", false),
 		Database: DatabaseConfig{
 			Host:            getEnv("DB_HOST", "127.0.0.1"),
-			Port:            getEnvInt("DB_PORT", 4000),
-			Name:            getEnv("DB_NAME", "xiaoan3_go"),
+			Port:            getEnvInt("DB_PORT", 3306),
+			Name:            getEnv("DB_NAME", "xiaoan"),
 			User:            getEnv("DB_USER", "root"),
 			Password:        getEnv("DB_PASSWORD", ""),
 			MaxOpenConns:    getEnvInt("DB_MAX_OPEN_CONNS", 40),

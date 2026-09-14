@@ -12,7 +12,7 @@ import (
 )
 
 // RecoverExpiredLeases is the reaper (Recovery Coordinator — 修复计划
-// §11-13, Phase 3). Each run is recovered in ONE TiDB transaction:
+// §11-13, Phase 3). Each run is recovered in ONE database transaction:
 //
 //	BEGIN
 //	  SELECT the run FOR UPDATE                (common first lock)

@@ -15,7 +15,7 @@ func (s *Service) RetryOwnedRun(ctx context.Context, run *Run, own ExecutionOwne
 	return s.RetryOwnedRunAfter(ctx, run, own, reason, s.requeueDelay())
 }
 
-// RetryOwnedRunAfter requeues a running run for another attempt as ONE TiDB
+// RetryOwnedRunAfter requeues a running run for another attempt as ONE database
 // transaction (修复计划 §19-20, Phase 2 / Clock Authority Phase 3):
 //
 //  1. verify ownership (run row locked FOR UPDATE, epoch checked)

@@ -1,7 +1,7 @@
 -- Creation Agent Studio — clean target schema (Go backend).
 --
 -- Constraints honoured throughout:
---   * MySQL 5.7 compatible: no TiDB-only syntax, no functional indexes,
+--   * MySQL 5.7 compatible: no MySQL-8-only syntax, no functional indexes,
 --     no DEFAULT on TEXT/JSON columns, utf8mb4, DATETIME(3) UTC.
 --   * Run-domain resources use app-generated UUIDv7 stored BINARY(16)
 --     (never NULL); conversion happens in Go, SQL stays portable.

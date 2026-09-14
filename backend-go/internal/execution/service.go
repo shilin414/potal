@@ -37,7 +37,7 @@ var ErrInvalidTerminalStatus = errors.New("execution: invalid terminal status")
 // fail the run, not retry it.
 var ErrProviderAttemptsExhausted = errors.New("execution: provider attempts exhausted")
 
-// Service implements the Run lifecycle on top of TiDB.
+// Service implements the Run lifecycle on top of MySQL.
 type Service struct {
 	DB      *sql.DB
 	Redis   *redisx.Client
@@ -348,7 +348,7 @@ func mustID(b []byte) ids.ID {
 // ─────────────────────────────────────────────────────── claim / lease ──
 
 // ClaimRun atomically transitions queued→running AND inserts the lease
-// row (carrying the new lease_epoch) in ONE TiDB transaction, then loads
+// row (carrying the new lease_epoch) in ONE database transaction, then loads
 // the run and returns it coupled with its immutable ExecutionOwnership
 // (修复计划 §6). If the lease INSERT fails the whole claim rolls back and
 // the run stays queued — a "running run without a lease" produced by the
@@ -493,7 +493,7 @@ func (s *Service) HeartbeatOwned(ctx context.Context, own ExecutionOwnership, le
 }
 
 // HeartbeatOwnedWithSlot extends the run lease and, when the caller still
-// holds it, renews the ownership-scoped provider slot in the SAME TiDB
+// holds it, renews the ownership-scoped provider slot in the SAME database
 // transaction (Admission Fairness & Lease Hardening §20): Run Ownership
 // alive ⇔ Provider Slot alive becomes an invariant instead of two
 // independently drifting leases.
@@ -640,7 +640,7 @@ func slogKey(k string) string { return k }
 // FinishInput carries terminal transition fields. The finalize
 // transaction (FinalizeOwnedRun) persists the terminal CAS, the terminal
 // RunEvent, the assistant message, the occurrence state and the lease
-// cleanup as ONE TiDB transaction (修复计划 §29-32).
+// cleanup as ONE database transaction (修复计划 §29-32).
 type FinishInput struct {
 	Status         string
 	Output         map[string]any

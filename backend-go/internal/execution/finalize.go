@@ -8,7 +8,7 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
 )
 
-// FinalizeOwnedRun applies the terminal transition as ONE TiDB
+// FinalizeOwnedRun applies the terminal transition as ONE database
 // transaction (修复计划 §29-32, Phase 6):
 //
 //  1. verify ownership (run row locked FOR UPDATE, epoch checked)

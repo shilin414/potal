@@ -106,7 +106,7 @@ UPDATE runs SET status = 'queued' WHERE id = ? AND status = 'running';
 -- desynchronized run availability from outbox publishing, so a
 -- redispatched run was invisible to the CAS until the fallback scan found
 -- it ~20s later) and neither may depend on the app clock, whose skew
--- against TiDB has already caused a wakeup/claimability mismatch (Phase 3).
+-- against the database has already caused a wakeup/claimability mismatch (Phase 3).
 UPDATE runs
 SET status = 'queued', priority = 'retry',
     available_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(retry_delay_micros) MICROSECOND)
@@ -243,7 +243,7 @@ LIMIT ?;
 -- ───────────────────────────────────────── provider execution slots ──
 -- Provider Inflight Durable Truth (Admission Fairness & Distributed Lease
 -- Hardening, Phase 2): max_inflight is a safety capacity state and lives in
--- TiDB, not in a transient Redis semaphore. Every timestamp decision uses
+-- MySQL, not in a transient Redis semaphore. Every timestamp decision uses
 -- the DB clock; Redis restart/flush can never raise real provider
 -- concurrency above the configured limit.
 
@@ -255,15 +255,14 @@ ON DUPLICATE KEY UPDATE provider = provider;
 
 -- name: LockProviderAdmission :execresult
 -- Serialize the admission decision per provider with a CONFLICTING WRITE on
--- the shared row (migration 0013). A locking read is not enough: TiDB may run
--- the transaction optimistically, where SELECT ... FOR UPDATE does not block a
--- concurrent decision and every contender counts zero active slots (observed
--- in CI as admitted=8/8 on a fresh provider). Writing this row makes the
--- decision conflict for real — pessimistically the loser waits for the row
--- lock, optimistically it aborts with 9007 at commit and retries with a fresh
--- snapshot — so "delete expired → count active → insert" stays atomic on TiDB
--- and MySQL 5.7. Affected rows must be 1; 0 means the row is missing and the
--- caller fails closed (the next Acquire re-materializes it).
+-- the shared row (migration 0013). A locking read is not enough: SELECT ...
+-- FOR UPDATE alone does not stop a concurrent decision from observing the same
+-- pre-insert depth, so every contender counts zero active slots (observed in
+-- CI as admitted=8/8 on a fresh provider). Writing this row forces a real
+-- conflict, so "delete expired → count active → insert" stays atomic; a loser
+-- that still fails with 1213 (deadlock) or 1205 (lock wait timeout) is retried
+-- with a fresh snapshot. Affected rows must be 1; 0 means the row is missing
+-- and the caller fails closed (the next Acquire re-materializes it).
 UPDATE provider_admission_locks
 SET admissions = admissions + 1
 WHERE provider = ?;

@@ -63,7 +63,7 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	// Outbox relay: TiDB → Redis Streams (§22). Also routes delivery
+	// Outbox relay: MySQL → Redis Streams (§22). Also routes delivery
 	// outbox events to the feishu_delivery stream.
 	relay := execution.NewRelay(a.Runs, a.Redis, 200)
 	wg.Add(1)

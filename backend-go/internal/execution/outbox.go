@@ -49,7 +49,7 @@ func dispatchTarget(rdb *redisx.Client, eventType string, payload dbtypes.JSONTe
 
 // Relay publishes pending outbox events to Redis Streams.
 //
-// Outbox rows and their aggregates commit in one TiDB transaction; this
+// Outbox rows and their aggregates commit in one database transaction; this
 // relay is the only component allowed to turn them into queue messages.
 // It is at-least-once: workers must stay idempotent (they are — CAS).
 type Relay struct {

@@ -28,7 +28,7 @@ const DefaultProviderSlotLease = 2 * time.Minute
 
 // ProviderSlot is the ownership-scoped provider concurrency reservation
 // (Admission Fairness & Distributed Lease Hardening, §35 terminology). It is
-// derived from the immutable ExecutionOwnership and durable in TiDB: the row
+// derived from the immutable ExecutionOwnership and durable in MySQL: the row
 // is unique on (provider, run_id, lease_epoch), so slots of different
 // attempts (and different workers) of the same run are distinct — a stale
 // worker releasing or renewing its slot can never touch (or delete) the new
@@ -63,11 +63,11 @@ func (s *ProviderSlot) providerOr(def string) string {
 
 // ProviderSlots is the provider-wide distributed concurrency semaphore.
 //
-// max_inflight is a SAFETY capacity state, so it lives in TiDB — the
+// max_inflight is a SAFETY capacity state, so it lives in MySQL — the
 // correctness plane — instead of a transient Redis semaphore: a Redis
 // restart / flush / failover used to drop the whole inflight ZSET while the
 // real provider calls kept running, and the next workers admitted a fresh
-// full batch (real concurrency up to 2×limit). Every decision is a TiDB
+// full batch (real concurrency up to 2×limit). Every decision is a database
 // transaction and every timestamp comes from the DB clock:
 //
 //	Acquire  — serialized per provider by a CONFLICTING WRITE on the shared
@@ -124,11 +124,10 @@ func (l *ProviderSlots) Acquire(ctx context.Context, own ExecutionOwnership) (*P
 	}
 	slot := newProviderSlot(l.Provider, own)
 
-	// TiDB may run explicit transactions optimistically. Concurrent admission
-	// decisions then serialize at commit and losers receive Error 9007. Retry
-	// the WHOLE decision with a fresh snapshot; retrying only COMMIT would
-	// reuse the stale count and could over-admit. MySQL deadlock/lock-timeout
-	// victims use the same safe transaction-boundary retry.
+	// Concurrent admission decisions serialize on the shared lock row
+	// (migration 0013) and losers are retried with a FRESH snapshot by
+	// Acquire. Retrying only COMMIT would reuse the stale count and could
+	// over-admit, so the whole decision is replayed.
 	for attempt := 0; ; attempt++ {
 		got, ok, depth, err := l.acquireOnce(ctx, own, slot)
 		if err == nil || !isRetryableAdmissionConflict(err) || attempt >= maxProviderAdmissionRetries-1 {
@@ -143,7 +142,7 @@ func (l *ProviderSlots) Acquire(ctx context.Context, own ExecutionOwnership) (*P
 func (l *ProviderSlots) acquireOnce(ctx context.Context, own ExecutionOwnership, slot *ProviderSlot) (*ProviderSlot, bool, int, error) {
 	// Materialize the serialization row before opening the explicit
 	// admission transaction. This avoids coupling first-provider creation to
-	// the capacity decision; any remaining optimistic conflict is handled by
+	// the capacity decision; any remaining write conflict is handled by
 	// Acquire's full-transaction retry above.
 	if err := db.New(l.DB).EnsureProviderAdmissionLock(ctx, l.Provider); err != nil {
 		return nil, false, 0, fmt.Errorf("ensure provider admission lock: %w", err)
@@ -158,9 +157,10 @@ func (l *ProviderSlots) acquireOnce(ctx context.Context, own ExecutionOwnership,
 
 	// 1. Serialize the admission decision per provider with a conflicting
 	// WRITE on the shared lock row, so "delete expired → count active →
-	// insert" is atomic on TiDB and MySQL 5.7 — under pessimistic row locks
-	// AND under optimistic transactions (where a locking read does not block
-	// a concurrent decision at all; migration 0013 documents the CI evidence).
+	// insert" is atomic. A plain locking read is not enough: the read must
+	// CONFLICT, otherwise two concurrent decisions both observe the same
+	// pre-insert depth and over-admit (migration 0013 documents the CI
+	// evidence).
 	res, err := q.LockProviderAdmission(ctx, l.Provider)
 	if err != nil {
 		return nil, false, 0, fmt.Errorf("lock provider admission: %w", err)
@@ -254,15 +254,22 @@ func (l *ProviderSlots) acquireOnce(ctx context.Context, own ExecutionOwnership,
 	return slot, true, int(count) + 1, nil
 }
 
+// isRetryableAdmissionConflict reports whether err is an InnoDB
+// transaction conflict that a full-decision replay can safely absorb:
+//
+//	1213 — deadlock victim
+//	1205 — lock wait timeout
+//
+// Both are transient and leave the transaction rolled back, so replaying
+// the whole admission decision (never just the commit) is safe.
 func isRetryableAdmissionConflict(err error) bool {
 	var mysqlErr *mysql.MySQLError
 	if !errors.As(err, &mysqlErr) {
 		return false
 	}
 	switch mysqlErr.Number {
-	case 9007, // TiDB optimistic write conflict
-		1213, // MySQL deadlock victim
-		1205: // MySQL lock wait timeout
+	case 1213, // deadlock victim
+		1205: // lock wait timeout
 		return true
 	default:
 		return false

@@ -1,7 +1,7 @@
 // Package execution owns the unified Run model: creation, dispatch
 // (Outbox → Redis Streams), CAS claim, leases, events and artifacts.
 //
-// TiDB is the source of truth; Redis is only dispatch speed and realtime
+// MySQL is the source of truth; Redis is only dispatch speed and realtime
 // fanout. Duplicate queue messages can never duplicate execution because
 // workers must win the CAS claim before doing anything.
 package execution

@@ -142,7 +142,7 @@ func NewMetrics(service string) *Metrics {
 		}),
 		DBLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "studio_db_query_seconds",
-			Help:    "TiDB query latency.",
+			Help:    "SQL query latency.",
 			Buckets: prometheus.ExponentialBuckets(0.001, 2, 12),
 		}, []string{"op"}),
 		RedisLatency: prometheus.NewHistogramVec(prometheus.HistogramOpts{

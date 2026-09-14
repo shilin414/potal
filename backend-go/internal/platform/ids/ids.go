@@ -1,7 +1,7 @@
 // Package ids provides app-generated identifiers.
 //
 // Run-domain resources use UUIDv7: time-ordered, generated in the
-// application, stored as BINARY(16) in TiDB and rendered as strings by the
+// application, stored as BINARY(16) in MySQL and rendered as strings by the
 // API. SQL stays MySQL-5.7 compatible (no UUID_TO_BIN).
 package ids
 

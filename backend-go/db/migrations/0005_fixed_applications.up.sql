@@ -5,8 +5,9 @@
 -- center) while admins still see it for management. Chat agents keep their
 -- runtime binding as the primary switch; enabled defaults to 1 so existing
 -- rows are unaffected.
--- NOTE: TiDB rejects an index on a column added in the same ALTER statement
--- ("column does not exist"), so the index is a separate statement.
+-- NOTE: the index is created in a statement separate from the column it
+-- covers, so the migration never depends on same-statement column
+-- visibility ordering.
 ALTER TABLE applications
     ADD COLUMN enabled TINYINT(1) NOT NULL DEFAULT 1 AFTER is_default_agent;
 

@@ -1,6 +1,6 @@
 // Package sse implements the run event stream gateway:
 //
-//  1. Replay every persisted RunEvent from TiDB (sequence 0 → head).
+//  1. Replay every persisted RunEvent from MySQL (sequence 0 → head).
 //  2. Subscribe the Redis pub/sub channel for live events.
 //  3. Keepalive comment after 15s of silence.
 //  4. Close after replay when the run is already terminal, or after the
@@ -85,7 +85,7 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 	// Phase order matters (§35):
 	//   1. SUBSCRIBE first — live events buffer in the pub/sub channel
 	//      from this point; nothing published later can be missed.
-	//   2. Replay persisted events from TiDB (snapshot after subscription).
+	//   2. Replay persisted events from MySQL (snapshot after subscription).
 	//   3. Drain live frames, skipping sequences already replayed
 	//      (overlap between snapshot and subscription is deduplicated).
 	var lastReplayed uint64
@@ -109,7 +109,7 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 		}
 	}
 
-	// Phase 2: TiDB replay.
+	// Phase 2: MySQL replay.
 	events, err := g.Runs.ListEventsAfter(ctx, run.ID, 0)
 	if err != nil {
 		return

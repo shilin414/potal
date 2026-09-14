@@ -193,7 +193,7 @@ func (e *Executor) bindThreadAndRun(ctx context.Context, claimed *execution.Clai
 
 // deltaCoalescer batches high-frequency provider deltas into durable
 // content.chunk events (评测 P1: run_events write amplification). Live
-// consumers still see every delta via the transient Redis channel; TiDB
+// consumers still see every delta via the transient Redis channel; MySQL
 // only receives a chunk every flushInterval / flushBytes.
 type deltaCoalescer struct {
 	buf          []byte

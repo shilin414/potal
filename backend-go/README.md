@@ -4,7 +4,7 @@
 不是 Django 的逐文件翻译，而是一个以 OpenAPI 契约为唯一 HTTP Contract 的
 Go Control Plane + Streaming Plane + Execution Plane。
 
-> 状态：**G0–G10 已完成**；Go API + Worker + Vite 已通过真实 TiDB/Redis、真实用户 UAT 与
+> 状态：**G0–G10 已完成**；Go API + Worker + Vite 已通过真实 MySQL 5.7/Redis、真实用户 UAT 与
 > 浏览器 E2E 验收，Django 已退出运行架构（历史参考在 docs/archive/django-reference/）。
 > 当前生产部署拓扑仍属于 G15。
 
@@ -17,11 +17,11 @@ Nginx
  └─ React SPA
 
 studio-worker (cmd/worker) —— 执行面（可按 provider 水平扩容）
-   Outbox Relay: TiDB → Redis Streams
-   Worker:       XREADGROUP → TiDB CAS Claim → RunLease → Provider Handler
+   Outbox Relay: MySQL → Redis Streams
+   Worker:       XREADGROUP → MySQL CAS Claim → RunLease → Provider Handler
 ```
 
-- **TiDB（Source of Truth）**：users / feishu_identities / providers /
+- **MySQL 5.7（Source of Truth）**：users / feishu_identities / providers /
   applications / runtime_bindings / conversations / agent_threads / messages /
   runs / run_events / run_commands / run_leases / runtime_attachments /
   run_artifacts / outbox_events / quota_policies / audit_logs
@@ -49,16 +49,26 @@ internal/gen         oapi-codegen / sqlc 生成代码（勿手改）
 
 ## Bootstrap（一次性）
 
-`xiaoanuser` 无 `CREATE DATABASE` 权限，且新 Schema 的表名与 Django 旧库 `xiaoan3`
-存在冲突（users/applications/conversations/messages/agent_threads/
-application_favorites），因此 Go 后端使用**独立新库 `xiaoan3_go`**，绝不触碰现有数据：
-（Django 已在 G10 退出运行架构，历史参考归档在 `docs/archive/django-reference/`）
+数据库基线是 **MySQL 5.7**（TiDB 8.0.0 / TiProxy 已退出运行架构，不再参与数据库链路）。
+Go 后端使用**独立库 `xiaoan`**，与 Django 旧库 `xiaoan3` 物理隔离，绝不触碰历史数据
+（Django 已在 G10 退出运行架构，历史参考归档在 `docs/archive/django-reference/`）。
+
+库级 collation 必须是 `utf8mb4_bin`，与全部 migration 保持一致——改成
+`utf8mb4_general_ci` / `utf8mb4_unicode_ci` 会改变字符串唯一索引与大小写比较语义。
 
 ```sql
--- 用有全局权限的账号执行一次：
-CREATE DATABASE xiaoan3_go CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
-GRANT ALL PRIVILEGES ON xiaoan3_go.* TO 'xiaoanuser'@'%';
+-- 用有建库权限的账号执行一次：
+CREATE DATABASE xiaoan CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;
+
+-- 迁移账号（仅 migration Job 持有 DDL 权限）：
+GRANT ALL PRIVILEGES ON xiaoan.* TO 'potal_migrate'@'%';
+
+-- 运行账号（studio-api/stream/worker/scheduler 只用 DML）：
+GRANT SELECT, INSERT, UPDATE, DELETE ON xiaoan.* TO 'potal_app'@'%';
 ```
+
+Schema 权威来源是 `db/migrations`——**不要**把任何 dump 的 `SHOW CREATE TABLE`
+输出当作目标 Schema 权威；数据权威来源才是原 TiDB 库。
 
 然后：
 
@@ -75,10 +85,10 @@ go run ./cmd/worker            # 另一个终端：执行面
 ```bash
 make build        # go build ./...
 make vet          # go vet ./...
-make test         # 全部单测（不需要 TiDB）
+make test         # 全部单测（不需要数据库）
 make test-race    # -race
 make gen          # 重新生成 OpenAPI/SQL 代码
-STUDIO_TEST_TIDB=1 STUDIO_TEST_REDIS=1 go test ./tests/integration/ -count=1
+STUDIO_TEST_DB=1 STUDIO_TEST_REDIS=1 go test ./tests/integration/ -count=1
 # 浏览器 E2E 另需 Go API + Worker + Vite 三进程：
 C:/software/miniconda3/envs/py311/python.exe tests/e2e_go_chat.py
 ```
