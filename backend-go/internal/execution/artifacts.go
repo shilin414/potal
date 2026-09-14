@@ -48,7 +48,7 @@ func (s *Service) PersistArtifactOwned(ctx context.Context, own ExecutionOwnersh
 	q := db.New(tx)
 
 	// 1. Fence check under the run row lock — before any write.
-	if _, _, err := verifyOwnershipTx(ctx, tx, own); err != nil {
+	if _, err := verifyActiveOwnershipTx(ctx, tx, own); err != nil {
 		return ids.ID{}, err
 	}
 
@@ -131,7 +131,7 @@ func (s *Service) BindProviderSessionOwned(ctx context.Context, own ExecutionOwn
 
 	// Fence check under the run row lock — a stale worker must not even
 	// touch the conversation's provider session.
-	if _, _, err := verifyOwnershipTx(ctx, tx, own); err != nil {
+	if _, err := verifyActiveOwnershipTx(ctx, tx, own); err != nil {
 		return err
 	}
 

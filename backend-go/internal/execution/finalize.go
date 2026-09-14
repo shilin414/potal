@@ -2,7 +2,6 @@ package execution
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
@@ -33,7 +32,7 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 		return ErrLostOwnership
 	}
 	if !IsTerminal(in.Status) {
-		in.Status = StatusFailed // never persist a non-terminal via finalize
+		return ErrInvalidTerminalStatus
 	}
 
 	output := in.Output
@@ -51,7 +50,7 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 	q := db.New(tx)
 
 	// 1. Ownership verification under the row lock.
-	row, terminal, err := verifyOwnershipTx(ctx, tx, own)
+	row, terminal, err := verifyFinalizeOwnershipTx(ctx, tx, own)
 	if err != nil {
 		return err
 	}
@@ -118,21 +117,27 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 
 	// 5. Occurrence convergence (scheduled runs): the occurrence follows
 	// the run into its terminal state; delivery state stays separate.
-	if row.TriggerType == TriggerTypeScheduled && row.TriggerID.Valid {
-		occStatus := StatusFailed
-		if in.Status == StatusSucceeded {
-			occStatus = StatusSucceeded
+	isScheduled := row.TriggerType == TriggerTypeScheduled && row.TriggerID.Valid
+	if isScheduled {
+		if err := finishOccurrenceTx(ctx, tx, row, own.RunID, in.Status); err != nil {
+			return err
 		}
-		_, _ = q.CASFinishOccurrenceByRun(ctx, db.CASFinishOccurrenceByRunParams{
-			Status: occStatus,
-			RunID:  sql.NullString{String: string(own.RunID.Bytes()), Valid: true},
-		})
+	}
+
+	// Delivery requests become durable in the same commit as terminal
+	// success. The callback is pure database work; external sending stays
+	// in the delivery worker and can never make a completed run fail.
+	if isScheduled && in.Status == StatusSucceeded && s.CreateDeliveryExecutionsTx != nil {
+		current := runFromLockedRow(run, row)
+		if err := s.CreateDeliveryExecutionsTx(ctx, tx, current); err != nil {
+			return err
+		}
 	}
 
 	// 6. Lease cleanup — same transaction: a terminal run never keeps a lease.
-	_, _ = q.DeleteLeaseByToken(ctx, db.DeleteLeaseByTokenParams{
-		RunID: own.RunID.Bytes(), LeaseToken: own.LeaseToken.Bytes(),
-	})
+	if err := deleteOwnedLeaseTx(ctx, q, own); err != nil {
+		return err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return err
@@ -147,19 +152,6 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 				WithLabelValues(run.Provider, in.Status).
 				Observe(timeSinceSeconds(*run.StartedAt))
 		}
-	}
-	// Delivery fan-out: only the finalize winner triggers, only scheduled
-	// runs have deliveries, and a hook panic must never fail the run.
-	if in.Status == StatusSucceeded && s.OnRunSucceeded != nil &&
-		run.TriggerType == TriggerTypeScheduled && run.TriggerID != nil && run.UserID != nil {
-		func() {
-			defer func() {
-				if rec := recover(); rec != nil {
-					s.Log.Error("run succeeded hook panicked", slogKey("run_id"), own.RunID.String(), slogKey("panic"), rec)
-				}
-			}()
-			s.OnRunSucceeded(ctx, run, output)
-		}()
 	}
 	return nil
 }
@@ -179,10 +171,14 @@ func (s *Service) FailOwnedRun(ctx context.Context, run *Run, own ExecutionOwner
 // terminal event (修复计划 §16: terminal events must be unique).
 func terminalEventName(status string) string {
 	switch status {
+	case StatusSucceeded:
+		return EventRunCompleted
+	case StatusCancelled:
+		return EventRunCancelled
 	case StatusFailed, StatusInterrupted:
 		return EventRunFailed
 	default:
-		return EventRunCompleted // succeeded / cancelled
+		return EventRunCompleted
 	}
 }
 

@@ -4,9 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 
-	"github.com/creation-agent-studio/backend-go/internal/automation/schedule"
+	"github.com/creation-agent-studio/backend-go/internal/execution"
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
 	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
@@ -15,10 +16,9 @@ import (
 
 func marshalJSON(v any) ([]byte, error) { return json.Marshal(v) }
 
-// Dispatcher fans a succeeded scheduled run out to delivery executions.
-// It runs inside the worker process right after the winning terminal CAS;
-// the UNIQUE (occurrence_id, schedule_delivery_id) barrier keeps repeated
-// fan-out (worker crashes, duplicate events) harmless.
+// Dispatcher turns succeeded scheduled runs into durable delivery
+// executions. It runs inside the finalize transaction; no post-commit
+// in-memory hook can lose a delivery request.
 type Dispatcher struct {
 	DB      *sql.DB
 	Log     *slog.Logger
@@ -32,55 +32,38 @@ func NewDispatcher(d *sql.DB, log *slog.Logger, m *telemetry.Metrics) *Dispatche
 	return &Dispatcher{DB: d, Log: log, Metrics: m}
 }
 
-// OnRunSucceeded is the execution.Service hook. Never returns an error:
-// delivery scheduling failure is logged, it must not fail the AI run.
-func (d *Dispatcher) OnRunSucceeded(ctx context.Context, runIDStr string, triggerType string, triggerID int64, senderUserID int64, _ map[string]any) {
-	if triggerType != schedule.TriggerTypeScheduled || triggerID == 0 {
-		return
+// CreateInTx inserts one execution and one domain outbox row for every
+// enabled target. A duplicate (occurrence, target) is idempotent.
+func (d *Dispatcher) CreateInTx(ctx context.Context, tx *sql.Tx, run *execution.Run) error {
+	if run == nil || run.TriggerID == nil || run.UserID == nil || *run.TriggerID == 0 || *run.UserID == 0 {
+		return nil
 	}
-	q := db.New(d.DB)
-	occ, err := q.GetScheduleOccurrenceByID(ctx, uint64(triggerID))
+	q := db.New(tx)
+	occ, err := q.GetScheduleOccurrenceByID(ctx, uint64(*run.TriggerID))
 	if err != nil {
-		d.Log.Warn("delivery fan-out: occurrence missing", "occurrence_id", triggerID, "err", err)
-		return
+		return fmt.Errorf("delivery fan-out: occurrence missing: %w", err)
 	}
 	dels, err := q.ListEnabledDeliveriesBySchedule(ctx, occ.ScheduleID)
 	if err != nil {
-		d.Log.Warn("delivery fan-out: list deliveries failed", "err", err)
-		return
+		return fmt.Errorf("delivery fan-out: list deliveries: %w", err)
 	}
 	if len(dels) == 0 {
-		return
+		return nil
 	}
 
-	tx, err := d.DB.BeginTx(ctx, nil)
-	if err != nil {
-		d.Log.Warn("delivery fan-out: begin tx", "err", err)
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-	tq := db.New(tx)
-
-	var runID ids.ID
-	_ = runID.Scan([]byte(runIDStr))
-	runIDBytes := runID.Bytes()
-
-	created := 0
 	for _, del := range dels {
 		id := ids.New()
-		res, err := tq.CreateDeliveryExecution(ctx, db.CreateDeliveryExecutionParams{
+		res, err := q.CreateDeliveryExecution(ctx, db.CreateDeliveryExecutionParams{
 			ID:                 id.Bytes(),
 			OccurrenceID:       occ.ID,
-			RunID:              runIDBytes,
+			RunID:              run.ID.Bytes(),
 			ScheduleDeliveryID: del.ID,
-			SenderUserID:       uint64(senderUserID),
+			SenderUserID:       uint64(*run.UserID),
 			TargetType:         del.TargetType,
 			TargetID:           del.TargetID,
 		})
 		if err != nil {
-			d.Log.Warn("delivery fan-out: insert execution failed",
-				"occurrence_id", occ.ID, "delivery", del.ID, "err", err)
-			continue
+			return fmt.Errorf("delivery fan-out: insert execution: %w", err)
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
 			continue // duplicate (occurrence, delivery) — already fanned out
@@ -90,22 +73,15 @@ func (d *Dispatcher) OnRunSucceeded(ctx context.Context, runIDStr string, trigge
 			"provider":    ProviderKey,
 			"channel":     ChannelFeishu,
 		})
-		if _, err := tq.CreateOutboxEvent(ctx, db.CreateOutboxEventParams{
+		if _, err := q.CreateOutboxEvent(ctx, db.CreateOutboxEventParams{
 			Aggregate:   "delivery",
 			AggregateID: id.Bytes(),
 			EventType:   "delivery.dispatch",
 			Payload:     dbtypes.JSONText(payload),
 		}); err != nil {
-			d.Log.Warn("delivery fan-out: outbox insert failed", "delivery_id", id.Hex(), "err", err)
-			continue
+			return fmt.Errorf("delivery fan-out: insert outbox: %w", err)
 		}
-		created++
+		d.Log.Info("delivery request durable", "occurrence_id", occ.ID, "delivery_id", id.Hex())
 	}
-	if err := tx.Commit(); err != nil {
-		d.Log.Warn("delivery fan-out: commit failed", "err", err)
-		return
-	}
-	if created > 0 {
-		d.Log.Info("delivery fan-out", "occurrence_id", occ.ID, "created", created)
-	}
+	return nil
 }

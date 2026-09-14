@@ -37,17 +37,9 @@ func (s *Service) RetryOwnedRun(ctx context.Context, run *Run, own ExecutionOwne
 	q := db.New(tx)
 
 	// 1. Ownership verification under the row lock.
-	row, terminal, err := verifyOwnershipTx(ctx, tx, own)
+	row, err := verifyActiveOwnershipTx(ctx, tx, own)
 	if err != nil {
 		return err
-	}
-	if terminal {
-		return nil // already finalized — nothing to retry
-	}
-	if row.Status == StatusQueued {
-		// Already requeued (this owner retried before, duplicate message):
-		// the outbox row from the first retry still dispatches it.
-		return nil
 	}
 
 	// 2. Requeue CAS (fenced by the verified epoch).
@@ -73,7 +65,9 @@ func (s *Service) RetryOwnedRun(ctx context.Context, run *Run, own ExecutionOwne
 	}
 
 	// 4. Re-dispatch through the outbox so the queue wakes a worker.
-	payload, _ := json.Marshal(map[string]any{"run_id": own.RunID.String(), "provider": run.Provider})
+	payload, _ := json.Marshal(map[string]any{
+		"run_id": own.RunID.String(), "provider": run.Provider,
+	})
 	if _, err := q.CreateOutboxEvent(ctx, db.CreateOutboxEventParams{
 		Aggregate:   "run",
 		AggregateID: own.RunID.Bytes(),
@@ -84,9 +78,9 @@ func (s *Service) RetryOwnedRun(ctx context.Context, run *Run, own ExecutionOwne
 	}
 
 	// 5. Lease cleanup — same transaction.
-	_, _ = q.DeleteLeaseByToken(ctx, db.DeleteLeaseByTokenParams{
-		RunID: own.RunID.Bytes(), LeaseToken: own.LeaseToken.Bytes(),
-	})
+	if err := deleteOwnedLeaseTx(ctx, q, own); err != nil {
+		return err
+	}
 
 	if err := tx.Commit(); err != nil {
 		return err

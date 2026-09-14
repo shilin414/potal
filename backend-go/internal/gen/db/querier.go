@@ -47,6 +47,9 @@ type Querier interface {
 	CountActiveOccurrencesExcluding(ctx context.Context, arg CountActiveOccurrencesExcludingParams) (int64, error)
 	CountConversationByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
 	CountMessagesByConversation(ctx context.Context, conversationID uint64) (int64, error)
+	// Invariant L: every enabled target of a succeeded occurrence has a
+	// durable delivery execution row.
+	CountMissingDeliveryExecutions(ctx context.Context) (int64, error)
 	CountPendingOutbox(ctx context.Context) (int64, error)
 	// Invariant B: a queued run must NOT hold a lease.
 	CountQueuedWithLease(ctx context.Context) (int64, error)
@@ -62,6 +65,8 @@ type Querier interface {
 	// Invariant F: overlap=queue schedules must never run in parallel.
 	// Returns one row per violating schedule.
 	CountScheduleOverlapViolations(ctx context.Context) ([]CountScheduleOverlapViolationsRow, error)
+	// Invariant H: a terminal scheduled run and its occurrence must converge.
+	CountScheduledRunOccurrenceMismatch(ctx context.Context) (int64, error)
 	CountSkippedOccurrencesForSlot(ctx context.Context, arg CountSkippedOccurrencesForSlotParams) (int64, error)
 	// Invariant C: a terminal run must NOT hold a lease.
 	CountTerminalWithLease(ctx context.Context) (int64, error)
@@ -214,6 +219,8 @@ type Querier interface {
 	ListMessagesByConversation(ctx context.Context, conversationID uint64) ([]Message, error)
 	ListOccurrencesBySchedule(ctx context.Context, arg ListOccurrencesByScheduleParams) ([]ScheduleOccurrence, error)
 	ListPendingOutbox(ctx context.Context, limit int32) ([]OutboxEvent, error)
+	// Provider admission order. Base priority is explicit and waiting time
+	// adds a bounded bonus so scheduled/background work cannot starve.
 	ListQueuedRunIDs(ctx context.Context, arg ListQueuedRunIDsParams) ([][]byte, error)
 	ListRunArtifacts(ctx context.Context, runID []byte) ([]RunArtifact, error)
 	ListRunArtifactsByExternalID(ctx context.Context, arg ListRunArtifactsByExternalIDParams) (RunArtifact, error)
@@ -243,6 +250,7 @@ type Querier interface {
 	SetApplicationEnabled(ctx context.Context, arg SetApplicationEnabledParams) error
 	SetAttachmentUploaded(ctx context.Context, arg SetAttachmentUploadedParams) error
 	SetDefaultAgent(ctx context.Context, id uint64) error
+	SetRunImmediatelyAvailable(ctx context.Context, id []byte) error
 	// Lazy binding for conversation_policy=reuse on first run.
 	SetScheduleConversation(ctx context.Context, arg SetScheduleConversationParams) (sql.Result, error)
 	SetScheduleEnabled(ctx context.Context, arg SetScheduleEnabledParams) (sql.Result, error)
@@ -258,7 +266,7 @@ type Querier interface {
 	// Set-once semantic guarded in Go (only write when empty).
 	UpdateRunExternalID(ctx context.Context, arg UpdateRunExternalIDParams) error
 	// Set-once semantic guarded in Go (only write when empty) + fence.
-	UpdateRunExternalIDFenced(ctx context.Context, arg UpdateRunExternalIDFencedParams) error
+	UpdateRunExternalIDFenced(ctx context.Context, arg UpdateRunExternalIDFencedParams) (sql.Result, error)
 	UpdateSchedule(ctx context.Context, arg UpdateScheduleParams) (sql.Result, error)
 	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (sql.Result, error)

@@ -35,7 +35,8 @@ UPDATE runs SET external_run_id = ? WHERE id = ? AND external_run_id = '';
 UPDATE runs
 SET status = 'running', started_at = CURRENT_TIMESTAMP(3), attempt = attempt + 1,
     lease_epoch = lease_epoch + 1
-WHERE id = ? AND status = 'queued';
+WHERE id = ? AND status = 'queued'
+  AND (available_at IS NULL OR available_at <= CURRENT_TIMESTAMP(3));
 
 -- name: GetRunLeaseEpoch :one
 SELECT lease_epoch FROM runs WHERE id = ?;
@@ -48,14 +49,30 @@ SET status = ?, output = ?, provider_status = ?, provider_finish_reason = ?,
     error_code = ?, error_message = ?, finished_at = CURRENT_TIMESTAMP(3)
 WHERE id = ? AND status = 'running' AND lease_epoch = ?;
 
--- name: UpdateRunExternalIDFenced :exec
+-- name: UpdateRunExternalIDFenced :execresult
 -- Set-once semantic guarded in Go (only write when empty) + fence.
 UPDATE runs SET external_run_id = ? WHERE id = ? AND external_run_id = '' AND lease_epoch = ?;
 
 -- name: ListQueuedRunIDs :many
+-- Provider admission order. Base priority is explicit and waiting time
+-- adds a bounded bonus so scheduled/background work cannot starve.
 SELECT id FROM runs
 WHERE status = 'queued' AND provider = ?
-ORDER BY queued_at
+  AND (available_at IS NULL OR available_at <= CURRENT_TIMESTAMP(3))
+ORDER BY (
+    CASE priority
+        WHEN 'interactive_user' THEN 100
+        WHEN 'retry' THEN 70
+        WHEN 'scheduled_high' THEN 50
+        WHEN 'scheduled_normal' THEN 45
+        ELSE 20
+    END
+) + (
+    CASE
+        WHEN attempt > 0 THEN 25
+        ELSE 0
+    END + LEAST(TIMESTAMPDIFF(SECOND, queued_at, CURRENT_TIMESTAMP(3)), 40)
+) DESC, queued_at, id
 LIMIT ?;
 
 -- name: CASFinishRun :execresult
@@ -69,7 +86,14 @@ WHERE id = ? AND status NOT IN ('cancelled', 'succeeded', 'failed');
 UPDATE runs SET status = 'queued' WHERE id = ? AND status = 'running';
 
 -- name: RequeueRunFenced :execresult
-UPDATE runs SET status = 'queued' WHERE id = ? AND status = 'running' AND lease_epoch = ?;
+UPDATE runs
+SET status = 'queued', priority = 'retry',
+    available_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 1 SECOND)
+WHERE id = ? AND status = 'running' AND lease_epoch = ?;
+
+-- name: SetRunImmediatelyAvailable :exec
+UPDATE runs SET available_at = CURRENT_TIMESTAMP(3)
+WHERE id = ? AND status = 'queued' AND priority = 'retry';
 
 -- name: FailExpiredRun :execresult
 UPDATE runs
@@ -130,7 +154,8 @@ FOR UPDATE;
 -- Lock the run row inside an ownership-verified transaction (finalize /
 -- retry / recovery). Returns the lease_epoch so the caller can verify
 -- the fence under the lock.
-SELECT id, status, lease_epoch, attempt, max_attempts, trigger_type, trigger_id, conversation_id
+SELECT id, user_id, external_run_id, status, lease_epoch, attempt, max_attempts,
+       trigger_type, trigger_id, conversation_id
 FROM runs WHERE id = ? FOR UPDATE;
 
 -- name: DeleteLeaseByToken :execresult
@@ -209,6 +234,28 @@ JOIN schedules s ON s.id = o.schedule_id
 WHERE s.overlap_policy = 'queue' AND o.status IN ('queued', 'running')
 GROUP BY o.schedule_id
 HAVING COUNT(*) > 1;
+
+-- name: CountScheduledRunOccurrenceMismatch :one
+-- Invariant H: a terminal scheduled run and its occurrence must converge.
+SELECT COUNT(*) AS n
+FROM runs r
+LEFT JOIN schedule_occurrences o ON o.run_id = r.id
+WHERE r.trigger_type = 'scheduled'
+  AND r.status IN ('succeeded', 'failed', 'cancelled')
+  AND (o.id IS NULL
+       OR (r.status = 'succeeded' AND o.status != 'succeeded')
+       OR (r.status IN ('failed', 'cancelled') AND o.status != 'failed'));
+
+-- name: CountMissingDeliveryExecutions :one
+-- Invariant L: every enabled target of a succeeded occurrence has a
+-- durable delivery execution row.
+SELECT COUNT(*) AS n
+FROM schedule_occurrences o
+JOIN schedule_deliveries d
+  ON d.schedule_id = o.schedule_id AND d.enabled = 1
+LEFT JOIN delivery_executions de
+  ON de.occurrence_id = o.id AND de.schedule_delivery_id = d.id
+WHERE o.status = 'succeeded' AND de.id IS NULL;
 
 -- name: OldestPendingOutboxAgeSeconds :one
 -- Invariant G: the outbox relay must not lag (pending events older than

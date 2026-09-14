@@ -30,10 +30,11 @@ func (r *Repo) ProviderByKey(ctx context.Context, key string) (*Provider, error)
 		return nil, err
 	}
 	p := &Provider{
-		ID:     int64(row.ID),
-		Key:    row.ProviderKey,
-		Name:   row.Name,
-		Status: row.Status,
+		ID:          int64(row.ID),
+		Key:         row.ProviderKey,
+		Name:        row.Name,
+		Status:      row.Status,
+		MaxInflight: int(row.MaxInflight),
 	}
 	_ = json.Unmarshal(row.SupportedRuntimeTypes, &p.SupportedRuntimeTypes)
 	_ = json.Unmarshal(row.Capabilities, &p.Capabilities)
@@ -50,7 +51,7 @@ func (r *Repo) ListActiveProviders(ctx context.Context) ([]Provider, error) {
 	}
 	out := make([]Provider, 0, len(rows))
 	for _, row := range rows {
-		p := Provider{ID: int64(row.ID), Key: row.ProviderKey, Name: row.Name, Status: row.Status}
+		p := Provider{ID: int64(row.ID), Key: row.ProviderKey, Name: row.Name, Status: row.Status, MaxInflight: int(row.MaxInflight)}
 		_ = json.Unmarshal(row.SupportedRuntimeTypes, &p.SupportedRuntimeTypes)
 		_ = json.Unmarshal(row.Capabilities, &p.Capabilities)
 		if p.Capabilities == nil {

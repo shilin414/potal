@@ -24,6 +24,12 @@ var ErrNotFound = errors.New("execution: not found")
 // immediately on this error — another worker owns the canonical state.
 var ErrLostOwnership = errors.New("execution: lease ownership lost")
 
+var ErrExternalRunIDConflict = errors.New("execution: external run id conflict")
+
+var ErrOccurrenceStateConflict = errors.New("execution: schedule occurrence state conflict")
+
+var ErrInvalidTerminalStatus = errors.New("execution: invalid terminal status")
+
 // Service implements the Run lifecycle on top of TiDB.
 type Service struct {
 	DB      *sql.DB
@@ -31,10 +37,10 @@ type Service struct {
 	Log     *slog.Logger
 	Metrics *telemetry.Metrics
 
-	// OnRunSucceeded fires after a winning terminal transition to
-	// succeeded for scheduled runs; used for delivery fan-out. It must
-	// not block on external IO and must not panic (guarded).
-	OnRunSucceeded func(ctx context.Context, run *Run, output map[string]any)
+	// CreateDeliveryExecutionsTx is an in-transaction extension used by
+	// finalize to make scheduled delivery requests durable before commit.
+	// Delivery execution is decoupled in a separate delivery package.
+	CreateDeliveryExecutionsTx func(ctx context.Context, tx *sql.Tx, run *Run) error
 }
 
 func NewService(d *sql.DB, r *redisx.Client, log *slog.Logger, m *telemetry.Metrics) *Service {
@@ -284,6 +290,26 @@ func runFromRow(row db.Run) *Run {
 	return out
 }
 
+func runFromLockedRow(base *Run, row db.GetRunForUpdateRow) *Run {
+	if base == nil {
+		base = &Run{}
+	}
+	base.ID = mustID(row.ID)
+	if row.UserID.Valid {
+		v := row.UserID.Int64
+		base.UserID = &v
+	}
+	if row.TriggerID.Valid {
+		v := row.TriggerID.Int64
+		base.TriggerID = &v
+	}
+	base.TriggerType = row.TriggerType
+	if base.TriggerType == "" {
+		base.TriggerType = DefaultTriggerType
+	}
+	return base
+}
+
 func mustID(b []byte) ids.ID {
 	var id ids.ID
 	_ = id.Scan(b)
@@ -333,9 +359,11 @@ func (s *Service) ClaimRun(ctx context.Context, runID ids.ID, workerID string, l
 		// never strand a running run without a lease).
 		return nil, false, err
 	}
-	// Best-effort fan-out inside the same tx: a scheduled run's occurrence
-	// follows the run into 'running'. Interactive runs have no occurrence.
-	_, _ = q.MarkOccurrenceRunningByRun(ctx, sql.NullString{String: string(runID.Bytes()), Valid: true})
+	// Occurrence fan-out shares the claim transaction: running runs and
+	// running occurrences can never diverge. Interactive runs have no row.
+	if _, err := q.MarkOccurrenceRunningByRun(ctx, sql.NullString{String: string(runID.Bytes()), Valid: true}); err != nil {
+		return nil, false, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, false, err
 	}
@@ -404,27 +432,6 @@ func (s *Service) CheckOwnership(ctx context.Context, runID ids.ID, epoch uint64
 	return err
 }
 
-// verifyOwnershipTx locks the run row FOR UPDATE and verifies the fence
-// in the same statement. Returns ErrLostOwnership for a stale caller.
-// Terminal runs are reported via isTerminal so callers can decide
-// idempotency semantics.
-func verifyOwnershipTx(ctx context.Context, tx *sql.Tx, own ExecutionOwnership) (row db.GetRunForUpdateRow, isTerminal bool, err error) {
-	row, err = db.New(tx).GetRunForUpdate(ctx, own.RunID.Bytes())
-	if errors.Is(err, sql.ErrNoRows) {
-		return row, false, ErrNotFound
-	}
-	if err != nil {
-		return row, false, err
-	}
-	if IsTerminal(row.Status) {
-		return row, true, nil
-	}
-	if row.Status != StatusRunning || row.LeaseEpoch != own.LeaseEpoch {
-		return row, false, ErrLostOwnership
-	}
-	return row, false, nil
-}
-
 // UpdateExternalRunIDOwned records the provider chat id (set-once) with
 // the lease fence: stale workers cannot stamp their external id onto a
 // run owned by someone else.
@@ -432,16 +439,25 @@ func (s *Service) UpdateExternalRunIDOwned(ctx context.Context, own ExecutionOwn
 	if externalID == "" {
 		return nil
 	}
-	if err := s.q(ctx).UpdateRunExternalIDFenced(ctx, db.UpdateRunExternalIDFencedParams{
-		ExternalRunID: externalID,
-		ID:            own.RunID.Bytes(),
-		LeaseEpoch:    own.LeaseEpoch,
-	}); err != nil {
+	if !own.Valid() {
+		return ErrLostOwnership
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	// Set-once guard: a fenced no-op is fine when already written; the
-	// ownership predicate is checked separately.
-	return s.CheckOwnership(ctx, own.RunID, own.LeaseEpoch)
+	defer func() { _ = tx.Rollback() }()
+	row, err := verifyActiveOwnershipTx(ctx, tx, own)
+	if err != nil {
+		return err
+	}
+	if err := updateExternalRunIDTx(ctx, tx, row, own, externalID); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func slogKey(k string) string { return k }

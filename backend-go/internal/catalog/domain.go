@@ -10,6 +10,7 @@ type Provider struct {
 	SupportedRuntimeTypes []string
 	Capabilities          map[string]any
 	Status                string
+	MaxInflight           int
 }
 
 // Application is the product-level business app.

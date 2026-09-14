@@ -57,6 +57,7 @@ type App struct {
 	DeliveryDispatch *delivery.Dispatcher
 	DeliverySender   delivery.Sender
 	DeliveryLimiter  *execution.RateLimiter
+	ProviderInflight *execution.InflightLimiter
 }
 
 // Build constructs the graph; ctx bounds connection setup.
@@ -155,14 +156,9 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 	// The Aily auth resolver doubles as the delivery UAT source — both
 	// must run under the schedule owner's identity.
 	disp := delivery.NewDispatcher(dbh, log, metrics)
+	runs.CreateDeliveryExecutionsTx = disp.CreateInTx
 	feishuSender := &delivery.FeishuSender{Client: feishu, Auth: ailyAuth}
 	deliveryLimiter := execution.NewRateLimiter(rdb, rdb.Key("rate", "feishu", "im"), 20, time.Second)
-	runs.OnRunSucceeded = func(ctx context.Context, run *execution.Run, output map[string]any) {
-		if run.TriggerID == nil || run.UserID == nil {
-			return
-		}
-		disp.OnRunSucceeded(ctx, run.ID.String(), run.TriggerType, *run.TriggerID, *run.UserID, output)
-	}
 
 	schedSvc := schedule.NewService(dbh, &schedulableChecker{Catalog: catalogSvc}, log)
 	schedJob := scheduler.New(dbh, runs, &bindingResolver{Catalog: catalogSvc}, log, metrics)
@@ -175,6 +171,7 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 		Runs: runs, ArtifactsRL: ailyExecutor.ArtifactsL, AilyExecutor: ailyExecutor,
 		Schedules: schedSvc, Scheduler: schedJob,
 		DeliveryDispatch: disp, DeliverySender: feishuSender, DeliveryLimiter: deliveryLimiter,
+		ProviderInflight: execution.NewInflightLimiter(rdb, "feishu_aily", cfg.Aily.MaxInflight, cfg.Runner.LeaseSeconds),
 	}, nil
 }
 

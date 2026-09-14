@@ -52,6 +52,7 @@ func newScheduleEnv(t *testing.T) *scheduleEnv {
 	runsSvc := execution.NewService(d, nil, testLogger(), telemetry.NewMetrics("test"))
 	svc := schedule.NewService(d, nil, testLogger())
 	schd := scheduler.New(d, runsSvc, resolver, testLogger(), telemetry.NewMetrics("test"))
+	schd.Batch = 500
 	return &scheduleEnv{db: d, svc: svc, schd: schd}
 }
 
@@ -201,8 +202,8 @@ func TestRunNowLeavesNextRunAt(t *testing.T) {
 	}
 }
 
-// TestDeliveryFanoutIdempotent: calling the dispatcher twice for the same
-// run creates exactly one delivery execution.
+// TestDeliveryFanoutIdempotent: invoking the transactional fan-out twice
+// for the same run creates exactly one delivery execution.
 func TestDeliveryFanoutIdempotent(t *testing.T) {
 	env := newScheduleEnv(t)
 	ctx := context.Background()
@@ -249,13 +250,32 @@ func TestDeliveryFanoutIdempotent(t *testing.T) {
 	}
 
 	disp := delivery.NewDispatcher(env.db, testLogger(), telemetry.NewMetrics("test"))
-	disp.OnRunSucceeded(ctx, runID.String(), "scheduled", int64(occ.ID), 42, nil)
-	disp.OnRunSucceeded(ctx, runID.String(), "scheduled", int64(occ.ID), 42, nil)
+	run := &execution.Run{
+		ID: runID, UserID: newInt64(42), TriggerType: execution.TriggerTypeScheduled,
+		TriggerID: newInt64(int64(occ.ID)),
+	}
+	tx, err := env.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := disp.CreateInTx(ctx, tx, run); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := disp.CreateInTx(ctx, tx, run); err != nil {
+		_ = tx.Rollback()
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
 
 	if n := env.count(t, `SELECT COUNT(*) FROM delivery_executions WHERE occurrence_id = ?`, occ.ID); n != 1 {
 		t.Fatalf("delivery executions = %d, want 1 (idempotent)", n)
 	}
 }
+
+func newInt64(v int64) *int64 { return &v }
 
 // setMisfire flips a seeded schedule's misfire policy.
 func (e *scheduleEnv) setMisfire(t *testing.T, id int64, policy string) {

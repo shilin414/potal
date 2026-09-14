@@ -123,6 +123,9 @@ func (s *Service) recoverExpiredLeaseTx(ctx context.Context, runID ids.ID) (bool
 		}); err != nil {
 			return false, err
 		}
+		if err := q.SetRunImmediatelyAvailable(ctx, runID.Bytes()); err != nil {
+			return false, err
+		}
 		eventType = EventRunRetrying
 		eventPayload = map[string]any{
 			"attempt":      row.Attempt,
@@ -134,7 +137,9 @@ func (s *Service) recoverExpiredLeaseTx(ctx context.Context, runID ids.ID) (bool
 		if err != nil {
 			return false, err
 		}
-		payloadRaw, _ := json.Marshal(map[string]any{"run_id": runID.String(), "provider": providerOfRun(ctx, q, runID)})
+		payloadRaw, _ := json.Marshal(map[string]any{
+			"run_id": runID.String(), "provider": providerOfRun(ctx, q, runID),
+		})
 		if _, err := q.CreateOutboxEvent(ctx, db.CreateOutboxEventParams{
 			Aggregate:   "run",
 			AggregateID: runID.Bytes(),
@@ -163,12 +168,19 @@ func (s *Service) recoverExpiredLeaseTx(ctx context.Context, runID ids.ID) (bool
 		if err != nil {
 			return false, err
 		}
+		if err := finishOccurrenceTx(ctx, tx, row, runID, StatusFailed); err != nil {
+			return false, err
+		}
 	}
 
 	// Lease cleanup — same transaction as the state transition.
-	if _, err := q.DeleteLeaseByToken(ctx, db.DeleteLeaseByTokenParams{
-		RunID: runID.Bytes(), LeaseToken: lease.LeaseToken,
-	}); err != nil {
+	leaseOwn := ExecutionOwnership{
+		RunID:      runID,
+		WorkerID:   lease.WorkerID,
+		LeaseEpoch: row.LeaseEpoch,
+		LeaseToken: mustID(lease.LeaseToken),
+	}
+	if err := deleteOwnedLeaseTx(ctx, q, leaseOwn); err != nil {
 		return false, err
 	}
 

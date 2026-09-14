@@ -50,6 +50,9 @@ type Worker struct {
 	// duplicates). Zero defaults to 60s.
 	ReclaimAfter time.Duration
 	Log          *slog.Logger
+	// ProviderInflight caps provider-wide concurrent runs across worker
+	// instances. Its Redis slots expire with the worker lease.
+	ProviderInflight *InflightLimiter
 
 	mu       sync.Mutex
 	inflight map[ids.ID]*executionControl
@@ -207,6 +210,29 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun) {
 	w.trackInflight(claimed.Ownership, cancel)
 	defer w.trackInflight(claimed.Ownership, nil)
 
+	if w.ProviderInflight != nil {
+		ok, depth, err := w.ProviderInflight.Acquire(ctx, claimed.Run.ID)
+		if err != nil {
+			w.Log.Warn("provider inflight limiter unavailable; requeueing run",
+				"run_id", claimed.Run.ID.String(), "err", err)
+			w.recordProviderAdmission("provider_inflight_unavailable")
+			w.requeueForAdmission(claimed, "provider_inflight_unavailable")
+			return
+		}
+		if !ok {
+			w.Log.Warn("provider max_inflight reached; requeueing run",
+				"run_id", claimed.Run.ID.String(), "depth", depth)
+			w.recordProviderAdmission("provider_inflight_limit")
+			w.requeueForAdmission(claimed, "provider_inflight_limit")
+			return
+		}
+		defer func() {
+			if err := w.ProviderInflight.Release(context.Background(), claimed.Run.ID); err != nil {
+				w.Log.Warn("provider inflight release failed", "run_id", claimed.Run.ID.String(), "err", err)
+			}
+		}()
+	}
+
 	defer func() {
 		if rec := recover(); rec != nil {
 			w.Log.Error("handler panic recovered (scan)", "run_id", claimed.Run.ID.String(), "panic", rec)
@@ -232,6 +258,19 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun) {
 		} else {
 			w.Log.Warn("handler error", "run_id", claimed.Run.ID.String(), "err", err)
 		}
+	}
+}
+
+func (w *Worker) recordProviderAdmission(reason string) {
+	if w.Svc != nil && w.Svc.Metrics != nil {
+		w.Svc.Metrics.ProviderInflightRejected.WithLabelValues(w.Provider, reason).Inc()
+	}
+}
+
+func (w *Worker) requeueForAdmission(claimed *ClaimedRun, reason string) {
+	if err := w.Svc.RetryOwnedRun(context.Background(), claimed.Run, claimed.Ownership, reason); err != nil && err != ErrLostOwnership {
+		w.Log.Error("requeue after provider admission failed",
+			"run_id", claimed.Run.ID.String(), "reason", reason, "err", err)
 	}
 }
 
@@ -352,6 +391,11 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 			w.mu.Unlock()
 			for id, ctl := range snapshot {
 				ok, err := w.Svc.HeartbeatOwned(ctx, ctl.own, w.Lease)
+				if w.ProviderInflight != nil {
+					if err := w.ProviderInflight.Renew(ctx, id); err != nil {
+						w.Log.Warn("provider inflight renew failed", "run_id", id.String(), "err", err)
+					}
+				}
 				if err != nil || !ok {
 					// Ownership lost: stop the local execution immediately
 					// (the provider call cannot be cancelled remotely, but

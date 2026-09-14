@@ -26,13 +26,15 @@ import (
 
 // Violation types exported for metric labels and alerts.
 const (
-	TypeRunningWithoutLease          = "running_without_lease"
-	TypeQueuedWithLease              = "queued_with_lease"
-	TypeTerminalWithLease            = "terminal_with_lease"
-	TypeTerminalWithoutTerminalEvent = "terminal_without_terminal_event"
-	TypeLeaseEpochMismatch           = "running_lease_epoch_mismatch"
-	TypeScheduleOverlapViolation     = "schedule_overlap_violation"
-	TypeOutboxBacklogAge             = "outbox_backlog_age"
+	TypeRunningWithoutLease            = "running_without_lease"
+	TypeQueuedWithLease                = "queued_with_lease"
+	TypeTerminalWithLease              = "terminal_with_lease"
+	TypeTerminalWithoutTerminalEvent   = "terminal_without_terminal_event"
+	TypeLeaseEpochMismatch             = "running_lease_epoch_mismatch"
+	TypeScheduleOverlapViolation       = "schedule_overlap_violation"
+	TypeOutboxBacklogAge               = "outbox_backlog_age"
+	TypeScheduledRunOccurrenceMismatch = "scheduled_run_occurrence_mismatch"
+	TypeMissingDeliveryExecution       = "missing_delivery_execution"
 )
 
 // Checker scans the canonical state and reports invariant violations.
@@ -122,6 +124,22 @@ func (c *Checker) RunOnce(ctx context.Context) Result {
 		}
 	} else {
 		c.Log.Warn("invariant check failed", "type", TypeOutboxBacklogAge, "err", err)
+	}
+
+	// H. scheduled terminal run / occurrence convergence.
+	if n, err := q.CountScheduledRunOccurrenceMismatch(ctx); err == nil && n > 0 {
+		res.TotalViolations += int(n)
+		c.report(TypeScheduledRunOccurrenceMismatch, n)
+	} else if err != nil {
+		c.Log.Warn("invariant check failed", "type", TypeScheduledRunOccurrenceMismatch, "err", err)
+	}
+
+	// L. durable delivery request coverage.
+	if n, err := q.CountMissingDeliveryExecutions(ctx); err == nil && n > 0 {
+		res.TotalViolations += int(n)
+		c.report(TypeMissingDeliveryExecution, n)
+	} else if err != nil {
+		c.Log.Warn("invariant check failed", "type", TypeMissingDeliveryExecution, "err", err)
 	}
 
 	return res

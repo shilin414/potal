@@ -51,8 +51,10 @@ type Metrics struct {
 	DeliveryFailuresTotal *prometheus.CounterVec
 
 	// Execution Correctness Closure (修复计划 §42-51).
-	InvariantViolation      *prometheus.CounterVec // {type}
-	ProviderLimiterDegraded prometheus.Gauge
+	InvariantViolation       *prometheus.CounterVec // {type}
+	ProviderLimiterDegraded  prometheus.Gauge
+	ProviderInflight         *prometheus.GaugeVec
+	ProviderInflightRejected *prometheus.CounterVec
 }
 
 func NewMetrics(service string) *Metrics {
@@ -154,6 +156,14 @@ func NewMetrics(service string) *Metrics {
 			Name: "studio_provider_limiter_degraded",
 			Help: "1 while the provider rate limiter runs on its local (Redis-unreachable) fallback.",
 		}),
+		ProviderInflight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "studio_provider_inflight",
+			Help: "Current provider executions by provider.",
+		}, []string{"provider"}),
+		ProviderInflightRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "studio_provider_inflight_rejected_total",
+			Help: "Runs not admitted because the provider concurrency limit was reached.",
+		}, []string{"provider", "reason"}),
 	}
 	reg.MustRegister(
 		m.HTTPDuration, m.HTTPRequests, m.SSEActive, m.QueueDepth,
@@ -162,6 +172,7 @@ func NewMetrics(service string) *Metrics {
 		m.ScheduleTriggerDelay, m.ScheduleQueueDelay, m.ScheduleMisfireTotal,
 		m.OverlapSkippedTotal, m.DeliveryDuration, m.DeliveryFailuresTotal,
 		m.InvariantViolation, m.ProviderLimiterDegraded,
+		m.ProviderInflight, m.ProviderInflightRejected,
 	)
 	return m
 }

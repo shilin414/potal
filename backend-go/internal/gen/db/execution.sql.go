@@ -69,6 +69,7 @@ UPDATE runs
 SET status = 'running', started_at = CURRENT_TIMESTAMP(3), attempt = attempt + 1,
     lease_epoch = lease_epoch + 1
 WHERE id = ? AND status = 'queued'
+  AND (available_at IS NULL OR available_at <= CURRENT_TIMESTAMP(3))
 `
 
 // CAS claim: exactly one worker wins; affected_rows == 1 means success.
@@ -165,6 +166,25 @@ func (q *Queries) CacheArtifactURL(ctx context.Context, arg CacheArtifactURLPara
 		arg.ID,
 	)
 	return err
+}
+
+const countMissingDeliveryExecutions = `-- name: CountMissingDeliveryExecutions :one
+SELECT COUNT(*) AS n
+FROM schedule_occurrences o
+JOIN schedule_deliveries d
+  ON d.schedule_id = o.schedule_id AND d.enabled = 1
+LEFT JOIN delivery_executions de
+  ON de.occurrence_id = o.id AND de.schedule_delivery_id = d.id
+WHERE o.status = 'succeeded' AND de.id IS NULL
+`
+
+// Invariant L: every enabled target of a succeeded occurrence has a
+// durable delivery execution row.
+func (q *Queries) CountMissingDeliveryExecutions(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countMissingDeliveryExecutions)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
 }
 
 const countPendingOutbox = `-- name: CountPendingOutbox :one
@@ -272,6 +292,25 @@ func (q *Queries) CountScheduleOverlapViolations(ctx context.Context) ([]CountSc
 		return nil, err
 	}
 	return items, nil
+}
+
+const countScheduledRunOccurrenceMismatch = `-- name: CountScheduledRunOccurrenceMismatch :one
+SELECT COUNT(*) AS n
+FROM runs r
+LEFT JOIN schedule_occurrences o ON o.run_id = r.id
+WHERE r.trigger_type = 'scheduled'
+  AND r.status IN ('succeeded', 'failed', 'cancelled')
+  AND (o.id IS NULL
+       OR (r.status = 'succeeded' AND o.status != 'succeeded')
+       OR (r.status IN ('failed', 'cancelled') AND o.status != 'failed'))
+`
+
+// Invariant H: a terminal scheduled run and its occurrence must converge.
+func (q *Queries) CountScheduledRunOccurrenceMismatch(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countScheduledRunOccurrenceMismatch)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
 }
 
 const countTerminalWithLease = `-- name: CountTerminalWithLease :one
@@ -848,12 +887,15 @@ func (q *Queries) GetRunCommandByID(ctx context.Context, id []byte) (RunCommand,
 }
 
 const getRunForUpdate = `-- name: GetRunForUpdate :one
-SELECT id, status, lease_epoch, attempt, max_attempts, trigger_type, trigger_id, conversation_id
+SELECT id, user_id, external_run_id, status, lease_epoch, attempt, max_attempts,
+       trigger_type, trigger_id, conversation_id
 FROM runs WHERE id = ? FOR UPDATE
 `
 
 type GetRunForUpdateRow struct {
 	ID             []byte
+	UserID         sql.NullInt64
+	ExternalRunID  string
 	Status         string
 	LeaseEpoch     uint64
 	Attempt        uint32
@@ -871,6 +913,8 @@ func (q *Queries) GetRunForUpdate(ctx context.Context, id []byte) (GetRunForUpda
 	var i GetRunForUpdateRow
 	err := row.Scan(
 		&i.ID,
+		&i.UserID,
+		&i.ExternalRunID,
 		&i.Status,
 		&i.LeaseEpoch,
 		&i.Attempt,
@@ -1050,7 +1094,21 @@ func (q *Queries) ListPendingOutbox(ctx context.Context, limit int32) ([]OutboxE
 const listQueuedRunIDs = `-- name: ListQueuedRunIDs :many
 SELECT id FROM runs
 WHERE status = 'queued' AND provider = ?
-ORDER BY queued_at
+  AND (available_at IS NULL OR available_at <= CURRENT_TIMESTAMP(3))
+ORDER BY (
+    CASE priority
+        WHEN 'interactive_user' THEN 100
+        WHEN 'retry' THEN 70
+        WHEN 'scheduled_high' THEN 50
+        WHEN 'scheduled_normal' THEN 45
+        ELSE 20
+    END
+) + (
+    CASE
+        WHEN attempt > 0 THEN 25
+        ELSE 0
+    END + LEAST(TIMESTAMPDIFF(SECOND, queued_at, CURRENT_TIMESTAMP(3)), 40)
+) DESC, queued_at, id
 LIMIT ?
 `
 
@@ -1059,6 +1117,8 @@ type ListQueuedRunIDsParams struct {
 	Limit    int32
 }
 
+// Provider admission order. Base priority is explicit and waiting time
+// adds a bounded bonus so scheduled/background work cannot starve.
 func (q *Queries) ListQueuedRunIDs(ctx context.Context, arg ListQueuedRunIDsParams) ([][]byte, error) {
 	rows, err := q.db.QueryContext(ctx, listQueuedRunIDs, arg.Provider, arg.Limit)
 	if err != nil {
@@ -1303,7 +1363,10 @@ func (q *Queries) RequeueRun(ctx context.Context, id []byte) error {
 }
 
 const requeueRunFenced = `-- name: RequeueRunFenced :execresult
-UPDATE runs SET status = 'queued' WHERE id = ? AND status = 'running' AND lease_epoch = ?
+UPDATE runs
+SET status = 'queued', priority = 'retry',
+    available_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 1 SECOND)
+WHERE id = ? AND status = 'running' AND lease_epoch = ?
 `
 
 type RequeueRunFencedParams struct {
@@ -1329,6 +1392,16 @@ func (q *Queries) SetAttachmentUploaded(ctx context.Context, arg SetAttachmentUp
 	return err
 }
 
+const setRunImmediatelyAvailable = `-- name: SetRunImmediatelyAvailable :exec
+UPDATE runs SET available_at = CURRENT_TIMESTAMP(3)
+WHERE id = ? AND status = 'queued' AND priority = 'retry'
+`
+
+func (q *Queries) SetRunImmediatelyAvailable(ctx context.Context, id []byte) error {
+	_, err := q.db.ExecContext(ctx, setRunImmediatelyAvailable, id)
+	return err
+}
+
 const updateRunExternalID = `-- name: UpdateRunExternalID :exec
 UPDATE runs SET external_run_id = ? WHERE id = ? AND external_run_id = ''
 `
@@ -1344,7 +1417,7 @@ func (q *Queries) UpdateRunExternalID(ctx context.Context, arg UpdateRunExternal
 	return err
 }
 
-const updateRunExternalIDFenced = `-- name: UpdateRunExternalIDFenced :exec
+const updateRunExternalIDFenced = `-- name: UpdateRunExternalIDFenced :execresult
 UPDATE runs SET external_run_id = ? WHERE id = ? AND external_run_id = '' AND lease_epoch = ?
 `
 
@@ -1355,9 +1428,8 @@ type UpdateRunExternalIDFencedParams struct {
 }
 
 // Set-once semantic guarded in Go (only write when empty) + fence.
-func (q *Queries) UpdateRunExternalIDFenced(ctx context.Context, arg UpdateRunExternalIDFencedParams) error {
-	_, err := q.db.ExecContext(ctx, updateRunExternalIDFenced, arg.ExternalRunID, arg.ID, arg.LeaseEpoch)
-	return err
+func (q *Queries) UpdateRunExternalIDFenced(ctx context.Context, arg UpdateRunExternalIDFencedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, updateRunExternalIDFenced, arg.ExternalRunID, arg.ID, arg.LeaseEpoch)
 }
 
 const upsertRunArtifact = `-- name: UpsertRunArtifact :exec

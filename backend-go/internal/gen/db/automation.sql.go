@@ -56,7 +56,7 @@ func (q *Queries) CASFinishDelivery(ctx context.Context, arg CASFinishDeliveryPa
 const cASFinishOccurrenceByRun = `-- name: CASFinishOccurrenceByRun :execresult
 UPDATE schedule_occurrences
 SET status = ?, finished_at = CURRENT_TIMESTAMP(3)
-WHERE run_id = ? AND status NOT IN ('succeeded', 'failed', 'skipped')
+WHERE run_id = ? AND status IN ('queued', 'running')
 `
 
 type CASFinishOccurrenceByRunParams struct {
@@ -277,8 +277,10 @@ func (q *Queries) GetDeliveryExecutionByID(ctx context.Context, id []byte) (Deli
 }
 
 const getScheduleByID = `-- name: GetScheduleByID :one
-SELECT id, owner_user_id, name, description, application_id, input_payload,
-       schedule_type, cron_expression, trigger_config, timezone, run_at, enabled,
+SELECT id, owner_user_id, name, description, application_id,
+       COALESCE(input_payload, '{}') AS input_payload,
+       schedule_type, cron_expression, COALESCE(trigger_config, '{}') AS trigger_config,
+       timezone, run_at, enabled,
        conversation_policy, conversation_id, overlap_policy, misfire_policy,
        execution_window_seconds, deadline_policy, next_run_at, last_run_at,
        created_at, updated_at
@@ -750,8 +752,10 @@ func (q *Queries) ListDueDeliveries(ctx context.Context, arg ListDueDeliveriesPa
 }
 
 const listDueSchedules = `-- name: ListDueSchedules :many
-SELECT id, owner_user_id, name, description, application_id, input_payload,
-       schedule_type, cron_expression, trigger_config, timezone, run_at, enabled,
+SELECT id, owner_user_id, name, description, application_id,
+       COALESCE(input_payload, '{}') AS input_payload,
+       schedule_type, cron_expression, COALESCE(trigger_config, '{}') AS trigger_config,
+       timezone, run_at, enabled,
        conversation_policy, conversation_id, overlap_policy, misfire_policy,
        execution_window_seconds, deadline_policy, next_run_at, last_run_at,
        created_at, updated_at
@@ -966,8 +970,10 @@ func (q *Queries) ListOccurrencesBySchedule(ctx context.Context, arg ListOccurre
 }
 
 const listSchedulesByOwner = `-- name: ListSchedulesByOwner :many
-SELECT s.id, s.owner_user_id, s.name, s.description, s.application_id, s.input_payload,
-       s.schedule_type, s.cron_expression, s.trigger_config, s.timezone, s.run_at, s.enabled,
+SELECT s.id, s.owner_user_id, s.name, s.description, s.application_id,
+       COALESCE(s.input_payload, '{}') AS input_payload,
+       s.schedule_type, s.cron_expression, COALESCE(s.trigger_config, '{}') AS trigger_config,
+       s.timezone, s.run_at, s.enabled,
        s.conversation_policy, s.conversation_id, s.overlap_policy, s.misfire_policy,
        s.execution_window_seconds, s.deadline_policy, s.next_run_at, s.last_run_at,
        s.created_at, s.updated_at
