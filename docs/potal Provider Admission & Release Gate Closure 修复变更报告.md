@@ -175,6 +175,8 @@ queue:feishu_aily:scheduled     weight 2
 | `TestProviderAttemptExhaustionIsExplicit` | 预算耗尽显式返回 `ErrProviderAttemptsExhausted` | 同上 |
 | `TestReaperBeforeProviderAttemptDoesNotExhaustRetries` | 未触达 provider 的 3 次租约过期不致 Run failed | 同上 |
 | `TestRetryRunAndOutboxShareRetryAt` | Run.available_at ≡ Outbox.available_at，且 relay 不会提前发布 | 同上 |
+| `TestReaperRequeueIsImmediatelyClaimableAndInSync` | reaper 恢复即时可 claim，且与 outbox 同取 DB 时钟 | 同上 |
+| `TestMigrateUpAgainstRealDatabase` | 迁移全链路（含曾因 SERIALIZABLE 失败的 SetVersion 写入） | `tests/integration/migrate_test.go` |
 | `TestRelayRoutesRunDispatchByPriorityClass` | class 路由命中对应 stream，且不泄漏进旧 FIFO 流 | 同上 |
 | `TestCreateRunOutboxCarriesPriorityClass` | 创建 Run 的 outbox 自带 priority_class | 同上 |
 | `TestDeliveryRequestIdempotencyKey` | 投递请求携带稳定幂等键 | `internal/delivery/adapter_test.go` |
@@ -203,14 +205,15 @@ STUDIO_TEST_TIDB=1 STUDIO_TEST_REDIS=1 go test ./tests/integration/... -count=1 
 ```text
 .github/workflows/backend.yml
 backend-go/db/queries/execution.sql
+backend-go/cmd/migrate/main.go                       (新增：仅迁移入口)
+backend-go/internal/app/migrate.go                   (TiDB 隔离级别兼容)
 backend-go/internal/execution/{inflight,worker,priority,retry,recovery,service,outbox,finalize,artifacts,ownership}.go
 backend-go/internal/execution/{inflight_test,priority_test,ratelimit_test}.go
 backend-go/internal/integrations/aily/executor.go
 backend-go/internal/delivery/{adapter,worker,adapter_test}.go
 backend-go/internal/platform/{config/config.go, telemetry/telemetry.go}
-backend-go/internal/app/app.go
 backend-go/cmd/worker/main.go
-backend-go/tests/integration/{provider_admission_test,tidb_cas_test,correctness_closure_test}.go
+backend-go/tests/integration/{provider_admission_test,migrate_test,tidb_cas_test,correctness_closure_test}.go
 backend-go/internal/gen/db/*        (sqlc 重新生成)
 ```
 
@@ -225,21 +228,50 @@ backend-go/internal/gen/db/*        (sqlc 重新生成)
 | Admission 不消耗 Provider Attempt | ✅ | 3 个 attempt 测试 |
 | Interactive priority 真正作用于正常队列 | ✅ | relay class 路由 + 7:1:2 份额测试 |
 | Scheduled 有公平执行保证 | ✅ | 不饿死 / 借用测试 |
-| Run retryAt = Outbox retryAt | ✅ | `TestRetryRunAndOutboxShareRetryAt` |
-| Provider max_inflight 压测不突破 | ⚠️ 局部 | 单元/集成层已证明；**真实压测未执行**（见 §7） |
-| Backend CI GREEN | ⚠️ 待 CI 实跑 | workflow 结构已修复 + actionlint 门禁；本地无法跑 Runner |
-| TiDB Integration GREEN | ✅ | 本地真实 TiDB 全绿 |
-| MySQL57 Integration GREEN | ⚠️ 待 CI 实跑 | job 结构与 readiness 已修正 |
+| Run retryAt = Outbox retryAt | ✅ | `TestRetryRunAndOutboxShareRetryAt`、`TestReaperRequeueIsImmediatelyClaimableAndInSync` |
+| Provider max_inflight 压测不突破 | ⚠️ 局部 | 单元/集成层已证明机制；**真实压测未执行**（见 §7） |
+| Backend CI GREEN | ✅ | run `34804570324` @ `d098e4c`：check / integration / mysql57 三个 job 全绿 |
+| TiDB Integration GREEN | ✅ | 同上，且为**全新 TiDB 容器**（迁移 + 全量集成测试） |
+| MySQL57 Integration GREEN | ✅ | 同上，MySQL 5.7 容器内迁移 + 集成测试全绿 |
 | Delivery duplicate semantics 已明确/处理 | ✅ | At-Least-Once 显式声明 + 指标 |
+
+### 6.1 提交后 CI 实跑发现并修掉的额外缺陷
+
+CI 第一次真正跑起来后，又暴露出 4 个问题（全部修复，最终 run 全绿）：
+
+| # | 问题 | 性质 | 修复 |
+|---|---|---|---|
+| 1 | `cmd/api -migrate` 迁移后**继续 app.Build 并起 HTTP server**，CI 里既没有运行时密钥（`TOKEN_ENCRYPTION_KEY`）又不可能退出 | 工程缺陷（CI 步骤不可用） | 新增 `cmd/migrate`：只做迁移然后退出；两个 DB job 改用它 |
+| 2 | 全新 TiDB 上迁移直接失败：`Error 8048 (HY000): The isolation level 'SERIALIZABLE' is not supported`（golang-migrate 的 mysql 驱动用 SERIALIZABLE 事务写 `schema_migrations`）；dev 库只是恰好已跳过该检查 | **真实产品缺陷**（生产全新 TiDB 同样失败） | `MigrateUp` 先 `SELECT VERSION()` 识别 TiDB，再以连接参数携带 `tidb_skip_isolation_level_check=1`（对连接池每个连接生效，含迁移驱动自己的连接）；MySQL 不受影响 |
+| 3 | reaper 重排改为 `now + RequeueDelay` 后，恢复出来的 Run 在 1s 内不可 claim，而 outbox 已把 worker 唤醒 → CAS 失败、白等兜底扫描（本地之所以没暴露是因为 dev TiDB 时钟比本机快） | **真实语义缺陷**（MySQL CI 稳定复现） | 新增 `RequeueRunFencedImmediate`（`available_at = CURRENT_TIMESTAMP(3)`）+ 同事务 `CreateOutboxEvent`：恢复即时可 claim，且 Run/Outbox 可用时刻同取 DB 时钟，彻底不依赖 app/DB 时钟偏差；provider 失败退避仍用显式共享 retryAt |
+| 4 | 测试夹具 `WHERE id IN (SELECT UNHEX(run_id) ...)`：`schedule_occurrences.run_id` 是 `BINARY(16)` 原始字节，TiDB 宽容、MySQL 5.7 报 `Error 1411 ... for function unhex` | 测试可移植性缺陷 | 直接比较原始列与 `runs.id` |
+| 5 | actionlint 门禁本身：`rhysd/actionlint@v1` 不存在（无浮动大版本 tag）；runner 自带 shellcheck 后 `for i in $(seq ...)` 触发 SC2034 | CI 门禁缺陷 | 固定 `v1.7.12`；循环改为算术循环；两个 DB job 的迁移/测试失败改为 `::error` annotation（无需下载日志即可定位，实测用此读完 3 份失败原因） |
 
 ---
 
 ## 7. 遗留 / 未验证项（本轮如实声明）
 
-1. **GitHub Actions 实跑结果未验证**：本地无法执行 Runner，`check / integration / mysql57` 是否 GREEN 需推送后在 CI 确认；MySQL 5.7 兼容性只能由该 job 证明。
-2. **Phase 7 压测未执行**：报告要求的"1000 scheduled @ 08:30 + 持续 interactive"场景需要压测环境与真实 provider 配额，本轮只做到策略级与集成级证明（比例、借用、不饿死、max 不突破的机制验证）。
-3. **升级窗口内的旧单流消息**：不做数据迁移，由 fallback scan 兜底（§3.4 说明）。
-4. 报告第九部分 Phase 1 建议的独立文件 `provider_slot.go` 未单独拆出——`ProviderSlot` 与 Lua 脚本仍与 `InflightLimiter` 同处 `inflight.go`（职责内聚，行为与建议一致）。
+1. **Phase 7 压测未执行**：报告要求的"1000 scheduled @ 08:30 + 持续 interactive"场景需要压测环境与真实 provider 配额，本轮只做到策略级与集成级证明（比例、借用、不饿死、max 不突破的机制验证）。
+2. **升级窗口内的旧单流消息**：不做数据迁移，由 fallback scan 兜底（§3.4 说明）。
+3. 报告第九部分 Phase 1 建议的独立文件 `provider_slot.go` 未单独拆出——`ProviderSlot` 与 Lua 脚本仍与 `InflightLimiter` 同处 `inflight.go`（职责内聚，行为与建议一致）。
+4. **MySQL 5.7 job 未开 Redis**：该 job 只设 `STUDIO_TEST_TIDB=1`，Redis 相关用例会 skip，因此它证明的是"Schema/DDL/DML 与核心执行链路在 5.7 上兼容"，不是"5.7 上全量用例通过"。若要全量覆盖，给该 job 加一个 redis service 并把 `STUDIO_TEST_REDIS=1` 一起打开即可（本轮未改动，避免引入新变量）。
 5. 与此前迭代相同的遗留（非本轮范围）：Aily 附件流式上传、Legacy Workflow RuntimeAdapter 收敛。
 
-另：仓库根目录存在上一轮排查遗留的临时文件 `findings.md` / `progress.md` / `task_plan.md`（未跟踪），本报告未修改它们，可按需删除。
+另：仓库根目录存在上一轮排查遗留的临时文件 `findings.md` / `progress.md` / `task_plan.md`（未跟踪、未提交），本报告未修改它们，可按需删除。
+
+---
+
+## 8. 提交记录（dev 分支）
+
+```text
+1cdfe22 fix(ci): restore backend integration and mysql57 gates
+a35ba2c fix(execution): close provider admission, retry timing and delivery gaps
+9957929 docs: record provider admission closure and the review chain
+b7361e6 fix(ci): make the migration step terminate and pin actionlint
+a6e18d9 fix(ci): make migration failures diagnosable and drop the duplicated cwd
+fd11997 fix(execution): make crash recovery immediate and migrate vanilla TiDB
+9981ca9 fix(ci): satisfy the shellcheck gate and surface readiness timeouts
+d098e4c test(integration): drop UNHEX from the dual-scheduler admission test
+```
+
+最终验证：`backend` workflow run `34804570324`（head `d098e4c`）→ **check / integration / mysql57 三个 job 全部 success**。

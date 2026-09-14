@@ -19,6 +19,15 @@
 - **delivery 语义**：外部发送是 **At Least Once**（DB 侧 DeliveryExecution 幂等，外部副作用不保证）；
   `Sender.Send(ctx, DeliveryRequest)`，`IdempotencyKey = DeliveryExecution.ID`
 - **配置权威**：provider 并发上限以 catalog `providers.max_inflight` 为权威，`AILY_MAX_INFLIGHT` 仅 bootstrap
+- **CI（已实跑全绿，run 34804570324 @ d098e4c）**：`.github/workflows/backend.yml` 三个 job
+  （check=actionlint(pin v1.7.12)+gofmt/vet/build/unit、integration=全新 TiDB 容器、mysql57=MySQL 5.7 容器）；
+  迁移步骤用 `go run ./cmd/migrate`（`cmd/api -migrate` 会继续起 server，不可用于 CI）；
+  **失败诊断靠 `::error` annotation**（job 日志需 admin，读
+  `GET /repos/shilin414/potal/check-runs/<id>/annotations` 即可）
+- **TiDB 迁移兼容**：全新 TiDB 默认拒绝 SERIALIZABLE，而 golang-migrate 用它写 schema_migrations →
+  `app.MigrateUp` 检测 TiDB 后以连接参数带 `tidb_skip_isolation_level_check=1`
+- **reaper 恢复即时**：`RequeueRunFencedImmediate` + `CreateOutboxEvent`，可用时刻同取 DB 时钟
+  （避免 app/DB 时钟偏差；曾因 `now+delay` 导致恢复出的 Run 1s 内不可 claim）
 
 ## Execution Correctness Closure（2026-09-14 完成）
 
