@@ -70,9 +70,10 @@ func (s *ProviderSlot) providerOr(def string) string {
 // full batch (real concurrency up to 2×limit). Every decision is a TiDB
 // transaction and every timestamp comes from the DB clock:
 //
-//	Acquire  — serialized per provider (admission lock row), deletes expired
-//	           slots, is idempotent for the same ownership, and rejects once
-//	           the active count reaches max
+//	Acquire  — serialized per provider by a CONFLICTING WRITE on the shared
+//	           admission-lock row, deletes expired slots, is idempotent for
+//	           the same ownership, and rejects once the active count reaches
+//	           max
 //	Renew    — XX-only: refreshes an existing slot, never recreates one
 //	Release  — deletes exactly the caller's own ownership slot
 //	expiry   — DB clock + slot lease; a crashed worker's slot self-heals
@@ -155,10 +156,22 @@ func (l *ProviderSlots) acquireOnce(ctx context.Context, own ExecutionOwnership,
 	defer func() { _ = tx.Rollback() }()
 	q := db.New(tx)
 
-	// 1. Serialize the admission decision per provider. The lock row makes
-	// "delete expired → count active → insert" atomic on TiDB and MySQL 5.7.
-	if _, err := q.LockProviderAdmission(ctx, l.Provider); err != nil {
+	// 1. Serialize the admission decision per provider with a conflicting
+	// WRITE on the shared lock row, so "delete expired → count active →
+	// insert" is atomic on TiDB and MySQL 5.7 — under pessimistic row locks
+	// AND under optimistic transactions (where a locking read does not block
+	// a concurrent decision at all; migration 0013 documents the CI evidence).
+	res, err := q.LockProviderAdmission(ctx, l.Provider)
+	if err != nil {
 		return nil, false, 0, fmt.Errorf("lock provider admission: %w", err)
+	}
+	if n, nerr := res.RowsAffected(); nerr != nil {
+		return nil, false, 0, nerr
+	} else if n != 1 {
+		// The serialization row vanished (operator cleanup): fail closed
+		// instead of deciding without serialization. The next Acquire
+		// re-materializes it through EnsureProviderAdmissionLock.
+		return nil, false, 0, fmt.Errorf("lock provider admission: no row for provider %q", l.Provider)
 	}
 
 	// 2. Fence under locks: provider -> run -> lease. Recovery uses
@@ -218,9 +231,9 @@ func (l *ProviderSlots) acquireOnce(ctx context.Context, own ExecutionOwnership,
 		return nil, false, 0, err
 	}
 	if int(count) >= l.MaxInflight {
-		if err := tx.Commit(); err != nil {
-			return nil, false, 0, err
-		}
+		// Rejection writes nothing: the deferred rollback discards the
+		// serialization write, so concurrent rejections cannot conflict with
+		// each other at commit and cannot exhaust the retry budget.
 		return nil, false, int(count), nil
 	}
 

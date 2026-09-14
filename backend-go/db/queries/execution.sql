@@ -253,11 +253,20 @@ LIMIT ?;
 INSERT INTO provider_admission_locks (provider) VALUES (?)
 ON DUPLICATE KEY UPDATE provider = provider;
 
--- name: LockProviderAdmission :one
--- Acquire holds this row lock for the rest of its transaction, so
--- "delete expired → count active → insert" is atomic on TiDB and MySQL 5.7
--- without table locks. Row missing = error (owner recovers by requeue).
-SELECT provider FROM provider_admission_locks WHERE provider = ? FOR UPDATE;
+-- name: LockProviderAdmission :execresult
+-- Serialize the admission decision per provider with a CONFLICTING WRITE on
+-- the shared row (migration 0013). A locking read is not enough: TiDB may run
+-- the transaction optimistically, where SELECT ... FOR UPDATE does not block a
+-- concurrent decision and every contender counts zero active slots (observed
+-- in CI as admitted=8/8 on a fresh provider). Writing this row makes the
+-- decision conflict for real — pessimistically the loser waits for the row
+-- lock, optimistically it aborts with 9007 at commit and retries with a fresh
+-- snapshot — so "delete expired → count active → insert" stays atomic on TiDB
+-- and MySQL 5.7. Affected rows must be 1; 0 means the row is missing and the
+-- caller fails closed (the next Acquire re-materializes it).
+UPDATE provider_admission_locks
+SET admissions = admissions + 1
+WHERE provider = ?;
 
 -- name: CurrentDBTime :one
 -- Authoritative clock read. State written in the same transaction derives

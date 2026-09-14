@@ -110,15 +110,27 @@ func TestProviderSlotsEnforceGlobalMaxAcrossWorkers(t *testing.T) {
 }
 
 // TestConcurrentProviderAdmissionOnFreshProvider serializes the very first
-// admission decision for a provider. Creating the admission-lock row inside
-// both explicit transactions used to make TiDB abort one contender with a
-// 9007 write conflict instead of returning the normal capacity rejection.
+// admission decision for a provider. Two failure modes are pinned here:
+//
+//   - creating the admission-lock row inside both explicit transactions made
+//     TiDB abort one contender with a 9007 write conflict instead of the
+//     normal capacity rejection;
+//   - serializing with a locking READ alone is not enough, because TiDB may
+//     run the admission transaction optimistically, where SELECT ... FOR
+//     UPDATE blocks nothing and every contender counts zero active slots
+//     (observed in CI: admitted=8 rejected=0, and two runs concurrently
+//     admitted by the real worker with max_inflight=1). The decision
+//     therefore performs a CONFLICTING WRITE on the shared lock row.
 func TestConcurrentProviderAdmissionOnFreshProvider(t *testing.T) {
 	svc, _ := testEnv(t)
 	ctx := context.Background()
 	provider := slotProvider(t)
 	slots := newTestSlots(t, svc, provider, 1, time.Minute)
-	const contenders = 8
+	// Deliberately high contention: with only a handful of contenders a fast
+	// local database can finish the winning decision before the others even
+	// count, hiding an unserialized decision. The burst must be wide enough
+	// that interleaving is guaranteed on any machine.
+	const contenders = 64
 	claimed := make([]*execution.ClaimedRun, 0, contenders)
 	for i := 0; i < contenders; i++ {
 		claimed = append(claimed, claimForSlots(t, svc, provider))
@@ -166,6 +178,25 @@ func TestConcurrentProviderAdmissionOnFreshProvider(t *testing.T) {
 	if got := activeSlotRows(t, svc, provider); got != 1 {
 		t.Fatalf("active slot rows=%d after concurrent admission, want 1", got)
 	}
+	// The serialization must be a conflicting WRITE on the shared admission
+	// row (migration 0013), not a locking read: a read-only decision cannot
+	// serialize under optimistic transactions. Exactly the committed
+	// decisions persist a write (rejected decisions roll theirs back), so a
+	// locking-read implementation would leave the counter at zero.
+	if got := admissionLockWrites(t, svc, provider); got != uint64(admitted) {
+		t.Fatalf("admission lock row written %d time(s), want %d (one per admitted decision)", got, admitted)
+	}
+}
+
+// admissionLockWrites reads the per-provider serialization counter.
+func admissionLockWrites(t *testing.T, svc *execution.Service, provider string) uint64 {
+	t.Helper()
+	var n uint64
+	if err := svc.DB.QueryRowContext(context.Background(),
+		`SELECT admissions FROM provider_admission_locks WHERE provider = ?`, provider).Scan(&n); err != nil {
+		t.Fatalf("read admission lock counter: %v", err)
+	}
+	return n
 }
 
 // TestProviderCapacityIsRedisIndependent — the report's "Redis restart may

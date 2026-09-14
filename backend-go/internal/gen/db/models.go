@@ -189,8 +189,9 @@ type Provider struct {
 }
 
 type ProviderAdmissionLock struct {
-	Provider  string
-	CreatedAt time.Time
+	Provider   string
+	CreatedAt  time.Time
+	Admissions uint64
 }
 
 type ProviderExecutionSlot struct {
