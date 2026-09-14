@@ -25,6 +25,12 @@ type Dispatcher struct {
 	Metrics *telemetry.Metrics
 }
 
+type occurrenceDeliveryExpectation struct {
+	scheduleDeliveryID uint64
+	targetType         string
+	targetID           string
+}
+
 func NewDispatcher(d *sql.DB, log *slog.Logger, m *telemetry.Metrics) *Dispatcher {
 	if log == nil {
 		log = slog.Default()
@@ -43,24 +49,50 @@ func (d *Dispatcher) CreateInTx(ctx context.Context, tx *sql.Tx, run *execution.
 	if err != nil {
 		return fmt.Errorf("delivery fan-out: occurrence missing: %w", err)
 	}
-	dels, err := q.ListEnabledDeliveriesBySchedule(ctx, occ.ScheduleID)
-	if err != nil {
-		return fmt.Errorf("delivery fan-out: list deliveries: %w", err)
+	expectations := make([]occurrenceDeliveryExpectation, 0)
+	if occ.DeliverySnapshotAt.Valid {
+		rows, err := q.ListOccurrenceDeliveryExpectations(ctx, occ.ID)
+		if err != nil {
+			return fmt.Errorf("delivery fan-out: list occurrence expectations: %w", err)
+		}
+		for _, row := range rows {
+			expectations = append(expectations, occurrenceDeliveryExpectation{
+				scheduleDeliveryID: row.ScheduleDeliveryID,
+				targetType:         row.TargetType,
+				targetID:           row.TargetID,
+			})
+		}
+	} else {
+		// Compatibility for occurrences committed before migration 0012.
+		// Their historical policy cannot be reconstructed exactly, so preserve
+		// the previous fan-out behavior; all newly created occurrences carry a
+		// marker and use the immutable branch above.
+		dels, err := q.ListEnabledDeliveriesBySchedule(ctx, occ.ScheduleID)
+		if err != nil {
+			return fmt.Errorf("delivery fan-out: list legacy deliveries: %w", err)
+		}
+		for _, del := range dels {
+			expectations = append(expectations, occurrenceDeliveryExpectation{
+				scheduleDeliveryID: del.ID,
+				targetType:         del.TargetType,
+				targetID:           del.TargetID,
+			})
+		}
 	}
-	if len(dels) == 0 {
+	if len(expectations) == 0 {
 		return nil
 	}
 
-	for _, del := range dels {
+	for _, expected := range expectations {
 		id := ids.New()
 		res, err := q.CreateDeliveryExecution(ctx, db.CreateDeliveryExecutionParams{
 			ID:                 id.Bytes(),
 			OccurrenceID:       occ.ID,
 			RunID:              run.ID.Bytes(),
-			ScheduleDeliveryID: del.ID,
+			ScheduleDeliveryID: expected.scheduleDeliveryID,
 			SenderUserID:       uint64(*run.UserID),
-			TargetType:         del.TargetType,
-			TargetID:           del.TargetID,
+			TargetType:         expected.targetType,
+			TargetID:           expected.targetID,
 		})
 		if err != nil {
 			return fmt.Errorf("delivery fan-out: insert execution: %w", err)

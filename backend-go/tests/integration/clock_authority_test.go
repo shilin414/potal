@@ -68,15 +68,22 @@ func TestLeaseExpiryUsesDatabaseClock(t *testing.T) {
 		t.Fatalf("leases marked expired = %d, want 1 (DB clock must apply the negative delay)", n)
 	}
 
-	// Hygiene: extend the lease again so this test does not leave an
-	// expired lease behind for the reaper tests (shared dev database).
-	if _, err := svc.Querier().HeartbeatLeaseFenced(ctx, db.HeartbeatLeaseFencedParams{
+	// Expiry is terminal ownership loss: the production fenced heartbeat
+	// must not revive the row during the pre-reaper window.
+	res, err := svc.Querier().HeartbeatLeaseFenced(ctx, db.HeartbeatLeaseFencedParams{
 		LeaseMicros: int64(10 * time.Minute / time.Microsecond),
 		RunID:       runID.Bytes(),
 		LeaseToken:  mustLeaseToken(t, svc, runID),
-	}); err != nil {
-		t.Fatalf("restore lease: %v", err)
+	})
+	if err != nil {
+		t.Fatalf("expired heartbeat: %v", err)
 	}
+	if n, err := res.RowsAffected(); err != nil || n != 0 {
+		t.Fatalf("expired heartbeat revived lease: affected=%d err=%v, want 0", n, err)
+	}
+	// Hygiene: recover instead of reviving so this shared dev database does
+	// not retain an expired lease for unrelated tests.
+	recoverRun(t, svc, runID)
 }
 
 // mustLeaseToken loads the run's current lease token.

@@ -70,6 +70,29 @@ func (q *Queries) CASFinishOccurrenceByRun(ctx context.Context, arg CASFinishOcc
 	return q.db.ExecContext(ctx, cASFinishOccurrenceByRun, arg.Status, arg.RunID)
 }
 
+const captureOccurrenceDeliveryExpectations = `-- name: CaptureOccurrenceDeliveryExpectations :exec
+
+INSERT INTO occurrence_delivery_expectations
+    (occurrence_id, schedule_delivery_id, channel, sender_identity_mode,
+     target_type, target_id, target_name, content_mode)
+SELECT o.id, d.id, d.channel, d.sender_identity_mode,
+       d.target_type, d.target_id, d.target_name, d.content_mode
+FROM schedule_occurrences o
+JOIN schedule_deliveries d
+  ON d.schedule_id = o.schedule_id AND d.enabled = 1
+WHERE o.id = ? AND o.delivery_snapshot_at IS NULL
+ON DUPLICATE KEY UPDATE occurrence_id = VALUES(occurrence_id)
+`
+
+// ─────────────────────────────────────────────────── schedule_deliveries ──
+// Freeze the enabled delivery policy exactly once. The NULL marker makes
+// repeated calls safe and prevents a later schedule edit from adding new
+// expectations to an already-created occurrence.
+func (q *Queries) CaptureOccurrenceDeliveryExpectations(ctx context.Context, id uint64) error {
+	_, err := q.db.ExecContext(ctx, captureOccurrenceDeliveryExpectations, id)
+	return err
+}
+
 const countActiveOccurrencesExcluding = `-- name: CountActiveOccurrencesExcluding :one
 SELECT COUNT(*) AS n FROM schedule_occurrences
 WHERE schedule_id = ? AND id != ? AND status IN ('queued', 'running')
@@ -346,7 +369,7 @@ func (q *Queries) GetScheduleDeliveryByID(ctx context.Context, id uint64) (Sched
 
 const getScheduleOccurrenceByID = `-- name: GetScheduleOccurrenceByID :one
 SELECT id, schedule_id, scheduled_at, enqueued_at, admitted_at, run_id, status,
-       triggered_at, finished_at, created_at, updated_at
+       triggered_at, finished_at, created_at, updated_at, delivery_snapshot_at
 FROM schedule_occurrences WHERE id = ?
 `
 
@@ -365,13 +388,14 @@ func (q *Queries) GetScheduleOccurrenceByID(ctx context.Context, id uint64) (Sch
 		&i.FinishedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DeliverySnapshotAt,
 	)
 	return i, err
 }
 
 const getScheduleOccurrenceBySlot = `-- name: GetScheduleOccurrenceBySlot :one
 SELECT id, schedule_id, scheduled_at, enqueued_at, admitted_at, run_id, status,
-       triggered_at, finished_at, created_at, updated_at
+       triggered_at, finished_at, created_at, updated_at, delivery_snapshot_at
 FROM schedule_occurrences WHERE schedule_id = ? AND scheduled_at = ?
 `
 
@@ -395,6 +419,7 @@ func (q *Queries) GetScheduleOccurrenceBySlot(ctx context.Context, arg GetSchedu
 		&i.FinishedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DeliverySnapshotAt,
 	)
 	return i, err
 }
@@ -424,7 +449,7 @@ func (q *Queries) HasActiveOccurrence(ctx context.Context, scheduleID uint64) (i
 
 const latestOccurrenceBySchedule = `-- name: LatestOccurrenceBySchedule :one
 SELECT id, schedule_id, scheduled_at, enqueued_at, admitted_at, run_id, status,
-       triggered_at, finished_at, created_at, updated_at
+       triggered_at, finished_at, created_at, updated_at, delivery_snapshot_at
 FROM schedule_occurrences WHERE schedule_id = ?
 ORDER BY id DESC
 LIMIT 1
@@ -445,13 +470,14 @@ func (q *Queries) LatestOccurrenceBySchedule(ctx context.Context, scheduleID uin
 		&i.FinishedAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DeliverySnapshotAt,
 	)
 	return i, err
 }
 
 const listAdmissiblePendingOccurrences = `-- name: ListAdmissiblePendingOccurrences :many
 SELECT id, schedule_id, scheduled_at, enqueued_at, admitted_at, run_id, status,
-       triggered_at, finished_at, created_at, updated_at
+       triggered_at, finished_at, created_at, updated_at, delivery_snapshot_at
 FROM schedule_occurrences
 WHERE status = 'pending'
 ORDER BY scheduled_at, id
@@ -482,6 +508,7 @@ func (q *Queries) ListAdmissiblePendingOccurrences(ctx context.Context, limit in
 			&i.FinishedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.DeliverySnapshotAt,
 		); err != nil {
 			return nil, err
 		}
@@ -858,7 +885,8 @@ func (q *Queries) ListEnabledDeliveriesBySchedule(ctx context.Context, scheduleI
 
 const listLatestOccurrencesForSchedules = `-- name: ListLatestOccurrencesForSchedules :many
 SELECT o.id, o.schedule_id, o.scheduled_at, o.enqueued_at, o.admitted_at, o.run_id,
-       o.status, o.triggered_at, o.finished_at, o.created_at, o.updated_at
+       o.status, o.triggered_at, o.finished_at, o.created_at, o.updated_at,
+       o.delivery_snapshot_at
 FROM schedule_occurrences o
 JOIN (
     SELECT x.schedule_id, MAX(x.id) AS max_id
@@ -899,6 +927,48 @@ func (q *Queries) ListLatestOccurrencesForSchedules(ctx context.Context, ids []u
 			&i.FinishedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.DeliverySnapshotAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listOccurrenceDeliveryExpectations = `-- name: ListOccurrenceDeliveryExpectations :many
+SELECT occurrence_id, schedule_delivery_id, channel, sender_identity_mode,
+       target_type, target_id, target_name, content_mode, created_at
+FROM occurrence_delivery_expectations
+WHERE occurrence_id = ?
+ORDER BY schedule_delivery_id
+`
+
+func (q *Queries) ListOccurrenceDeliveryExpectations(ctx context.Context, occurrenceID uint64) ([]OccurrenceDeliveryExpectation, error) {
+	rows, err := q.db.QueryContext(ctx, listOccurrenceDeliveryExpectations, occurrenceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []OccurrenceDeliveryExpectation{}
+	for rows.Next() {
+		var i OccurrenceDeliveryExpectation
+		if err := rows.Scan(
+			&i.OccurrenceID,
+			&i.ScheduleDeliveryID,
+			&i.Channel,
+			&i.SenderIdentityMode,
+			&i.TargetType,
+			&i.TargetID,
+			&i.TargetName,
+			&i.ContentMode,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -915,7 +985,7 @@ func (q *Queries) ListLatestOccurrencesForSchedules(ctx context.Context, ids []u
 
 const listOccurrencesBySchedule = `-- name: ListOccurrencesBySchedule :many
 SELECT id, schedule_id, scheduled_at, enqueued_at, admitted_at, run_id, status,
-       triggered_at, finished_at, created_at, updated_at
+       triggered_at, finished_at, created_at, updated_at, delivery_snapshot_at
 FROM schedule_occurrences
 WHERE schedule_id = ? AND (? = 0 OR id < ?)
 ORDER BY id DESC
@@ -954,6 +1024,7 @@ func (q *Queries) ListOccurrencesBySchedule(ctx context.Context, arg ListOccurre
 			&i.FinishedAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.DeliverySnapshotAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1069,17 +1140,31 @@ type ListStuckPendingOccurrencesParams struct {
 	Limit     int32
 }
 
+type ListStuckPendingOccurrencesRow struct {
+	ID          uint64
+	ScheduleID  uint64
+	ScheduledAt time.Time
+	EnqueuedAt  sql.NullTime
+	AdmittedAt  sql.NullTime
+	RunID       sql.NullString
+	Status      string
+	TriggeredAt sql.NullTime
+	FinishedAt  sql.NullTime
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
 // Occurrences stuck in pending longer than the grace period: their
 // creating scheduler died between INSERT and the run-creating commit.
-func (q *Queries) ListStuckPendingOccurrences(ctx context.Context, arg ListStuckPendingOccurrencesParams) ([]ScheduleOccurrence, error) {
+func (q *Queries) ListStuckPendingOccurrences(ctx context.Context, arg ListStuckPendingOccurrencesParams) ([]ListStuckPendingOccurrencesRow, error) {
 	rows, err := q.db.QueryContext(ctx, listStuckPendingOccurrences, arg.CreatedAt, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []ScheduleOccurrence{}
+	items := []ListStuckPendingOccurrencesRow{}
 	for rows.Next() {
-		var i ScheduleOccurrence
+		var i ListStuckPendingOccurrencesRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.ScheduleID,
@@ -1104,6 +1189,16 @@ func (q *Queries) ListStuckPendingOccurrences(ctx context.Context, arg ListStuck
 		return nil, err
 	}
 	return items, nil
+}
+
+const markOccurrenceDeliverySnapshotCaptured = `-- name: MarkOccurrenceDeliverySnapshotCaptured :execresult
+UPDATE schedule_occurrences
+SET delivery_snapshot_at = CURRENT_TIMESTAMP(3)
+WHERE id = ? AND delivery_snapshot_at IS NULL
+`
+
+func (q *Queries) MarkOccurrenceDeliverySnapshotCaptured(ctx context.Context, id uint64) (sql.Result, error) {
+	return q.db.ExecContext(ctx, markOccurrenceDeliverySnapshotCaptured, id)
 }
 
 const markOccurrenceQueued = `-- name: MarkOccurrenceQueued :execresult
@@ -1305,7 +1400,6 @@ func (q *Queries) UpdateSchedule(ctx context.Context, arg UpdateScheduleParams) 
 }
 
 const upsertScheduleDelivery = `-- name: UpsertScheduleDelivery :execresult
-
 INSERT INTO schedule_deliveries (schedule_id, channel, sender_identity_mode, target_type,
     target_id, target_name, content_mode, enabled)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1325,7 +1419,6 @@ type UpsertScheduleDeliveryParams struct {
 	Enabled            bool
 }
 
-// ─────────────────────────────────────────────────── schedule_deliveries ──
 func (q *Queries) UpsertScheduleDelivery(ctx context.Context, arg UpsertScheduleDeliveryParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, upsertScheduleDelivery,
 		arg.ScheduleID,

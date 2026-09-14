@@ -11,6 +11,7 @@ import (
 
 	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
 	"github.com/creation-agent-studio/backend-go/internal/platform/redisx"
+	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
 )
 
 // Handler executes a claimed run for one provider. The worker guarantees
@@ -63,9 +64,10 @@ func PriorityClassOf(priority string) string {
 // context and releases the attempt's provider slot: the provider stream /
 // poll loop stops and the handler must stop writing canonical state.
 type executionControl struct {
-	cancel context.CancelFunc
-	own    ExecutionOwnership
-	slot   *ProviderSlot
+	cancel         context.CancelFunc
+	own            ExecutionOwnership
+	slot           *ProviderSlot
+	leaseRenewedAt time.Time
 }
 
 // Worker consumes provider queues: Redis Streams wake it up (fast), then
@@ -209,11 +211,22 @@ func (w *Worker) readWeighted(ctx context.Context, name string, sched *classSche
 		}
 		if sm, ok := w.readOne(ctx, name, streams[idx]); ok {
 			sched.consume(idx)
+			w.recordPriorityDispatch(idx)
 			return sm, true
 		}
 		sched.markEmpty(idx)
 	}
 	return streamMessage{}, false
+}
+
+// recordPriorityDispatch counts the fair-dispatch decisions per class
+// (studio_priority_dispatch_total{class}); a sustained skew between classes
+// is the signal that the weights or the backlog are off.
+func (w *Worker) recordPriorityDispatch(classIndex int) {
+	if w.Svc == nil || w.Svc.Metrics == nil || classIndex < 0 || classIndex >= len(PriorityClasses) {
+		return
+	}
+	w.Svc.Metrics.PriorityDispatchTotal.WithLabelValues(PriorityClasses[classIndex]).Inc()
 }
 
 // readOne performs a non-blocking XREADGROUP (Count 1) on one stream.
@@ -273,6 +286,10 @@ func (w *Worker) process(ctx context.Context, sm streamMessage) {
 // stream wakeup and the fallback scan. The claim and the lease commit in
 // ONE transaction; only the winner (with its immutable ownership) runs.
 func (w *Worker) claimAndExecute(ctx context.Context, runID ids.ID, ack func()) {
+	// Conservative local monotonic baseline: the DB creates the lease after
+	// this instant, so self-fencing from here can only stop early, never keep
+	// executing after the confirmed DB TTL.
+	claimStartedAt := time.Now()
 	claimed, won, err := w.Svc.ClaimRun(ctx, runID, w.WorkerID, w.Lease)
 	if err != nil {
 		w.Log.Error("claim+lease failed", "run_id", runID.String(), "err", err)
@@ -303,17 +320,17 @@ func (w *Worker) claimAndExecute(ctx context.Context, runID ids.ID, ack func()) 
 		}
 		w.Log.Warn("append run.started failed", "run_id", runID.String(), "err", err)
 	}
-	w.execute(ctx, claimed)
+	w.execute(ctx, claimed, claimStartedAt)
 	if ack != nil {
 		ack()
 	}
 }
 
-func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun) {
+func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun, leaseRenewedAt time.Time) {
 	execCtx, cancel := context.WithCancel(ctx)
 	// Heartbeat registration: losing the lease cancels execCtx.
-	w.trackInflight(claimed.Ownership, cancel)
-	defer w.trackInflight(claimed.Ownership, nil)
+	w.trackInflight(claimed.Ownership, cancel, leaseRenewedAt)
+	defer w.trackInflight(claimed.Ownership, nil, time.Time{})
 
 	if w.ProviderSlots != nil {
 		// Ownership-scoped, durable acquire: the row is keyed by the
@@ -326,6 +343,7 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun) {
 			// already owns recovery.
 			w.Log.Warn("provider slot acquire rejected: run ownership lost",
 				"run_id", claimed.Run.ID.String())
+			w.recordAdmission(telemetry.AdmissionLostOwnership)
 			return
 		}
 		if err != nil {
@@ -339,9 +357,11 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun) {
 			w.Log.Warn("provider max_inflight reached; requeueing run",
 				"run_id", claimed.Run.ID.String(), "depth", depth)
 			w.recordProviderAdmission("provider_inflight_limit")
+			w.recordAdmission(telemetry.AdmissionCapacityRejected)
 			w.requeueForAdmission(claimed, "provider_inflight_limit")
 			return
 		}
+		w.recordAdmission(telemetry.AdmissionAdmitted)
 		w.attachProviderSlot(claimed.Ownership, slot)
 		defer func() {
 			if err := w.ProviderSlots.Release(context.Background(), slot); err != nil {
@@ -381,6 +401,14 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun) {
 func (w *Worker) recordProviderAdmission(reason string) {
 	if w.Svc != nil && w.Svc.Metrics != nil {
 		w.Svc.Metrics.ProviderInflightRejected.WithLabelValues(w.Provider, reason).Inc()
+	}
+}
+
+// recordAdmission classifies one provider admission decision (P3): the
+// result label is a closed set so alerts can be defined per outcome.
+func (w *Worker) recordAdmission(result string) {
+	if w.Svc != nil && w.Svc.Metrics != nil {
+		w.Svc.Metrics.ProviderAdmission.WithLabelValues(w.Provider, result).Inc()
 	}
 }
 
@@ -505,14 +533,18 @@ func (w *Worker) reclaimStream(ctx context.Context, stream string, reclaimAfter 
 
 // trackInflight registers an in-flight run with its cancellation handle.
 // Passing cancel == nil removes it (deferred cleanup).
-func (w *Worker) trackInflight(own ExecutionOwnership, cancel context.CancelFunc) {
+func (w *Worker) trackInflight(own ExecutionOwnership, cancel context.CancelFunc, leaseRenewedAt time.Time) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.inflight == nil {
 		w.inflight = map[ids.ID]*executionControl{}
 	}
 	if cancel != nil {
-		w.inflight[own.RunID] = &executionControl{cancel: cancel, own: own}
+		w.inflight[own.RunID] = &executionControl{
+			cancel:         cancel,
+			own:            own,
+			leaseRenewedAt: leaseRenewedAt,
+		}
 	} else {
 		delete(w.inflight, own.RunID)
 	}
@@ -547,8 +579,9 @@ func (w *Worker) heartbeatOwned(ctx context.Context, ctl *executionControl, slot
 // slot pointer is read while w.mu is held (attachProviderSlot writes it
 // under the same lock), so the heartbeat loop never races with the executor.
 type inflightSnapshot struct {
-	ctl  *executionControl
-	slot *ProviderSlot
+	ctl            *executionControl
+	slot           *ProviderSlot
+	leaseRenewedAt time.Time
 }
 
 func (w *Worker) heartbeatLoop(ctx context.Context) {
@@ -562,20 +595,43 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 			w.mu.Lock()
 			snapshot := make(map[ids.ID]inflightSnapshot, len(w.inflight))
 			for id, ctl := range w.inflight {
-				snapshot[id] = inflightSnapshot{ctl: ctl, slot: ctl.slot}
+				snapshot[id] = inflightSnapshot{
+					ctl:            ctl,
+					slot:           ctl.slot,
+					leaseRenewedAt: ctl.leaseRenewedAt,
+				}
 			}
 			w.mu.Unlock()
 			for id, snap := range snapshot {
 				ctl := snap.ctl
+				// A successful heartbeat establishes a lease at some point after
+				// this conservative monotonic timestamp.
+				heartbeatStartedAt := time.Now()
 				leaseOK, slotOK, err := w.heartbeatOwned(ctx, ctl, snap.slot)
-				if err != nil || !leaseOK {
+				deadlineElapsed := leaseRenewalDeadlineElapsed(
+					snap.leaseRenewedAt, w.Lease, time.Now())
+				cancelForLoss := shouldCancelAfterHeartbeat(leaseOK, err, deadlineElapsed)
+				if err != nil && !cancelForLoss {
+					// A transport/write-conflict failure does not prove ownership
+					// loss before the last confirmed TTL. Keep the provider
+					// execution and slot until the next tick; the local monotonic
+					// deadline self-fences if the outage spans the full lease.
+					w.Log.Warn("heartbeat failed — ownership unconfirmed; retrying",
+						"run_id", id.String(), "err", err)
+					continue
+				}
+				if cancelForLoss {
 					// Ownership lost: stop the local execution immediately
 					// (the provider call cannot be cancelled remotely, but
 					// this worker loses the right to write canonical state —
 					// fenced writes will reject it anyway; cancelling here
 					// also stops pointless polling).
+					reason := "heartbeat fence rejected ownership"
+					if err != nil {
+						reason = "heartbeat unavailable past local lease deadline"
+					}
 					w.Log.Warn("heartbeat lost lease — cancelling local execution",
-						"run_id", id.String(), "err", err)
+						"run_id", id.String(), "reason", reason, "err", err)
 					ctl.cancel()
 					w.mu.Lock()
 					// Only remove if the entry is still ours (not re-registered).
@@ -596,16 +652,49 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 					}
 					continue
 				}
+				w.recordHeartbeatSuccess(id, ctl, heartbeatStartedAt)
 				if !slotOK {
 					// The slot was released or expired (worker stalled longer
 					// than the slot lease). The run ownership fence is
 					// unaffected; capacity accounting self-heals when this
 					// attempt finishes (release is idempotent).
 					w.recordProviderAdmission("provider_slot_lost")
+					w.recordAdmission(telemetry.AdmissionProviderSlotLost)
 				}
 			}
 		}
 	}
+}
+
+// recordHeartbeatSuccess advances the monotonic self-fencing deadline only
+// for the same in-flight attempt. Using the pre-request instant is
+// conservative relative to the DB timestamp written during the request.
+func (w *Worker) recordHeartbeatSuccess(id ids.ID, ctl *executionControl, renewedAt time.Time) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if cur, ok := w.inflight[id]; ok && cur == ctl {
+		cur.leaseRenewedAt = renewedAt
+	}
+}
+
+// shouldCancelAfterHeartbeat distinguishes a confirmed fence rejection from
+// an inconclusive infrastructure error. Only a successful DB round-trip that
+// reports leaseOK=false proves this worker is stale. Infrastructure errors
+// remain inconclusive only until the last confirmed lease TTL; after that
+// local monotonic time fails closed so a prolonged outage cannot overlap a
+// recovered owner indefinitely.
+func shouldCancelAfterHeartbeat(leaseOK bool, err error, leaseDeadlineElapsed bool) bool {
+	if err != nil {
+		return leaseDeadlineElapsed
+	}
+	return !leaseOK
+}
+
+func leaseRenewalDeadlineElapsed(lastRenewedAt time.Time, lease time.Duration, now time.Time) bool {
+	if lastRenewedAt.IsZero() || lease <= 0 {
+		return true
+	}
+	return !now.Before(lastRenewedAt.Add(lease))
 }
 
 func itoa(i int) string {

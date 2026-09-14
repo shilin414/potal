@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
+
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
 )
@@ -17,6 +19,8 @@ import (
 // superseded). Renew never recreates a missing slot — a stale attempt must
 // not resurrect capacity accounting.
 var ErrProviderSlotLost = errors.New("execution: provider inflight slot lost")
+
+const maxProviderAdmissionRetries = 8
 
 // DefaultProviderSlotLease bounds how long a crashed worker's slot can pin
 // provider capacity when no explicit lease is configured.
@@ -119,6 +123,31 @@ func (l *ProviderSlots) Acquire(ctx context.Context, own ExecutionOwnership) (*P
 	}
 	slot := newProviderSlot(l.Provider, own)
 
+	// TiDB may run explicit transactions optimistically. Concurrent admission
+	// decisions then serialize at commit and losers receive Error 9007. Retry
+	// the WHOLE decision with a fresh snapshot; retrying only COMMIT would
+	// reuse the stale count and could over-admit. MySQL deadlock/lock-timeout
+	// victims use the same safe transaction-boundary retry.
+	for attempt := 0; ; attempt++ {
+		got, ok, depth, err := l.acquireOnce(ctx, own, slot)
+		if err == nil || !isRetryableAdmissionConflict(err) || attempt >= maxProviderAdmissionRetries-1 {
+			return got, ok, depth, err
+		}
+		if ctx.Err() != nil {
+			return nil, false, 0, ctx.Err()
+		}
+	}
+}
+
+func (l *ProviderSlots) acquireOnce(ctx context.Context, own ExecutionOwnership, slot *ProviderSlot) (*ProviderSlot, bool, int, error) {
+	// Materialize the serialization row before opening the explicit
+	// admission transaction. This avoids coupling first-provider creation to
+	// the capacity decision; any remaining optimistic conflict is handled by
+	// Acquire's full-transaction retry above.
+	if err := db.New(l.DB).EnsureProviderAdmissionLock(ctx, l.Provider); err != nil {
+		return nil, false, 0, fmt.Errorf("ensure provider admission lock: %w", err)
+	}
+
 	tx, err := l.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, false, 0, err
@@ -128,23 +157,17 @@ func (l *ProviderSlots) Acquire(ctx context.Context, own ExecutionOwnership) (*P
 
 	// 1. Serialize the admission decision per provider. The lock row makes
 	// "delete expired → count active → insert" atomic on TiDB and MySQL 5.7.
-	if err := q.EnsureProviderAdmissionLock(ctx, l.Provider); err != nil {
-		return nil, false, 0, fmt.Errorf("ensure provider admission lock: %w", err)
-	}
 	if _, err := q.LockProviderAdmission(ctx, l.Provider); err != nil {
 		return nil, false, 0, fmt.Errorf("lock provider admission: %w", err)
 	}
 
-	// 2. Fence: only the CURRENT owner of a running run may hold capacity.
-	owned, err := q.CountRunningRunAtEpoch(ctx, db.CountRunningRunAtEpochParams{
-		ID:         own.RunID.Bytes(),
-		LeaseEpoch: own.LeaseEpoch,
-	})
-	if err != nil {
+	// 2. Fence under locks: provider -> run -> lease. Recovery uses
+	// run -> lease and never takes the provider admission lock, so there is
+	// no lock cycle. A concurrent reaper/heartbeat either commits first or
+	// conflicts this whole admission transaction, which Acquire retries with
+	// a fresh snapshot.
+	if _, err := verifyActiveOwnershipTx(ctx, tx, own); err != nil {
 		return nil, false, 0, err
-	}
-	if owned == 0 {
-		return nil, false, 0, ErrLostOwnership
 	}
 
 	// 3. Expired slots must not pin capacity (DB clock decides expiry).
@@ -216,6 +239,21 @@ func (l *ProviderSlots) Acquire(ctx context.Context, own ExecutionOwnership) (*P
 		return nil, false, 0, err
 	}
 	return slot, true, int(count) + 1, nil
+}
+
+func isRetryableAdmissionConflict(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	switch mysqlErr.Number {
+	case 9007, // TiDB optimistic write conflict
+		1213, // MySQL deadlock victim
+		1205: // MySQL lock wait timeout
+		return true
+	default:
+		return false
+	}
 }
 
 // Renew extends the slot's DB-clock lease. XX-only semantics: a missing

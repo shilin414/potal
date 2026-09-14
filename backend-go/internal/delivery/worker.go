@@ -259,6 +259,9 @@ func (w *Worker) handleFailure(ctx context.Context, row db.DeliveryExecution, se
 		w.Log.Error("delivery requeue failed", "err", err)
 		return
 	}
+	if w.Metrics != nil {
+		w.Metrics.DeliveryRetryTotal.Inc()
+	}
 	w.Log.Warn("delivery retry scheduled", "delivery_id", hexID(row.ID),
 		"attempt", attempt, "code", code, "backoff", backoff.String())
 }

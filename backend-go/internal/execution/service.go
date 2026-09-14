@@ -486,6 +486,9 @@ func (s *Service) HeartbeatOwned(ctx context.Context, own ExecutionOwnership, le
 		return false, err
 	}
 	n, err := res.RowsAffected()
+	if err == nil && n != 1 && s.Metrics != nil {
+		s.Metrics.RunOwnershipLostTotal.Inc()
+	}
 	return n == 1, err
 }
 
@@ -535,6 +538,9 @@ func (s *Service) HeartbeatOwnedWithSlot(ctx context.Context, own ExecutionOwner
 		// recovered attempt's accounting now and expires on its own
 		// (or was already cleaned by the reaper in the same transaction
 		// that requeued the run).
+		if s.Metrics != nil {
+			s.Metrics.RunOwnershipLostTotal.Inc()
+		}
 		return false, false, nil
 	}
 

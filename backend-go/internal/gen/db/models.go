@@ -141,6 +141,18 @@ type Message struct {
 	CreatedAt      time.Time
 }
 
+type OccurrenceDeliveryExpectation struct {
+	OccurrenceID       uint64
+	ScheduleDeliveryID uint64
+	Channel            string
+	SenderIdentityMode string
+	TargetType         string
+	TargetID           string
+	TargetName         string
+	ContentMode        string
+	CreatedAt          time.Time
+}
+
 type OutboxEvent struct {
 	ID          uint64
 	Aggregate   string
@@ -372,17 +384,18 @@ type ScheduleDelivery struct {
 }
 
 type ScheduleOccurrence struct {
-	ID          uint64
-	ScheduleID  uint64
-	ScheduledAt time.Time
-	EnqueuedAt  sql.NullTime
-	AdmittedAt  sql.NullTime
-	RunID       sql.NullString
-	Status      string
-	TriggeredAt sql.NullTime
-	FinishedAt  sql.NullTime
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID                 uint64
+	ScheduleID         uint64
+	ScheduledAt        time.Time
+	EnqueuedAt         sql.NullTime
+	AdmittedAt         sql.NullTime
+	RunID              sql.NullString
+	Status             string
+	TriggeredAt        sql.NullTime
+	FinishedAt         sql.NullTime
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+	DeliverySnapshotAt sql.NullTime
 }
 
 type User struct {

@@ -9,9 +9,10 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
 )
 
-// verifyActiveOwnershipTx is the strict worker-write verifier. A worker
-// may write only while the run is running at the caller's lease epoch;
-// terminal, queued and stale-epoch callers all lose ownership.
+// verifyActiveOwnershipTx is the strict worker-write verifier. The lock
+// order is run -> lease across worker mutations and recovery. A worker may
+// write only while the run is running at the caller's epoch and its exact
+// lease token is still unexpired according to the DB clock.
 func verifyActiveOwnershipTx(ctx context.Context, tx *sql.Tx, own ExecutionOwnership) (db.GetRunForUpdateRow, error) {
 	row, err := db.New(tx).GetRunForUpdate(ctx, own.RunID.Bytes())
 	if errors.Is(err, sql.ErrNoRows) {
@@ -22,6 +23,17 @@ func verifyActiveOwnershipTx(ctx context.Context, tx *sql.Tx, own ExecutionOwner
 	}
 	if row.Status != StatusRunning || row.LeaseEpoch != own.LeaseEpoch {
 		return row, ErrLostOwnership
+	}
+	_, err = db.New(tx).GetActiveLeaseForUpdate(ctx, db.GetActiveLeaseForUpdateParams{
+		RunID:      own.RunID.Bytes(),
+		LeaseEpoch: own.LeaseEpoch,
+		LeaseToken: own.LeaseToken.Bytes(),
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return row, ErrLostOwnership
+	}
+	if err != nil {
+		return row, err
 	}
 	return row, nil
 }
@@ -42,6 +54,17 @@ func verifyFinalizeOwnershipTx(ctx context.Context, tx *sql.Tx, own ExecutionOwn
 	}
 	if row.Status != StatusRunning || row.LeaseEpoch != own.LeaseEpoch {
 		return row, false, ErrLostOwnership
+	}
+	_, err = db.New(tx).GetActiveLeaseForUpdate(ctx, db.GetActiveLeaseForUpdateParams{
+		RunID:      own.RunID.Bytes(),
+		LeaseEpoch: own.LeaseEpoch,
+		LeaseToken: own.LeaseToken.Bytes(),
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return row, false, ErrLostOwnership
+	}
+	if err != nil {
+		return row, false, err
 	}
 	return row, false, nil
 }

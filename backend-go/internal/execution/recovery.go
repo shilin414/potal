@@ -15,8 +15,8 @@ import (
 // §11-13, Phase 3). Each run is recovered in ONE TiDB transaction:
 //
 //	BEGIN
+//	  SELECT the run FOR UPDATE                (common first lock)
 //	  SELECT the expired lease FOR UPDATE      (heartbeat-first wins)
-//	  SELECT the run FOR UPDATE                (status + epoch verified)
 //	  retryable:  runs → queued, run.retrying event, outbox dispatch
 //	  exhausted:  runs → failed, run.failed event
 //	  DELETE the expired lease (by token)
@@ -47,6 +47,7 @@ func (s *Service) RecoverExpiredLeases(ctx context.Context, limit int) (int, err
 			recovered++
 			if s.Metrics != nil {
 				s.Metrics.LeaseExpired.Inc()
+				s.Metrics.RunReaperTotal.Inc()
 			}
 		}
 	}
@@ -64,26 +65,36 @@ func (s *Service) recoverExpiredLeaseTx(ctx context.Context, runID ids.ID) (bool
 	defer func() { _ = tx.Rollback() }()
 	q := db.New(tx)
 
-	// Lock the expired lease: a concurrent heartbeat that renewed it
-	// makes this SELECT miss (expires_at in the future) → nothing to do.
-	lease, err := q.GetExpiredLeaseForUpdate(ctx, runID.Bytes())
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil // renewed first — the owner keeps running
-	}
-	if err != nil {
-		return false, err
-	}
-
-	// Lock the run and decide its recovery under the same transaction.
+	// Lock run first: worker-owned mutations use the same run -> lease order,
+	// avoiding a verifier/reaper deadlock while preserving atomic recovery.
 	row, err := q.GetRunForUpdate(ctx, runID.Bytes())
 	if errors.Is(err, sql.ErrNoRows) {
-		// Orphan lease row without a run: just drop it.
+		// Preserve orphan hygiene: with no run row there is no competing
+		// run lock to order, so lock and remove an expired dangling lease.
+		lease, lerr := q.GetExpiredLeaseForUpdate(ctx, runID.Bytes())
+		if errors.Is(lerr, sql.ErrNoRows) {
+			return false, nil
+		}
+		if lerr != nil {
+			return false, lerr
+		}
 		if _, derr := q.DeleteLeaseByToken(ctx, db.DeleteLeaseByTokenParams{
 			RunID: runID.Bytes(), LeaseToken: lease.LeaseToken,
 		}); derr != nil {
 			return false, derr
 		}
 		return true, tx.Commit()
+	}
+	if err != nil {
+		return false, err
+	}
+
+	// Lock the expired lease second. A concurrent heartbeat that renewed it
+	// before this lock makes the SELECT miss; after it expires, production
+	// heartbeat SQL cannot revive it.
+	lease, err := q.GetExpiredLeaseForUpdate(ctx, runID.Bytes())
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
 	}
 	if err != nil {
 		return false, err

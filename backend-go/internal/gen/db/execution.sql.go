@@ -207,19 +207,17 @@ func (q *Queries) CountActiveProviderSlots(ctx context.Context, provider string)
 
 const countMissingDeliveryExecutions = `-- name: CountMissingDeliveryExecutions :one
 SELECT COUNT(*) AS n
-FROM schedule_occurrences o
-JOIN schedule_deliveries d
-  ON d.schedule_id = o.schedule_id AND d.enabled = 1
-  AND d.created_at <= COALESCE(o.finished_at, o.updated_at)
+FROM occurrence_delivery_expectations e
+JOIN schedule_occurrences o ON o.id = e.occurrence_id
 LEFT JOIN delivery_executions de
-  ON de.occurrence_id = o.id AND de.schedule_delivery_id = d.id
+  ON de.occurrence_id = e.occurrence_id
+ AND de.schedule_delivery_id = e.schedule_delivery_id
 WHERE o.status = 'succeeded' AND de.id IS NULL
 `
 
-// Invariant L: every enabled target of a succeeded occurrence has a
-// durable delivery execution row. The created_at guard avoids false
-// positives on historical occurrences: a target enabled AFTER the
-// occurrence finished was never supposed to receive it.
+// Invariant L: every target captured for a succeeded occurrence has a
+// durable delivery execution row. The expectation is immutable history;
+// later schedule edits cannot reinterpret an old occurrence.
 func (q *Queries) CountMissingDeliveryExecutions(ctx context.Context) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countMissingDeliveryExecutions)
 	var n int64
@@ -288,26 +286,6 @@ WHERE r.status = 'running' AND r.lease_epoch != l.lease_epoch
 // Invariant E: a running run's lease_epoch must equal its lease row's.
 func (q *Queries) CountRunningLeaseEpochMismatch(ctx context.Context) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countRunningLeaseEpochMismatch)
-	var n int64
-	err := row.Scan(&n)
-	return n, err
-}
-
-const countRunningRunAtEpoch = `-- name: CountRunningRunAtEpoch :one
-SELECT COUNT(*) AS n FROM runs
-WHERE id = ? AND status = 'running' AND lease_epoch = ?
-`
-
-type CountRunningRunAtEpochParams struct {
-	ID         []byte
-	LeaseEpoch uint64
-}
-
-// Ownership probe for provider slot Acquire: only the CURRENT owner of a
-// running run may hold provider capacity, so a stale worker that wakes up
-// after its run was reclaimed/reaped cannot pollute the semaphore.
-func (q *Queries) CountRunningRunAtEpoch(ctx context.Context, arg CountRunningRunAtEpochParams) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countRunningRunAtEpoch, arg.ID, arg.LeaseEpoch)
 	var n int64
 	err := row.Scan(&n)
 	return n, err
@@ -878,6 +856,50 @@ func (q *Queries) FailRunFenced(ctx context.Context, arg FailRunFencedParams) (s
 	)
 }
 
+const getActiveLeaseForUpdate = `-- name: GetActiveLeaseForUpdate :one
+SELECT id, run_id, worker_id, lease_token, lease_epoch, acquired_at, heartbeat_at, expires_at
+FROM run_leases
+WHERE run_id = ? AND lease_epoch = ? AND lease_token = ?
+  AND expires_at > CURRENT_TIMESTAMP(3)
+FOR UPDATE
+`
+
+type GetActiveLeaseForUpdateParams struct {
+	RunID      []byte
+	LeaseEpoch uint64
+	LeaseToken []byte
+}
+
+type GetActiveLeaseForUpdateRow struct {
+	ID          uint64
+	RunID       []byte
+	WorkerID    string
+	LeaseToken  []byte
+	LeaseEpoch  uint64
+	AcquiredAt  time.Time
+	HeartbeatAt sql.NullTime
+	ExpiresAt   time.Time
+}
+
+// Worker-owned mutations lock and validate the exact live lease after
+// locking the run row. Expired ownership cannot be revived or used in the
+// interval before the reaper observes it.
+func (q *Queries) GetActiveLeaseForUpdate(ctx context.Context, arg GetActiveLeaseForUpdateParams) (GetActiveLeaseForUpdateRow, error) {
+	row := q.db.QueryRowContext(ctx, getActiveLeaseForUpdate, arg.RunID, arg.LeaseEpoch, arg.LeaseToken)
+	var i GetActiveLeaseForUpdateRow
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.WorkerID,
+		&i.LeaseToken,
+		&i.LeaseEpoch,
+		&i.AcquiredAt,
+		&i.HeartbeatAt,
+		&i.ExpiresAt,
+	)
+	return i, err
+}
+
 const getAttachmentByID = `-- name: GetAttachmentByID :one
 SELECT id, run_id, conversation_id, provider, external_attachment_id, attachment_type,
        name, source_type, source_url, storage_key, content_type, size_bytes,
@@ -1231,6 +1253,7 @@ UPDATE run_leases
 SET heartbeat_at = CURRENT_TIMESTAMP(3),
     expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND)
 WHERE run_id = ? AND lease_token = ?
+  AND expires_at > CURRENT_TIMESTAMP(3)
 `
 
 type HeartbeatLeaseFencedParams struct {
@@ -1241,7 +1264,8 @@ type HeartbeatLeaseFencedParams struct {
 
 // Ownership-checked by lease token (not worker_id): a recycled worker id
 // cannot renew a lease it no longer owns. Extension is DB-clock based, so a
-// skewed worker clock can neither extend nor shorten the lease.
+// skewed worker clock can neither extend nor shorten the lease. An expired
+// lease is terminal ownership loss and cannot be revived before the reaper.
 func (q *Queries) HeartbeatLeaseFenced(ctx context.Context, arg HeartbeatLeaseFencedParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, heartbeatLeaseFenced, arg.LeaseMicros, arg.RunID, arg.LeaseToken)
 }
@@ -1702,6 +1726,7 @@ UPDATE provider_execution_slots
 SET heartbeat_at = CURRENT_TIMESTAMP(3),
     expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND)
 WHERE provider = ? AND run_id = ? AND lease_epoch = ? AND lease_token = ?
+  AND expires_at > CURRENT_TIMESTAMP(3)
 `
 
 type TouchProviderSlotParams struct {

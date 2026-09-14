@@ -3,6 +3,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"testing"
@@ -16,6 +17,13 @@ import (
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+}
+
+// silentLogger discards worker chatter. Fault-injection tests deliberately
+// break Redis under a live worker, which logs every retry — the test asserts
+// on state, not on logs, so the noise is dropped.
+func silentLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
 // recoverRun drives the reaper until the given run is no longer running, i.e.

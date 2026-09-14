@@ -50,6 +50,11 @@ type Querier interface {
 	// running run. 0 rows = already terminal (idempotent) OR lost ownership.
 	CASFinishRunFenced(ctx context.Context, arg CASFinishRunFencedParams) (sql.Result, error)
 	CacheArtifactURL(ctx context.Context, arg CacheArtifactURLParams) error
+	// ─────────────────────────────────────────────────── schedule_deliveries ──
+	// Freeze the enabled delivery policy exactly once. The NULL marker makes
+	// repeated calls safe and prevents a later schedule edit from adding new
+	// expectations to an already-created occurrence.
+	CaptureOccurrenceDeliveryExpectations(ctx context.Context, id uint64) error
 	ClearDefaultAgent(ctx context.Context) error
 	// Admission check for a pending occurrence: does anything OTHER than
 	// itself still hold the schedule's execution slot (queued/running)?
@@ -59,10 +64,9 @@ type Querier interface {
 	CountActiveProviderSlots(ctx context.Context, provider string) (int64, error)
 	CountConversationByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
 	CountMessagesByConversation(ctx context.Context, conversationID uint64) (int64, error)
-	// Invariant L: every enabled target of a succeeded occurrence has a
-	// durable delivery execution row. The created_at guard avoids false
-	// positives on historical occurrences: a target enabled AFTER the
-	// occurrence finished was never supposed to receive it.
+	// Invariant L: every target captured for a succeeded occurrence has a
+	// durable delivery execution row. The expectation is immutable history;
+	// later schedule edits cannot reinterpret an old occurrence.
 	CountMissingDeliveryExecutions(ctx context.Context) (int64, error)
 	// Invariant M: an ACTIVE provider slot must belong to a running run at the
 	// matching lease epoch.
@@ -74,10 +78,6 @@ type Querier interface {
 	CountRunEvents(ctx context.Context, runID []byte) (int64, error)
 	// Invariant E: a running run's lease_epoch must equal its lease row's.
 	CountRunningLeaseEpochMismatch(ctx context.Context) (int64, error)
-	// Ownership probe for provider slot Acquire: only the CURRENT owner of a
-	// running run may hold provider capacity, so a stale worker that wakes up
-	// after its run was reclaimed/reaped cannot pollute the semaphore.
-	CountRunningRunAtEpoch(ctx context.Context, arg CountRunningRunAtEpochParams) (int64, error)
 	// ──────────────────────────────────────────────── invariant checks ──
 	// Execution invariant checker queries (修复计划 §43-49): detect only,
 	// never auto-repair.
@@ -195,6 +195,10 @@ type Querier interface {
 	FailRunFenced(ctx context.Context, arg FailRunFencedParams) (sql.Result, error)
 	FailStuckDeliveries(ctx context.Context, arg FailStuckDeliveriesParams) (sql.Result, error)
 	FindBinding(ctx context.Context, arg FindBindingParams) (RuntimeBinding, error)
+	// Worker-owned mutations lock and validate the exact live lease after
+	// locking the run row. Expired ownership cannot be revived or used in the
+	// interval before the reaper observes it.
+	GetActiveLeaseForUpdate(ctx context.Context, arg GetActiveLeaseForUpdateParams) (GetActiveLeaseForUpdateRow, error)
 	GetAgentThreadByConversation(ctx context.Context, conversationID uint64) (AgentThread, error)
 	GetAgentThreadByID(ctx context.Context, id []byte) (AgentThread, error)
 	GetApplicationByID(ctx context.Context, id uint64) (GetApplicationByIDRow, error)
@@ -248,7 +252,8 @@ type Querier interface {
 	HeartbeatLease(ctx context.Context, arg HeartbeatLeaseParams) (sql.Result, error)
 	// Ownership-checked by lease token (not worker_id): a recycled worker id
 	// cannot renew a lease it no longer owns. Extension is DB-clock based, so a
-	// skewed worker clock can neither extend nor shorten the lease.
+	// skewed worker clock can neither extend nor shorten the lease. An expired
+	// lease is terminal ownership loss and cannot be revived before the reaper.
 	HeartbeatLeaseFenced(ctx context.Context, arg HeartbeatLeaseFencedParams) (sql.Result, error)
 	IncrementApplicationUsage(ctx context.Context, id uint64) error
 	LatestOccurrenceBySchedule(ctx context.Context, scheduleID uint64) (ScheduleOccurrence, error)
@@ -282,6 +287,7 @@ type Querier interface {
 	ListFavorites(ctx context.Context, userID uint64) ([]uint64, error)
 	ListLatestOccurrencesForSchedules(ctx context.Context, ids []uint64) ([]ScheduleOccurrence, error)
 	ListMessagesByConversation(ctx context.Context, conversationID uint64) ([]Message, error)
+	ListOccurrenceDeliveryExpectations(ctx context.Context, occurrenceID uint64) ([]OccurrenceDeliveryExpectation, error)
 	ListOccurrencesBySchedule(ctx context.Context, arg ListOccurrencesByScheduleParams) ([]ScheduleOccurrence, error)
 	ListPendingOutbox(ctx context.Context, limit int32) ([]OutboxEvent, error)
 	// Provider admission order. Base priority is explicit and waiting time
@@ -295,11 +301,12 @@ type Querier interface {
 	ListSchedulesByOwner(ctx context.Context, arg ListSchedulesByOwnerParams) ([]Schedule, error)
 	// Occurrences stuck in pending longer than the grace period: their
 	// creating scheduler died between INSERT and the run-creating commit.
-	ListStuckPendingOccurrences(ctx context.Context, arg ListStuckPendingOccurrencesParams) ([]ScheduleOccurrence, error)
+	ListStuckPendingOccurrences(ctx context.Context, arg ListStuckPendingOccurrencesParams) ([]ListStuckPendingOccurrencesRow, error)
 	// Acquire holds this row lock for the rest of its transaction, so
 	// "delete expired → count active → insert" is atomic on TiDB and MySQL 5.7
 	// without table locks. Row missing = error (owner recovers by requeue).
 	LockProviderAdmission(ctx context.Context, provider string) (string, error)
+	MarkOccurrenceDeliverySnapshotCaptured(ctx context.Context, id uint64) (sql.Result, error)
 	MarkOccurrenceQueued(ctx context.Context, arg MarkOccurrenceQueuedParams) (sql.Result, error)
 	// Run claim fan-out: the occurrence linked to this run enters 'running'.
 	MarkOccurrenceRunningByRun(ctx context.Context, runID sql.NullString) (sql.Result, error)
@@ -360,7 +367,6 @@ type Querier interface {
 	// Guarded by unique (run_id, external_artifact_id); empty external ids get
 	// their own row keyed by the generated PK.
 	UpsertRunArtifact(ctx context.Context, arg UpsertRunArtifactParams) error
-	// ─────────────────────────────────────────────────── schedule_deliveries ──
 	UpsertScheduleDelivery(ctx context.Context, arg UpsertScheduleDeliveryParams) (sql.Result, error)
 	UserUsageByApplication(ctx context.Context, userID sql.NullInt64) ([]UserUsageByApplicationRow, error)
 	UsernameExists(ctx context.Context, username string) (int64, error)

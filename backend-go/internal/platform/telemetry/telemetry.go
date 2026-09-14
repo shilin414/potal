@@ -60,7 +60,31 @@ type Metrics struct {
 	ProviderLimiterDegraded  prometheus.Gauge
 	ProviderInflight         *prometheus.GaugeVec
 	ProviderInflightRejected *prometheus.CounterVec
+
+	// Production alerting surface (剩余问题报告 P3): one decision counter for
+	// provider admission, a reaper counter, a confirmed ownership-loss
+	// counter, fair-dispatch accounting and delivery retries. These are the
+	// series the on-call alerts are defined on:
+	//
+	//	orphan provider slot  > 0   (ProviderInflight vs. real executions)
+	//	provider_slot_lost    > 0   (ProviderAdmission{result="provider_slot_lost"})
+	//	ownership loss spikes       (RunOwnershipLostTotal)
+	//	reaper spikes               (RunReaperTotal)
+	//	capacity_rejected sustained (ProviderAdmission{result="capacity_rejected"})
+	ProviderAdmission     *prometheus.CounterVec // {provider, result}
+	RunReaperTotal        prometheus.Counter
+	RunOwnershipLostTotal prometheus.Counter
+	PriorityDispatchTotal *prometheus.CounterVec // {class}
+	DeliveryRetryTotal    prometheus.Counter
 }
+
+// Provider admission results (ProviderAdmission label values).
+const (
+	AdmissionAdmitted         = "admitted"
+	AdmissionCapacityRejected = "capacity_rejected"
+	AdmissionLostOwnership    = "lost_ownership"
+	AdmissionProviderSlotLost = "provider_slot_lost"
+)
 
 func NewMetrics(service string) *Metrics {
 	reg := prometheus.NewRegistry()
@@ -173,6 +197,26 @@ func NewMetrics(service string) *Metrics {
 			Name: "studio_provider_inflight_rejected_total",
 			Help: "Runs not admitted because the provider concurrency limit was reached.",
 		}, []string{"provider", "reason"}),
+		ProviderAdmission: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "studio_provider_admission_total",
+			Help: "Provider admission decisions: admitted, capacity_rejected, lost_ownership, provider_slot_lost.",
+		}, []string{"provider", "result"}),
+		RunReaperTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_run_reaper_total",
+			Help: "Expired run leases recovered (requeued or failed) by the reaper.",
+		}),
+		RunOwnershipLostTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_run_ownership_lost_total",
+			Help: "Fenced heartbeats that proved the caller no longer owns its run lease.",
+		}),
+		PriorityDispatchTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "studio_priority_dispatch_total",
+			Help: "Run queue messages dispatched by priority class (weighted fair scheduling).",
+		}, []string{"class"}),
+		DeliveryRetryTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_delivery_retry_total",
+			Help: "Feishu delivery attempts requeued with backoff after a send failure.",
+		}),
 	}
 	reg.MustRegister(
 		m.HTTPDuration, m.HTTPRequests, m.SSEActive, m.QueueDepth,
@@ -183,6 +227,8 @@ func NewMetrics(service string) *Metrics {
 		m.DeliverySendsTotal,
 		m.InvariantViolation, m.ProviderLimiterDegraded,
 		m.ProviderInflight, m.ProviderInflightRejected,
+		m.ProviderAdmission, m.RunReaperTotal, m.RunOwnershipLostTotal,
+		m.PriorityDispatchTotal, m.DeliveryRetryTotal,
 	)
 	return m
 }

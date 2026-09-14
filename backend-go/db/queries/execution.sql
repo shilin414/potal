@@ -181,6 +181,16 @@ FROM run_leases
 WHERE run_id = ? AND expires_at <= CURRENT_TIMESTAMP(3)
 FOR UPDATE;
 
+-- name: GetActiveLeaseForUpdate :one
+-- Worker-owned mutations lock and validate the exact live lease after
+-- locking the run row. Expired ownership cannot be revived or used in the
+-- interval before the reaper observes it.
+SELECT id, run_id, worker_id, lease_token, lease_epoch, acquired_at, heartbeat_at, expires_at
+FROM run_leases
+WHERE run_id = ? AND lease_epoch = ? AND lease_token = ?
+  AND expires_at > CURRENT_TIMESTAMP(3)
+FOR UPDATE;
+
 -- name: GetRunForUpdate :one
 -- Lock the run row inside an ownership-verified transaction (finalize /
 -- retry / recovery). Returns the lease_epoch so the caller can verify
@@ -206,11 +216,13 @@ WHERE run_id = ? AND worker_id = ?;
 -- name: HeartbeatLeaseFenced :execresult
 -- Ownership-checked by lease token (not worker_id): a recycled worker id
 -- cannot renew a lease it no longer owns. Extension is DB-clock based, so a
--- skewed worker clock can neither extend nor shorten the lease.
+-- skewed worker clock can neither extend nor shorten the lease. An expired
+-- lease is terminal ownership loss and cannot be revived before the reaper.
 UPDATE run_leases
 SET heartbeat_at = CURRENT_TIMESTAMP(3),
     expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(lease_micros) MICROSECOND)
-WHERE run_id = ? AND lease_token = ?;
+WHERE run_id = ? AND lease_token = ?
+  AND expires_at > CURRENT_TIMESTAMP(3);
 
 -- name: DeleteLease :exec
 DELETE FROM run_leases WHERE run_id = ?;
@@ -253,13 +265,6 @@ SELECT provider FROM provider_admission_locks WHERE provider = ? FOR UPDATE;
 -- never from the application clock (Phase 3).
 SELECT CURRENT_TIMESTAMP(3) AS now;
 
--- name: CountRunningRunAtEpoch :one
--- Ownership probe for provider slot Acquire: only the CURRENT owner of a
--- running run may hold provider capacity, so a stale worker that wakes up
--- after its run was reclaimed/reaped cannot pollute the semaphore.
-SELECT COUNT(*) AS n FROM runs
-WHERE id = ? AND status = 'running' AND lease_epoch = ?;
-
 -- name: DeleteExpiredProviderSlots :execresult
 -- Crash recovery inside Acquire: a worker that died without releasing must
 -- not pin provider capacity beyond its DB-clock lease.
@@ -279,7 +284,8 @@ FOR UPDATE;
 UPDATE provider_execution_slots
 SET heartbeat_at = CURRENT_TIMESTAMP(3),
     expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(lease_micros) MICROSECOND)
-WHERE provider = ? AND run_id = ? AND lease_epoch = ? AND lease_token = ?;
+WHERE provider = ? AND run_id = ? AND lease_epoch = ? AND lease_token = ?
+  AND expires_at > CURRENT_TIMESTAMP(3);
 
 -- name: CountActiveProviderSlots :one
 -- Active = not past its DB-clock expiry.
@@ -375,17 +381,15 @@ WHERE r.trigger_type = 'scheduled'
        OR (r.status IN ('failed', 'cancelled') AND o.status != 'failed'));
 
 -- name: CountMissingDeliveryExecutions :one
--- Invariant L: every enabled target of a succeeded occurrence has a
--- durable delivery execution row. The created_at guard avoids false
--- positives on historical occurrences: a target enabled AFTER the
--- occurrence finished was never supposed to receive it.
+-- Invariant L: every target captured for a succeeded occurrence has a
+-- durable delivery execution row. The expectation is immutable history;
+-- later schedule edits cannot reinterpret an old occurrence.
 SELECT COUNT(*) AS n
-FROM schedule_occurrences o
-JOIN schedule_deliveries d
-  ON d.schedule_id = o.schedule_id AND d.enabled = 1
-  AND d.created_at <= COALESCE(o.finished_at, o.updated_at)
+FROM occurrence_delivery_expectations e
+JOIN schedule_occurrences o ON o.id = e.occurrence_id
 LEFT JOIN delivery_executions de
-  ON de.occurrence_id = o.id AND de.schedule_delivery_id = d.id
+  ON de.occurrence_id = e.occurrence_id
+ AND de.schedule_delivery_id = e.schedule_delivery_id
 WHERE o.status = 'succeeded' AND de.id IS NULL;
 
 -- name: OldestPendingOutboxAgeSeconds :one

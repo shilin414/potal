@@ -88,6 +88,20 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 func (s *Scheduler) q(ctx context.Context) db.Querier { return db.New(s.DB) }
 
+// captureDeliveryExpectations freezes the schedule's enabled destinations
+// for one occurrence. Both statements run in the caller's transaction, so a
+// committed occurrence always has either its complete snapshot (including an
+// explicitly empty one) or no occurrence at all.
+func captureDeliveryExpectations(ctx context.Context, q db.Querier, occurrenceID uint64) error {
+	if err := q.CaptureOccurrenceDeliveryExpectations(ctx, occurrenceID); err != nil {
+		return fmt.Errorf("capture occurrence delivery expectations: %w", err)
+	}
+	if _, err := q.MarkOccurrenceDeliverySnapshotCaptured(ctx, occurrenceID); err != nil {
+		return fmt.Errorf("mark occurrence delivery snapshot: %w", err)
+	}
+	return nil
+}
+
 // ProcessDue runs one scan tick (exported for tests and admin tooling):
 // first admit any pending occurrences (overlap=queue backlog), then fire
 // due schedule slots.
@@ -135,6 +149,9 @@ func (s *Scheduler) recordSlot(ctx context.Context, scheduleID int64, slot time.
 		ScheduleID: uint64(scheduleID), ScheduledAt: slot,
 	})
 	if err != nil {
+		return
+	}
+	if err := captureDeliveryExpectations(ctx, q, occ.ID); err != nil {
 		return
 	}
 	if _, err := q.MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: status, ID: occ.ID}); err != nil {
@@ -337,6 +354,9 @@ func (s *Scheduler) skipPast(ctx context.Context, sch *schedule.Schedule, slot, 
 	} else if occ, err := q.GetScheduleOccurrenceBySlot(ctx, db.GetScheduleOccurrenceBySlotParams{
 		ScheduleID: uint64(sch.ID), ScheduledAt: slot,
 	}); err == nil {
+		if err := captureDeliveryExpectations(ctx, q, occ.ID); err != nil {
+			return err
+		}
 		_, _ = q.MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: schedule.OccSkipped, ID: occ.ID})
 	}
 	if _, err := s.advancePast(ctx, q, sch.ID, slot, now); err != nil {
@@ -487,6 +507,9 @@ func (s *Scheduler) createOccurrenceAndRun(ctx context.Context, sch *schedule.Sc
 	if err != nil {
 		return 0, err
 	}
+	if err := captureDeliveryExpectations(ctx, q, occRow.ID); err != nil {
+		return 0, err
+	}
 
 	if _, err := s.createRunForOccurrenceTx(ctx, tx, sch, occRow.ID, binding, now); err != nil {
 		return 0, err
@@ -572,7 +595,13 @@ func (s *Scheduler) TriggerNow(ctx context.Context, scheduleID, userID int64, is
 // admitPending converts it into a run later.
 func (s *Scheduler) enqueuePendingOccurrence(ctx context.Context, sch *schedule.Schedule) (*schedule.Occurrence, error) {
 	now := s.nowFunc().UTC().Truncate(time.Millisecond)
-	if _, err := s.q(ctx).CreateScheduleOccurrence(ctx, db.CreateScheduleOccurrenceParams{
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := db.New(tx)
+	if _, err := q.CreateScheduleOccurrence(ctx, db.CreateScheduleOccurrenceParams{
 		ScheduleID: uint64(sch.ID), ScheduledAt: now,
 	}); err != nil {
 		if isDuplicate(err) {
@@ -580,10 +609,16 @@ func (s *Scheduler) enqueuePendingOccurrence(ctx context.Context, sch *schedule.
 		}
 		return nil, err
 	}
-	occRow, err := s.q(ctx).GetScheduleOccurrenceBySlot(ctx, db.GetScheduleOccurrenceBySlotParams{
+	occRow, err := q.GetScheduleOccurrenceBySlot(ctx, db.GetScheduleOccurrenceBySlotParams{
 		ScheduleID: uint64(sch.ID), ScheduledAt: now,
 	})
 	if err != nil {
+		return nil, err
+	}
+	if err := captureDeliveryExpectations(ctx, q, occRow.ID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	s.Log.Info("run-now queued behind active occurrence", "schedule_id", sch.ID, "occurrence_id", occRow.ID)
@@ -665,6 +700,12 @@ func (s *Scheduler) admitOne(ctx context.Context, occRow db.ScheduleOccurrence) 
 	}
 	if active2 > 0 {
 		return nil
+	}
+	// Legacy pending occurrences created before the snapshot migration are
+	// captured at their first admission. New occurrences are already marked,
+	// and the query is deliberately idempotent so later edits cannot leak in.
+	if err := captureDeliveryExpectations(ctx, q, occRow.ID); err != nil {
+		return err
 	}
 	if _, err := s.createRunForOccurrenceTx(ctx, tx, sch, occRow.ID, binding, now); err != nil {
 		return err
