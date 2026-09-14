@@ -24,8 +24,10 @@ jobs:
 
       # Workflow lint gate: duplicate YAML keys and invalid workflow
       # structures fail here BEFORE wasting the integration jobs.
+      # Pinned: actionlint publishes no floating major tag (there is no
+      # `v1`), so `@v1` fails at "Set up job".
       - name: actionlint
-        uses: rhysd/actionlint@v1
+        uses: rhysd/actionlint@v1.7.12
 
       - name: gofmt check
         run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
@@ -84,9 +86,13 @@ jobs:
             sleep 2
           done
           mysql -h 127.0.0.1 -P 4000 -u root -e "CREATE DATABASE IF NOT EXISTS xiaoan3_go"
+      # studio-migrate applies migrations and EXITS. `cmd/api -migrate`
+      # would continue into app.Build + the HTTP server: without the
+      # runtime secrets (TOKEN_ENCRYPTION_KEY is unset in CI) the build
+      # fails, and with them it would block on the server.
       - name: apply migrations
         working-directory: backend-go
-        run: go run ./cmd/api -migrate
+        run: go run ./cmd/migrate
       - name: integration tests
         working-directory: backend-go
         run: go test ./tests/integration/... -count=1 -v
@@ -129,7 +135,7 @@ jobs:
           mysql -h 127.0.0.1 -P 3306 -u root -e "SELECT 1"
       - name: apply migrations
         working-directory: backend-go
-        run: go run ./cmd/api -migrate
+        run: go run ./cmd/migrate
       - name: integration tests
         working-directory: backend-go
         run: go test ./tests/integration/... -count=1 -v
