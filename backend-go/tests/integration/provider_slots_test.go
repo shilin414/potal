@@ -9,9 +9,12 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"sync"
@@ -771,6 +774,10 @@ func TestWorkerHoldsRunBackWhenProviderSlotIsFull(t *testing.T) {
 		svc:     svc,
 		calls:   &atomic.Int64{},
 	}
+	// Worker logs are the primary evidence for an admission anomaly, but CI
+	// job logs require authentication; the buffer lets a failure re-emit them
+	// through t.Logf, which the workflow's check annotation captures.
+	logs := &syncLogBuffer{}
 	worker := &execution.Worker{
 		Svc:           svc,
 		RDB:           rdb,
@@ -783,7 +790,7 @@ func TestWorkerHoldsRunBackWhenProviderSlotIsFull(t *testing.T) {
 		Heartbeat:     5 * time.Second,
 		ScanEvery:     time.Second, // re-claims the admission-requeued run
 		ReclaimAfter:  time.Minute,
-		Log:           testLogger(),
+		Log:           slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})),
 		ProviderSlots: slots,
 	}
 	go worker.Run(ctx)
@@ -811,11 +818,22 @@ func TestWorkerHoldsRunBackWhenProviderSlotIsFull(t *testing.T) {
 		if !held.IsZero() {
 			break
 		}
+		// Two overlapping provider executions with max_inflight=1 is a
+		// capacity violation by construction — fail fast with the evidence
+		// instead of waiting out the deadline.
+		if handler.maxConcurrent() > 1 {
+			diag := admissionFacts(t, svc, handler, provider, runA, runB)
+			dumpWorkerLogs(t, logs)
+			t.Fatalf("provider admission admitted %d concurrent executions with max_inflight=1: %s",
+				handler.maxConcurrent(), diag)
+		}
 		if time.Now().After(deadline) {
 			runAState, _ := svc.GetRun(ctx, runA)
 			runBState, _ := svc.GetRun(ctx, runB)
-			t.Fatalf("neither run was held back for provider admission (A=%s B=%s, handler calls=%d)",
-				runAState.Status, runBState.Status, handler.calls.Load())
+			diag := admissionFacts(t, svc, handler, provider, runA, runB)
+			dumpWorkerLogs(t, logs)
+			t.Fatalf("neither run was held back for provider admission (A=%s B=%s, handler calls=%d): %s",
+				runAState.Status, runBState.Status, handler.calls.Load(), diag)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -872,6 +890,122 @@ func TestWorkerHoldsRunBackWhenProviderSlotIsFull(t *testing.T) {
 			t.Fatalf("run %s executed %d times, want exactly 1", runID, got)
 		}
 	}
+}
+
+// syncLogBuffer captures worker logs (slog sink) so a failing run can re-emit
+// the tail through t.Logf.
+type syncLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// tail returns up to n non-empty lines, newest last, each length-capped.
+func (b *syncLogBuffer) tail(n int) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	lines := strings.Split(strings.TrimRight(b.buf.String(), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(line) > 200 {
+			line = line[len(line)-200:]
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
+// dumpWorkerLogs re-emits the worker's recent warnings as test log lines: CI
+// job logs need authentication, so the check annotation is the only window.
+func dumpWorkerLogs(t *testing.T, logs *syncLogBuffer) {
+	t.Helper()
+	for _, line := range logs.tail(4) {
+		t.Logf("worker log: %s", line)
+	}
+}
+
+// admissionFacts renders the provider admission state as one compact line:
+// handler counters, the durable slot rows (epoch + remaining lease) and each
+// run's status/attempt/epoch/lease/events. A negative slot or lease remainder
+// means the DB clock already considers that row expired.
+func admissionFacts(t *testing.T, svc *execution.Service, handler *blockingHandler, provider string, runs ...ids.ID) string {
+	t.Helper()
+	ctx := context.Background()
+	var b strings.Builder
+	fmt.Fprintf(&b, "calls=%d act=%d max=%d", handler.entered(), handler.activeEntries(), handler.maxConcurrent())
+
+	if rows, err := svc.DB.QueryContext(ctx,
+		`SELECT lease_epoch, TIMESTAMPDIFF(MICROSECOND, CURRENT_TIMESTAMP(3), expires_at), run_id
+		 FROM provider_execution_slots WHERE provider = ?`, provider); err == nil {
+		slots := make([]string, 0, 4)
+		for rows.Next() {
+			var epoch uint64
+			var remaining int64
+			var runID []byte
+			if err := rows.Scan(&epoch, &remaining, &runID); err != nil {
+				continue
+			}
+			id := ids.ID{}
+			_ = id.Scan(runID)
+			slots = append(slots, fmt.Sprintf("%s@e%d%+dms", shortID(id), epoch, remaining/1000))
+		}
+		rows.Close()
+		fmt.Fprintf(&b, " slots=[%s]", strings.Join(slots, ","))
+	}
+
+	for i, runID := range runs {
+		status := "?"
+		attempt := int64(-1)
+		if run, err := svc.GetRun(ctx, runID); err == nil {
+			status, attempt = run.Status, run.Attempt
+		}
+		var epoch uint64
+		_ = svc.DB.QueryRowContext(ctx, `SELECT lease_epoch FROM runs WHERE id = ?`, runID.Bytes()).Scan(&epoch)
+		var leaseRemaining sql.NullInt64
+		_ = svc.DB.QueryRowContext(ctx,
+			`SELECT TIMESTAMPDIFF(MICROSECOND, CURRENT_TIMESTAMP(3), expires_at) FROM run_leases WHERE run_id = ?`,
+			runID.Bytes()).Scan(&leaseRemaining)
+		lease := "none"
+		if leaseRemaining.Valid {
+			lease = fmt.Sprintf("%+dms", leaseRemaining.Int64/1000)
+		}
+		events, _ := svc.ListEventsAfter(ctx, runID, 0)
+		kinds := make([]string, 0, len(events))
+		for _, ev := range events {
+			kind := ev.EventType
+			if ev.EventType == execution.EventRunRetrying {
+				if r, ok := ev.Payload["reason"].(string); ok {
+					kind += ":" + r
+				}
+			}
+			kinds = append(kinds, kind)
+		}
+		fmt.Fprintf(&b, " %c=%s/a%d/ep%d/l%s/%s[%s]",
+			'A'+rune(i), status, attempt, epoch, lease, shortID(runID), strings.Join(kinds, ","))
+	}
+	return b.String()
+}
+
+// shortID is the first 8 characters of a UUID — enough to correlate runs with
+// slot rows in a compact diagnostic line.
+func shortID(id ids.ID) string {
+	s := id.String()
+	if len(s) > 8 {
+		return s[:8]
+	}
+	return s
 }
 
 // reasonOf reports which of the two runs was last requeued for provider

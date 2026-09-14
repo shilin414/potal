@@ -139,8 +139,13 @@ jobs:
           set -uo pipefail
           if ! out=$(go test ./tests/integration/... -count=1 -v 2>&1); then
             printf '%s\n' "$out"
-            msg=$(printf '%s' "$out" | grep -E '^(--- FAIL|FAIL|panic:|\s+.*_test\.go:)' | tr '\n' ' ' | tr -s ' ' | tail -c 900)
-            echo "::error title=integration tests failed::$msg"
+            # Job logs need authentication; the annotation is the only failure
+            # surface a CI-only reader sees. Keep a short summary AND the
+            # failing test's own log lines (the test re-emits worker warnings
+            # through t.Logf for exactly this reason).
+            summary=$(printf '%s' "$out" | grep -E '^(--- FAIL|FAIL|panic:)' | tr '\n' ' ' | tr -s ' ' | tail -c 300)
+            context=$(printf '%s' "$out" | grep -B 6 '^--- FAIL' | grep -E '^\s+\S+_test\.go:' | tr '\n' ' ' | tr -s ' ' | tail -c 600)
+            echo "::error title=integration tests failed::$summary :: $context"
             exit 1
           fi
           printf '%s\n' "$out" | tail -40
@@ -204,8 +209,9 @@ jobs:
           set -uo pipefail
           if ! out=$(go test ./tests/integration/... -count=1 -v 2>&1); then
             printf '%s\n' "$out"
-            msg=$(printf '%s' "$out" | grep -E '^(--- FAIL|FAIL|panic:|\s+.*_test\.go:)' | tr '\n' ' ' | tr -s ' ' | tail -c 900)
-            echo "::error title=integration tests failed (mysql57)::$msg"
+            summary=$(printf '%s' "$out" | grep -E '^(--- FAIL|FAIL|panic:)' | tr '\n' ' ' | tr -s ' ' | tail -c 300)
+            context=$(printf '%s' "$out" | grep -B 6 '^--- FAIL' | grep -E '^\s+\S+_test\.go:' | tr '\n' ' ' | tr -s ' ' | tail -c 600)
+            echo "::error title=integration tests failed (mysql57)::$summary :: $context"
             exit 1
           fi
           printf '%s\n' "$out" | tail -40
