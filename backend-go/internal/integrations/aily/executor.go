@@ -76,6 +76,18 @@ func (e *Executor) Execute(ctx context.Context, claimed *execution.ClaimedRun) e
 		return e.failRun(ctx, claimed, "aily_rate_limit", "waiting for provider rate limit cancelled")
 	}
 
+	// Attempt accounting (P0-2): attempt counts PROVIDER EXECUTIONS. The
+	// claim no longer consumes one, and neither does provider admission —
+	// only reaching this point (auth resolved, rate limit granted, about
+	// to submit) does.
+	if err := e.Owned.BeginProviderAttempt(ctx, claimed); err != nil {
+		if errors.Is(err, execution.ErrProviderAttemptsExhausted) {
+			return e.failRun(ctx, claimed, "aily_attempts_exhausted",
+				"provider retry budget exhausted before submit")
+		}
+		return err // ErrLostOwnership → stop writing
+	}
+
 	if run.ExecutionMode() == "interactive" {
 		if err := e.executeStreaming(ctx, claimed, auth, agentID); err != nil {
 			return e.classifyError(ctx, claimed, err)

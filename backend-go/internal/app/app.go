@@ -120,6 +120,9 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 	}
 
 	runs := execution.NewService(dbh, rdb, log, metrics)
+	// Retry timing has ONE source of truth: the run's available_at and the
+	// dispatch outbox row share now+RequeueDelay (P1-2).
+	runs.RequeueDelay = cfg.Runner.RequeueDelay
 
 	// Aily provider wiring: adapter + executor + limiters.
 	ailyAuth := &aily.AuthResolver{
@@ -163,6 +166,21 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 	schedSvc := schedule.NewService(dbh, &schedulableChecker{Catalog: catalogSvc}, log)
 	schedJob := scheduler.New(dbh, runs, &bindingResolver{Catalog: catalogSvc}, log, metrics)
 
+	// Provider concurrency cap: the provider catalog row is the source of
+	// truth; AILY_MAX_INFLIGHT is only a bootstrap/default (and a
+	// deliberate override when the catalog row is absent or zero).
+	maxInflight := cfg.Aily.MaxInflight
+	if p, err := catalogRepo.ProviderByKey(ctx, "feishu_aily"); err == nil && p != nil && p.MaxInflight > 0 {
+		if p.MaxInflight != maxInflight {
+			log.Info("provider max_inflight from catalog policy",
+				"provider", p.Key, "policy", p.MaxInflight, "env_default", maxInflight)
+		}
+		maxInflight = p.MaxInflight
+	} else {
+		log.Info("provider max_inflight from env bootstrap",
+			"provider", "feishu_aily", "value", maxInflight)
+	}
+
 	return &App{
 		Cfg: cfg, Log: log, DB: dbh, Redis: rdb, Metrics: metrics, Storage: st,
 		IdentityRepo: identityRepo, Sessions: sessions, StateCodec: stateCodec,
@@ -171,7 +189,7 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 		Runs: runs, ArtifactsRL: ailyExecutor.ArtifactsL, AilyExecutor: ailyExecutor,
 		Schedules: schedSvc, Scheduler: schedJob,
 		DeliveryDispatch: disp, DeliverySender: feishuSender, DeliveryLimiter: deliveryLimiter,
-		ProviderInflight: execution.NewInflightLimiter(rdb, "feishu_aily", cfg.Aily.MaxInflight, cfg.Runner.LeaseSeconds),
+		ProviderInflight: execution.NewInflightLimiter(rdb, "feishu_aily", maxInflight, cfg.Runner.LeaseSeconds),
 	}, nil
 }
 

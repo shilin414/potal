@@ -95,8 +95,10 @@ func TestCASRaceSingleWinner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if run.Status != execution.StatusRunning || run.Attempt != 1 {
-		t.Fatalf("status=%s attempt=%d, want running/1", run.Status, run.Attempt)
+	if run.Status != execution.StatusRunning || run.Attempt != 0 {
+		// attempt counts PROVIDER EXECUTIONS, not claims (P0-2): a claim
+		// that never reached the provider must not consume retry budget.
+		t.Fatalf("status=%s attempt=%d, want running/0 (claim must not consume an attempt)", run.Status, run.Attempt)
 	}
 }
 
@@ -115,7 +117,9 @@ func TestDuplicateQueueMessagesNoDoubleExecution(t *testing.T) {
 
 	execCalls := atomic.Int64{}
 	group := fmt.Sprintf("itest-%d", time.Now().UnixNano())
-	stream := execution.QueueStream(rdb, provider)
+	// Workers consume the per-priority streams (weighted admission), so
+	// the fixture publishes to the interactive class stream.
+	stream := execution.PriorityStream(rdb, provider, execution.PriorityClassInteractive)
 	// Pre-create the group so the published messages are readable by ">".
 	setupCtx, cancelSetup := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancelSetup()
@@ -218,15 +222,21 @@ func (h countingHandler) Execute(ctx context.Context, claimed *execution.Claimed
 }
 
 // TestLeaseExpiryAndReaper: a claimed run whose worker dies (lease never
-// renewed) is requeued by the reaper with attempts retained, and fails
-// once attempts are exhausted.
+// renewed) is requeued by the reaper with its PROVIDER ATTEMPTS retained,
+// and fails once attempts are exhausted. attempt counts provider
+// executions (BeginProviderAttemptOwned), never claims (P0-2).
 func TestLeaseExpiryAndReaper(t *testing.T) {
 	svc, _ := testEnv(t)
 	ctx := context.Background()
 	runID := seedRun(t, svc, "itest_closure")
 
-	if _, won, err := svc.ClaimRun(ctx, runID, "dead-worker", 120*time.Second); err != nil || !won {
+	claimed, won, err := svc.ClaimRun(ctx, runID, "dead-worker", 120*time.Second)
+	if err != nil || !won {
 		t.Fatalf("claim: won=%v err=%v", won, err)
+	}
+	// The worker reached the provider, then died.
+	if _, err := svc.BeginProviderAttemptOwned(ctx, claimed.Ownership); err != nil {
+		t.Fatalf("begin provider attempt: %v", err)
 	}
 	// Simulate the worker dying: force the lease into the past.
 	if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
@@ -254,10 +264,15 @@ func TestLeaseExpiryAndReaper(t *testing.T) {
 		t.Fatalf("attempt = %d, want retained 1", run.Attempt)
 	}
 
-	// Exhaust attempts: claim + expire twice more → third expiry fails it.
+	// Exhaust attempts: claim + reach the provider + die, twice more →
+	// the third expiry fails the run.
 	for i := 0; i < 2; i++ {
-		if _, won, err := svc.ClaimRun(ctx, runID, "dead-worker", 120*time.Second); err != nil || !won {
+		claimed, won, err := svc.ClaimRun(ctx, runID, "dead-worker", 120*time.Second)
+		if err != nil || !won {
 			t.Fatalf("reclaim %d: won=%v err=%v", i, won, err)
+		}
+		if _, err := svc.BeginProviderAttemptOwned(ctx, claimed.Ownership); err != nil {
+			t.Fatalf("begin provider attempt %d: %v", i, err)
 		}
 		if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
 			t.Fatal(err)

@@ -164,9 +164,13 @@ func (w *Worker) process(ctx context.Context, msg goredis.XMessage) {
 		ID:     id.Bytes(),
 	}); err != nil {
 		w.Log.Error("delivery finish failed", "delivery_id", raw, "err", err)
-	} else if w.Metrics != nil {
-		w.Metrics.DeliveryDuration.WithLabelValues(ChannelFeishu, schedule.DeliverySucceeded).
-			Observe(time.Since(started).Seconds())
+	} else {
+		if w.Metrics != nil {
+			w.Metrics.DeliveryDuration.WithLabelValues(ChannelFeishu, schedule.DeliverySucceeded).
+				Observe(time.Since(started).Seconds())
+			w.Metrics.DeliverySendsTotal.
+				WithLabelValues(ChannelFeishu, "keyed").Inc()
+		}
 	}
 	w.ack(ctx, msg.ID)
 }
@@ -195,8 +199,16 @@ func (w *Worker) send(ctx context.Context, row db.DeliveryExecution) error {
 	_ = json.Unmarshal(run.Output, &output)
 	answer, _ := output["text"].(string)
 	text := BuildDeliveryText(sch.Name, answer)
-	return w.Sender.Send(ctx, int64(row.SenderUserID), Target{
-		Type: row.TargetType, ID: row.TargetID, Content: text,
+	// Idempotency key = the DeliveryExecution id: stable across every
+	// retry of this delivery, so adapters can dedupe natively where the
+	// provider supports it and ops can correlate duplicate sends where it
+	// does not (at-least-once external side effect).
+	execID := ids.ID(row.ID)
+	return w.Sender.Send(ctx, DeliveryRequest{
+		ExecutionID:    execID,
+		SenderUserID:   int64(row.SenderUserID),
+		Target:         Target{Type: row.TargetType, ID: row.TargetID, Content: text},
+		IdempotencyKey: execID.String(),
 	})
 }
 

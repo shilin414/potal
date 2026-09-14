@@ -88,6 +88,19 @@ func (w *WorkerOwnedService) Retry(ctx context.Context, claimed *ClaimedRun, rea
 	return w.svc.RetryOwnedRun(ctx, claimed.Run, claimed.Ownership, reason)
 }
 
+// BeginProviderAttempt consumes one provider execution attempt under the
+// ownership fence and updates the in-memory claim so the executor's
+// retry-budget decisions see the fresh count (P0-2). Call it immediately
+// before the provider submit, never at claim time.
+func (w *WorkerOwnedService) BeginProviderAttempt(ctx context.Context, claimed *ClaimedRun) error {
+	attempt, err := w.svc.BeginProviderAttemptOwned(ctx, claimed.Ownership)
+	if err != nil {
+		return err
+	}
+	claimed.Run.Attempt = attempt
+	return nil
+}
+
 // Fail drives the run into the terminal failed state.
 func (w *WorkerOwnedService) Fail(ctx context.Context, claimed *ClaimedRun, errorCode, message string) error {
 	return w.svc.FailOwnedRun(ctx, claimed.Run, claimed.Ownership, errorCode, message)

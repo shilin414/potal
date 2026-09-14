@@ -79,7 +79,11 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 			terminalPayload["text"] = t
 		}
 	}
-	sequence, err := appendEventTx(ctx, tx, own.RunID, own.LeaseEpoch, terminalEventName(in.Status), terminalPayload)
+	terminalEvent, err := terminalEventName(in.Status)
+	if err != nil {
+		return err
+	}
+	sequence, err := appendEventTx(ctx, tx, own.RunID, own.LeaseEpoch, terminalEvent, terminalPayload)
 	if err != nil {
 		return err
 	}
@@ -144,7 +148,7 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 	}
 
 	// ── post-commit side effects (best-effort, never correctness) ──
-	s.publishLive(ctx, own.RunID, sequence, terminalEventName(in.Status), terminalPayload)
+	s.publishLive(ctx, own.RunID, sequence, terminalEvent, terminalPayload)
 	if s.Metrics != nil {
 		s.Metrics.RunTotal.WithLabelValues(run.Provider, in.Status).Inc()
 		if !run.StartedAt.IsZero() {
@@ -169,16 +173,20 @@ func (s *Service) FailOwnedRun(ctx context.Context, run *Run, own ExecutionOwner
 // terminalEventName maps a terminal status to its terminal event. The
 // legacy interrupted status maps to run.failed — retry never produces a
 // terminal event (修复计划 §16: terminal events must be unique).
-func terminalEventName(status string) string {
+//
+// An unknown status is a programming error and returns
+// ErrInvalidTerminalStatus. Defaulting it to "success" would let a bug
+// fabricate a run.completed event for a state nobody defined.
+func terminalEventName(status string) (string, error) {
 	switch status {
 	case StatusSucceeded:
-		return EventRunCompleted
+		return EventRunCompleted, nil
 	case StatusCancelled:
-		return EventRunCancelled
+		return EventRunCancelled, nil
 	case StatusFailed, StatusInterrupted:
-		return EventRunFailed
+		return EventRunFailed, nil
 	default:
-		return EventRunCompleted
+		return "", ErrInvalidTerminalStatus
 	}
 }
 

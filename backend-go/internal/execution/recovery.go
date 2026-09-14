@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"time"
 
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
@@ -116,14 +117,15 @@ func (s *Service) recoverExpiredLeaseTx(ctx context.Context, runID ids.ID) (bool
 	var eventType string
 	var eventPayload map[string]any
 	if row.Attempt < row.MaxAttempts {
-		// Retry: running → queued + run.retrying (non-terminal).
+		// Retry: running → queued + run.retrying (non-terminal). The
+		// requeue instant is shared with the dispatch outbox row so the
+		// worker is woken exactly when the run becomes claimable (P1-2).
+		retryAt := time.Now().UTC().Add(s.requeueDelay())
 		if _, err := q.RequeueRunFenced(ctx, db.RequeueRunFencedParams{
-			ID:         runID.Bytes(),
-			LeaseEpoch: row.LeaseEpoch,
+			AvailableAt: sql.NullTime{Time: retryAt, Valid: true},
+			ID:          runID.Bytes(),
+			LeaseEpoch:  row.LeaseEpoch,
 		}); err != nil {
-			return false, err
-		}
-		if err := q.SetRunImmediatelyAvailable(ctx, runID.Bytes()); err != nil {
 			return false, err
 		}
 		eventType = EventRunRetrying
@@ -132,19 +134,23 @@ func (s *Service) recoverExpiredLeaseTx(ctx context.Context, runID ids.ID) (bool
 			"max_attempts": row.MaxAttempts,
 			"reason":       "lease_expired",
 			"worker_id":    lease.WorkerID,
+			"retry_at":     retryAt.Format(time.RFC3339Nano),
 		}
 		sequence, err = appendEventTx(ctx, tx, runID, 0, eventType, eventPayload)
 		if err != nil {
 			return false, err
 		}
 		payloadRaw, _ := json.Marshal(map[string]any{
-			"run_id": runID.String(), "provider": providerOfRun(ctx, q, runID),
+			"run_id":         runID.String(),
+			"provider":       providerOfRun(ctx, q, runID),
+			"priority_class": PriorityClassRetry,
 		})
-		if _, err := q.CreateOutboxEvent(ctx, db.CreateOutboxEventParams{
+		if _, err := q.CreateOutboxEventAt(ctx, db.CreateOutboxEventAtParams{
 			Aggregate:   "run",
 			AggregateID: runID.Bytes(),
 			EventType:   "run.dispatch",
 			Payload:     dbtypes.JSONText(payloadRaw),
+			AvailableAt: retryAt,
 		}); err != nil {
 			return false, err
 		}

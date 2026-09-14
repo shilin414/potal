@@ -21,14 +21,13 @@ func TestGCRAAgainstRealRedis(t *testing.T) {
 	if os.Getenv("STUDIO_TEST_REDIS") != "1" {
 		t.Skip("set STUDIO_TEST_REDIS=1 to run against real Redis")
 	}
-	cfg := &config.RedisConfig{
-		Host: os.Getenv("REDIS_HOST"), Port: 6380,
-		Password: os.Getenv("REDIS_PASSWORD"), DB: 2, KeyPrefix: "xiaoan3",
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config: %v", err)
 	}
-	if cfg.Host == "" {
-		cfg.Host = "192.168.211.239"
-	}
-	rdb, err := redisx.Open(context.Background(), *cfg)
+	// config.Load reads .env.local, so the shared dev Redis (host, port AND
+	// password) is used exactly as the binaries use it.
+	rdb, err := redisx.Open(context.Background(), cfg.Redis)
 	if err != nil {
 		t.Fatalf("redis: %v", err)
 	}

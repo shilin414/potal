@@ -93,10 +93,13 @@ type FeishuConfig struct {
 type AilyConfig struct {
 	BaseURL              string
 	StartRateLimitPerSec int
-	MaxInflight          int
-	PollBackoff          []time.Duration
-	StreamTimeout        time.Duration
-	RequestTimeout       time.Duration
+	// MaxInflight is the BOOTSTRAP / override value for the provider-wide
+	// concurrency cap. The provider catalog row (providers.max_inflight)
+	// is authoritative when present — see app.Build.
+	MaxInflight    int
+	PollBackoff    []time.Duration
+	StreamTimeout  time.Duration
+	RequestTimeout time.Duration
 }
 
 type RunnerConfig struct {
@@ -108,6 +111,9 @@ type RunnerConfig struct {
 	ReaperInterval    time.Duration
 	RelayInterval     time.Duration
 	RequeueDelay      time.Duration
+	// PriorityWeights is the weighted fair scheduling share of
+	// [interactive, retry, scheduled] class streams.
+	PriorityWeights []int
 }
 
 type SessionConfig struct {
@@ -199,6 +205,7 @@ func Load(searchPaths ...string) (*Config, error) {
 			ReaperInterval:    getEnvDuration("RUN_REAPER_INTERVAL", 20*time.Second),
 			RelayInterval:     getEnvDuration("OUTBOX_RELAY_INTERVAL", 500*time.Millisecond),
 			RequeueDelay:      getEnvDuration("RUN_REQUEUE_DELAY", 5*time.Second),
+			PriorityWeights:   parseWeights(getEnv("RUN_PRIORITY_WEIGHTS", "7,1,2")),
 		},
 		Session: SessionConfig{
 			TTL:        getEnvDuration("SESSION_TTL", 12*time.Hour),
@@ -371,6 +378,28 @@ func parseBackoff(s string) []time.Duration {
 	}
 	if len(out) == 0 {
 		out = []time.Duration{1 * time.Second, 2 * time.Second, 3 * time.Second, 5 * time.Second}
+	}
+	return out
+}
+
+// parseWeights parses "interactive,retry,scheduled" shares (RUN_PRIORITY_WEIGHTS)
+// in execution.Worker's class order. Invalid input falls back to 7/1/2 so a
+// typo can never disable weighted scheduling.
+func parseWeights(s string) []int {
+	parts := strings.Split(s, ",")
+	if len(parts) != 3 {
+		return []int{7, 1, 2}
+	}
+	out := make([]int, 0, 3)
+	for _, part := range parts {
+		n, err := strconv.Atoi(strings.TrimSpace(part))
+		if err != nil || n < 0 {
+			return []int{7, 1, 2}
+		}
+		out = append(out, n)
+	}
+	if out[0]+out[1]+out[2] == 0 {
+		return []int{7, 1, 2}
 	}
 	return out
 }

@@ -143,7 +143,11 @@ func (s *Service) BindProviderSessionOwned(ctx context.Context, own ExecutionOwn
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	n, raErr := res.RowsAffected()
+	if raErr != nil {
+		return raErr
+	}
+	if n == 0 {
 		// Distinguish idempotent re-bind (same session) from an owner
 		// re-binding a NEW session (the old one belongs to a dead
 		// attempt — e.g. the previous worker's lease expired mid-flight).

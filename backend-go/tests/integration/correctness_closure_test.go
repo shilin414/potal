@@ -150,8 +150,16 @@ func TestReaperRecoveryAtomicFail(t *testing.T) {
 	runID := seedRun(t, svc, "itest_closure")
 
 	for i := 0; i < 3; i++ { // max_attempts = 3
-		if _, won, err := svc.ClaimRun(ctx, runID, "dead-worker", time.Minute); err != nil || !won {
+		claimed, won, err := svc.ClaimRun(ctx, runID, "dead-worker", time.Minute)
+		if err != nil || !won {
 			t.Fatalf("claim %d: won=%v err=%v", i, won, err)
+		}
+		// attempt counts PROVIDER EXECUTIONS (P0-2): the claim alone no
+		// longer burns retry budget, so the dead worker must have reached
+		// the provider — exactly what the executor does right before the
+		// submit.
+		if _, err := svc.BeginProviderAttemptOwned(ctx, claimed.Ownership); err != nil {
+			t.Fatalf("begin provider attempt %d: %v", i, err)
 		}
 		if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
 			t.Fatalf("force expire %d: %v", i, err)

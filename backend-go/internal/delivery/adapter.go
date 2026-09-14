@@ -7,6 +7,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
 )
 
 // Channel / identity / content constants (first stage scope).
@@ -34,8 +36,29 @@ type Target struct {
 }
 
 // Sender delivers one message to one target.
+//
+// Delivery semantics: AT LEAST ONCE. The database side is exactly-once
+// per DeliveryExecution (CAS claim), but the external send is a side
+// effect outside any transaction: a crash between "provider accepted the
+// send" and "CAS → succeeded" makes the reclaimer retry, and the user may
+// see the message twice. DeliveryRequest carries a stable
+// IdempotencyKey (= DeliveryExecution.ID) so adapters can (a) pass it to
+// providers that support native idempotency, or (b) log/correlate
+// duplicates. Feishu IM in v1 has no idempotency parameter, so this
+// adapter is explicitly at-least-once.
 type Sender interface {
-	Send(ctx context.Context, senderUserID int64, t Target) error
+	Send(ctx context.Context, req DeliveryRequest) error
+}
+
+// DeliveryRequest is one delivery attempt.
+type DeliveryRequest struct {
+	ExecutionID ids.ID
+	// SenderUserID is the user whose UAT sends the message.
+	SenderUserID int64
+	Target       Target
+	// IdempotencyKey is stable across retries of the same
+	// DeliveryExecution (= ExecutionID as a canonical string).
+	IdempotencyKey string
 }
 
 // UATResolver returns the owner's user access token.
@@ -55,17 +78,22 @@ type FeishuSender struct {
 }
 
 // Send implements Sender. receive_id_type follows the target type.
-func (s *FeishuSender) Send(ctx context.Context, senderUserID int64, t Target) error {
-	token, err := s.Auth.UserAccessToken(ctx, senderUserID)
+//
+// Feishu IM (im/v1/messages) accepts no idempotency parameter, so the
+// key is recorded for observability only: duplicate deliveries caused by
+// a crash between send and CAS are inherent to the at-least-once model
+// and are observable through studio_delivery_send_total{idempotency}.
+func (s *FeishuSender) Send(ctx context.Context, req DeliveryRequest) error {
+	token, err := s.Auth.UserAccessToken(ctx, req.SenderUserID)
 	if err != nil {
 		return fmt.Errorf("delivery: owner uat: %w", err)
 	}
 	idType := "open_id"
-	if t.Type == TargetChat {
+	if req.Target.Type == TargetChat {
 		idType = "chat_id"
 	}
-	content, _ := marshalJSON(map[string]string{"text": t.Content})
-	return s.Client.SendIMMessage(ctx, token, idType, t.ID, "text", string(content))
+	content, _ := marshalJSON(map[string]string{"text": req.Target.Content})
+	return s.Client.SendIMMessage(ctx, token, idType, req.Target.ID, "text", string(content))
 }
 
 // BuildDeliveryText renders the delivered message body: a schedule header

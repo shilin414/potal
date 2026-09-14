@@ -15,6 +15,11 @@ type Querier interface {
 	// Late-attachment race guard: only while queued.
 	AppendUserAttachmentToRunInput(ctx context.Context, arg AppendUserAttachmentToRunInputParams) (sql.Result, error)
 	ApplicationSlugExists(ctx context.Context, slug string) (int64, error)
+	// Consumes ONE provider execution attempt, fenced by the current lease
+	// epoch. Called by the owner right before the provider submit; claim /
+	// admission requeues never touch attempt. attempt < max_attempts is
+	// checked under the run row lock in Go (BeginProviderAttemptOwned).
+	BeginProviderAttemptFenced(ctx context.Context, arg BeginProviderAttemptFencedParams) (sql.Result, error)
 	BindAgentThreadSession(ctx context.Context, arg BindAgentThreadSessionParams) error
 	// Set-once session bind (修复计划 §27-28): binding succeeds when the
 	// remote_id is empty OR already equals the value (idempotent re-bind by
@@ -29,6 +34,11 @@ type Querier interface {
 	// CAS claim: exactly one worker wins; affected_rows == 1 means success.
 	// lease_epoch bump is the fencing token: every later write by the winning
 	// worker must match the new epoch, so stale workers lose ownership.
+	// NOTE (Provider Admission & Release Gate): the claim deliberately does
+	// NOT increment attempt — attempt counts PROVIDER EXECUTIONS, not claims.
+	// Provider admission requeues (inflight limit / limiter outage) must not
+	// burn retry budget; only BeginProviderAttemptFenced consumes an attempt,
+	// immediately before the provider submit.
 	CASClaimRun(ctx context.Context, id []byte) (sql.Result, error)
 	CASFinishDelivery(ctx context.Context, arg CASFinishDeliveryParams) (sql.Result, error)
 	// Run terminal fan-out: occurrence converges with the run's outcome
@@ -48,7 +58,9 @@ type Querier interface {
 	CountConversationByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
 	CountMessagesByConversation(ctx context.Context, conversationID uint64) (int64, error)
 	// Invariant L: every enabled target of a succeeded occurrence has a
-	// durable delivery execution row.
+	// durable delivery execution row. The created_at guard avoids false
+	// positives on historical occurrences: a target enabled AFTER the
+	// occurrence finished was never supposed to receive it.
 	CountMissingDeliveryExecutions(ctx context.Context) (int64, error)
 	CountPendingOutbox(ctx context.Context) (int64, error)
 	// Invariant B: a queued run must NOT hold a lease.
@@ -92,6 +104,11 @@ type Querier interface {
 	CreateFeishuIdentity(ctx context.Context, arg CreateFeishuIdentityParams) (sql.Result, error)
 	CreateMessage(ctx context.Context, arg CreateMessageParams) (sql.Result, error)
 	CreateOutboxEvent(ctx context.Context, arg CreateOutboxEventParams) (sql.Result, error)
+	// Delayed-publish variant: the row stays invisible to the relay until
+	// retryAt. Run.available_at and outbox availability share one timestamp
+	// so a retried run is dispatched exactly when it becomes claimable
+	// (P1-2) — no earlier, no later.
+	CreateOutboxEventAt(ctx context.Context, arg CreateOutboxEventAtParams) (sql.Result, error)
 	// ─────────────────────────────────────────────────────────── execution ──
 	CreateRun(ctx context.Context, arg CreateRunParams) (sql.Result, error)
 	CreateRunArtifact(ctx context.Context, arg CreateRunArtifactParams) error
@@ -244,13 +261,17 @@ type Querier interface {
 	ReclaimStuckDeliveries(ctx context.Context, updatedAt time.Time) (sql.Result, error)
 	RequeueDelivery(ctx context.Context, arg RequeueDeliveryParams) (sql.Result, error)
 	RequeueRun(ctx context.Context, id []byte) error
+	// available_at is an explicit param: Run.available_at and the outbox
+	// row's available_at MUST carry the same retryAt (P1-2: a hardcoded
+	// INTERVAL here desynchronized run availability from outbox publishing,
+	// so a redispatched run was invisible to the CAS until the fallback scan
+	// found it ~20s later).
 	RequeueRunFenced(ctx context.Context, arg RequeueRunFencedParams) (sql.Result, error)
 	RevokeConversationShare(ctx context.Context, arg RevokeConversationShareParams) error
 	RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) error
 	SetApplicationEnabled(ctx context.Context, arg SetApplicationEnabledParams) error
 	SetAttachmentUploaded(ctx context.Context, arg SetAttachmentUploadedParams) error
 	SetDefaultAgent(ctx context.Context, id uint64) error
-	SetRunImmediatelyAvailable(ctx context.Context, id []byte) error
 	// Lazy binding for conversation_policy=reuse on first run.
 	SetScheduleConversation(ctx context.Context, arg SetScheduleConversationParams) (sql.Result, error)
 	SetScheduleEnabled(ctx context.Context, arg SetScheduleEnabledParams) (sql.Result, error)

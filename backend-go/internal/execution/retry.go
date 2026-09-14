@@ -2,7 +2,9 @@ package execution
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"time"
 
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
@@ -12,12 +14,18 @@ import (
 // transaction (修复计划 §19-20, Phase 2):
 //
 //  1. verify ownership (run row locked FOR UPDATE, epoch checked)
-//  2. CAS runs running → queued
+//  2. CAS runs running → queued with available_at = retryAt
 //  3. append run.retrying (NON-terminal — SSE stays open, the frontend
 //     keeps streaming; 评测 §八 lifecycle semantics)
-//  4. INSERT outbox run.dispatch (wakes a worker for the next attempt)
+//  4. INSERT outbox run.dispatch with the SAME retryAt as available_at —
+//     Run availability and outbox publishing must never diverge (P1-2:
+//     publishing immediately made the woken worker lose the CAS against
+//     its own not-yet-available run and wait for the fallback scan)
 //  5. DELETE the caller's own lease row
 //     COMMIT
+//
+// retryAt = now + Service.RequeueDelay (RUN_REQUEUE_DELAY), so retry
+// timing has exactly one source of truth.
 //
 // Idempotency: a run already requeued by the same owner (duplicate
 // dispatch) or already terminal is a no-op returning nil. A run owned by
@@ -25,6 +33,12 @@ import (
 // requeue the new owner's run, never create a duplicate dispatch and
 // never drop the new owner's lease (评测 §九).
 func (s *Service) RetryOwnedRun(ctx context.Context, run *Run, own ExecutionOwnership, reason string) error {
+	return s.RetryOwnedRunAt(ctx, run, own, reason, time.Now().UTC().Add(s.requeueDelay()))
+}
+
+// RetryOwnedRunAt is RetryOwnedRun with an explicit retry instant (both
+// the run's available_at and the outbox row use it).
+func (s *Service) RetryOwnedRunAt(ctx context.Context, run *Run, own ExecutionOwnership, reason string, retryAt time.Time) error {
 	if !own.Valid() {
 		return ErrLostOwnership
 	}
@@ -42,10 +56,11 @@ func (s *Service) RetryOwnedRun(ctx context.Context, run *Run, own ExecutionOwne
 		return err
 	}
 
-	// 2. Requeue CAS (fenced by the verified epoch).
+	// 2. Requeue CAS (fenced by the verified epoch), carrying retryAt.
 	if _, err := q.RequeueRunFenced(ctx, db.RequeueRunFencedParams{
-		ID:         own.RunID.Bytes(),
-		LeaseEpoch: own.LeaseEpoch,
+		AvailableAt: sql.NullTime{Time: retryAt, Valid: true},
+		ID:          own.RunID.Bytes(),
+		LeaseEpoch:  own.LeaseEpoch,
 	}); err != nil {
 		return err
 	}
@@ -59,20 +74,25 @@ func (s *Service) RetryOwnedRun(ctx context.Context, run *Run, own ExecutionOwne
 		"max_attempts": row.MaxAttempts,
 		"reason":       reason,
 		"worker_id":    own.WorkerID,
+		"retry_at":     retryAt.Format(time.RFC3339Nano),
 	})
 	if err != nil {
 		return err
 	}
 
-	// 4. Re-dispatch through the outbox so the queue wakes a worker.
+	// 4. Re-dispatch through the outbox so the queue wakes a worker — at
+	// retryAt, exactly when the run becomes claimable.
 	payload, _ := json.Marshal(map[string]any{
-		"run_id": own.RunID.String(), "provider": run.Provider,
+		"run_id":         own.RunID.String(),
+		"provider":       run.Provider,
+		"priority_class": PriorityClassRetry,
 	})
-	if _, err := q.CreateOutboxEvent(ctx, db.CreateOutboxEventParams{
+	if _, err := q.CreateOutboxEventAt(ctx, db.CreateOutboxEventAtParams{
 		Aggregate:   "run",
 		AggregateID: own.RunID.Bytes(),
 		EventType:   "run.dispatch",
 		Payload:     dbtypes.JSONText(payload),
+		AvailableAt: retryAt,
 	}); err != nil {
 		return err
 	}
@@ -91,6 +111,7 @@ func (s *Service) RetryOwnedRun(ctx context.Context, run *Run, own ExecutionOwne
 		"max_attempts": row.MaxAttempts,
 		"reason":       reason,
 		"worker_id":    own.WorkerID,
+		"retry_at":     retryAt.Format(time.RFC3339Nano),
 	})
 	return nil
 }

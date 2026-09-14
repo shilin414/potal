@@ -28,7 +28,14 @@ var ErrExternalRunIDConflict = errors.New("execution: external run id conflict")
 
 var ErrOccurrenceStateConflict = errors.New("execution: schedule occurrence state conflict")
 
+// ErrInvalidTerminalStatus marks an attempt to finalize a run with a
+// non-terminal status.
 var ErrInvalidTerminalStatus = errors.New("execution: invalid terminal status")
+
+// ErrProviderAttemptsExhausted marks a provider execution attempt that
+// was refused because the run's retry budget is used up. The caller must
+// fail the run, not retry it.
+var ErrProviderAttemptsExhausted = errors.New("execution: provider attempts exhausted")
 
 // Service implements the Run lifecycle on top of TiDB.
 type Service struct {
@@ -37,10 +44,27 @@ type Service struct {
 	Log     *slog.Logger
 	Metrics *telemetry.Metrics
 
+	// RequeueDelay is the single source of truth for retry timing:
+	// RetryOwnedRun writes Run.available_at = now+RequeueDelay AND the
+	// dispatch outbox row's available_at = the same instant, so the relay
+	// publishes the wakeup exactly when the run becomes claimable
+	// (P1-2). Zero falls back to DefaultRequeueDelay.
+	RequeueDelay time.Duration
+
 	// CreateDeliveryExecutionsTx is an in-transaction extension used by
 	// finalize to make scheduled delivery requests durable before commit.
 	// Delivery execution is decoupled in a separate delivery package.
 	CreateDeliveryExecutionsTx func(ctx context.Context, tx *sql.Tx, run *Run) error
+}
+
+// DefaultRequeueDelay is used when Service.RequeueDelay is unset.
+const DefaultRequeueDelay = time.Second
+
+func (s *Service) requeueDelay() time.Duration {
+	if s.RequeueDelay > 0 {
+		return s.RequeueDelay
+	}
+	return DefaultRequeueDelay
 }
 
 func NewService(d *sql.DB, r *redisx.Client, log *slog.Logger, m *telemetry.Metrics) *Service {
@@ -124,9 +148,18 @@ func (s *Service) CreateRunInTx(ctx context.Context, tx *sql.Tx, in *CreateRunIn
 		input["agent_attachment_ids"] = ids0
 	}
 
+	priority := in.Priority
+	if priority == "" {
+		priority = DefaultPriority
+	}
+	// priority_class routes the dispatch to the matching priority stream
+	// (P1-1): the relay maps provider + priority_class → stream, so
+	// interactive runs jump ahead of a scheduled backlog on the normal
+	// Redis path, not only in the fallback scan.
 	outboxPayload := map[string]any{
-		"run_id":   runID.String(),
-		"provider": in.Provider,
+		"run_id":         runID.String(),
+		"provider":       in.Provider,
+		"priority_class": PriorityClassOf(priority),
 	}
 	outboxJSON, _ := json.Marshal(outboxPayload)
 	inputJSON, _ := json.Marshal(input)
@@ -149,10 +182,6 @@ func (s *Service) CreateRunInTx(ctx context.Context, tx *sql.Tx, in *CreateRunIn
 	triggerType := in.TriggerType
 	if triggerType == "" {
 		triggerType = DefaultTriggerType
-	}
-	priority := in.Priority
-	if priority == "" {
-		priority = DefaultPriority
 	}
 	var availableAt sql.NullTime
 	if !in.AvailableAt.IsZero() {
@@ -397,6 +426,50 @@ func (s *Service) ClaimCandidates(ctx context.Context, provider string, limit in
 		out = append(out, mustID(raw))
 	}
 	return out, nil
+}
+
+// BeginProviderAttemptOwned consumes ONE provider execution attempt for
+// the owning worker (P0-2). Semantics:
+//
+//	attempt == provider execution count — NOT a claim count
+//	claim / admission requeue / inflight rejection never consume one
+//
+// It runs in one transaction under the run row lock:
+//
+//	verify ownership (running + epoch)
+//	attempt >= max_attempts → ErrProviderAttemptsExhausted
+//	attempt++ → return the new count
+//
+// The caller invokes it immediately before the real provider submit
+// (Auth → rate limit → BeginProviderAttempt → StartChat/Submit), so a run
+// that never reached the provider never burns retry budget.
+func (s *Service) BeginProviderAttemptOwned(ctx context.Context, own ExecutionOwnership) (int64, error) {
+	if !own.Valid() {
+		return 0, ErrLostOwnership
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	row, err := verifyActiveOwnershipTx(ctx, tx, own)
+	if err != nil {
+		return 0, err
+	}
+	if int64(row.Attempt) >= int64(row.MaxAttempts) {
+		return 0, ErrProviderAttemptsExhausted
+	}
+	if _, err := db.New(tx).BeginProviderAttemptFenced(ctx, db.BeginProviderAttemptFencedParams{
+		ID:         own.RunID.Bytes(),
+		LeaseEpoch: own.LeaseEpoch,
+	}); err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int64(row.Attempt) + 1, nil
 }
 
 // HeartbeatOwned extends the lease; the WHERE carries the lease token so

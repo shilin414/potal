@@ -49,6 +49,25 @@ func (q *Queries) AppendUserAttachmentToRunInput(ctx context.Context, arg Append
 	return q.db.ExecContext(ctx, appendUserAttachmentToRunInput, arg.JSONARRAYAPPEND, arg.ID)
 }
 
+const beginProviderAttemptFenced = `-- name: BeginProviderAttemptFenced :execresult
+UPDATE runs
+SET attempt = attempt + 1
+WHERE id = ? AND status = 'running' AND lease_epoch = ?
+`
+
+type BeginProviderAttemptFencedParams struct {
+	ID         []byte
+	LeaseEpoch uint64
+}
+
+// Consumes ONE provider execution attempt, fenced by the current lease
+// epoch. Called by the owner right before the provider submit; claim /
+// admission requeues never touch attempt. attempt < max_attempts is
+// checked under the run row lock in Go (BeginProviderAttemptOwned).
+func (q *Queries) BeginProviderAttemptFenced(ctx context.Context, arg BeginProviderAttemptFencedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, beginProviderAttemptFenced, arg.ID, arg.LeaseEpoch)
+}
+
 const bindAttachmentToRun = `-- name: BindAttachmentToRun :exec
 UPDATE runtime_attachments SET run_id = ?, conversation_id = ? WHERE id = ?
 `
@@ -66,7 +85,7 @@ func (q *Queries) BindAttachmentToRun(ctx context.Context, arg BindAttachmentToR
 
 const cASClaimRun = `-- name: CASClaimRun :execresult
 UPDATE runs
-SET status = 'running', started_at = CURRENT_TIMESTAMP(3), attempt = attempt + 1,
+SET status = 'running', started_at = CURRENT_TIMESTAMP(3),
     lease_epoch = lease_epoch + 1
 WHERE id = ? AND status = 'queued'
   AND (available_at IS NULL OR available_at <= CURRENT_TIMESTAMP(3))
@@ -75,6 +94,11 @@ WHERE id = ? AND status = 'queued'
 // CAS claim: exactly one worker wins; affected_rows == 1 means success.
 // lease_epoch bump is the fencing token: every later write by the winning
 // worker must match the new epoch, so stale workers lose ownership.
+// NOTE (Provider Admission & Release Gate): the claim deliberately does
+// NOT increment attempt — attempt counts PROVIDER EXECUTIONS, not claims.
+// Provider admission requeues (inflight limit / limiter outage) must not
+// burn retry budget; only BeginProviderAttemptFenced consumes an attempt,
+// immediately before the provider submit.
 func (q *Queries) CASClaimRun(ctx context.Context, id []byte) (sql.Result, error) {
 	return q.db.ExecContext(ctx, cASClaimRun, id)
 }
@@ -173,13 +197,16 @@ SELECT COUNT(*) AS n
 FROM schedule_occurrences o
 JOIN schedule_deliveries d
   ON d.schedule_id = o.schedule_id AND d.enabled = 1
+  AND d.created_at <= COALESCE(o.finished_at, o.updated_at)
 LEFT JOIN delivery_executions de
   ON de.occurrence_id = o.id AND de.schedule_delivery_id = d.id
 WHERE o.status = 'succeeded' AND de.id IS NULL
 `
 
 // Invariant L: every enabled target of a succeeded occurrence has a
-// durable delivery execution row.
+// durable delivery execution row. The created_at guard avoids false
+// positives on historical occurrences: a target enabled AFTER the
+// occurrence finished was never supposed to receive it.
 func (q *Queries) CountMissingDeliveryExecutions(ctx context.Context) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countMissingDeliveryExecutions)
 	var n int64
@@ -406,6 +433,33 @@ func (q *Queries) CreateOutboxEvent(ctx context.Context, arg CreateOutboxEventPa
 		arg.AggregateID,
 		arg.EventType,
 		arg.Payload,
+	)
+}
+
+const createOutboxEventAt = `-- name: CreateOutboxEventAt :execresult
+INSERT INTO outbox_events (aggregate, aggregate_id, event_type, payload, status, available_at)
+VALUES (?, ?, ?, ?, 'pending', ?)
+`
+
+type CreateOutboxEventAtParams struct {
+	Aggregate   string
+	AggregateID []byte
+	EventType   string
+	Payload     dbtypes.JSONText
+	AvailableAt time.Time
+}
+
+// Delayed-publish variant: the row stays invisible to the relay until
+// retryAt. Run.available_at and outbox availability share one timestamp
+// so a retried run is dispatched exactly when it becomes claimable
+// (P1-2) — no earlier, no later.
+func (q *Queries) CreateOutboxEventAt(ctx context.Context, arg CreateOutboxEventAtParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, createOutboxEventAt,
+		arg.Aggregate,
+		arg.AggregateID,
+		arg.EventType,
+		arg.Payload,
+		arg.AvailableAt,
 	)
 }
 
@@ -1364,18 +1418,23 @@ func (q *Queries) RequeueRun(ctx context.Context, id []byte) error {
 
 const requeueRunFenced = `-- name: RequeueRunFenced :execresult
 UPDATE runs
-SET status = 'queued', priority = 'retry',
-    available_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 1 SECOND)
+SET status = 'queued', priority = 'retry', available_at = ?
 WHERE id = ? AND status = 'running' AND lease_epoch = ?
 `
 
 type RequeueRunFencedParams struct {
-	ID         []byte
-	LeaseEpoch uint64
+	AvailableAt sql.NullTime
+	ID          []byte
+	LeaseEpoch  uint64
 }
 
+// available_at is an explicit param: Run.available_at and the outbox
+// row's available_at MUST carry the same retryAt (P1-2: a hardcoded
+// INTERVAL here desynchronized run availability from outbox publishing,
+// so a redispatched run was invisible to the CAS until the fallback scan
+// found it ~20s later).
 func (q *Queries) RequeueRunFenced(ctx context.Context, arg RequeueRunFencedParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, requeueRunFenced, arg.ID, arg.LeaseEpoch)
+	return q.db.ExecContext(ctx, requeueRunFenced, arg.AvailableAt, arg.ID, arg.LeaseEpoch)
 }
 
 const setAttachmentUploaded = `-- name: SetAttachmentUploaded :exec
@@ -1389,16 +1448,6 @@ type SetAttachmentUploadedParams struct {
 
 func (q *Queries) SetAttachmentUploaded(ctx context.Context, arg SetAttachmentUploadedParams) error {
 	_, err := q.db.ExecContext(ctx, setAttachmentUploaded, arg.ExternalAttachmentID, arg.ID)
-	return err
-}
-
-const setRunImmediatelyAvailable = `-- name: SetRunImmediatelyAvailable :exec
-UPDATE runs SET available_at = CURRENT_TIMESTAMP(3)
-WHERE id = ? AND status = 'queued' AND priority = 'retry'
-`
-
-func (q *Queries) SetRunImmediatelyAvailable(ctx context.Context, id []byte) error {
-	_, err := q.db.ExecContext(ctx, setRunImmediatelyAvailable, id)
 	return err
 }
 

@@ -22,18 +22,59 @@ type Handler interface {
 	Execute(ctx context.Context, claimed *ClaimedRun) error
 }
 
-// executionControl couples an in-flight run with its ownership fence and
-// a local cancellation handle. Losing the lease (heartbeat rejected by
-// the fence) cancels the local execution context: the provider stream /
+// Priority admission classes (P1-1): interactive runs outrank scheduled
+// runs on the NORMAL Redis path, and scheduled runs can never starve —
+// each class gets its own stream and the worker applies weighted fair
+// scheduling across them.
+const (
+	PriorityClassInteractive = "interactive"
+	PriorityClassRetry       = "retry"
+	PriorityClassScheduled   = "scheduled"
+)
+
+// PriorityClasses lists the consumption order (highest first).
+var PriorityClasses = []string{PriorityClassInteractive, PriorityClassRetry, PriorityClassScheduled}
+
+// DefaultPriorityWeights: interactive 7 / retry 1 / scheduled 2 —
+// configurable via RUN_PRIORITY_WEIGHTS.
+var DefaultPriorityWeights = []int{7, 1, 2}
+
+// AdmissionRequeueDelay is the pause before a run rejected by provider
+// admission becomes claimable again. It does NOT consume a provider
+// attempt (P0-2) and stays independent of the provider-retry backoff.
+const AdmissionRequeueDelay = time.Second
+
+// PriorityClassOf maps a run priority to its admission class.
+func PriorityClassOf(priority string) string {
+	switch priority {
+	case "retry":
+		return PriorityClassRetry
+	case "scheduled", "scheduled_high", "scheduled_normal":
+		return PriorityClassScheduled
+	default:
+		return PriorityClassInteractive
+	}
+}
+
+// executionControl couples an in-flight run with its ownership fence, its
+// attempt-scoped provider slot and a local cancellation handle. Losing
+// the lease (heartbeat rejected by the fence) cancels the local execution
+// context and releases the attempt's provider slot: the provider stream /
 // poll loop stops and the handler must stop writing canonical state.
 type executionControl struct {
 	cancel context.CancelFunc
 	own    ExecutionOwnership
+	slot   *ProviderSlot
 }
 
 // Worker consumes provider queues: Redis Streams wake it up (fast), then
 // the TiDB CAS claim makes it correct. A fallback scan (FallbackScan)
 // covers messages lost to Redis restarts.
+//
+// Queue layout: one stream per priority class
+// (queue:<provider>:interactive|retry|scheduled) consumed under weighted
+// fair scheduling, so interactive traffic jumps ahead of a scheduled
+// backlog while scheduled/retry work keeps a guaranteed share.
 type Worker struct {
 	Svc         *Service
 	RDB         *redisx.Client
@@ -51,20 +92,45 @@ type Worker struct {
 	ReclaimAfter time.Duration
 	Log          *slog.Logger
 	// ProviderInflight caps provider-wide concurrent runs across worker
-	// instances. Its Redis slots expire with the worker lease.
+	// instances. Slots are attempt-scoped (ownership-derived members).
 	ProviderInflight *InflightLimiter
+	// PriorityWeights per class [interactive, retry, scheduled]; zero
+	// value falls back to DefaultPriorityWeights.
+	PriorityWeights []int
 
 	mu       sync.Mutex
 	inflight map[ids.ID]*executionControl
 }
 
-func (w *Worker) stream() string { return QueueStream(w.RDB, w.Provider) }
+// classStreams returns the per-priority streams in PriorityClasses order.
+func (w *Worker) classStreams() []string {
+	out := make([]string, len(PriorityClasses))
+	for i, class := range PriorityClasses {
+		out[i] = PriorityStream(w.RDB, w.Provider, class)
+	}
+	return out
+}
 
-// ensureGroup creates the consumer group idempotently.
+func (w *Worker) priorityWeights() []int {
+	if len(w.PriorityWeights) == len(PriorityClasses) {
+		return w.PriorityWeights
+	}
+	return DefaultPriorityWeights
+}
+
+// PriorityStream returns the Redis Stream key of one priority class.
+func PriorityStream(rdb *redisx.Client, provider, class string) string {
+	return rdb.Key("queue", provider, class)
+}
+
+// ensureGroup creates the consumer group idempotently on every class
+// stream.
 func (w *Worker) ensureGroup(ctx context.Context) {
-	err := w.RDB.XGroupCreateMkStream(ctx, w.stream(), w.Group, "0").Err()
-	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
-		w.Log.Warn("create consumer group failed", "err", err)
+	for _, stream := range w.classStreams() {
+		err := w.RDB.XGroupCreateMkStream(ctx, stream, w.Group, "0").Err()
+		if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+			w.Log.Warn("create consumer group failed", "err", err, "stream", stream)
+		}
 	}
 }
 
@@ -103,51 +169,86 @@ func (w *Worker) Run(ctx context.Context) {
 	wg.Wait()
 }
 
+type streamMessage struct {
+	stream string
+	msg    goredis.XMessage
+}
+
 func (w *Worker) loop(ctx context.Context, consumer int) {
 	name := w.WorkerID + "-" + itoa(consumer)
+	sched := newClassScheduler(w.priorityWeights())
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		res, err := w.RDB.XReadGroup(ctx, &goredis.XReadGroupArgs{
-			Group:    w.Group,
-			Consumer: name,
-			Streams:  []string{w.stream(), ">"},
-			Count:    1,
-			Block:    2 * time.Second,
-		}).Result()
-		if err == goredis.Nil {
+		if sm, ok := w.readWeighted(ctx, name, sched); ok {
+			w.process(ctx, sm)
 			continue
 		}
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			w.Log.Warn("xreadgroup failed", "err", err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Second):
-			}
-			continue
-		}
-		for _, stream := range res {
-			for _, msg := range stream.Messages {
-				w.process(ctx, msg)
-			}
+		// Every class is empty: brief pause before probing again.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(200 * time.Millisecond):
 		}
 	}
 }
 
+// readWeighted applies weighted fair scheduling across the class streams
+// (policy in classScheduler): credited classes in weight order first, then
+// idle-capacity borrowing so a queue never starves while the worker is
+// free.
+func (w *Worker) readWeighted(ctx context.Context, name string, sched *classScheduler) (streamMessage, bool) {
+	streams := w.classStreams()
+	for _, idx := range sched.order() {
+		if idx >= len(streams) {
+			continue
+		}
+		if sm, ok := w.readOne(ctx, name, streams[idx]); ok {
+			sched.consume(idx)
+			return sm, true
+		}
+	}
+	return streamMessage{}, false
+}
+
+// readOne performs a non-blocking XREADGROUP (Count 1) on one stream.
+func (w *Worker) readOne(ctx context.Context, name, stream string) (streamMessage, bool) {
+	res, err := w.RDB.XReadGroup(ctx, &goredis.XReadGroupArgs{
+		Group:    w.Group,
+		Consumer: name,
+		Streams:  []string{stream, ">"},
+		Count:    1,
+		Block:    -1, // omit BLOCK → non-blocking
+	}).Result()
+	if err == goredis.Nil {
+		return streamMessage{}, false
+	}
+	if err != nil {
+		if ctx.Err() != nil {
+			return streamMessage{}, false
+		}
+		w.Log.Warn("xreadgroup failed", "err", err, "stream", stream)
+		return streamMessage{}, false
+	}
+	for _, st := range res {
+		for _, msg := range st.Messages {
+			return streamMessage{stream: st.Stream, msg: msg}, true
+		}
+	}
+	return streamMessage{}, false
+}
+
 // process claims and executes one queued message. Duplicate or stale
 // messages lose the CAS and are simply ACKed.
-func (w *Worker) process(ctx context.Context, msg goredis.XMessage) {
+func (w *Worker) process(ctx context.Context, sm streamMessage) {
+	msg := sm.msg
 	runIDRaw := msg.Values["run_id"]
 	runIDStr, _ := runIDRaw.(string)
 	runID, err := ids.Parse(runIDStr)
 	if err != nil {
 		w.Log.Warn("unparseable run_id in queue message (acking)", "run_id", runIDStr)
-		w.ack(ctx, msg.ID)
+		w.ack(ctx, sm.stream, msg.ID)
 		return
 	}
 	defer func() {
@@ -158,10 +259,10 @@ func (w *Worker) process(ctx context.Context, msg goredis.XMessage) {
 		// the damage.
 		if rec := recover(); rec != nil {
 			w.Log.Error("handler panic recovered", "run_id", runIDStr, "panic", rec)
-			w.ack(ctx, msg.ID)
+			w.ack(ctx, sm.stream, msg.ID)
 		}
 	}()
-	w.claimAndExecute(ctx, runID, func() { w.ack(ctx, msg.ID) })
+	w.claimAndExecute(ctx, runID, func() { w.ack(ctx, sm.stream, msg.ID) })
 }
 
 // claimAndExecute is the shared claim → execute path for both the Redis
@@ -211,7 +312,10 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun) {
 	defer w.trackInflight(claimed.Ownership, nil)
 
 	if w.ProviderInflight != nil {
-		ok, depth, err := w.ProviderInflight.Acquire(ctx, claimed.Run.ID)
+		// Attempt-scoped acquire (P0-1): the slot member is derived from
+		// the ownership, so this attempt can never collide with or delete
+		// another attempt's slot.
+		slot, ok, depth, err := w.ProviderInflight.Acquire(ctx, claimed.Ownership)
 		if err != nil {
 			w.Log.Warn("provider inflight limiter unavailable; requeueing run",
 				"run_id", claimed.Run.ID.String(), "err", err)
@@ -226,8 +330,9 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun) {
 			w.requeueForAdmission(claimed, "provider_inflight_limit")
 			return
 		}
+		w.attachProviderSlot(claimed.Ownership, slot)
 		defer func() {
-			if err := w.ProviderInflight.Release(context.Background(), claimed.Run.ID); err != nil {
+			if err := w.ProviderInflight.Release(context.Background(), slot); err != nil {
 				w.Log.Warn("provider inflight release failed", "run_id", claimed.Run.ID.String(), "err", err)
 			}
 		}()
@@ -268,7 +373,13 @@ func (w *Worker) recordProviderAdmission(reason string) {
 }
 
 func (w *Worker) requeueForAdmission(claimed *ClaimedRun, reason string) {
-	if err := w.Svc.RetryOwnedRun(context.Background(), claimed.Run, claimed.Ownership, reason); err != nil && err != ErrLostOwnership {
+	// Admission contention is a capacity problem, not a provider failure:
+	// the run is made claimable again after a short pause (long enough to
+	// avoid hot-looping against the saturated provider, short enough that
+	// a freed slot is used immediately). Provider-failure retries keep
+	// their own backoff (Service.RequeueDelay).
+	retryAt := time.Now().UTC().Add(AdmissionRequeueDelay)
+	if err := w.Svc.RetryOwnedRunAt(context.Background(), claimed.Run, claimed.Ownership, reason, retryAt); err != nil && err != ErrLostOwnership {
 		w.Log.Error("requeue after provider admission failed",
 			"run_id", claimed.Run.ID.String(), "reason", reason, "err", err)
 	}
@@ -284,8 +395,8 @@ func (w *Worker) maxRuntime(run *Run) time.Duration {
 	return d + 30*time.Second
 }
 
-func (w *Worker) ack(ctx context.Context, msgID string) {
-	if err := w.RDB.XAck(ctx, w.stream(), w.Group, msgID).Err(); err != nil {
+func (w *Worker) ack(ctx context.Context, stream, msgID string) {
+	if err := w.RDB.XAck(ctx, stream, w.Group, msgID).Err(); err != nil {
 		w.Log.Warn("xack failed", "err", err)
 	}
 }
@@ -324,13 +435,29 @@ func (w *Worker) reclaimLoop(ctx context.Context) {
 	if reclaimAfter <= 0 {
 		reclaimAfter = time.Minute
 	}
-	var cursor string
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		for _, stream := range w.classStreams() {
+			w.reclaimStream(ctx, stream, reclaimAfter)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func (w *Worker) reclaimStream(ctx context.Context, stream string, reclaimAfter time.Duration) {
+	cursor := "0"
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		res, next, err := w.RDB.XAutoClaim(ctx, &goredis.XAutoClaimArgs{
-			Stream:   w.stream(),
+			Stream:   stream,
 			Group:    w.Group,
 			Consumer: w.WorkerID + "-reclaim",
 			MinIdle:  reclaimAfter,
@@ -341,22 +468,18 @@ func (w *Worker) reclaimLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Second):
-			}
-			continue
+			w.Log.Warn("xautoclaim failed", "err", err, "stream", stream)
+			return
+		}
+		for _, msg := range res {
+			w.process(ctx, streamMessage{stream: stream, msg: msg})
+		}
+		// Sweep done: the cursor wrapped back to the start, nothing idle
+		// was returned, or the cursor stalled (defensive: never spin).
+		if len(res) == 0 || next == "0" || next == "0-0" || next == cursor {
+			return
 		}
 		cursor = next
-		for _, msg := range res {
-			w.process(ctx, msg)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(5 * time.Second):
-		}
 	}
 }
 
@@ -375,6 +498,17 @@ func (w *Worker) trackInflight(own ExecutionOwnership, cancel context.CancelFunc
 	}
 }
 
+// attachProviderSlot records the attempt's provider slot on the control
+// entry so the heartbeat loop renews exactly this slot (never a
+// recreated one).
+func (w *Worker) attachProviderSlot(own ExecutionOwnership, slot *ProviderSlot) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if ctl, ok := w.inflight[own.RunID]; ok {
+		ctl.slot = slot
+	}
+}
+
 func (w *Worker) heartbeatLoop(ctx context.Context) {
 	ticker := time.NewTicker(w.Heartbeat)
 	defer ticker.Stop()
@@ -390,12 +524,11 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 			}
 			w.mu.Unlock()
 			for id, ctl := range snapshot {
+				// Order is mandatory (P0-1): the RUN lease first, the
+				// provider slot second. Renewing the slot before checking
+				// ownership would let an already-fenced attempt refresh
+				// capacity accounting for a run it no longer owns.
 				ok, err := w.Svc.HeartbeatOwned(ctx, ctl.own, w.Lease)
-				if w.ProviderInflight != nil {
-					if err := w.ProviderInflight.Renew(ctx, id); err != nil {
-						w.Log.Warn("provider inflight renew failed", "run_id", id.String(), "err", err)
-					}
-				}
 				if err != nil || !ok {
 					// Ownership lost: stop the local execution immediately
 					// (the provider call cannot be cancelled remotely, but
@@ -411,8 +544,32 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 						delete(w.inflight, id)
 					}
 					w.mu.Unlock()
+					// Release this attempt's own provider slot (never the
+					// new owner's — the member is attempt-scoped).
+					if ctl.slot != nil && w.ProviderInflight != nil {
+						if rerr := w.ProviderInflight.Release(context.Background(), ctl.slot); rerr != nil && rerr != ErrProviderSlotLost {
+							w.Log.Warn("provider inflight release after lease loss failed",
+								"run_id", id.String(), "err", rerr)
+						}
+					}
 					if w.Svc.Metrics != nil {
 						w.Svc.Metrics.LeaseExpired.Inc()
+					}
+					continue
+				}
+				// Run lease still held: renew the attempt-scoped slot.
+				// XX-only — a lost slot is never recreated here.
+				if w.ProviderInflight != nil && ctl.slot != nil {
+					if rerr := w.ProviderInflight.Renew(ctx, ctl.slot); rerr != nil {
+						if rerr == ErrProviderSlotLost {
+							// The slot expired (worker stalled longer than
+							// the slot lease). The run ownership fence is
+							// unaffected; capacity accounting self-heals
+							// when the attempt finishes.
+							w.recordProviderAdmission("provider_slot_lost")
+						} else {
+							w.Log.Warn("provider inflight renew failed", "run_id", id.String(), "err", rerr)
+						}
 					}
 				}
 			}
@@ -424,12 +581,20 @@ func itoa(i int) string {
 	if i == 0 {
 		return "0"
 	}
-	var b [20]byte
+	neg := i < 0
+	if neg {
+		i = -i
+	}
+	var b [21]byte
 	pos := len(b)
 	for i > 0 {
 		pos--
 		b[pos] = byte('0' + i%10)
 		i /= 10
+	}
+	if neg {
+		pos--
+		b[pos] = '-'
 	}
 	return string(b[pos:])
 }

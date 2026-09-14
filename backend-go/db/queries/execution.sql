@@ -32,11 +32,25 @@ UPDATE runs SET external_run_id = ? WHERE id = ? AND external_run_id = '';
 -- CAS claim: exactly one worker wins; affected_rows == 1 means success.
 -- lease_epoch bump is the fencing token: every later write by the winning
 -- worker must match the new epoch, so stale workers lose ownership.
+-- NOTE (Provider Admission & Release Gate): the claim deliberately does
+-- NOT increment attempt — attempt counts PROVIDER EXECUTIONS, not claims.
+-- Provider admission requeues (inflight limit / limiter outage) must not
+-- burn retry budget; only BeginProviderAttemptFenced consumes an attempt,
+-- immediately before the provider submit.
 UPDATE runs
-SET status = 'running', started_at = CURRENT_TIMESTAMP(3), attempt = attempt + 1,
+SET status = 'running', started_at = CURRENT_TIMESTAMP(3),
     lease_epoch = lease_epoch + 1
 WHERE id = ? AND status = 'queued'
   AND (available_at IS NULL OR available_at <= CURRENT_TIMESTAMP(3));
+
+-- name: BeginProviderAttemptFenced :execresult
+-- Consumes ONE provider execution attempt, fenced by the current lease
+-- epoch. Called by the owner right before the provider submit; claim /
+-- admission requeues never touch attempt. attempt < max_attempts is
+-- checked under the run row lock in Go (BeginProviderAttemptOwned).
+UPDATE runs
+SET attempt = attempt + 1
+WHERE id = ? AND status = 'running' AND lease_epoch = ?;
 
 -- name: GetRunLeaseEpoch :one
 SELECT lease_epoch FROM runs WHERE id = ?;
@@ -86,14 +100,14 @@ WHERE id = ? AND status NOT IN ('cancelled', 'succeeded', 'failed');
 UPDATE runs SET status = 'queued' WHERE id = ? AND status = 'running';
 
 -- name: RequeueRunFenced :execresult
+-- available_at is an explicit param: Run.available_at and the outbox
+-- row's available_at MUST carry the same retryAt (P1-2: a hardcoded
+-- INTERVAL here desynchronized run availability from outbox publishing,
+-- so a redispatched run was invisible to the CAS until the fallback scan
+-- found it ~20s later).
 UPDATE runs
-SET status = 'queued', priority = 'retry',
-    available_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL 1 SECOND)
+SET status = 'queued', priority = 'retry', available_at = ?
 WHERE id = ? AND status = 'running' AND lease_epoch = ?;
-
--- name: SetRunImmediatelyAvailable :exec
-UPDATE runs SET available_at = CURRENT_TIMESTAMP(3)
-WHERE id = ? AND status = 'queued' AND priority = 'retry';
 
 -- name: FailExpiredRun :execresult
 UPDATE runs
@@ -248,11 +262,14 @@ WHERE r.trigger_type = 'scheduled'
 
 -- name: CountMissingDeliveryExecutions :one
 -- Invariant L: every enabled target of a succeeded occurrence has a
--- durable delivery execution row.
+-- durable delivery execution row. The created_at guard avoids false
+-- positives on historical occurrences: a target enabled AFTER the
+-- occurrence finished was never supposed to receive it.
 SELECT COUNT(*) AS n
 FROM schedule_occurrences o
 JOIN schedule_deliveries d
   ON d.schedule_id = o.schedule_id AND d.enabled = 1
+  AND d.created_at <= COALESCE(o.finished_at, o.updated_at)
 LEFT JOIN delivery_executions de
   ON de.occurrence_id = o.id AND de.schedule_delivery_id = d.id
 WHERE o.status = 'succeeded' AND de.id IS NULL;
@@ -270,6 +287,14 @@ FROM run_leases WHERE run_id = ?;
 -- name: CreateOutboxEvent :execresult
 INSERT INTO outbox_events (aggregate, aggregate_id, event_type, payload, status, available_at)
 VALUES (?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP(3));
+
+-- name: CreateOutboxEventAt :execresult
+-- Delayed-publish variant: the row stays invisible to the relay until
+-- retryAt. Run.available_at and outbox availability share one timestamp
+-- so a retried run is dispatched exactly when it becomes claimable
+-- (P1-2) — no earlier, no later.
+INSERT INTO outbox_events (aggregate, aggregate_id, event_type, payload, status, available_at)
+VALUES (?, ?, ?, ?, 'pending', ?);
 
 -- name: ListPendingOutbox :many
 SELECT id, aggregate, aggregate_id, event_type, payload, status, available_at,

@@ -97,6 +97,7 @@ func main() {
 			ScanEvery:        cfg.Runner.ReaperInterval,
 			Log:              logger,
 			ProviderInflight: a.ProviderInflight,
+			PriorityWeights:  cfg.Runner.PriorityWeights,
 		}
 		wg.Add(1)
 		go func() {

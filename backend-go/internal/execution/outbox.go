@@ -13,8 +13,38 @@ import (
 )
 
 // QueueStream returns the Redis Stream key for a provider dispatch queue.
+// It is the LEGACY / default stream: run dispatches that carry no
+// priority_class (pre-upgrade rows, delivery dispatches) land here.
 func QueueStream(rdb *redisx.Client, provider string) string {
 	return rdb.Key("queue", provider)
+}
+
+// dispatchTarget resolves the stream a pending outbox row must be
+// published to. Run dispatches carry priority_class and are routed to the
+// matching per-class stream (P1-1: weighted fair scheduling needs the
+// classes separated in Redis, not only in the fallback SQL scan);
+// everything else (delivery.dispatch, legacy rows) keeps the single
+// provider stream.
+func dispatchTarget(rdb *redisx.Client, eventType string, payload dbtypes.JSONText) string {
+	var p struct {
+		Provider      string `json:"provider"`
+		PriorityClass string `json:"priority_class"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	provider := p.Provider
+	if provider == "" {
+		provider = "unknown"
+	}
+	if eventType == "run.dispatch" && p.PriorityClass != "" {
+		for _, class := range PriorityClasses {
+			if class == p.PriorityClass {
+				return PriorityStream(rdb, provider, class)
+			}
+		}
+		// Unknown class: fall back to the default stream rather than
+		// dropping the dispatch (the fallback scan still covers it).
+	}
+	return QueueStream(rdb, provider)
 }
 
 // Relay publishes pending outbox events to Redis Streams.
@@ -43,7 +73,7 @@ func (r *Relay) RunOnce(ctx context.Context) (int, error) {
 	}
 	published := 0
 	for _, row := range rows {
-		stream := QueueStream(r.rdb, providerFromPayload(row.EventType, dbtypes.JSONText(row.Payload)))
+		stream := dispatchTarget(r.rdb, row.EventType, dbtypes.JSONText(row.Payload))
 		// ID boundary (§评测 P0-1): aggregate_id is BINARY(16) — it must
 		// cross the transport boundary as a canonical UUID string, never
 		// as raw bytes coerced into a Go string (workers ids.Parse it).
@@ -94,16 +124,4 @@ func (r *Relay) Run(ctx context.Context, interval time.Duration) {
 			_ = published
 		}
 	}
-}
-
-// providerFromPayload prefers the payload provider; outbox aggregate is
-// always "run" today but the payload keeps the queue routing explicit.
-func providerFromPayload(_ string, payload dbtypes.JSONText) string {
-	var p struct {
-		Provider string `json:"provider"`
-	}
-	if err := json.Unmarshal(payload, &p); err == nil && p.Provider != "" {
-		return p.Provider
-	}
-	return "unknown"
 }
