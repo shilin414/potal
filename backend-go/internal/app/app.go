@@ -5,7 +5,6 @@ package app
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -165,8 +164,9 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 	feishuSender := &delivery.FeishuSender{Client: feishu, Auth: ailyAuth}
 	deliveryLimiter := execution.NewRateLimiter(rdb, rdb.Key("rate", "feishu", "im"), 20, time.Second)
 
-	schedSvc := schedule.NewService(dbh, &schedulableChecker{Catalog: catalogSvc}, log)
-	schedJob := scheduler.New(dbh, runs, &bindingResolver{Catalog: catalogSvc}, log, metrics)
+	schedSvc := schedule.NewService(dbh, &schedulableChecker{Catalog: catalogSvc, Users: identityRepo}, log)
+	schedSvc.MaxSchedules = cfg.Runner.UserMaxSchedules
+	schedJob := scheduler.New(dbh, runs, &bindingResolver{Catalog: catalogSvc, Users: identityRepo}, log, metrics)
 
 	// Provider concurrency cap: the provider catalog row is the source of
 	// truth; AILY_MAX_INFLIGHT is only a bootstrap/default (and a
@@ -196,44 +196,74 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 }
 
 // schedulableChecker adapts the catalog to the schedule ApplicationChecker.
-type schedulableChecker struct{ Catalog *catalog.Service }
+type schedulableChecker struct {
+	Catalog *catalog.Service
+	Users   *identity.Repo
+}
 
-func (c *schedulableChecker) SchedulableApplication(ctx context.Context, appID, _ int64) error {
-	app, err := c.Catalog.ApplicationByID(ctx, appID)
-	if err != nil {
-		return err
-	}
-	if app == nil || !app.Enabled || app.Kind != "chat" {
-		return errors.New("application is not schedulable")
-	}
-	b, err := c.Catalog.EnabledBinding(ctx, appID)
-	if err != nil {
-		return err
-	}
-	if b == nil {
-		return errors.New("application has no enabled runtime binding")
-	}
-	return nil
+// SchedulableApplication enforces the SAME execution gate as CreateRun
+// (评测 P0-1): the schedule owner must be allowed to execute the
+// application — public + enabled for regular owners, anything for staff.
+// The ownerUserID parameter is authoritative (schedule.Service passes the
+// real owner on create; update passes the caller).
+func (c *schedulableChecker) SchedulableApplication(ctx context.Context, appID, ownerUserID int64) error {
+	_, err := authorizeForOwner(ctx, c.Catalog, c.Users, appID, ownerUserID)
+	return err
 }
 
 // bindingResolver adapts the catalog to the scheduler RuntimeResolver.
-type bindingResolver struct{ Catalog *catalog.Service }
+// Every due-slot / admission fire re-validates the schedule owner's right
+// to execute the application (评测 P0-1): a private or disabled
+// application stops producing runs even for schedules that already
+// exist. Staff owners keep their staff rights at fire time.
+type bindingResolver struct {
+	Catalog *catalog.Service
+	Users   *identity.Repo
+}
 
+// EnabledBinding resolves without an owner (legacy signature used by
+// transports that have no user context): the strictest regular-user
+// rules apply.
 func (r *bindingResolver) EnabledBinding(ctx context.Context, appID int64) (*scheduler.BindingView, error) {
-	b, err := r.Catalog.EnabledBinding(ctx, appID)
+	exe, err := authorizeForOwner(ctx, r.Catalog, r.Users, appID, 0)
 	if err != nil {
-		return nil, err
+		return nil, nil // not executable → scheduler treats as not schedulable
 	}
-	if b == nil {
+	return bindingViewOf(exe), nil
+}
+
+// EnabledBindingFor resolves the binding under the schedule owner's
+// identity (used by the scheduler's per-fire authorization).
+func (r *bindingResolver) EnabledBindingFor(ctx context.Context, appID, ownerUserID int64) (*scheduler.BindingView, error) {
+	exe, err := authorizeForOwner(ctx, r.Catalog, r.Users, appID, ownerUserID)
+	if err != nil {
 		return nil, nil
 	}
+	return bindingViewOf(exe), nil
+}
+
+// authorizeForOwner runs the unified execution gate for one owner,
+// resolving the owner's staff flag through the identity repo (unknown
+// owner → strictest non-staff rules).
+func authorizeForOwner(ctx context.Context, svc *catalog.Service, users *identity.Repo, appID, ownerUserID int64) (*catalog.Executable, error) {
+	isStaff := false
+	if ownerUserID > 0 && users != nil {
+		if u, _, err := users.UserWithIdentity(ctx, ownerUserID); err == nil && u != nil {
+			isStaff = u.IsStaff
+		}
+	}
+	return svc.AuthorizeExecution(ctx, appID, ownerUserID, isStaff)
+}
+
+func bindingViewOf(exe *catalog.Executable) *scheduler.BindingView {
+	b := exe.Binding
 	return &scheduler.BindingView{
 		ID:            b.ID,
 		ProviderKey:   b.ProviderKey,
 		RuntimeType:   b.RuntimeType,
 		ExecutionMode: b.ExecutionMode,
 		Snapshot:      b.Snapshot(),
-	}, nil
+	}
 }
 
 // Close releases shared resources.

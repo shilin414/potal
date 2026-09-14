@@ -117,6 +117,11 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 		}); err != nil {
 			return err
 		}
+		// Sidebar ordering (评测 §十三): the assistant answer moves the
+		// conversation to the top of the list in the same commit.
+		if err := q.TouchConversationUpdated(ctx, uint64(row.ConversationID.Int64)); err != nil {
+			return err
+		}
 	}
 
 	// 5. Occurrence convergence (scheduled runs): the occurrence follows

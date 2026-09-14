@@ -29,6 +29,23 @@ type RuntimeResolver interface {
 	EnabledBinding(ctx context.Context, appID int64) (*BindingView, error)
 }
 
+// OwnerAwareResolver re-resolves the binding under the schedule owner's
+// identity (评测 P0-1): every fire re-validates that the owner may still
+// execute the application — a private/disabled application stops
+// producing runs even for schedules created earlier.
+type OwnerAwareResolver interface {
+	EnabledBindingFor(ctx context.Context, appID, ownerUserID int64) (*BindingView, error)
+}
+
+// resolveBinding picks the owner-aware path when available, falling back
+// to the strict (non-staff) resolver otherwise.
+func (s *Scheduler) resolveBinding(ctx context.Context, appID, ownerUserID int64) (*BindingView, error) {
+	if oa, ok := s.Binding.(OwnerAwareResolver); ok {
+		return oa.EnabledBindingFor(ctx, appID, ownerUserID)
+	}
+	return s.Binding.EnabledBinding(ctx, appID)
+}
+
 // BindingView is the subset the scheduler needs (decoupled from catalog).
 type BindingView struct {
 	ID            int64
@@ -106,12 +123,24 @@ func captureDeliveryExpectations(ctx context.Context, q db.Querier, occurrenceID
 // first admit any pending occurrences (overlap=queue backlog), then fire
 // due schedule slots.
 func (s *Scheduler) ProcessDue(ctx context.Context) {
-	s.admitPending(ctx, s.Batch)
-	s.processDue(ctx, s.Batch)
+	now := s.dbNow(ctx)
+	s.admitPending(ctx, s.Batch, now)
+	s.processDue(ctx, s.Batch, now)
 }
 
-func (s *Scheduler) processDue(ctx context.Context, batch int) {
-	now := s.nowFunc().UTC()
+// dbNow resolves the tick clock from MySQL (Clock Authority, 评测 §十七):
+// due, misfire and execution-window decisions must not depend on any one
+// scheduler host's local clock. Falls back to the local clock only when
+// the DB read fails (degraded, logged by the caller's error path).
+func (s *Scheduler) dbNow(ctx context.Context) time.Time {
+	t, err := s.q(ctx).DBNow(ctx)
+	if err != nil || t.IsZero() {
+		return s.nowFunc().UTC()
+	}
+	return t.UTC()
+}
+
+func (s *Scheduler) processDue(ctx context.Context, batch int, now time.Time) {
 	rows, err := s.q(ctx).ListDueSchedules(ctx, db.ListDueSchedulesParams{
 		NextRunAt: sql.NullTime{Time: now, Valid: true},
 		Limit:     int32(batch),
@@ -123,48 +152,11 @@ func (s *Scheduler) processDue(ctx context.Context, batch int) {
 	for _, row := range rows {
 		slot := row.NextRunAt.Time.Truncate(time.Millisecond) // DATETIME(3) 丢纳秒
 		sch := schedule.FromDBRow(row)
-		if err := s.triggerSchedule(ctx, sch, slot); err != nil {
+		if err := s.triggerSchedule(ctx, sch, slot, now); err != nil {
 			s.Log.Error("schedule trigger failed",
 				"schedule_id", sch.ID, "slot", slot.Format(time.RFC3339), "err", err)
 		}
 	}
-}
-
-// recordSlot atomically claims the slot with a terminal-status occurrence
-// (skipped / failed) so the scan stops seeing it and no orphan pending
-// occurrence can block future overlap checks. Losing the unique race is fine.
-func (s *Scheduler) recordSlot(ctx context.Context, scheduleID int64, slot time.Time, status string) {
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-	q := db.New(tx)
-	if _, err := q.CreateScheduleOccurrence(ctx, db.CreateScheduleOccurrenceParams{
-		ScheduleID: uint64(scheduleID), ScheduledAt: slot,
-	}); err != nil {
-		return // slot already claimed
-	}
-	occ, err := q.GetScheduleOccurrenceBySlot(ctx, db.GetScheduleOccurrenceBySlotParams{
-		ScheduleID: uint64(scheduleID), ScheduledAt: slot,
-	})
-	if err != nil {
-		return
-	}
-	if err := captureDeliveryExpectations(ctx, q, occ.ID); err != nil {
-		return
-	}
-	if _, err := q.MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: status, ID: occ.ID}); err != nil {
-		return
-	}
-	if err := s.advance(ctx, q, scheduleID, slot); err != nil {
-		s.Log.Error("advance after skip failed", "schedule_id", scheduleID, "err", err)
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		return
-	}
-	s.Log.Info("schedule occurrence recorded", "schedule_id", scheduleID, "status", status)
 }
 
 // advance recomputes next_run_at from the fired slot; a once schedule
@@ -234,18 +226,66 @@ func (s *Scheduler) advancePast(ctx context.Context, q db.Querier, scheduleID in
 
 // triggerSchedule applies policies then atomically creates
 // occurrence + conversation + message + run + outbox + next_run_at.
-func (s *Scheduler) triggerSchedule(ctx context.Context, sch *schedule.Schedule, slot time.Time) error {
-	now := s.nowFunc().UTC()
-	q := s.q(ctx)
+//
+// Admission unification (评测 P1-1/P1-2): the whole fire decision now
+// happens inside ONE transaction that holds the schedules row lock and
+// re-reads the CURRENT schedule state under it. The scan-time snapshot
+// is only used to find due rows — disable/prompt/policy edits made
+// after the scan are visible before the run is created, closing the
+// TOCTOU window between /disable and the scheduler tick.
+func (s *Scheduler) triggerSchedule(ctx context.Context, schSnapshot *schedule.Schedule, slot, now time.Time) error {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := db.New(tx)
 
-	// Overlap policy: is a previous occurrence still active?
+	// Re-read the schedule under the admission lock (评测 P1-2).
+	schRow, err := q.GetScheduleRowForUpdate(ctx, uint64(schSnapshot.ID))
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil // soft-deleted concurrently — nothing to fire
+		}
+		return err
+	}
+	sch := schedule.FromDBRow(schRow)
+	if !sch.Enabled || schRow.DeletedAt.Valid {
+		return nil // disabled between scan and admission — no run
+	}
+
+	// Overlap policy: is a previous occurrence still active? Counted
+	// under the lock, so a concurrent run-now / admission sees this
+	// fire's occurrence (no parallel active occurrences, 评测 P1-1).
 	active, err := q.HasActiveOccurrence(ctx, uint64(sch.ID))
 	if err != nil {
-		return fmt.Errorf("overlap check: %w", err)
+		return err
 	}
 	if active > 0 {
 		if sch.OverlapPolicy == schedule.OverlapSkip {
-			s.recordSlot(ctx, sch.ID, slot, schedule.OccSkipped)
+			if _, err := q.CreateScheduleOccurrence(ctx, db.CreateScheduleOccurrenceParams{
+				ScheduleID: uint64(sch.ID), ScheduledAt: slot,
+			}); err != nil && !isDuplicate(err) {
+				return err
+			}
+			occ, err := q.GetScheduleOccurrenceBySlot(ctx, db.GetScheduleOccurrenceBySlotParams{
+				ScheduleID: uint64(sch.ID), ScheduledAt: slot,
+			})
+			if err != nil {
+				return err
+			}
+			if err := captureDeliveryExpectations(ctx, q, occ.ID); err != nil {
+				return err
+			}
+			if _, err := q.MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: schedule.OccSkipped, ID: occ.ID}); err != nil {
+				return err
+			}
+			if err := s.advance(ctx, q, sch.ID, slot); err != nil {
+				return err
+			}
+			if err := tx.Commit(); err != nil {
+				return err
+			}
 			if s.Metrics != nil {
 				s.Metrics.OverlapSkippedTotal.Inc()
 			}
@@ -261,8 +301,23 @@ func (s *Scheduler) triggerSchedule(ctx context.Context, sch *schedule.Schedule,
 	delay := now.Sub(slot)
 	window := time.Duration(sch.ExecutionWindowSeconds) * time.Second
 	if window > 0 && delay > window && sch.DeadlinePolicy == schedule.DeadlineSkip {
-		s.recordSlot(ctx, sch.ID, slot, schedule.OccSkipped)
-		return nil
+		if _, err := q.CreateScheduleOccurrence(ctx, db.CreateScheduleOccurrenceParams{
+			ScheduleID: uint64(sch.ID), ScheduledAt: slot,
+		}); err != nil && !isDuplicate(err) {
+			return err
+		}
+		if occ, err := q.GetScheduleOccurrenceBySlot(ctx, db.GetScheduleOccurrenceBySlotParams{
+			ScheduleID: uint64(sch.ID), ScheduledAt: slot,
+		}); err == nil {
+			if err := captureDeliveryExpectations(ctx, q, occ.ID); err != nil {
+				return err
+			}
+			_, _ = q.MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: schedule.OccSkipped, ID: occ.ID})
+		}
+		if err := s.advance(ctx, q, sch.ID, slot); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 
 	// Misfire policies (scheduler downtime): the slot is older than the
@@ -273,13 +328,13 @@ func (s *Scheduler) triggerSchedule(ctx context.Context, sch *schedule.Schedule,
 		switch sch.MisfirePolicy {
 		case schedule.MisfireSkip:
 			// Do not execute; fast-forward to the first future slot.
-			if err := s.skipPast(ctx, sch, slot, now, "misfire: skip"); err != nil {
+			if err := s.skipPastInTx(ctx, tx, q, sch, slot, now, "misfire: skip"); err != nil {
 				return err
 			}
 			if s.Metrics != nil {
 				s.Metrics.ScheduleMisfireTotal.Inc()
 			}
-			return nil
+			return tx.Commit()
 		case schedule.MisfireCatchUp:
 			// Allowed to replay missed slots one at a time, but bounded
 			// by MaxCatchUpSlots — beyond that we fast-forward like skip.
@@ -288,13 +343,13 @@ func (s *Scheduler) triggerSchedule(ctx context.Context, sch *schedule.Schedule,
 				return err
 			}
 			if missed > schedule.MaxCatchUpSlots {
-				if err := s.skipPast(ctx, sch, slot, now, "misfire: catch_up over limit"); err != nil {
+				if err := s.skipPastInTx(ctx, tx, q, sch, slot, now, "misfire: catch_up over limit"); err != nil {
 					return err
 				}
 				if s.Metrics != nil {
 					s.Metrics.ScheduleMisfireTotal.Inc()
 				}
-				return nil
+				return tx.Commit()
 			}
 			// Fall through: fire this (oldest) missed slot; the next tick
 			// fires the following one until caught up.
@@ -302,30 +357,52 @@ func (s *Scheduler) triggerSchedule(ctx context.Context, sch *schedule.Schedule,
 			// fire_once (default): exactly ONE compensation run for the
 			// missed window at the original planned slot, then jump
 			// next_run_at past now — never slot-by-slot catch-up.
-			occID, err := s.fireMisfiredOnce(ctx, sch, slot, now)
-			if err != nil {
+			if err := s.fireMisfiredOnceInTx(ctx, tx, q, sch, slot, now); err != nil {
 				return err
 			}
-			_ = occID
 			if s.Metrics != nil {
 				s.Metrics.ScheduleMisfireTotal.Inc()
 			}
-			return nil
+			return tx.Commit()
 		}
 	}
 
-	binding, err := s.Binding.EnabledBinding(ctx, sch.ApplicationID)
+	// Per-fire authorization under the schedule owner's identity
+	// (评测 P0-1): application disabled/private after schedule creation
+	// → record a failed occurrence, no run.
+	binding, err := s.resolveBinding(ctx, sch.ApplicationID, sch.OwnerUserID)
 	if err != nil {
-		return fmt.Errorf("resolve binding: %w", err)
+		return err
 	}
 	if binding == nil {
 		// Record a failed occurrence so the UI shows why nothing ran.
-		s.recordSlot(ctx, sch.ID, slot, schedule.OccFailed)
+		if _, err := q.CreateScheduleOccurrence(ctx, db.CreateScheduleOccurrenceParams{
+			ScheduleID: uint64(sch.ID), ScheduledAt: slot,
+		}); err != nil && !isDuplicate(err) {
+			return err
+		}
+		if occ, err := q.GetScheduleOccurrenceBySlot(ctx, db.GetScheduleOccurrenceBySlotParams{
+			ScheduleID: uint64(sch.ID), ScheduledAt: slot,
+		}); err == nil {
+			if err := captureDeliveryExpectations(ctx, q, occ.ID); err != nil {
+				return err
+			}
+			_, _ = q.MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: schedule.OccFailed, ID: occ.ID})
+		}
+		if err := s.advance(ctx, q, sch.ID, slot); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
 		return ErrNotSchedulable
 	}
 
-	occID, err := s.createOccurrenceAndRun(ctx, sch, slot, binding, now, "")
+	occID, err := s.createOccurrenceAndRunTx(ctx, tx, q, sch, slot, binding, now, "")
 	if err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
 		return err
 	}
 	if s.Metrics != nil {
@@ -335,15 +412,9 @@ func (s *Scheduler) triggerSchedule(ctx context.Context, sch *schedule.Schedule,
 	return nil
 }
 
-// skipPast claims the slot as skipped and fast-forwards next_run_at past
-// now in one transaction.
-func (s *Scheduler) skipPast(ctx context.Context, sch *schedule.Schedule, slot, now time.Time, reason string) error {
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	q := db.New(tx)
+// skipPastInTx claims the slot as skipped and fast-forwards next_run_at
+// past now, inside the caller's (already locked) transaction.
+func (s *Scheduler) skipPastInTx(ctx context.Context, tx *sql.Tx, q db.Querier, sch *schedule.Schedule, slot, now time.Time, reason string) error {
 	if _, err := q.CreateScheduleOccurrence(ctx, db.CreateScheduleOccurrenceParams{
 		ScheduleID: uint64(sch.ID), ScheduledAt: slot,
 	}); err != nil {
@@ -362,32 +433,30 @@ func (s *Scheduler) skipPast(ctx context.Context, sch *schedule.Schedule, slot, 
 	if _, err := s.advancePast(ctx, q, sch.ID, slot, now); err != nil {
 		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
 	s.Log.Info("schedule slot skipped", "schedule_id", sch.ID, "slot", slot.Format(time.RFC3339), "reason", reason)
 	return nil
 }
 
-// fireMisfiredOnce creates ONE run for the oldest missed slot (original
-// scheduled_at preserved) and fast-forwards next_run_at past now.
-func (s *Scheduler) fireMisfiredOnce(ctx context.Context, sch *schedule.Schedule, slot, now time.Time) (int64, error) {
-	binding, err := s.Binding.EnabledBinding(ctx, sch.ApplicationID)
+// fireMisfiredOnceInTx creates ONE run for the oldest missed slot
+// (original scheduled_at preserved) and fast-forwards next_run_at past
+// now, inside the caller's transaction.
+func (s *Scheduler) fireMisfiredOnceInTx(ctx context.Context, tx *sql.Tx, q db.Querier, sch *schedule.Schedule, slot, now time.Time) error {
+	binding, err := s.resolveBinding(ctx, sch.ApplicationID, sch.OwnerUserID)
 	if err != nil {
-		return 0, fmt.Errorf("resolve binding: %w", err)
+		return err
 	}
 	if binding == nil {
-		return 0, s.skipPast(ctx, sch, slot, now, "misfire: not schedulable")
+		return s.skipPastInTx(ctx, tx, q, sch, slot, now, "misfire: not schedulable")
 	}
-	occID, err := s.createOccurrenceAndRun(ctx, sch, slot, binding, now, "misfire")
+	occID, err := s.createOccurrenceAndRunTx(ctx, tx, q, sch, slot, binding, now, "misfire")
 	if err != nil {
-		return 0, err
+		return err
 	}
 	if s.Metrics != nil {
 		s.Metrics.ScheduleTriggerDelay.WithLabelValues("misfired").Observe(now.Sub(slot).Seconds())
 	}
 	s.Log.Info("schedule misfired-once fired", "schedule_id", sch.ID, "occurrence_id", occID, "slot", slot.Format(time.RFC3339))
-	return occID, nil
+	return nil
 }
 
 // countMissed counts how many slots between `slot` (exclusive) and `now`
@@ -476,19 +545,12 @@ func (s *Scheduler) createRunForOccurrenceTx(ctx context.Context, tx *sql.Tx, sc
 	return runID.String(), nil
 }
 
-// createOccurrenceAndRun commits occurrence + conversation + message +
-// run + outbox + bookkeeping as ONE transaction (crash-safe: no orphan
-// occurrences, no lost slots). mode "run_now" marks a manual trigger;
-// mode "misfire" fires the missed slot once and fast-forwards
-// next_run_at past now.
-func (s *Scheduler) createOccurrenceAndRun(ctx context.Context, sch *schedule.Schedule, slot time.Time, binding *BindingView, now time.Time, mode string) (int64, error) {
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	q := db.New(tx)
-
+// createOccurrenceAndRunTx commits occurrence + conversation + message +
+// run + outbox + bookkeeping inside the CALLER's (already locked)
+// transaction (crash-safe: no orphan occurrences, no lost slots). mode
+// "run_now" marks a manual trigger; mode "misfire" fires the missed
+// slot once and fast-forwards next_run_at past now.
+func (s *Scheduler) createOccurrenceAndRunTx(ctx context.Context, tx *sql.Tx, q db.Querier, sch *schedule.Schedule, slot time.Time, binding *BindingView, now time.Time, mode string) (int64, error) {
 	scheduledAt := slot
 	if mode == "run_now" {
 		scheduledAt = now.Truncate(time.Millisecond) // DATETIME(3) 丢纳秒
@@ -531,9 +593,6 @@ func (s *Scheduler) createOccurrenceAndRun(ctx context.Context, sch *schedule.Sc
 	} else if err := s.advance(ctx, q, sch.ID, slot); err != nil {
 		return 0, err
 	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
 	return int64(occRow.ID), nil
 }
 
@@ -544,23 +603,37 @@ func (s *Scheduler) createOccurrenceAndRun(ctx context.Context, sch *schedule.Sc
 // creates a PENDING occurrence that the admission loop converts into a
 // run as soon as the active execution goes terminal — never a parallel
 // second run.
+//
+// Admission unification (评测 P1-1): the whole decision — ownership,
+// enablement, overlap, authorization, occurrence creation — happens in
+// ONE transaction holding the schedules row lock and the CURRENT row
+// state, the same path the scan loop uses.
 func (s *Scheduler) TriggerNow(ctx context.Context, scheduleID, userID int64, isStaff bool) (*schedule.Occurrence, error) {
-	row, err := s.q(ctx).GetScheduleByID(ctx, uint64(scheduleID))
+	now := s.dbNow(ctx).Truncate(time.Millisecond)
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := db.New(tx)
+
+	schRow, err := q.GetScheduleRowForUpdate(ctx, uint64(scheduleID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, schedule.ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	if row.OwnerUserID != uint64(userID) && !isStaff {
+	if schRow.OwnerUserID != uint64(userID) && !isStaff {
 		return nil, schedule.ErrNotFound
 	}
-	if !row.Enabled {
+	if !schRow.Enabled || schRow.DeletedAt.Valid {
 		return nil, fmt.Errorf("schedule is disabled")
 	}
-	sch := schedule.FromDBRow(row)
+	sch := schedule.FromDBRow(schRow)
 
-	n, err := s.q(ctx).HasActiveOccurrence(ctx, uint64(scheduleID))
+	n, err := q.HasActiveOccurrence(ctx, uint64(scheduleID))
 	if err != nil {
 		return nil, err
 	}
@@ -568,10 +641,19 @@ func (s *Scheduler) TriggerNow(ctx context.Context, scheduleID, userID int64, is
 		return nil, fmt.Errorf("a previous run is still active (overlap policy: skip)")
 	}
 	if n > 0 && sch.OverlapPolicy == schedule.OverlapQueue {
-		return s.enqueuePendingOccurrence(ctx, sch)
+		occ, err := s.enqueuePendingOccurrenceTx(ctx, q, sch, now)
+		if err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		s.Log.Info("run-now queued behind active occurrence", "schedule_id", sch.ID, "occurrence_id", occ.ID)
+		return schedule.OccurrenceFromDBRow(occ), nil
 	}
 
-	binding, err := s.Binding.EnabledBinding(ctx, sch.ApplicationID)
+	// Per-fire authorization (评测 P0-1) under the admission lock.
+	binding, err := s.resolveBinding(ctx, sch.ApplicationID, sch.OwnerUserID)
 	if err != nil {
 		return nil, fmt.Errorf("resolve binding: %w", err)
 	}
@@ -579,8 +661,11 @@ func (s *Scheduler) TriggerNow(ctx context.Context, scheduleID, userID int64, is
 		return nil, ErrNotSchedulable
 	}
 
-	occID, err := s.createOccurrenceAndRun(ctx, sch, time.Time{}, binding, s.nowFunc().UTC(), "run_now")
+	occID, err := s.createOccurrenceAndRunTx(ctx, tx, q, sch, time.Time{}, binding, s.nowFunc().UTC(), "run_now")
 	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	row2, err := s.q(ctx).GetScheduleOccurrenceByID(ctx, uint64(occID))
@@ -590,65 +675,56 @@ func (s *Scheduler) TriggerNow(ctx context.Context, scheduleID, userID int64, is
 	return schedule.OccurrenceFromDBRow(row2), nil
 }
 
-// enqueuePendingOccurrence records a manual trigger that must wait for
+// enqueuePendingOccurrenceTx records a manual trigger that must wait for
 // the active execution (overlap=queue): the occurrence stays pending and
-// admitPending converts it into a run later.
-func (s *Scheduler) enqueuePendingOccurrence(ctx context.Context, sch *schedule.Schedule) (*schedule.Occurrence, error) {
-	now := s.nowFunc().UTC().Truncate(time.Millisecond)
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	q := db.New(tx)
+// admitPending converts it into a run later. Runs in the caller's
+// transaction (the schedules row lock is already held — the pending row
+// and the active check are serialized together).
+func (s *Scheduler) enqueuePendingOccurrenceTx(ctx context.Context, q db.Querier, sch *schedule.Schedule, now time.Time) (db.ScheduleOccurrence, error) {
 	if _, err := q.CreateScheduleOccurrence(ctx, db.CreateScheduleOccurrenceParams{
 		ScheduleID: uint64(sch.ID), ScheduledAt: now,
 	}); err != nil {
 		if isDuplicate(err) {
-			return nil, fmt.Errorf("a queued manual trigger already exists")
+			return db.ScheduleOccurrence{}, fmt.Errorf("a queued manual trigger already exists")
 		}
-		return nil, err
+		return db.ScheduleOccurrence{}, err
 	}
 	occRow, err := q.GetScheduleOccurrenceBySlot(ctx, db.GetScheduleOccurrenceBySlotParams{
 		ScheduleID: uint64(sch.ID), ScheduledAt: now,
 	})
 	if err != nil {
-		return nil, err
+		return db.ScheduleOccurrence{}, err
 	}
 	if err := captureDeliveryExpectations(ctx, q, occRow.ID); err != nil {
-		return nil, err
+		return db.ScheduleOccurrence{}, err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	s.Log.Info("run-now queued behind active occurrence", "schedule_id", sch.ID, "occurrence_id", occRow.ID)
-	return schedule.OccurrenceFromDBRow(occRow), nil
+	return occRow, nil
 }
 
 // admitPending converts pending occurrences (overlap=queue backlog and
 // stuck misfire rows) into runs once their schedule has no queued/running
 // execution. This is the unified Occurrence Admission: overlap policy
 // belongs to the scheduler, not to the UI or the worker.
-func (s *Scheduler) admitPending(ctx context.Context, batch int) {
+func (s *Scheduler) admitPending(ctx context.Context, batch int, now time.Time) {
 	rows, err := s.q(ctx).ListAdmissiblePendingOccurrences(ctx, int32(batch))
 	if err != nil {
 		s.Log.Error("admission scan failed", "err", err)
 		return
 	}
 	for _, occRow := range rows {
-		if err := s.admitOne(ctx, occRow); err != nil {
+		if err := s.admitOne(ctx, occRow, now); err != nil {
 			s.Log.Error("occurrence admission failed", "occurrence_id", occRow.ID, "err", err)
 		}
 	}
 }
 
-func (s *Scheduler) admitOne(ctx context.Context, occRow db.ScheduleOccurrence) error {
+func (s *Scheduler) admitOne(ctx context.Context, occRow db.ScheduleOccurrence, now time.Time) error {
 	schRow, err := s.q(ctx).GetScheduleByID(ctx, occRow.ScheduleID)
 	if err != nil {
 		return err
 	}
 	sch := schedule.FromDBRow(schRow)
-	if !sch.Enabled {
+	if !sch.Enabled || schRow.DeletedAt.Valid {
 		_, err := s.q(ctx).MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: schedule.OccSkipped, ID: occRow.ID})
 		return err
 	}
@@ -663,7 +739,7 @@ func (s *Scheduler) admitOne(ctx context.Context, occRow db.ScheduleOccurrence) 
 	if active > 0 {
 		return nil // still waiting (queue semantics)
 	}
-	binding, err := s.Binding.EnabledBinding(ctx, sch.ApplicationID)
+	binding, err := s.resolveBinding(ctx, sch.ApplicationID, sch.OwnerUserID)
 	if err != nil {
 		return err
 	}
@@ -674,7 +750,6 @@ func (s *Scheduler) admitOne(ctx context.Context, occRow db.ScheduleOccurrence) 
 		}
 		return ErrNotSchedulable
 	}
-	now := s.nowFunc().UTC()
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -686,9 +761,24 @@ func (s *Scheduler) admitOne(ctx context.Context, occRow db.ScheduleOccurrence) 
 	// occurrence could otherwise both count zero active occurrences and
 	// create two parallel runs (write skew) — the schedules row lock
 	// closes that window: the second transaction re-checks AFTER the
-	// first one committed.
-	if _, err := q.GetScheduleRowForUpdate(ctx, occRow.ScheduleID); err != nil {
+	// first one committed. The full-row re-read also makes disable /
+	// prompt edits visible before the run is created (评测 P1-2).
+	curRow, err := q.GetScheduleRowForUpdate(ctx, occRow.ScheduleID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			// Soft-deleted while pending: skip the occurrence.
+			_, _ = q.MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: schedule.OccSkipped, ID: occRow.ID})
+			_ = tx.Commit()
+			return nil
+		}
 		return err
+	}
+	cur := schedule.FromDBRow(curRow)
+	if !cur.Enabled || curRow.DeletedAt.Valid {
+		if _, err := q.MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: schedule.OccSkipped, ID: occRow.ID}); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	// Re-check under the lock: another admission/scan may have raced us
 	// to a queued occurrence for the same schedule.
@@ -707,7 +797,7 @@ func (s *Scheduler) admitOne(ctx context.Context, occRow db.ScheduleOccurrence) 
 	if err := captureDeliveryExpectations(ctx, q, occRow.ID); err != nil {
 		return err
 	}
-	if _, err := s.createRunForOccurrenceTx(ctx, tx, sch, occRow.ID, binding, now); err != nil {
+	if _, err := s.createRunForOccurrenceTx(ctx, tx, cur, occRow.ID, binding, now); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {

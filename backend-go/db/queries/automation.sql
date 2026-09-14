@@ -1,6 +1,12 @@
 -- ─────────────────────────────────────────────────────────── automation ──
 -- Schedule / Occurrence / Delivery queries (0006_schedule_automation).
 
+-- name: DBNow :one
+-- Clock Authority (评测 §十七): the scheduler resolves "now" from the
+-- database so due / misfire / window decisions are identical across
+-- scheduler hosts regardless of their local clock skew.
+SELECT CURRENT_TIMESTAMP(3) AS now;
+
 -- name: CreateSchedule :execresult
 INSERT INTO schedules (owner_user_id, name, description, application_id, input_payload,
     schedule_type, cron_expression, trigger_config, timezone, run_at, enabled,
@@ -15,20 +21,22 @@ SELECT id, owner_user_id, name, description, application_id,
        timezone, run_at, enabled,
        conversation_policy, conversation_id, overlap_policy, misfire_policy,
        execution_window_seconds, deadline_policy, next_run_at, last_run_at,
-       created_at, updated_at
+       created_at, updated_at, deleted_at
 FROM schedules WHERE id = ?;
 
 -- name: ListSchedulesByOwner :many
--- status: all | running | paused | failed (UI filters).
+-- status: all | running | paused | failed (UI filters). Soft-deleted
+-- schedules (deleted_at) never appear.
 SELECT s.id, s.owner_user_id, s.name, s.description, s.application_id,
        COALESCE(s.input_payload, '{}') AS input_payload,
        s.schedule_type, s.cron_expression, COALESCE(s.trigger_config, '{}') AS trigger_config,
        s.timezone, s.run_at, s.enabled,
        s.conversation_policy, s.conversation_id, s.overlap_policy, s.misfire_policy,
        s.execution_window_seconds, s.deadline_policy, s.next_run_at, s.last_run_at,
-       s.created_at, s.updated_at
+       s.created_at, s.updated_at, s.deleted_at
 FROM schedules s
 WHERE s.owner_user_id = ?
+  AND s.deleted_at IS NULL
   AND CASE
         WHEN sqlc.arg('status') = 'running' THEN s.enabled = 1
         WHEN sqlc.arg('status') = 'paused' THEN s.enabled = 0
@@ -42,6 +50,11 @@ WHERE s.owner_user_id = ?
   AND (sqlc.arg('before_id') = 0 OR s.id < sqlc.arg('before_id'))
 ORDER BY s.id DESC
 LIMIT ?;
+
+-- name: CountSchedulesByOwner :one
+-- Per-user schedule cap (评测 P1-7): only live (non-deleted) schedules
+-- count against the quota.
+SELECT COUNT(*) AS n FROM schedules WHERE owner_user_id = ? AND deleted_at IS NULL;
 
 -- name: ListLatestOccurrencesForSchedules :many
 SELECT o.id, o.schedule_id, o.scheduled_at, o.enqueued_at, o.admitted_at, o.run_id,
@@ -81,18 +94,22 @@ UPDATE schedules SET next_run_at = ? WHERE id = ?;
 UPDATE schedules SET conversation_id = ? WHERE id = ?;
 
 -- name: DeleteSchedule :execresult
-DELETE FROM schedules WHERE id = ?;
+-- Soft delete (评测 §十二): pending delivery executions still resolve
+-- schedule.Name to build their message; the row must survive. The
+-- scheduler scan and owner lists filter deleted_at IS NULL.
+UPDATE schedules SET deleted_at = CURRENT_TIMESTAMP(3), enabled = 0 WHERE id = ? AND deleted_at IS NULL;
 
 -- name: ListDueSchedules :many
+-- The scheduler scan never picks up disabled or soft-deleted rows.
 SELECT id, owner_user_id, name, description, application_id,
        COALESCE(input_payload, '{}') AS input_payload,
        schedule_type, cron_expression, COALESCE(trigger_config, '{}') AS trigger_config,
        timezone, run_at, enabled,
        conversation_policy, conversation_id, overlap_policy, misfire_policy,
        execution_window_seconds, deadline_policy, next_run_at, last_run_at,
-       created_at, updated_at
+       created_at, updated_at, deleted_at
 FROM schedules
-WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?
+WHERE enabled = 1 AND deleted_at IS NULL AND next_run_at IS NOT NULL AND next_run_at <= ?
 ORDER BY next_run_at
 LIMIT ?;
 
@@ -172,11 +189,22 @@ WHERE status = 'pending'
 ORDER BY scheduled_at, id
 LIMIT ?;
 
--- name: GetScheduleRowForUpdate :execresult
--- Admission lock (修复计划 §35): serializes concurrent admissions for the
--- same schedule so two schedulers can never both observe "no active
--- occurrence" and create parallel runs (write-skew guard).
-SELECT id FROM schedules WHERE id = ? FOR UPDATE;
+-- name: GetScheduleRowForUpdate :one
+-- Admission lock (修复计划 §35, 评测 P1-1/P1-2): serializes concurrent
+-- admissions for the same schedule so two schedulers can never both
+-- observe "no active occurrence" and create parallel runs (write-skew
+-- guard). Now returns the FULL row: the admission path re-reads the
+-- current schedule under the lock instead of trusting the scan-time
+-- snapshot (disable / prompt edits become visible before the run is
+-- created).
+SELECT id, owner_user_id, name, description, application_id,
+       COALESCE(input_payload, '{}') AS input_payload,
+       schedule_type, cron_expression, COALESCE(trigger_config, '{}') AS trigger_config,
+       timezone, run_at, enabled,
+       conversation_policy, conversation_id, overlap_policy, misfire_policy,
+       execution_window_seconds, deadline_policy, next_run_at, last_run_at,
+       created_at, updated_at, deleted_at
+FROM schedules WHERE id = ? AND deleted_at IS NULL FOR UPDATE;
 
 -- name: CountSkippedOccurrencesForSlot :one
 SELECT COUNT(*) AS n FROM schedule_occurrences

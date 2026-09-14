@@ -548,6 +548,102 @@ func (q *Queries) GetEnabledBinding(ctx context.Context, applicationID uint64) (
 	return i, err
 }
 
+const getExecutionAuthBundle = `-- name: GetExecutionAuthBundle :one
+SELECT a.id AS app_id, a.slug AS app_slug, a.name AS app_name, a.kind AS app_kind,
+       a.is_public AS app_is_public, a.enabled AS app_enabled,
+       b.id AS binding_id, b.provider_id AS binding_provider_id, b.provider_key AS binding_provider_key,
+       b.runtime_type AS binding_runtime_type, b.external_resource_id AS binding_external_resource_id,
+       b.endpoint_key AS binding_endpoint_key, b.identity_mode AS binding_identity_mode,
+       b.execution_mode AS binding_execution_mode, b.session_policy AS binding_session_policy,
+       b.artifact_policy AS binding_artifact_policy,
+       b.capabilities AS binding_capabilities, b.input_schema AS binding_input_schema,
+       b.output_schema AS binding_output_schema, b.config AS binding_config,
+       b.secret_ref AS binding_secret_ref, b.timeout_seconds AS binding_timeout_seconds,
+       b.enabled AS binding_enabled, b.created_at AS binding_created_at, b.updated_at AS binding_updated_at,
+       p.status AS provider_status
+FROM applications a
+JOIN runtime_bindings b ON b.application_id = a.id AND b.enabled = 1
+LEFT JOIN providers p ON p.id = b.provider_id
+WHERE a.id = ? AND a.enabled = 1 AND a.kind = 'chat'
+  AND (? OR a.is_public = 1)
+ORDER BY b.id DESC
+LIMIT 1
+`
+
+type GetExecutionAuthBundleParams struct {
+	ID      uint64
+	ShowAll interface{}
+}
+
+type GetExecutionAuthBundleRow struct {
+	AppID                     uint64
+	AppSlug                   string
+	AppName                   string
+	AppKind                   string
+	AppIsPublic               bool
+	AppEnabled                bool
+	BindingID                 uint64
+	BindingProviderID         sql.NullInt64
+	BindingProviderKey        string
+	BindingRuntimeType        string
+	BindingExternalResourceID string
+	BindingEndpointKey        string
+	BindingIdentityMode       string
+	BindingExecutionMode      string
+	BindingSessionPolicy      string
+	BindingArtifactPolicy     string
+	BindingCapabilities       dbtypes.JSONText
+	BindingInputSchema        dbtypes.JSONText
+	BindingOutputSchema       dbtypes.JSONText
+	BindingConfig             dbtypes.JSONText
+	BindingSecretRef          string
+	BindingTimeoutSeconds     uint32
+	BindingEnabled            bool
+	BindingCreatedAt          time.Time
+	BindingUpdatedAt          time.Time
+	ProviderStatus            sql.NullString
+}
+
+// AuthorizeExecution (评测 P0-1): ONE query that joins every fact the run /
+// schedule admission must verify. Visibility is enforced server-side —
+// staff see everything; regular users only public, enabled applications.
+// The join itself cannot express the staff bypass, so the Go layer calls
+// it with show_all for staff and is_public=1 for regular users (mirrors
+// ListApplicationsByVisibility).
+func (q *Queries) GetExecutionAuthBundle(ctx context.Context, arg GetExecutionAuthBundleParams) (GetExecutionAuthBundleRow, error) {
+	row := q.db.QueryRowContext(ctx, getExecutionAuthBundle, arg.ID, arg.ShowAll)
+	var i GetExecutionAuthBundleRow
+	err := row.Scan(
+		&i.AppID,
+		&i.AppSlug,
+		&i.AppName,
+		&i.AppKind,
+		&i.AppIsPublic,
+		&i.AppEnabled,
+		&i.BindingID,
+		&i.BindingProviderID,
+		&i.BindingProviderKey,
+		&i.BindingRuntimeType,
+		&i.BindingExternalResourceID,
+		&i.BindingEndpointKey,
+		&i.BindingIdentityMode,
+		&i.BindingExecutionMode,
+		&i.BindingSessionPolicy,
+		&i.BindingArtifactPolicy,
+		&i.BindingCapabilities,
+		&i.BindingInputSchema,
+		&i.BindingOutputSchema,
+		&i.BindingConfig,
+		&i.BindingSecretRef,
+		&i.BindingTimeoutSeconds,
+		&i.BindingEnabled,
+		&i.BindingCreatedAt,
+		&i.BindingUpdatedAt,
+		&i.ProviderStatus,
+	)
+	return i, err
+}
+
 const getProviderByKey = `-- name: GetProviderByKey :one
 
 SELECT id, provider_key, name, description, supported_runtime_types, capabilities,

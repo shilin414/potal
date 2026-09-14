@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	openapi_types "github.com/oapi-codegen/runtime/types"
@@ -126,18 +127,29 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	appID := *body.ApplicationID
 
-	binding, err := s.CatalogRepo.EnabledBinding(ctx, appID)
+	// Execution authorization (评测 P0-1): the ONE gate shared with the
+	// scheduler. Visibility is not authorization — a regular caller must
+	// not be able to execute a private or disabled application by guessing
+	// its id. Staff may execute private apps; nobody may execute a
+	// disabled one.
+	exe, err := s.Catalog.AuthorizeExecution(ctx, appID, caller.ID, caller.IsStaff)
 	if err != nil {
-		writeBare(w, http.StatusBadRequest, "application not found or has no runtime binding")
+		writeExecutionDenied(w, err)
+		return
+	}
+	binding := exe.Binding
+
+	// User admission (评测 P1-7): per-user QPS + outstanding backlog cap.
+	// Provider capacity is finite; without this an authenticated client can
+	// grow the MySQL backlog without bound.
+	if err := s.admitUserRun(ctx, caller.ID); err != nil {
+		writeDetail(w, http.StatusTooManyRequests, err.Error())
 		return
 	}
 
-	// Lazy conversation: reuse the caller's conversation or create one now.
+	// Conversation target: reuse the caller's own conversation, or create
+	// one inside the run transaction (lazy, atomic — no orphan rows).
 	convID := int64(0)
-	title := body.Content
-	if len([]rune(title)) > 80 {
-		title = string([]rune(title)[:80])
-	}
 	if body.ConversationID != nil && *body.ConversationID > 0 {
 		var owner, appCol int64
 		err := s.DB.QueryRowContext(ctx,
@@ -148,18 +160,10 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		convID = *body.ConversationID
-	} else {
-		res, err := s.DB.ExecContext(ctx,
-			`INSERT INTO conversations (user_id, application_id, organization_id, title) VALUES (?, ?, NULL, ?)`,
-			caller.ID, appID, title)
-		if err != nil {
-			writeSimpleError(w, http.StatusInternalServerError, "conversation create failed")
-			return
-		}
-		if convID, err = res.LastInsertId(); err != nil {
-			writeSimpleError(w, http.StatusInternalServerError, "conversation create failed")
-			return
-		}
+	}
+	title := body.Content
+	if len([]rune(title)) > 80 {
+		title = string([]rune(title)[:80])
 	}
 
 	// Attachments: only the caller's own unbound pending attachments.
@@ -174,35 +178,79 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	run, err := s.Runs.CreateRun(ctx, &execution.CreateRunInput{
-		UserID:            caller.ID,
-		ApplicationID:     appID,
-		ConversationID:    convID,
-		RuntimeBindingID:  binding.ID,
-		Provider:          binding.ProviderKey,
-		RuntimeType:       binding.RuntimeType,
-		ExecutionMode:     binding.ExecutionMode,
-		Content:           body.Content,
-		AttachmentIDs:     attachmentIDs,
-		ConversationTitle: title,
-		RuntimeSnapshot:   binding.Snapshot(),
+		UserID:             caller.ID,
+		ApplicationID:      appID,
+		ConversationID:     convID,
+		RuntimeBindingID:   binding.ID,
+		Provider:           binding.ProviderKey,
+		RuntimeType:        binding.RuntimeType,
+		ExecutionMode:      binding.ExecutionMode,
+		Content:            body.Content,
+		AttachmentIDs:      attachmentIDs,
+		ConversationTitle:  title,
+		CreateConversation: convID == 0,
+		RuntimeSnapshot:    binding.Snapshot(),
 	})
 	if err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		switch {
+		case errors.Is(err, execution.ErrConversationBusy):
+			// 评测 P0-2: one conversation executes one turn at a time.
+			writeDetail(w, http.StatusConflict, "previous turn is still running")
+		case errors.Is(err, execution.ErrAttachmentClaimed):
+			writeDetail(w, http.StatusConflict, "one or more attachments were already used")
+		case errors.Is(err, execution.ErrConversationNotFound):
+			writeBare(w, http.StatusBadRequest, "conversation not found")
+		default:
+			writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		}
 		return
 	}
 
-	// Bind attachment rows to the run.
-	for _, raw := range attachmentIDs {
-		attID, err := ids.Parse(raw)
-		if err != nil {
-			continue
-		}
-		_, _ = s.DB.ExecContext(ctx,
-			`UPDATE runtime_attachments SET run_id = ?, conversation_id = ? WHERE id = ? AND created_by = ? AND run_id IS NULL`,
-			run.ID.Bytes(), convID, attID.Bytes(), caller.ID)
-	}
-
 	writeJSON(w, http.StatusCreated, toRunRecord(run))
+}
+
+// writeExecutionDenied maps the unified execution gate's errors to the
+// wire envelope. Regular callers always see 404 (no existence leak);
+// staff get a precise conflict for the states they can see.
+func writeExecutionDenied(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, catalog.ErrExecutionDisabled):
+		writeDetail(w, http.StatusConflict, "application is disabled")
+	case errors.Is(err, catalog.ErrExecutionNotChat):
+		writeBare(w, http.StatusBadRequest, "application does not support chat runs")
+	case errors.Is(err, catalog.ErrExecutionProviderInactive):
+		writeDetail(w, http.StatusConflict, "provider is not active")
+	case errors.Is(err, catalog.ErrNoBinding):
+		writeDetail(w, http.StatusConflict, "application has no enabled runtime binding")
+	default:
+		writeDetail(w, http.StatusNotFound, "application not found")
+	}
+}
+
+// admitUserRun applies the per-user admission policy (评测 P1-7): a GCRA
+// QPS limit plus an outstanding (queued+running) run cap. Both are
+// skipped when unconfigured (tests / single-tenant dev).
+func (s *Server) admitUserRun(ctx context.Context, userID int64) error {
+	qps := s.Config.Runner.UserRunQPS
+	if qps > 0 && s.Redis != nil {
+		limiter := execution.NewRateLimiter(s.Redis,
+			s.Redis.Key("rate", "runs", "user", strconv.FormatInt(userID, 10)), qps, time.Second)
+		if ok, wait, err := limiter.Allow(ctx); err == nil && !ok {
+			secs := int(wait.Seconds())
+			if secs < 1 {
+				secs = 1
+			}
+			return fmt.Errorf("too many requests, retry in %ds", secs)
+		}
+	}
+	max := s.Config.Runner.UserMaxOutstanding
+	if max > 0 {
+		n, err := s.Runs.Querier().CountOutstandingRunsByUser(ctx, sql.NullInt64{Int64: userID, Valid: true})
+		if err == nil && n >= int64(max) {
+			return fmt.Errorf("too many outstanding runs (limit %d)", max)
+		}
+	}
+	return nil
 }
 
 func dedupe(in []string) []string {
@@ -550,11 +598,14 @@ func (s *Server) UploadApplicationAttachment(w http.ResponseWriter, r *http.Requ
 		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
 		return
 	}
-	binding, err := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	// Same execution gate as CreateRun (评测 P0-1): uploading an attachment
+	// for an application you may not run is itself a probe vector.
+	exe, err := s.Catalog.AuthorizeExecution(r.Context(), int64(id), caller.ID, caller.IsStaff)
 	if err != nil {
-		writeDetail(w, http.StatusNotFound, "application not found")
+		writeExecutionDenied(w, err)
 		return
 	}
+	binding := exe.Binding
 	if err := r.ParseMultipartForm(50 << 20); err != nil {
 		writeBare(w, http.StatusBadRequest, "file or doc_url is required")
 		return

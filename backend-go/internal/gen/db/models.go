@@ -368,6 +368,7 @@ type Schedule struct {
 	LastRunAt              sql.NullTime
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
+	DeletedAt              sql.NullTime
 }
 
 type ScheduleDelivery struct {

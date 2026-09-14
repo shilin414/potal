@@ -47,6 +47,20 @@ func (q *Queries) BindAgentThreadSessionOwned(ctx context.Context, arg BindAgent
 	return q.db.ExecContext(ctx, bindAgentThreadSessionOwned, arg.RemoteID, arg.ID, arg.RemoteID_2)
 }
 
+const countActiveRunsByConversation = `-- name: CountActiveRunsByConversation :one
+SELECT COUNT(*) AS n FROM runs
+WHERE conversation_id = ? AND status IN ('queued', 'running')
+`
+
+// Active-run count under the conversations row lock. Backed by
+// idx_runs_conversation_status (migration 0014).
+func (q *Queries) CountActiveRunsByConversation(ctx context.Context, conversationID sql.NullInt64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countActiveRunsByConversation, conversationID)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
 const countMessagesByConversation = `-- name: CountMessagesByConversation :one
 SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?
 `
@@ -286,6 +300,19 @@ func (q *Queries) GetConversationByID(ctx context.Context, id uint64) (Conversat
 	return i, err
 }
 
+const getConversationRowForUpdate = `-- name: GetConversationRowForUpdate :one
+SELECT id FROM conversations WHERE id = ? FOR UPDATE
+`
+
+// Conversation admission lock (评测 P0-2): CreateRunInTx takes this lock so
+// the active-run count is re-read under it — two concurrent submits to the
+// same conversation serialize and the loser sees the winner's run.
+func (q *Queries) GetConversationRowForUpdate(ctx context.Context, id uint64) (uint64, error) {
+	row := q.db.QueryRowContext(ctx, getConversationRowForUpdate, id)
+	err := row.Scan(&id)
+	return id, err
+}
+
 const listConversationsByApplication = `-- name: ListConversationsByApplication :many
 SELECT id, user_id, application_id, organization_id, title, created_at, updated_at
 FROM conversations
@@ -353,8 +380,8 @@ type ListConversationsForUserRow struct {
 }
 
 // Sidebar history: latest message + count via correlated scalar subqueries
-// in the SELECT list. (TiDB rejects subqueries inside JOIN ... ON, and
-// window functions are MySQL 8 only — the project must stay 5.7-compatible.)
+// in the SELECT list (window functions are MySQL 8 only — the project must
+// stay 5.7-compatible).
 func (q *Queries) ListConversationsForUser(ctx context.Context, userID uint64) ([]ListConversationsForUserRow, error) {
 	rows, err := q.db.QueryContext(ctx, listConversationsForUser, userID)
 	if err != nil {
@@ -480,6 +507,18 @@ func (q *Queries) ListMessagesByConversation(ctx context.Context, conversationID
 		return nil, err
 	}
 	return items, nil
+}
+
+const touchConversationUpdated = `-- name: TouchConversationUpdated :exec
+UPDATE conversations SET updated_at = CURRENT_TIMESTAMP(3) WHERE id = ?
+`
+
+// Sidebar ordering (评测 §十三): conversations.updated_at must move when a
+// message lands, otherwise an old conversation never returns to the top of
+// the list. Called in the same transaction as the message insert.
+func (q *Queries) TouchConversationUpdated(ctx context.Context, id uint64) error {
+	_, err := q.db.ExecContext(ctx, touchConversationUpdated, id)
+	return err
 }
 
 const unbindConversationAttachments = `-- name: UnbindConversationAttachments :exec

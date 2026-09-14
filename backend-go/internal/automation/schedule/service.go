@@ -57,10 +57,13 @@ type CreateInput struct {
 
 // Service implements schedule CRUD on MySQL.
 type Service struct {
-	DB      *sql.DB
-	Check   ApplicationChecker
-	Log     *slog.Logger
-	nowFunc func() time.Time
+	DB    *sql.DB
+	Check ApplicationChecker
+	Log   *slog.Logger
+	// MaxSchedules caps how many live schedules one owner may have
+	// (评测 P1-7); 0 disables the cap.
+	MaxSchedules int
+	nowFunc      func() time.Time
 }
 
 func NewService(d *sql.DB, check ApplicationChecker, log *slog.Logger) *Service {
@@ -103,11 +106,12 @@ var policyValues = map[string]map[string]bool{
 func policyValid(kind, v string) bool { return policyValues[kind][v] }
 
 // validate enforces domain rules; caller identity checks happen upstream.
-func (s *Service) validate(ctx context.Context, in *CreateInput) error {
-	return validateInput(ctx, in, s.nowFunc, s.Check)
+// ownerUserID feeds the AuthorizeExecution gate (评测 P0-1).
+func (s *Service) validate(ctx context.Context, in *CreateInput, ownerUserID int64) error {
+	return validateInput(ctx, in, ownerUserID, s.nowFunc, s.Check)
 }
 
-func validateInput(ctx context.Context, in *CreateInput, now func() time.Time, check ApplicationChecker) error {
+func validateInput(ctx context.Context, in *CreateInput, ownerUserID int64, now func() time.Time, check ApplicationChecker) error {
 	if in.Name == "" {
 		return &ValidationError{Msg: "name is required"}
 	}
@@ -157,8 +161,9 @@ func validateInput(ctx context.Context, in *CreateInput, now func() time.Time, c
 		}
 	}
 	if check != nil {
-		// Who may run it is decided by the application, not the caller of check.
-		if err := check.SchedulableApplication(ctx, in.ApplicationID, 0); err != nil {
+		// AuthorizeExecution gate (评测 P0-1): who may run it is decided by
+		// the application, validated under the owner's identity.
+		if err := check.SchedulableApplication(ctx, in.ApplicationID, ownerUserID); err != nil {
 			return &ValidationError{Msg: "application is not schedulable"}
 		}
 	}
@@ -171,8 +176,18 @@ func validateInput(ctx context.Context, in *CreateInput, now func() time.Time, c
 // one transaction. next_run_at is derived from the trigger.
 func (s *Service) Create(ctx context.Context, ownerUserID int64, in *CreateInput) (*Schedule, error) {
 	in.defaults()
-	if err := s.validate(ctx, in); err != nil {
+	if err := s.validate(ctx, in, ownerUserID); err != nil {
 		return nil, err
+	}
+	// Per-user schedule quota (评测 P1-7).
+	if s.MaxSchedules > 0 {
+		n, err := s.q(ctx).CountSchedulesByOwner(ctx, uint64(ownerUserID))
+		if err != nil {
+			return nil, err
+		}
+		if n >= int64(s.MaxSchedules) {
+			return nil, &ValidationError{Msg: "定时任务数量已达上限"}
+		}
 	}
 	now := s.nowFunc().UTC()
 	next, err := NextRunAfter(in.ScheduleType, in.TriggerConfig, in.RunAt, in.Timezone, now)
@@ -273,6 +288,11 @@ func (s *Service) Get(ctx context.Context, id, userID int64, isStaff bool) (*Sch
 		return nil, err
 	}
 	if row.OwnerUserID != uint64(userID) && !isStaff {
+		return nil, ErrNotFound
+	}
+	// Soft-deleted (评测 §十二): gone for every owner surface, while the
+	// delivery worker keeps resolving the row directly for its name.
+	if row.DeletedAt.Valid {
 		return nil, ErrNotFound
 	}
 	return FromDBRow(row), nil
@@ -460,7 +480,7 @@ func (s *Service) Update(ctx context.Context, id, userID int64, isStaff bool, in
 		next.ExecutionWindowSeconds = *in.ExecutionWindowSeconds
 	}
 	next.defaults()
-	if err := s.validate(ctx, next); err != nil {
+	if err := s.validate(ctx, next, userID); err != nil {
 		return nil, err
 	}
 	// Recompute from now; missed slots while editing are not replayed.
@@ -558,7 +578,10 @@ func (s *Service) SetEnabled(ctx context.Context, id, userID int64, isStaff, ena
 	return s.Get(ctx, id, userID, isStaff)
 }
 
-// Delete hard-deletes the schedule and its delivery config; occurrences,
+// Delete soft-deletes the schedule (评测 §十二): pending delivery
+// executions still resolve schedule.Name to build their Feishu message,
+// so the row must survive. The scheduler scan (ListDueSchedules filters
+// deleted_at IS NULL) and every owner surface stop seeing it; occurrences,
 // runs and delivery executions are kept as history.
 func (s *Service) Delete(ctx context.Context, id, userID int64, isStaff bool) error {
 	if _, err := s.Get(ctx, id, userID, isStaff); err != nil {

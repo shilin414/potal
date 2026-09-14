@@ -134,6 +134,12 @@ func (w *WorkerOwnedService) BindProviderSession(ctx context.Context, claimed *C
 // thread and enforces the identity invariant: one
 // user/agent/provider/auth-subject per thread. Thread creation is
 // conversation-scoped bookkeeping, not run canonical state.
+//
+// Concurrency (评测 P0-2): the create path is an atomic get-or-create —
+// UNIQUE(conversation_id) decides a race, the loser re-reads the winner's
+// row instead of failing. Combined with the conversation-level run
+// serialization this makes "two remote sessions for one conversation"
+// unreachable.
 func (w *WorkerOwnedService) EnsureAgentThread(ctx context.Context, conversationID int64, provider, authMode, subjectKey string) (threadID ids.ID, remoteID string, err error) {
 	if conversationID == 0 {
 		return ids.ID{}, "", nil
@@ -149,14 +155,25 @@ func (w *WorkerOwnedService) EnsureAgentThread(ctx context.Context, conversation
 			AuthMode:       authMode,
 			AuthSubjectKey: subjectKey,
 		}); cErr != nil {
-			return ids.ID{}, "", cErr
+			// A concurrent first turn won the UNIQUE(conversation_id)
+			// race — re-read its row rather than failing the run.
+			row, getErr = q.GetAgentThreadByConversation(ctx, uint64(conversationID))
+			if getErr != nil {
+				return ids.ID{}, "", cErr
+			}
+			return w.checkThreadIdentity(row, provider, authMode, subjectKey)
 		}
 		return newID, "", nil
 	}
 	if getErr != nil {
 		return ids.ID{}, "", getErr
 	}
-	// Identity mismatch = never reuse another user's provider session.
+	return w.checkThreadIdentity(row, provider, authMode, subjectKey)
+}
+
+// checkThreadIdentity rejects reusing a thread created under a different
+// identity/provider — never leak another user's provider session.
+func (w *WorkerOwnedService) checkThreadIdentity(row db.AgentThread, provider, authMode, subjectKey string) (ids.ID, string, error) {
 	if row.Provider != provider || row.AuthMode != authMode || row.AuthSubjectKey != subjectKey {
 		return ids.ID{}, "", errors.New("conversation thread identity/provider mismatch")
 	}

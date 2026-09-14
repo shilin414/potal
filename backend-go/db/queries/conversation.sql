@@ -105,3 +105,21 @@ DELETE FROM agent_threads WHERE conversation_id = ?;
 
 -- name: DeleteConversation :exec
 DELETE FROM conversations WHERE id = ?;
+
+-- name: GetConversationRowForUpdate :one
+-- Conversation admission lock (评测 P0-2): CreateRunInTx takes this lock so
+-- the active-run count is re-read under it — two concurrent submits to the
+-- same conversation serialize and the loser sees the winner's run.
+SELECT id FROM conversations WHERE id = ? FOR UPDATE;
+
+-- name: CountActiveRunsByConversation :one
+-- Active-run count under the conversations row lock. Backed by
+-- idx_runs_conversation_status (migration 0014).
+SELECT COUNT(*) AS n FROM runs
+WHERE conversation_id = ? AND status IN ('queued', 'running');
+
+-- name: TouchConversationUpdated :exec
+-- Sidebar ordering (评测 §十三): conversations.updated_at must move when a
+-- message lands, otherwise an old conversation never returns to the top of
+-- the list. Called in the same transaction as the message insert.
+UPDATE conversations SET updated_at = CURRENT_TIMESTAMP(3) WHERE id = ?;

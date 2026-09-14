@@ -114,6 +114,15 @@ type RunnerConfig struct {
 	// PriorityWeights is the weighted fair scheduling share of
 	// [interactive, retry, scheduled] class streams.
 	PriorityWeights []int
+
+	// User-level admission (评测 P1-7): provider capacity is finite, so an
+	// authenticated client must not be able to grow the MySQL backlog
+	// without bound. UserRunQPS is a per-user GCRA limit on run creation;
+	// UserMaxOutstanding caps that user's queued+running runs;
+	// UserMaxSchedules caps how many schedules one user may own.
+	UserRunQPS         int
+	UserMaxOutstanding int
+	UserMaxSchedules   int
 }
 
 type SessionConfig struct {
@@ -197,15 +206,18 @@ func Load(searchPaths ...string) (*Config, error) {
 			RequestTimeout:       getEnvDuration("AILY_REQUEST_TIMEOUT", 30*time.Second),
 		},
 		Runner: RunnerConfig{
-			LeaseSeconds:      getEnvDuration("RUN_LEASE_SECONDS", 120*time.Second),
-			HeartbeatInterval: getEnvDuration("RUN_LEASE_HEARTBEAT_SECONDS", 30*time.Second),
-			ClaimBatch:        getEnvInt("RUN_CLAIM_BATCH_SIZE", 10),
-			WorkerID:          getEnv("WORKER_ID", ""),
-			Concurrency:       getEnvInt("WORKER_CONCURRENCY", 10),
-			ReaperInterval:    getEnvDuration("RUN_REAPER_INTERVAL", 20*time.Second),
-			RelayInterval:     getEnvDuration("OUTBOX_RELAY_INTERVAL", 500*time.Millisecond),
-			RequeueDelay:      getEnvDuration("RUN_REQUEUE_DELAY", 5*time.Second),
-			PriorityWeights:   parseWeights(getEnv("RUN_PRIORITY_WEIGHTS", "7,1,2")),
+			LeaseSeconds:       getEnvDuration("RUN_LEASE_SECONDS", 120*time.Second),
+			HeartbeatInterval:  getEnvDuration("RUN_LEASE_HEARTBEAT_SECONDS", 30*time.Second),
+			ClaimBatch:         getEnvInt("RUN_CLAIM_BATCH_SIZE", 10),
+			WorkerID:           getEnv("WORKER_ID", ""),
+			Concurrency:        getEnvInt("WORKER_CONCURRENCY", 10),
+			ReaperInterval:     getEnvDuration("RUN_REAPER_INTERVAL", 20*time.Second),
+			RelayInterval:      getEnvDuration("OUTBOX_RELAY_INTERVAL", 500*time.Millisecond),
+			RequeueDelay:       getEnvDuration("RUN_REQUEUE_DELAY", 5*time.Second),
+			PriorityWeights:    parseWeights(getEnv("RUN_PRIORITY_WEIGHTS", "7,1,2")),
+			UserRunQPS:         getEnvInt("RUN_USER_QPS", 5),
+			UserMaxOutstanding: getEnvInt("RUN_USER_MAX_OUTSTANDING", 20),
+			UserMaxSchedules:   getEnvInt("SCHEDULE_USER_MAX", 50),
 		},
 		Session: SessionConfig{
 			TTL:        getEnvDuration("SESSION_TTL", 12*time.Hour),

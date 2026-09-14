@@ -7,6 +7,33 @@ SELECT id, provider_key, name, description, supported_runtime_types, capabilitie
        created_at, updated_at
 FROM providers WHERE provider_key = ?;
 
+-- name: GetExecutionAuthBundle :one
+-- AuthorizeExecution (评测 P0-1): ONE query that joins every fact the run /
+-- schedule admission must verify. Visibility is enforced server-side —
+-- staff see everything; regular users only public, enabled applications.
+-- The join itself cannot express the staff bypass, so the Go layer calls
+-- it with show_all for staff and is_public=1 for regular users (mirrors
+-- ListApplicationsByVisibility).
+SELECT a.id AS app_id, a.slug AS app_slug, a.name AS app_name, a.kind AS app_kind,
+       a.is_public AS app_is_public, a.enabled AS app_enabled,
+       b.id AS binding_id, b.provider_id AS binding_provider_id, b.provider_key AS binding_provider_key,
+       b.runtime_type AS binding_runtime_type, b.external_resource_id AS binding_external_resource_id,
+       b.endpoint_key AS binding_endpoint_key, b.identity_mode AS binding_identity_mode,
+       b.execution_mode AS binding_execution_mode, b.session_policy AS binding_session_policy,
+       b.artifact_policy AS binding_artifact_policy,
+       b.capabilities AS binding_capabilities, b.input_schema AS binding_input_schema,
+       b.output_schema AS binding_output_schema, b.config AS binding_config,
+       b.secret_ref AS binding_secret_ref, b.timeout_seconds AS binding_timeout_seconds,
+       b.enabled AS binding_enabled, b.created_at AS binding_created_at, b.updated_at AS binding_updated_at,
+       p.status AS provider_status
+FROM applications a
+JOIN runtime_bindings b ON b.application_id = a.id AND b.enabled = 1
+LEFT JOIN providers p ON p.id = b.provider_id
+WHERE a.id = ? AND a.enabled = 1 AND a.kind = 'chat'
+  AND (sqlc.arg('show_all') OR a.is_public = 1)
+ORDER BY b.id DESC
+LIMIT 1;
+
 -- name: ListActiveProviders :many
 SELECT id, provider_key, name, description, supported_runtime_types, capabilities,
        start_rate_limit, max_inflight, poll_rate_limit, artifact_rate_limit,

@@ -516,3 +516,18 @@ DELETE FROM runtime_attachments WHERE id = ?;
 -- Late-attachment race guard: only while queued.
 UPDATE runs SET input = JSON_ARRAY_APPEND(input, '$.agent_attachment_ids', ?)
 WHERE id = ? AND status = 'queued';
+
+-- name: ClaimAttachmentForRun :execresult
+-- Atomic attachment claim (评测 P1-5): the run row is created first, then
+-- each attachment is claimed with a run_id IS NULL guard. 0 rows affected
+-- = a concurrent run already claimed it; the caller MUST roll the whole
+-- CreateRun transaction back rather than create a run whose input lists an
+-- attachment it does not own.
+UPDATE runtime_attachments
+SET run_id = ?, conversation_id = ?
+WHERE id = ? AND created_by = ? AND status = 'pending' AND run_id IS NULL;
+
+-- name: CountOutstandingRunsByUser :one
+-- Per-user admission (评测 P1-7): queued + running runs against the cap.
+SELECT COUNT(*) AS n FROM runs
+WHERE user_id = ? AND status IN ('queued', 'running');

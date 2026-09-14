@@ -37,6 +37,21 @@ var ErrInvalidTerminalStatus = errors.New("execution: invalid terminal status")
 // fail the run, not retry it.
 var ErrProviderAttemptsExhausted = errors.New("execution: provider attempts exhausted")
 
+// ErrConversationBusy marks a CreateRun rejected because the conversation
+// already has a queued/running run (评测 P0-2). One conversation executes
+// one turn at a time: the provider-side session must never be addressed by
+// two concurrent runs, and answers must land in submission order.
+var ErrConversationBusy = errors.New("execution: previous turn is still running")
+
+// ErrConversationNotFound marks a CreateRun whose conversation vanished
+// (deleted) or does not belong to the caller (评测 P1-4 lifetime race).
+var ErrConversationNotFound = errors.New("execution: conversation not found")
+
+// ErrAttachmentClaimed marks a CreateRun rejected because one of its
+// attachments was concurrently claimed by another run (评测 P1-5). The
+// whole run creation rolls back.
+var ErrAttachmentClaimed = errors.New("execution: attachment already claimed")
+
 // Service implements the Run lifecycle on top of MySQL.
 type Service struct {
 	DB      *sql.DB
@@ -89,8 +104,12 @@ type CreateRunInput struct {
 	ContentItems      []map[string]any
 	AttachmentIDs     []string // studio attachment ids (owned, unbound)
 	ConversationTitle string
-	RuntimeSnapshot   map[string]any
-	MaxAttempts       int64
+	// CreateConversation asks CreateRunInTx to create the conversation
+	// inside the same transaction when ConversationID is 0 (评测 P1-5:
+	// no orphan conversation when the run creation fails).
+	CreateConversation bool
+	RuntimeSnapshot    map[string]any
+	MaxAttempts        int64
 	// Scheduling provenance: zero values mean an interactive run.
 	TriggerType string // "interactive_user" | "scheduled" | ...
 	TriggerID   int64  // schedule_occurrences.id for scheduled runs
@@ -129,8 +148,57 @@ func (s *Service) CreateRun(ctx context.Context, in *CreateRunInput) (*Run, erro
 // CreateRunInTx writes message + run + outbox inside a caller-owned
 // transaction so composite units (e.g. scheduler occurrence + run) commit
 // atomically. The caller owns commit/rollback.
+//
+// Admission guarantees enforced here (评测 P0-2 / P1-5):
+//   - at most ONE non-terminal run per conversation (serialized turns);
+//   - attachments are claimed with a run_id IS NULL guard, so a losing
+//     concurrent CreateRun rolls back instead of leaving a run whose input
+//     lists an attachment bound to another run;
+//   - the conversation's updated_at moves in the same transaction so the
+//     sidebar order is correct (§十三).
 func (s *Service) CreateRunInTx(ctx context.Context, tx *sql.Tx, in *CreateRunInput) (ids.ID, error) {
 	runID := ids.New()
+	q := db.New(tx)
+
+	convID := in.ConversationID
+	// Lazy conversation creation INSIDE the transaction: a failed run
+	// (e.g. a lost attachment claim) must not strand an empty conversation.
+	if convID == 0 && in.CreateConversation {
+		var appArg sql.NullInt64
+		if in.ApplicationID != 0 {
+			appArg = sql.NullInt64{Int64: in.ApplicationID, Valid: true}
+		}
+		res, err := q.CreateConversation(ctx, db.CreateConversationParams{
+			UserID:        uint64(in.UserID),
+			ApplicationID: appArg,
+			Title:         in.ConversationTitle,
+		})
+		if err != nil {
+			return runID, fmt.Errorf("insert conversation: %w", err)
+		}
+		if convID, err = res.LastInsertId(); err != nil {
+			return runID, fmt.Errorf("insert conversation: %w", err)
+		}
+	}
+
+	// Conversation admission (评测 P0-2): lock the conversation row, then
+	// count its non-terminal runs. Two concurrent submits serialize on the
+	// lock; the loser sees the winner's queued run and is rejected.
+	if convID != 0 {
+		if _, err := q.GetConversationRowForUpdate(ctx, uint64(convID)); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return runID, ErrConversationNotFound
+			}
+			return runID, fmt.Errorf("conversation admission: %w", err)
+		}
+		active, err := q.CountActiveRunsByConversation(ctx, sql.NullInt64{Int64: convID, Valid: true})
+		if err != nil {
+			return runID, fmt.Errorf("conversation admission: %w", err)
+		}
+		if active > 0 {
+			return runID, ErrConversationBusy
+		}
+	}
 
 	contentItems := in.ContentItems
 	if contentItems == nil {
@@ -165,10 +233,8 @@ func (s *Service) CreateRunInTx(ctx context.Context, tx *sql.Tx, in *CreateRunIn
 	inputJSON, _ := json.Marshal(input)
 	snapshotJSON, _ := json.Marshal(defaultMap(in.RuntimeSnapshot))
 
-	q := db.New(tx)
-
 	if _, err := q.CreateMessage(ctx, db.CreateMessageParams{
-		ConversationID: uint64(in.ConversationID),
+		ConversationID: uint64(convID),
 		Role:           "user",
 		Content:        in.Content,
 		Metadata:       dbtypes.JSONText(userMessageMetadata(runID, in.AttachmentIDs)),
@@ -187,11 +253,15 @@ func (s *Service) CreateRunInTx(ctx context.Context, tx *sql.Tx, in *CreateRunIn
 	if !in.AvailableAt.IsZero() {
 		availableAt = sql.NullTime{Time: in.AvailableAt, Valid: true}
 	}
+	var convArg sql.NullInt64
+	if convID != 0 {
+		convArg = sql.NullInt64{Int64: convID, Valid: true}
+	}
 	if _, err := q.CreateRun(ctx, db.CreateRunParams{
 		ID:               runID.Bytes(),
 		UserID:           nullInt64(&in.UserID),
 		ApplicationID:    nullInt64(&in.ApplicationID),
-		ConversationID:   nullInt64(&in.ConversationID),
+		ConversationID:   convArg,
 		RuntimeBindingID: nullInt64(&in.RuntimeBindingID),
 		Provider:         in.Provider,
 		RuntimeType:      in.RuntimeType,
@@ -205,6 +275,29 @@ func (s *Service) CreateRunInTx(ctx context.Context, tx *sql.Tx, in *CreateRunIn
 	}); err != nil {
 		return runID, fmt.Errorf("insert run: %w", err)
 	}
+
+	// Attachment claim (评测 P1-5): atomic, inside the run's transaction.
+	// Any failure rolls the whole run back — never a run whose input
+	// references an attachment owned by another run.
+	for _, raw := range in.AttachmentIDs {
+		attID, err := ids.Parse(raw)
+		if err != nil {
+			return runID, fmt.Errorf("attachment claim: %w", err)
+		}
+		res, err := q.ClaimAttachmentForRun(ctx, db.ClaimAttachmentForRunParams{
+			RunID:          sql.NullString{String: string(runID.Bytes()), Valid: true},
+			ConversationID: convArg,
+			ID:             attID.Bytes(),
+			CreatedBy:      sql.NullInt64{Int64: in.UserID, Valid: true},
+		})
+		if err != nil {
+			return runID, fmt.Errorf("attachment claim: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return runID, ErrAttachmentClaimed
+		}
+	}
+
 	if _, err := q.CreateOutboxEvent(ctx, db.CreateOutboxEventParams{
 		Aggregate:   "run",
 		AggregateID: runID.Bytes(),
@@ -212,6 +305,14 @@ func (s *Service) CreateRunInTx(ctx context.Context, tx *sql.Tx, in *CreateRunIn
 		Payload:     dbtypes.JSONText(outboxJSON),
 	}); err != nil {
 		return runID, fmt.Errorf("insert outbox: %w", err)
+	}
+
+	// Sidebar ordering (评测 §十三): the conversation must bubble to the
+	// top when a message lands.
+	if convID != 0 {
+		if err := q.TouchConversationUpdated(ctx, uint64(convID)); err != nil {
+			return runID, fmt.Errorf("touch conversation: %w", err)
+		}
 	}
 	return runID, nil
 }

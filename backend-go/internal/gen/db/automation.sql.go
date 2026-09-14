@@ -113,6 +113,19 @@ func (q *Queries) CountActiveOccurrencesExcluding(ctx context.Context, arg Count
 	return n, err
 }
 
+const countSchedulesByOwner = `-- name: CountSchedulesByOwner :one
+SELECT COUNT(*) AS n FROM schedules WHERE owner_user_id = ? AND deleted_at IS NULL
+`
+
+// Per-user schedule cap (评测 P1-7): only live (non-deleted) schedules
+// count against the quota.
+func (q *Queries) CountSchedulesByOwner(ctx context.Context, ownerUserID uint64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countSchedulesByOwner, ownerUserID)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
 const countSkippedOccurrencesForSlot = `-- name: CountSkippedOccurrencesForSlot :one
 SELECT COUNT(*) AS n FROM schedule_occurrences
 WHERE schedule_id = ? AND scheduled_at = ? AND status = 'skipped'
@@ -163,7 +176,6 @@ func (q *Queries) CreateDeliveryExecution(ctx context.Context, arg CreateDeliver
 }
 
 const createSchedule = `-- name: CreateSchedule :execresult
-
 INSERT INTO schedules (owner_user_id, name, description, application_id, input_payload,
     schedule_type, cron_expression, trigger_config, timezone, run_at, enabled,
     conversation_policy, conversation_id, overlap_policy, misfire_policy,
@@ -192,8 +204,6 @@ type CreateScheduleParams struct {
 	NextRunAt              sql.NullTime
 }
 
-// ─────────────────────────────────────────────────────────── automation ──
-// Schedule / Occurrence / Delivery queries (0006_schedule_automation).
 func (q *Queries) CreateSchedule(ctx context.Context, arg CreateScheduleParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, createSchedule,
 		arg.OwnerUserID,
@@ -235,10 +245,30 @@ func (q *Queries) CreateScheduleOccurrence(ctx context.Context, arg CreateSchedu
 	return q.db.ExecContext(ctx, createScheduleOccurrence, arg.ScheduleID, arg.ScheduledAt)
 }
 
-const deleteSchedule = `-- name: DeleteSchedule :execresult
-DELETE FROM schedules WHERE id = ?
+const dBNow = `-- name: DBNow :one
+
+SELECT CURRENT_TIMESTAMP(3) AS now
 `
 
+// ─────────────────────────────────────────────────────────── automation ──
+// Schedule / Occurrence / Delivery queries (0006_schedule_automation).
+// Clock Authority (评测 §十七): the scheduler resolves "now" from the
+// database so due / misfire / window decisions are identical across
+// scheduler hosts regardless of their local clock skew.
+func (q *Queries) DBNow(ctx context.Context) (time.Time, error) {
+	row := q.db.QueryRowContext(ctx, dBNow)
+	var now time.Time
+	err := row.Scan(&now)
+	return now, err
+}
+
+const deleteSchedule = `-- name: DeleteSchedule :execresult
+UPDATE schedules SET deleted_at = CURRENT_TIMESTAMP(3), enabled = 0 WHERE id = ? AND deleted_at IS NULL
+`
+
+// Soft delete (评测 §十二): pending delivery executions still resolve
+// schedule.Name to build their message; the row must survive. The
+// scheduler scan and owner lists filter deleted_at IS NULL.
 func (q *Queries) DeleteSchedule(ctx context.Context, id uint64) (sql.Result, error) {
 	return q.db.ExecContext(ctx, deleteSchedule, id)
 }
@@ -308,7 +338,7 @@ SELECT id, owner_user_id, name, description, application_id,
        timezone, run_at, enabled,
        conversation_policy, conversation_id, overlap_policy, misfire_policy,
        execution_window_seconds, deadline_policy, next_run_at, last_run_at,
-       created_at, updated_at
+       created_at, updated_at, deleted_at
 FROM schedules WHERE id = ?
 `
 
@@ -338,6 +368,7 @@ func (q *Queries) GetScheduleByID(ctx context.Context, id uint64) (Schedule, err
 		&i.LastRunAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DeletedAt,
 	)
 	return i, err
 }
@@ -424,15 +455,53 @@ func (q *Queries) GetScheduleOccurrenceBySlot(ctx context.Context, arg GetSchedu
 	return i, err
 }
 
-const getScheduleRowForUpdate = `-- name: GetScheduleRowForUpdate :execresult
-SELECT id FROM schedules WHERE id = ? FOR UPDATE
+const getScheduleRowForUpdate = `-- name: GetScheduleRowForUpdate :one
+SELECT id, owner_user_id, name, description, application_id,
+       COALESCE(input_payload, '{}') AS input_payload,
+       schedule_type, cron_expression, COALESCE(trigger_config, '{}') AS trigger_config,
+       timezone, run_at, enabled,
+       conversation_policy, conversation_id, overlap_policy, misfire_policy,
+       execution_window_seconds, deadline_policy, next_run_at, last_run_at,
+       created_at, updated_at, deleted_at
+FROM schedules WHERE id = ? AND deleted_at IS NULL FOR UPDATE
 `
 
-// Admission lock (修复计划 §35): serializes concurrent admissions for the
-// same schedule so two schedulers can never both observe "no active
-// occurrence" and create parallel runs (write-skew guard).
-func (q *Queries) GetScheduleRowForUpdate(ctx context.Context, id uint64) (sql.Result, error) {
-	return q.db.ExecContext(ctx, getScheduleRowForUpdate, id)
+// Admission lock (修复计划 §35, 评测 P1-1/P1-2): serializes concurrent
+// admissions for the same schedule so two schedulers can never both
+// observe "no active occurrence" and create parallel runs (write-skew
+// guard). Now returns the FULL row: the admission path re-reads the
+// current schedule under the lock instead of trusting the scan-time
+// snapshot (disable / prompt edits become visible before the run is
+// created).
+func (q *Queries) GetScheduleRowForUpdate(ctx context.Context, id uint64) (Schedule, error) {
+	row := q.db.QueryRowContext(ctx, getScheduleRowForUpdate, id)
+	var i Schedule
+	err := row.Scan(
+		&i.ID,
+		&i.OwnerUserID,
+		&i.Name,
+		&i.Description,
+		&i.ApplicationID,
+		&i.InputPayload,
+		&i.ScheduleType,
+		&i.CronExpression,
+		&i.TriggerConfig,
+		&i.Timezone,
+		&i.RunAt,
+		&i.Enabled,
+		&i.ConversationPolicy,
+		&i.ConversationID,
+		&i.OverlapPolicy,
+		&i.MisfirePolicy,
+		&i.ExecutionWindowSeconds,
+		&i.DeadlinePolicy,
+		&i.NextRunAt,
+		&i.LastRunAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.DeletedAt,
+	)
+	return i, err
 }
 
 const hasActiveOccurrence = `-- name: HasActiveOccurrence :one
@@ -784,9 +853,9 @@ SELECT id, owner_user_id, name, description, application_id,
        timezone, run_at, enabled,
        conversation_policy, conversation_id, overlap_policy, misfire_policy,
        execution_window_seconds, deadline_policy, next_run_at, last_run_at,
-       created_at, updated_at
+       created_at, updated_at, deleted_at
 FROM schedules
-WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?
+WHERE enabled = 1 AND deleted_at IS NULL AND next_run_at IS NOT NULL AND next_run_at <= ?
 ORDER BY next_run_at
 LIMIT ?
 `
@@ -796,6 +865,7 @@ type ListDueSchedulesParams struct {
 	Limit     int32
 }
 
+// The scheduler scan never picks up disabled or soft-deleted rows.
 func (q *Queries) ListDueSchedules(ctx context.Context, arg ListDueSchedulesParams) ([]Schedule, error) {
 	rows, err := q.db.QueryContext(ctx, listDueSchedules, arg.NextRunAt, arg.Limit)
 	if err != nil {
@@ -828,6 +898,7 @@ func (q *Queries) ListDueSchedules(ctx context.Context, arg ListDueSchedulesPara
 			&i.LastRunAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.DeletedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -1046,9 +1117,10 @@ SELECT s.id, s.owner_user_id, s.name, s.description, s.application_id,
        s.timezone, s.run_at, s.enabled,
        s.conversation_policy, s.conversation_id, s.overlap_policy, s.misfire_policy,
        s.execution_window_seconds, s.deadline_policy, s.next_run_at, s.last_run_at,
-       s.created_at, s.updated_at
+       s.created_at, s.updated_at, s.deleted_at
 FROM schedules s
 WHERE s.owner_user_id = ?
+  AND s.deleted_at IS NULL
   AND CASE
         WHEN ? = 'running' THEN s.enabled = 1
         WHEN ? = 'paused' THEN s.enabled = 0
@@ -1071,7 +1143,8 @@ type ListSchedulesByOwnerParams struct {
 	Limit       int32
 }
 
-// status: all | running | paused | failed (UI filters).
+// status: all | running | paused | failed (UI filters). Soft-deleted
+// schedules (deleted_at) never appear.
 func (q *Queries) ListSchedulesByOwner(ctx context.Context, arg ListSchedulesByOwnerParams) ([]Schedule, error) {
 	rows, err := q.db.QueryContext(ctx, listSchedulesByOwner,
 		arg.OwnerUserID,
@@ -1112,6 +1185,7 @@ func (q *Queries) ListSchedulesByOwner(ctx context.Context, arg ListSchedulesByO
 			&i.LastRunAt,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.DeletedAt,
 		); err != nil {
 			return nil, err
 		}

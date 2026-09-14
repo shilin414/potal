@@ -1,6 +1,46 @@
 # Creation Agent Studio — 项目长期记忆
 
-## 数据库基线 = MySQL 5.7（2026-09-14 切换完成，最新）
+## Admission 闭环：Conversation / Schedule / 用户层（2026-09-15 完成，最新）
+
+变更报告：`docs/potal Conversation 与 Schedule 准入闭环修复变更报告.md`。
+**执行内核与 Provider 准入层不要动**；本轮补的是「用户 → Conversation → Run」与
+「用户 → Schedule → Occurrence → Run → Delivery」这两条链上的准入/生命周期边界。
+
+- **P0-1 执行准入只有一个门**：`catalog.Service.AuthorizeExecution(ctx, appID, userID, isStaff)`
+  （`internal/catalog/authz.go`，底层 SQL `GetExecutionAuthBundle`）。判定：
+  app 存在 + `enabled=1` + `kind='chat'` + 普通用户要求 `is_public=1` + binding enabled + provider active。
+  **停用应用对任何人都不可执行（含 staff）**；staff 仅可执行 private。
+  **新增执行入口必须接这个门**，别再用 `EnabledBinding` 当权限判断。
+  错误分级：普通用户一律 404（不泄漏存在性），staff 精确原因。
+- **Scheduler 每次触发都重新授权**（按 schedule owner 身份，`OwnerAwareResolver.EnabledBindingFor`）；
+  不可执行 → 记一条 failed occurrence、**0 Run**、并推进 next_run_at（不重试同槽）。
+- **P0-2 一个 conversation 同时只允许一个非终态 Run**：串行化在 `execution.CreateRunInTx`
+  （`conversations` 行 `FOR UPDATE` + `CountActiveRunsByConversation`）→ `ErrConversationBusy` → HTTP **409**。
+  这是**串行语义不是排队**（后续消息会被拒，需重发）；要排队得加 `conversation_turn_seq`。
+  `EnsureAgentThread` 已改成原子 get-or-create（UNIQUE 冲突重读胜者）。
+- **Schedule admission 已统一到 schedules 行锁**：`GetScheduleRowForUpdate` 返回**整行**，
+  triggerSchedule / TriggerNow / admitOne 全是「锁内重读最新行 → 判定 → 创建」同一事务。
+  → `/disable` 返回后必无新 occurrence/run；PATCH prompt 立即生效；
+  tick 与 run-now 共享同一把锁（同 Schedule 最多一个 active occurrence）。
+  旧的非事务 helper（`recordSlot`/`skipPast`/`fireMisfiredOnce`/`createOccurrenceAndRun`）已删除，
+  现在是 `skipPastInTx`/`fireMisfiredOnceInTx`/`createOccurrenceAndRunTx`/`enqueuePendingOccurrenceTx`。
+- **附件 claim 在 CreateRun 事务内**：`ClaimAttachmentForRun`（`run_id IS NULL AND status='pending' AND created_by=?`），
+  `RowsAffected!=1` → `ErrAttachmentClaimed` → 整体回滚（409）。惰性建 conversation 也移入该事务。
+- **会话生命周期**：Clear = 删 messages **+ agent_thread**（=重新开始，下次新 Aily session）；
+  Clear/Delete 在有活跃 Run 时都 **409**；Delete 是单事务级联（不再 `_ =` 吞错）。
+- **Schedule 是软删除**（`schedules.deleted_at`，迁移 0015）：扫描/owner 列表/`schedule.Get` 全部过滤
+  `deleted_at IS NULL`，但 `GetScheduleByID` **故意不过滤**——delivery worker 还要靠它取 `Name`。
+  改这个查询时注意别把投递读路径一起过滤掉。
+- **用户级准入**：`RUN_USER_QPS`(5/s, Redis GCRA `rate:runs:user:<id>`) +
+  `RUN_USER_MAX_OUTSTANDING`(20) + `SCHEDULE_USER_MAX`(50) → 429。
+- **消息落库必须同事务 touch `conversations.updated_at`**（`TouchConversationUpdated`）：
+  两处 = `CreateRunInTx`、`FinalizeOwnedRun` 的 assistant message。Sidebar 按 updated_at 排序。
+- **Scheduler 时钟 = DB 时钟**（`DBNow` 查询，每 tick 一次）；本地时钟只做 DB 读取失败的回退。
+- 迁移到 `0015`。新增集成测试 `tests/integration/admission_closure_test.go`（7 个并发/准入不变量）。
+- 未做（下轮）：SSE Hub 多路复用、Worker 阻塞式 dispatcher、RunEvent 去 COUNT、
+  `client_request_id` 幂等键、Sidebar 反范式 + keyset 分页。
+
+## 数据库基线 = MySQL 5.7（2026-09-14 切换完成）
 
 **TiDB 8.0.0 / TiProxy 已退出运行架构，不要再往仓库里加 TiDB/TiProxy 假设。**
 变更报告：`docs/potal 从 TiDB 8.0.0 切换到 MySQL 5.7 执行变更报告.md`。

@@ -55,6 +55,12 @@ type Querier interface {
 	// repeated calls safe and prevents a later schedule edit from adding new
 	// expectations to an already-created occurrence.
 	CaptureOccurrenceDeliveryExpectations(ctx context.Context, id uint64) error
+	// Atomic attachment claim (评测 P1-5): the run row is created first, then
+	// each attachment is claimed with a run_id IS NULL guard. 0 rows affected
+	// = a concurrent run already claimed it; the caller MUST roll the whole
+	// CreateRun transaction back rather than create a run whose input lists an
+	// attachment it does not own.
+	ClaimAttachmentForRun(ctx context.Context, arg ClaimAttachmentForRunParams) (sql.Result, error)
 	ClearDefaultAgent(ctx context.Context) error
 	// Admission check for a pending occurrence: does anything OTHER than
 	// itself still hold the schedule's execution slot (queued/running)?
@@ -62,6 +68,9 @@ type Querier interface {
 	CountActiveOccurrencesExcluding(ctx context.Context, arg CountActiveOccurrencesExcludingParams) (int64, error)
 	// Active = not past its DB-clock expiry.
 	CountActiveProviderSlots(ctx context.Context, provider string) (int64, error)
+	// Active-run count under the conversations row lock. Backed by
+	// idx_runs_conversation_status (migration 0014).
+	CountActiveRunsByConversation(ctx context.Context, conversationID sql.NullInt64) (int64, error)
 	CountConversationByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
 	CountMessagesByConversation(ctx context.Context, conversationID uint64) (int64, error)
 	// Invariant L: every target captured for a succeeded occurrence has a
@@ -71,6 +80,8 @@ type Querier interface {
 	// Invariant M: an ACTIVE provider slot must belong to a running run at the
 	// matching lease epoch.
 	CountOrphanProviderSlots(ctx context.Context) (int64, error)
+	// Per-user admission (评测 P1-7): queued + running runs against the cap.
+	CountOutstandingRunsByUser(ctx context.Context, userID sql.NullInt64) (int64, error)
 	CountPendingOutbox(ctx context.Context) (int64, error)
 	// Invariant B: a queued run must NOT hold a lease.
 	CountQueuedWithLease(ctx context.Context) (int64, error)
@@ -88,6 +99,9 @@ type Querier interface {
 	CountScheduleOverlapViolations(ctx context.Context) ([]CountScheduleOverlapViolationsRow, error)
 	// Invariant H: a terminal scheduled run and its occurrence must converge.
 	CountScheduledRunOccurrenceMismatch(ctx context.Context) (int64, error)
+	// Per-user schedule cap (评测 P1-7): only live (non-deleted) schedules
+	// count against the quota.
+	CountSchedulesByOwner(ctx context.Context, ownerUserID uint64) (int64, error)
 	CountSkippedOccurrencesForSlot(ctx context.Context, arg CountSkippedOccurrencesForSlotParams) (int64, error)
 	// Invariant C: a terminal run must NOT hold a lease.
 	CountTerminalWithLease(ctx context.Context) (int64, error)
@@ -131,8 +145,6 @@ type Querier interface {
 	// heartbeat and expired under ONE clock authority (Phase 3), never from
 	// the worker's local clock.
 	CreateRunLease(ctx context.Context, arg CreateRunLeaseParams) error
-	// ─────────────────────────────────────────────────────────── automation ──
-	// Schedule / Occurrence / Delivery queries (0006_schedule_automation).
 	CreateSchedule(ctx context.Context, arg CreateScheduleParams) (sql.Result, error)
 	// ──────────────────────────────────────────────────── schedule_occurrences ──
 	// UNIQUE (schedule_id, scheduled_at) is the idempotency barrier: a losing
@@ -144,6 +156,12 @@ type Querier interface {
 	// its timestamps from this value or from CURRENT_TIMESTAMP(3) directly —
 	// never from the application clock (Phase 3).
 	CurrentDBTime(ctx context.Context) (time.Time, error)
+	// ─────────────────────────────────────────────────────────── automation ──
+	// Schedule / Occurrence / Delivery queries (0006_schedule_automation).
+	// Clock Authority (评测 §十七): the scheduler resolves "now" from the
+	// database so due / misfire / window decisions are identical across
+	// scheduler hosts regardless of their local clock skew.
+	DBNow(ctx context.Context) (time.Time, error)
 	DeleteApplication(ctx context.Context, id uint64) error
 	DeleteAttachment(ctx context.Context, id []byte) error
 	DeleteConversation(ctx context.Context, id uint64) error
@@ -177,6 +195,9 @@ type Querier interface {
 	DeleteRunEvents(ctx context.Context, runID []byte) error
 	DeleteRunLeaseByRun(ctx context.Context, runID []byte) error
 	DeleteRunsByConversation(ctx context.Context, conversationID sql.NullInt64) error
+	// Soft delete (评测 §十二): pending delivery executions still resolve
+	// schedule.Name to build their message; the row must survive. The
+	// scheduler scan and owner lists filter deleted_at IS NULL.
 	DeleteSchedule(ctx context.Context, id uint64) (sql.Result, error)
 	DeleteScheduleDeliveries(ctx context.Context, scheduleID uint64) error
 	DeleteSharesByConversation(ctx context.Context, conversationID uint64) error
@@ -184,7 +205,7 @@ type Querier interface {
 	// ───────────────────────────────────────── provider execution slots ──
 	// Provider Inflight Durable Truth (Admission Fairness & Distributed Lease
 	// Hardening, Phase 2): max_inflight is a safety capacity state and lives in
-	// TiDB, not in a transient Redis semaphore. Every timestamp decision uses
+	// MySQL, not in a transient Redis semaphore. Every timestamp decision uses
 	// the DB clock; Redis restart/flush can never raise real provider
 	// concurrency above the configured limit.
 	// Materializes the per-provider serialization row (seeded by migration
@@ -208,10 +229,21 @@ type Querier interface {
 	GetCategoryByName(ctx context.Context, name string) (ApplicationCategory, error)
 	GetCategoryBySlug(ctx context.Context, slug string) (ApplicationCategory, error)
 	GetConversationByID(ctx context.Context, id uint64) (Conversation, error)
+	// Conversation admission lock (评测 P0-2): CreateRunInTx takes this lock so
+	// the active-run count is re-read under it — two concurrent submits to the
+	// same conversation serialize and the loser sees the winner's run.
+	GetConversationRowForUpdate(ctx context.Context, id uint64) (uint64, error)
 	GetConversationShareByToken(ctx context.Context, token string) (GetConversationShareByTokenRow, error)
 	GetDefaultAgent(ctx context.Context) (GetDefaultAgentRow, error)
 	GetDeliveryExecutionByID(ctx context.Context, id []byte) (DeliveryExecution, error)
 	GetEnabledBinding(ctx context.Context, applicationID uint64) (RuntimeBinding, error)
+	// AuthorizeExecution (评测 P0-1): ONE query that joins every fact the run /
+	// schedule admission must verify. Visibility is enforced server-side —
+	// staff see everything; regular users only public, enabled applications.
+	// The join itself cannot express the staff bypass, so the Go layer calls
+	// it with show_all for staff and is_public=1 for regular users (mirrors
+	// ListApplicationsByVisibility).
+	GetExecutionAuthBundle(ctx context.Context, arg GetExecutionAuthBundleParams) (GetExecutionAuthBundleRow, error)
 	// Reaper row lock: the lease is re-validated under lock inside the
 	// recovery transaction — a heartbeat that lands first wins the row.
 	GetExpiredLeaseForUpdate(ctx context.Context, runID []byte) (GetExpiredLeaseForUpdateRow, error)
@@ -239,10 +271,14 @@ type Querier interface {
 	GetScheduleDeliveryByID(ctx context.Context, id uint64) (ScheduleDelivery, error)
 	GetScheduleOccurrenceByID(ctx context.Context, id uint64) (ScheduleOccurrence, error)
 	GetScheduleOccurrenceBySlot(ctx context.Context, arg GetScheduleOccurrenceBySlotParams) (ScheduleOccurrence, error)
-	// Admission lock (修复计划 §35): serializes concurrent admissions for the
-	// same schedule so two schedulers can never both observe "no active
-	// occurrence" and create parallel runs (write-skew guard).
-	GetScheduleRowForUpdate(ctx context.Context, id uint64) (sql.Result, error)
+	// Admission lock (修复计划 §35, 评测 P1-1/P1-2): serializes concurrent
+	// admissions for the same schedule so two schedulers can never both
+	// observe "no active occurrence" and create parallel runs (write-skew
+	// guard). Now returns the FULL row: the admission path re-reads the
+	// current schedule under the lock instead of trusting the scan-time
+	// snapshot (disable / prompt edits become visible before the run is
+	// created).
+	GetScheduleRowForUpdate(ctx context.Context, id uint64) (Schedule, error)
 	GetUserByID(ctx context.Context, id uint64) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	HasActiveOccurrence(ctx context.Context, scheduleID uint64) (int64, error)
@@ -269,8 +305,8 @@ type Querier interface {
 	ListBindingsByApplication(ctx context.Context, applicationID uint64) ([]RuntimeBinding, error)
 	ListConversationsByApplication(ctx context.Context, arg ListConversationsByApplicationParams) ([]Conversation, error)
 	// Sidebar history: latest message + count via correlated scalar subqueries
-	// in the SELECT list. (TiDB rejects subqueries inside JOIN ... ON, and
-	// window functions are MySQL 8 only — the project must stay 5.7-compatible.)
+	// in the SELECT list (window functions are MySQL 8 only — the project must
+	// stay 5.7-compatible).
 	ListConversationsForUser(ctx context.Context, userID uint64) ([]ListConversationsForUserRow, error)
 	ListConversationsForUserApp(ctx context.Context, arg ListConversationsForUserAppParams) ([]ListConversationsForUserAppRow, error)
 	ListDeliveriesBySchedule(ctx context.Context, scheduleID uint64) ([]ScheduleDelivery, error)
@@ -280,6 +316,7 @@ type Querier interface {
 	ListDeliveryExecutionsByRun(ctx context.Context, runID []byte) ([]DeliveryExecution, error)
 	// "Due" is decided by the DB clock, not by the caller's clock.
 	ListDueDeliveries(ctx context.Context, limit int32) ([]DeliveryExecution, error)
+	// The scheduler scan never picks up disabled or soft-deleted rows.
 	ListDueSchedules(ctx context.Context, arg ListDueSchedulesParams) ([]Schedule, error)
 	ListEnabledBindings(ctx context.Context) ([]RuntimeBinding, error)
 	ListEnabledDeliveriesBySchedule(ctx context.Context, scheduleID uint64) ([]ScheduleDelivery, error)
@@ -297,21 +334,21 @@ type Querier interface {
 	ListRunArtifactsByExternalID(ctx context.Context, arg ListRunArtifactsByExternalIDParams) (RunArtifact, error)
 	ListRunEventsAfter(ctx context.Context, arg ListRunEventsAfterParams) ([]RunEvent, error)
 	ListRunsByConversation(ctx context.Context, conversationID sql.NullInt64) ([]Run, error)
-	// status: all | running | paused | failed (UI filters).
+	// status: all | running | paused | failed (UI filters). Soft-deleted
+	// schedules (deleted_at) never appear.
 	ListSchedulesByOwner(ctx context.Context, arg ListSchedulesByOwnerParams) ([]Schedule, error)
 	// Occurrences stuck in pending longer than the grace period: their
 	// creating scheduler died between INSERT and the run-creating commit.
 	ListStuckPendingOccurrences(ctx context.Context, arg ListStuckPendingOccurrencesParams) ([]ListStuckPendingOccurrencesRow, error)
 	// Serialize the admission decision per provider with a CONFLICTING WRITE on
-	// the shared row (migration 0013). A locking read is not enough: TiDB may run
-	// the transaction optimistically, where SELECT ... FOR UPDATE does not block a
-	// concurrent decision and every contender counts zero active slots (observed
-	// in CI as admitted=8/8 on a fresh provider). Writing this row makes the
-	// decision conflict for real — pessimistically the loser waits for the row
-	// lock, optimistically it aborts with 9007 at commit and retries with a fresh
-	// snapshot — so "delete expired → count active → insert" stays atomic on TiDB
-	// and MySQL 5.7. Affected rows must be 1; 0 means the row is missing and the
-	// caller fails closed (the next Acquire re-materializes it).
+	// the shared row (migration 0013). A locking read is not enough: SELECT ...
+	// FOR UPDATE alone does not stop a concurrent decision from observing the same
+	// pre-insert depth, so every contender counts zero active slots (observed in
+	// CI as admitted=8/8 on a fresh provider). Writing this row forces a real
+	// conflict, so "delete expired → count active → insert" stays atomic; a loser
+	// that still fails with 1213 (deadlock) or 1205 (lock wait timeout) is retried
+	// with a fresh snapshot. Affected rows must be 1; 0 means the row is missing
+	// and the caller fails closed (the next Acquire re-materializes it).
 	LockProviderAdmission(ctx context.Context, provider string) (sql.Result, error)
 	MarkOccurrenceDeliverySnapshotCaptured(ctx context.Context, id uint64) (sql.Result, error)
 	MarkOccurrenceQueued(ctx context.Context, arg MarkOccurrenceQueuedParams) (sql.Result, error)
@@ -336,7 +373,7 @@ type Querier interface {
 	// desynchronized run availability from outbox publishing, so a
 	// redispatched run was invisible to the CAS until the fallback scan found
 	// it ~20s later) and neither may depend on the app clock, whose skew
-	// against TiDB has already caused a wakeup/claimability mismatch (Phase 3).
+	// against the database has already caused a wakeup/claimability mismatch (Phase 3).
 	RequeueRunFenced(ctx context.Context, arg RequeueRunFencedParams) (sql.Result, error)
 	// Reaper recovery requeue: a crashed worker's run becomes claimable AT
 	// ONCE — crash recovery must not wait out a retry backoff. available_at
@@ -355,6 +392,10 @@ type Querier interface {
 	// run-now bookkeeping: last_run_at moves, next_run_at stays untouched.
 	SetScheduleLastRun(ctx context.Context, arg SetScheduleLastRunParams) (sql.Result, error)
 	SetScheduleNextRun(ctx context.Context, arg SetScheduleNextRunParams) (sql.Result, error)
+	// Sidebar ordering (评测 §十三): conversations.updated_at must move when a
+	// message lands, otherwise an old conversation never returns to the top of
+	// the list. Called in the same transaction as the message insert.
+	TouchConversationUpdated(ctx context.Context, id uint64) error
 	// Renew (XX-only): the slot must already exist. 0 rows = expired/released →
 	// ErrProviderSlotLost; a lost slot is NEVER recreated by a renewal.
 	TouchProviderSlot(ctx context.Context, arg TouchProviderSlotParams) (sql.Result, error)

@@ -192,6 +192,33 @@ func (q *Queries) CacheArtifactURL(ctx context.Context, arg CacheArtifactURLPara
 	return err
 }
 
+const claimAttachmentForRun = `-- name: ClaimAttachmentForRun :execresult
+UPDATE runtime_attachments
+SET run_id = ?, conversation_id = ?
+WHERE id = ? AND created_by = ? AND status = 'pending' AND run_id IS NULL
+`
+
+type ClaimAttachmentForRunParams struct {
+	RunID          sql.NullString
+	ConversationID sql.NullInt64
+	ID             []byte
+	CreatedBy      sql.NullInt64
+}
+
+// Atomic attachment claim (评测 P1-5): the run row is created first, then
+// each attachment is claimed with a run_id IS NULL guard. 0 rows affected
+// = a concurrent run already claimed it; the caller MUST roll the whole
+// CreateRun transaction back rather than create a run whose input lists an
+// attachment it does not own.
+func (q *Queries) ClaimAttachmentForRun(ctx context.Context, arg ClaimAttachmentForRunParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, claimAttachmentForRun,
+		arg.RunID,
+		arg.ConversationID,
+		arg.ID,
+		arg.CreatedBy,
+	)
+}
+
 const countActiveProviderSlots = `-- name: CountActiveProviderSlots :one
 SELECT COUNT(*) AS n FROM provider_execution_slots
 WHERE provider = ? AND expires_at > CURRENT_TIMESTAMP(3)
@@ -236,6 +263,19 @@ WHERE s.expires_at > CURRENT_TIMESTAMP(3) AND r.id IS NULL
 // matching lease epoch.
 func (q *Queries) CountOrphanProviderSlots(ctx context.Context) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countOrphanProviderSlots)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
+const countOutstandingRunsByUser = `-- name: CountOutstandingRunsByUser :one
+SELECT COUNT(*) AS n FROM runs
+WHERE user_id = ? AND status IN ('queued', 'running')
+`
+
+// Per-user admission (评测 P1-7): queued + running runs against the cap.
+func (q *Queries) CountOutstandingRunsByUser(ctx context.Context, userID sql.NullInt64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countOutstandingRunsByUser, userID)
 	var n int64
 	err := row.Scan(&n)
 	return n, err
@@ -790,7 +830,7 @@ ON DUPLICATE KEY UPDATE provider = provider
 // ───────────────────────────────────────── provider execution slots ──
 // Provider Inflight Durable Truth (Admission Fairness & Distributed Lease
 // Hardening, Phase 2): max_inflight is a safety capacity state and lives in
-// TiDB, not in a transient Redis semaphore. Every timestamp decision uses
+// MySQL, not in a transient Redis semaphore. Every timestamp decision uses
 // the DB clock; Redis restart/flush can never raise real provider
 // concurrency above the configured limit.
 // Materializes the per-provider serialization row (seeded by migration
@@ -1625,15 +1665,14 @@ WHERE provider = ?
 `
 
 // Serialize the admission decision per provider with a CONFLICTING WRITE on
-// the shared row (migration 0013). A locking read is not enough: TiDB may run
-// the transaction optimistically, where SELECT ... FOR UPDATE does not block a
-// concurrent decision and every contender counts zero active slots (observed
-// in CI as admitted=8/8 on a fresh provider). Writing this row makes the
-// decision conflict for real — pessimistically the loser waits for the row
-// lock, optimistically it aborts with 9007 at commit and retries with a fresh
-// snapshot — so "delete expired → count active → insert" stays atomic on TiDB
-// and MySQL 5.7. Affected rows must be 1; 0 means the row is missing and the
-// caller fails closed (the next Acquire re-materializes it).
+// the shared row (migration 0013). A locking read is not enough: SELECT ...
+// FOR UPDATE alone does not stop a concurrent decision from observing the same
+// pre-insert depth, so every contender counts zero active slots (observed in
+// CI as admitted=8/8 on a fresh provider). Writing this row forces a real
+// conflict, so "delete expired → count active → insert" stays atomic; a loser
+// that still fails with 1213 (deadlock) or 1205 (lock wait timeout) is retried
+// with a fresh snapshot. Affected rows must be 1; 0 means the row is missing
+// and the caller fails closed (the next Acquire re-materializes it).
 func (q *Queries) LockProviderAdmission(ctx context.Context, provider string) (sql.Result, error) {
 	return q.db.ExecContext(ctx, lockProviderAdmission, provider)
 }
@@ -1689,7 +1728,7 @@ type RequeueRunFencedParams struct {
 // desynchronized run availability from outbox publishing, so a
 // redispatched run was invisible to the CAS until the fallback scan found
 // it ~20s later) and neither may depend on the app clock, whose skew
-// against TiDB has already caused a wakeup/claimability mismatch (Phase 3).
+// against the database has already caused a wakeup/claimability mismatch (Phase 3).
 func (q *Queries) RequeueRunFenced(ctx context.Context, arg RequeueRunFencedParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, requeueRunFenced, arg.RetryDelayMicros, arg.ID, arg.LeaseEpoch)
 }

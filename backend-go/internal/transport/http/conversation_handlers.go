@@ -151,6 +151,12 @@ func nullableID(v sql.NullInt64) any {
 // DeleteConversation implements DELETE /api/conversations/{id}/delete_conversation/.
 // Full cascade: runs (+events/artifacts/commands/leases), messages,
 // thread, attachments, then the conversation row.
+//
+// Lifetime safety (评测 P1-4): the whole cascade runs in ONE transaction
+// and REFUSES to delete while the conversation still has a queued/running
+// run — otherwise a worker's FinalizeOwnedRun could insert the assistant
+// message into (or race child deletes against) a half-deleted
+// conversation, leaving orphan rows.
 func (s *Server) DeleteConversation(w http.ResponseWriter, r *http.Request, conversationId int) {
 	caller := userFrom(r.Context())
 	if caller == nil {
@@ -158,48 +164,146 @@ func (s *Server) DeleteConversation(w http.ResponseWriter, r *http.Request, conv
 		return
 	}
 	ctx := r.Context()
-	q := s.Runs.Querier()
-	conv, err := q.GetConversationByID(ctx, uint64(conversationId))
-	if err != nil || conv.UserID != uint64(caller.ID) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := db.New(tx)
+
+	// Lock the conversation row first: it serializes with CreateRunInTx
+	// (which takes the same lock before counting active runs), so no run
+	// can be created between our active-run check and the delete.
+	if _, err := q.GetConversationRowForUpdate(ctx, uint64(conversationId)); err != nil {
 		writeDetail(w, http.StatusNotFound, "conversation not found")
 		return
 	}
+	owner, err := q.GetConversationByID(ctx, uint64(conversationId))
+	if err != nil || owner.UserID != uint64(caller.ID) {
+		writeDetail(w, http.StatusNotFound, "conversation not found")
+		return
+	}
+	active, err := q.CountActiveRunsByConversation(ctx, sql.NullInt64{Int64: int64(conversationId), Valid: true})
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if active > 0 {
+		writeDetail(w, http.StatusConflict, "conversation has an active run")
+		return
+	}
+
 	runIDs, err := q.DeleteConversationRuns(ctx, sql.NullInt64{Int64: int64(conversationId), Valid: true})
 	if err != nil {
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	for _, runID := range runIDs {
-		_ = q.DeleteRunEvents(ctx, runID)
-		_ = q.DeleteRunArtifacts(ctx, runID)
-		_ = q.DeleteRunCommands(ctx, runID)
-		_ = q.DeleteRunLeaseByRun(ctx, runID)
+		if err := q.DeleteRunEvents(ctx, runID); err != nil {
+			writeSimpleError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := q.DeleteRunArtifacts(ctx, runID); err != nil {
+			writeSimpleError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := q.DeleteRunCommands(ctx, runID); err != nil {
+			writeSimpleError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if err := q.DeleteRunLeaseByRun(ctx, runID); err != nil {
+			writeSimpleError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
-	if err := q.DeleteRunsByConversation(ctx, sql.NullInt64{Int64: int64(conversationId), Valid: true}); err != nil {
+	convArg := sql.NullInt64{Int64: int64(conversationId), Valid: true}
+	if err := q.DeleteRunsByConversation(ctx, convArg); err != nil {
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	_ = q.DeleteConversationMessages(ctx, uint64(conversationId))
-	_ = q.DeleteThreadByConversation(ctx, uint64(conversationId))
-	_ = q.DeleteSharesByConversation(ctx, uint64(conversationId))
-	_ = q.UnbindConversationAttachments(ctx, sql.NullInt64{Int64: int64(conversationId), Valid: true})
-	_ = q.DeleteConversation(ctx, uint64(conversationId))
+	if err := q.DeleteConversationMessages(ctx, uint64(conversationId)); err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := q.DeleteThreadByConversation(ctx, uint64(conversationId)); err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := q.DeleteSharesByConversation(ctx, uint64(conversationId)); err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := q.UnbindConversationAttachments(ctx, convArg); err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := q.DeleteConversation(ctx, uint64(conversationId)); err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"detail": "会话已删除"})
 }
 
 // ClearConversation implements DELETE /api/conversations/{id}/clear/.
+//
+// Semantics (评测 P1-3): 清空 = 重新开始. Messages AND the agent thread are
+// removed together, so the next turn starts a NEW provider session — a
+// cleared conversation must not keep answering with the old context. It
+// refuses while a run is active (the answer of an in-flight run would
+// otherwise reappear in a conversation the user just emptied).
 func (s *Server) ClearConversation(w http.ResponseWriter, r *http.Request, conversationId int) {
 	caller := userFrom(r.Context())
 	if caller == nil {
 		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
 		return
 	}
-	conv, err := s.Runs.Querier().GetConversationByID(r.Context(), uint64(conversationId))
+	ctx := r.Context()
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := db.New(tx)
+
+	if _, err := q.GetConversationRowForUpdate(ctx, uint64(conversationId)); err != nil {
+		writeDetail(w, http.StatusNotFound, "conversation not found")
+		return
+	}
+	conv, err := q.GetConversationByID(ctx, uint64(conversationId))
 	if err != nil || conv.UserID != uint64(caller.ID) {
 		writeDetail(w, http.StatusNotFound, "conversation not found")
 		return
 	}
-	if err := s.Runs.Querier().DeleteConversationMessages(r.Context(), uint64(conversationId)); err != nil {
+	active, err := q.CountActiveRunsByConversation(ctx, sql.NullInt64{Int64: int64(conversationId), Valid: true})
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if active > 0 {
+		writeDetail(w, http.StatusConflict, "conversation has an active run")
+		return
+	}
+	if err := q.DeleteConversationMessages(ctx, uint64(conversationId)); err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Reset the provider session too: deleting the thread makes the next
+	// turn lazily create a fresh one (and a fresh Aily session).
+	if err := q.DeleteThreadByConversation(ctx, uint64(conversationId)); err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := q.TouchConversationUpdated(ctx, uint64(conversationId)); err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
