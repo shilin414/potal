@@ -23,7 +23,7 @@ jobs:
           cache-dependency-path: backend-go/go.sum
 
       # Workflow lint gate: duplicate YAML keys and invalid workflow
-      # structures fail here BEFORE wasting the integration jobs.
+      # structures fail here BEFORE wasting the integration job.
       # Pinned: actionlint publishes no floating major tag (there is no
       # `v1`), so `@v1` fails at "Set up job".
       - name: actionlint
@@ -49,128 +49,49 @@ jobs:
           go test -race ./internal/execution/... ./internal/delivery/...
           ./internal/automation/... -count=1
 
-  # Integration gate: real TiDB + Redis via Docker (修复计划 §78).
-  # STUDIO_TEST_TIDB / STUDIO_TEST_REDIS opt the integration suite in.
+  # The single database integration gate: real MySQL 5.7 + Redis 7.
   #
-  # NOTE: the TiDB service container deliberately has NO health-cmd —
-  # `pingcap/tidb` may not ship curl/mysqladmin, and the check runs inside
-  # the container, not on the runner. Readiness is done host-side below.
+  # MySQL 5.7 is the only supported database baseline, so this job carries the
+  # FULL coverage in one place — migrations, the Redis/DB-backed package
+  # suites (provider slots, GCRA, delivery) and tests/integration. It replaced
+  # a pair of jobs that split those layers across two engines, which meant
+  # neither job on its own proved the production database path.
+  #
+  # STUDIO_TEST_DB / STUDIO_TEST_REDIS opt the integration suites in; without
+  # them those tests skip silently, so both are set here as REAL gates.
+  #
+  # MySQL 5.7 is green only as a whole: migrations, the database-backed
+  # package suites and tests/integration must all pass.
   integration:
     runs-on: ubuntu-latest
     env:
       DEBIAN_FRONTEND: noninteractive
-      STUDIO_TEST_TIDB: '1'
+      STUDIO_TEST_DB: '1'
       STUDIO_TEST_REDIS: '1'
       DB_HOST: 127.0.0.1
-      DB_PORT: 4000
-      DB_NAME: xiaoan3_go
+      DB_PORT: 3306
+      DB_NAME: xiaoan
       DB_USER: root
       DB_PASSWORD: ''
       REDIS_HOST: 127.0.0.1
       REDIS_PORT: 6379
       REDIS_DB: '2'
     services:
-      tidb:
-        image: pingcap/tidb:v8.0.0
-        ports: ['4000:4000']
+      mysql:
+        image: mysql:5.7
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
+          MYSQL_DATABASE: xiaoan
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1"
+          --health-interval 10s --health-timeout 5s --health-retries 30
       redis:
         image: redis:7-alpine
         ports: ['6379:6379']
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 3s --health-retries 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: backend-go/go.mod
-          cache-dependency-path: backend-go/go.sum
-      - name: Install database clients
-        run: sudo apt-get update && sudo apt-get install -y mysql-client curl
-      - name: wait for tidb (host-side readiness)
-        run: |
-          ready=0
-          for (( attempt = 0; attempt < 90; attempt++ )); do
-            if mysql -h 127.0.0.1 -P 4000 -u root -e "SELECT 1" >/dev/null 2>&1; then
-              ready=1
-              break
-            fi
-            sleep 2
-          done
-          if [ "$ready" -ne 1 ]; then
-            echo "::error title=tidb not ready::readiness timed out after 180s"
-            exit 1
-          fi
-          mysql -h 127.0.0.1 -P 4000 -u root -e "CREATE DATABASE IF NOT EXISTS xiaoan3_go"
-      # studio-migrate applies migrations and EXITS. `cmd/api -migrate`
-      # would continue into app.Build + the HTTP server: without the
-      # runtime secrets (TOKEN_ENCRYPTION_KEY is unset in CI) the build
-      # fails, and with them it would block on the server.
-      #
-      # The failure path emits a ::error annotation carrying pwd + the
-      # migrated tool's own message, so a red run is diagnosable from the
-      # checks API without downloading logs.
-      - name: apply migrations
-        run: |
-          set -uo pipefail
-          echo "pwd=$(pwd)"
-          if ! out=$(go run ./cmd/migrate 2>&1); then
-            printf '%s\n' "$out"
-            msg=$(printf '%s' "$out" | tr '\n' ' ' | tr -s ' ' | tail -c 500)
-            echo "::error title=migrate failed::pwd=$(pwd) :: $msg"
-            exit 1
-          fi
-          printf '%s\n' "$out"
-      # Redis-backed / TiDB-backed suites that live in the internal packages
-      # (provider slots, GCRA, delivery) — these are REAL integration gates,
-      # not optional local checks (§29-31): STUDIO_TEST_TIDB/REDIS are set.
-      - name: execution + delivery package tests (real TiDB/Redis)
-        run: |
-          set -uo pipefail
-          if ! out=$(go test ./internal/execution/... ./internal/delivery/... -count=1 -v 2>&1); then
-            printf '%s\n' "$out"
-            msg=$(printf '%s' "$out" | grep -E '^(--- FAIL|FAIL|panic:|\s+.*_test\.go:)' | tr '\n' ' ' | tr -s ' ' | tail -c 900)
-            echo "::error title=execution package tests failed::$msg"
-            exit 1
-          fi
-          printf '%s\n' "$out" | tail -40
-      - name: integration tests
-        run: |
-          set -uo pipefail
-          if ! out=$(go test ./tests/integration/... -count=1 -v 2>&1); then
-            printf '%s\n' "$out"
-            # Job logs need authentication; the annotation is the only failure
-            # surface a CI-only reader sees. Keep a short summary AND the
-            # failing test's own log lines (the test re-emits worker warnings
-            # through t.Logf for exactly this reason).
-            summary=$(printf '%s' "$out" | grep -E '^(--- FAIL|FAIL|panic:)' | tr '\n' ' ' | tr -s ' ' | tail -c 300)
-            context=$(printf '%s' "$out" | grep -B 6 '^--- FAIL' | grep -E '^\s+\S+_test\.go:' | tr '\n' ' ' | tr -s ' ' | tail -c 600)
-            echo "::error title=integration tests failed::$summary :: $context"
-            exit 1
-          fi
-          printf '%s\n' "$out" | tail -40
-
-  # Primary compatibility floor required by the architecture document.
-  mysql57:
-    runs-on: ubuntu-latest
-    env:
-      DEBIAN_FRONTEND: noninteractive
-      STUDIO_TEST_TIDB: '1'
-      DB_HOST: 127.0.0.1
-      DB_PORT: 3306
-      DB_NAME: xiaoan3_go
-      DB_USER: root
-      DB_PASSWORD: ''
-    services:
-      mysql:
-        image: mysql:5.7
-        env:
-          MYSQL_ALLOW_EMPTY_PASSWORD: 'yes'
-          MYSQL_DATABASE: xiaoan3_go
-        ports: ['3306:3306']
-        options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1"
-          --health-interval 10s --health-timeout 5s --health-retries 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -193,6 +114,19 @@ jobs:
             echo "::error title=mysql 5.7 not ready::readiness timed out after 120s"
             exit 1
           fi
+          # utf8mb4_bin is required: the migration set creates every table with
+          # COLLATE=utf8mb4_bin, and the service container's default schema
+          # collation must not silently differ from production.
+          mysql -h 127.0.0.1 -P 3306 -u root \
+            -e "ALTER DATABASE xiaoan CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"
+      # studio-migrate applies migrations and EXITS. `cmd/api -migrate`
+      # would continue into app.Build + the HTTP server: without the
+      # runtime secrets (TOKEN_ENCRYPTION_KEY is unset in CI) the build
+      # fails, and with them it would block on the server.
+      #
+      # The failure path emits a ::error annotation carrying pwd + the
+      # migrated tool's own message, so a red run is diagnosable from the
+      # checks API without downloading logs.
       - name: apply migrations
         run: |
           set -uo pipefail
@@ -200,18 +134,52 @@ jobs:
           if ! out=$(go run ./cmd/migrate 2>&1); then
             printf '%s\n' "$out"
             msg=$(printf '%s' "$out" | tr '\n' ' ' | tr -s ' ' | tail -c 500)
-            echo "::error title=migrate failed (mysql57)::pwd=$(pwd) :: $msg"
+            echo "::error title=migrate failed::pwd=$(pwd) :: $msg"
             exit 1
           fi
           printf '%s\n' "$out"
+      - name: apply migrations (second run must be a clean no-op)
+        run: |
+          set -uo pipefail
+          if ! out=$(go run ./cmd/migrate 2>&1); then
+            printf '%s\n' "$out"
+            msg=$(printf '%s' "$out" | tr '\n' ' ' | tr -s ' ' | tail -c 500)
+            echo "::error title=migrate re-run failed (must be idempotent)::pwd=$(pwd) :: $msg"
+            exit 1
+          fi
+          printf '%s\n' "$out"
+      # Redis-backed and DB-backed suites that live in the internal packages
+      # (provider slots, GCRA, delivery, the DB clock contract): real
+      # integration gates, not optional local checks. STUDIO_TEST_DB/REDIS are
+      # set above.
+      #
+      # internal/platform/... is included on purpose: TestSessionTimezoneUTC
+      # asserts the session clock is +00:00, which is the precondition for
+      # every lease / retry / schedule comparison. It used to be skipped
+      # everywhere in CI (the unit job runs without STUDIO_TEST_DB), so a
+      # server-side timezone regression could reach production unnoticed.
+      - name: database-backed package tests (real MySQL/Redis)
+        run: |
+          set -uo pipefail
+          if ! out=$(go test ./internal/execution/... ./internal/delivery/... ./internal/platform/... -count=1 -v 2>&1); then
+            printf '%s\n' "$out"
+            msg=$(printf '%s' "$out" | grep -E '^(--- FAIL|FAIL|panic:|\s+.*_test\.go:)' | tr '\n' ' ' | tr -s ' ' | tail -c 900)
+            echo "::error title=database-backed package tests failed::$msg"
+            exit 1
+          fi
+          printf '%s\n' "$out" | tail -40
       - name: integration tests
         run: |
           set -uo pipefail
           if ! out=$(go test ./tests/integration/... -count=1 -v 2>&1); then
             printf '%s\n' "$out"
+            # Job logs need authentication; the annotation is the only failure
+            # surface a CI-only reader sees. Keep a short summary AND the
+            # failing test's own log lines (the test re-emits worker warnings
+            # through t.Logf for exactly this reason).
             summary=$(printf '%s' "$out" | grep -E '^(--- FAIL|FAIL|panic:)' | tr '\n' ' ' | tr -s ' ' | tail -c 300)
             context=$(printf '%s' "$out" | grep -B 6 '^--- FAIL' | grep -E '^\s+\S+_test\.go:' | tr '\n' ' ' | tr -s ' ' | tail -c 600)
-            echo "::error title=integration tests failed (mysql57)::$summary :: $context"
+            echo "::error title=integration tests failed::$summary :: $context"
             exit 1
           fi
           printf '%s\n' "$out" | tail -40

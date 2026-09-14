@@ -1,5 +1,5 @@
-// Schedule automation integration tests (opt-in: STUDIO_TEST_TIDB=1).
-// They prove the scheduler correctness core on real TiDB: the
+// Schedule automation integration tests (opt-in: STUDIO_TEST_DB=1).
+// They prove the scheduler correctness core on a real database: the
 // (schedule_id, scheduled_at) unique barrier, overlap/misfire policies,
 // run-now and delivery fan-out idempotency.
 package integration
@@ -33,8 +33,8 @@ type scheduleEnv struct {
 
 func newScheduleEnv(t *testing.T) *scheduleEnv {
 	t.Helper()
-	if os.Getenv("STUDIO_TEST_TIDB") != "1" {
-		t.Skip("set STUDIO_TEST_TIDB=1 to run TiDB integration tests")
+	if os.Getenv("STUDIO_TEST_DB") != "1" {
+		t.Skip("set STUDIO_TEST_DB=1 to run database integration tests")
 	}
 	cfg, err := config.Load()
 	if err != nil {
@@ -42,7 +42,7 @@ func newScheduleEnv(t *testing.T) *scheduleEnv {
 	}
 	d, err := database.Open(context.Background(), cfg.Database)
 	if err != nil {
-		t.Fatalf("tidb: %v", err)
+		t.Fatalf("database: %v", err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
 	resolver := &fakeResolver{binding: &scheduler.BindingView{

@@ -358,7 +358,7 @@ func TestCreateRunOutboxCarriesPriorityClass(t *testing.T) {
 		run.ID.Bytes()).Scan(&payload); err != nil {
 		t.Fatalf("load outbox payload: %v", err)
 	}
-	// The JSON column is normalized by TiDB (spaces, key order), so parse
+	// MySQL re-normalizes JSON on write (key order, separator spacing), so parse
 	// it instead of substring matching.
 	var decoded struct {
 		PriorityClass string `json:"priority_class"`

@@ -10,10 +10,10 @@ import (
 
 // TestSessionTimezoneUTC pins the DSN contract: the session clock must be
 // UTC so DB-side CURRENT_TIMESTAMP matches the driver's loc=UTC parsing.
-// Opt-in (needs TiDB): STUDIO_TEST_TIDB=1.
+// Opt-in (needs a real database): STUDIO_TEST_DB=1.
 func TestSessionTimezoneUTC(t *testing.T) {
-	if os.Getenv("STUDIO_TEST_TIDB") != "1" {
-		t.Skip("set STUDIO_TEST_TIDB=1")
+	if os.Getenv("STUDIO_TEST_DB") != "1" {
+		t.Skip("set STUDIO_TEST_DB=1")
 	}
 	cfg, err := config.Load()
 	if err != nil {

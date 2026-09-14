@@ -57,7 +57,7 @@ func TestSSETerminalRunReplayOnly(t *testing.T) {
 	}
 }
 
-// TestSSEReplayThenLiveThenClose: replay from TiDB, live frames via Redis
+// TestSSEReplayThenLiveThenClose: replay from MySQL, live frames via Redis
 // pub/sub, close on the first terminal event.
 func TestSSEReplayThenLiveThenClose(t *testing.T) {
 	svc, rdb := testEnv(t)
@@ -104,7 +104,7 @@ func TestSSEReplayThenLiveThenClose(t *testing.T) {
 		}
 	}()
 
-	// Phase 1: the replayed frame must arrive (from TiDB, no created_at).
+	// Phase 1: the replayed frame must arrive (from MySQL, no created_at).
 	var replay *sseFrame
 	deadline := time.Now().Add(5 * time.Second)
 	for replay == nil && time.Now().Before(deadline) {

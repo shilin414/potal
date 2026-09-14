@@ -1,7 +1,7 @@
 // Provider Inflight Durable Truth integration tests (Admission Fairness &
 // Distributed Lease Hardening, Phase 2):
 //
-//	max_inflight is enforced from TiDB, so Redis loss, a worker restart or
+//	max_inflight is enforced from MySQL, so Redis loss, a worker restart or
 //	clock skew can never raise real provider concurrency above the limit.
 //	Slots are ownership-scoped and DB-clock leased: a stale worker can
 //	neither delete nor renew the new owner's slot, and a crashed worker's
@@ -69,7 +69,7 @@ func claimForSlots(t *testing.T, svc *execution.Service, provider string) *execu
 	return claimed
 }
 
-// activeSlotRows counts the provider's active rows straight from TiDB.
+// activeSlotRows counts the provider's active rows straight from MySQL.
 func activeSlotRows(t *testing.T, svc *execution.Service, provider string) int {
 	t.Helper()
 	var n int
@@ -112,12 +112,13 @@ func TestProviderSlotsEnforceGlobalMaxAcrossWorkers(t *testing.T) {
 // TestConcurrentProviderAdmissionOnFreshProvider serializes the very first
 // admission decision for a provider. Two failure modes are pinned here:
 //
-//   - creating the admission-lock row inside both explicit transactions made
-//     TiDB abort one contender with a 9007 write conflict instead of the
-//     normal capacity rejection;
-//   - serializing with a locking READ alone is not enough, because TiDB may
-//     run the admission transaction optimistically, where SELECT ... FOR
-//     UPDATE blocks nothing and every contender counts zero active slots
+//   - materializing the admission-lock row inside the capacity transaction
+//     coupled first-provider creation to the decision, so the very first
+//     concurrent admission resolved on a write conflict instead of on
+//     capacity;
+//   - serializing with a locking READ alone is not enough: SELECT ... FOR
+//     UPDATE does not stop a concurrent decision from observing the same
+//     pre-insert depth, so every contender counts zero active slots
 //     (observed in CI: admitted=8 rejected=0, and two runs concurrently
 //     admitted by the real worker with max_inflight=1). The decision
 //     therefore performs a CONFLICTING WRITE on the shared lock row.
@@ -200,7 +201,7 @@ func admissionLockWrites(t *testing.T, svc *execution.Service, provider string) 
 }
 
 // TestProviderCapacityIsRedisIndependent — the report's "Redis restart may
-// not raise max_inflight" requirement. Capacity lives in TiDB: deleting the
+// not raise max_inflight" requirement. Capacity lives in MySQL: deleting the
 // legacy Redis inflight key (or losing Redis entirely) has no effect, and a
 // FRESH worker process (new DB handle, no shared memory) observes the same
 // accounting.
@@ -360,7 +361,7 @@ func TestProviderSlotCrashExpiryReturnsCapacity(t *testing.T) {
 
 	claimed := claimForSlots(t, svc, provider)
 	// Claim the contender before starting the short slot lease. On a shared
-	// remote TiDB, creating a run can itself take longer than the lease and
+	// remote MySQL, creating a run can itself take longer than the lease and
 	// would turn the capacity assertion into an accidental expiry test.
 	other := claimForSlots(t, svc, provider)
 	if _, ok, _, err := slots.Acquire(ctx, claimed.Ownership); err != nil || !ok {
@@ -380,7 +381,7 @@ func TestProviderSlotCrashExpiryReturnsCapacity(t *testing.T) {
 }
 
 // TestProviderSlotRejectsStaleOwnership: a worker that wakes up after its run
-// was reaped cannot insert a capacity slot — the fence is checked from TiDB,
+// was reaped cannot insert a capacity slot — the fence is checked from MySQL,
 // so a stale process cannot pollute the semaphore.
 func TestProviderSlotRejectsStaleOwnership(t *testing.T) {
 	svc, _ := testEnv(t)
@@ -561,7 +562,7 @@ func TestMergedHeartbeatRenewsLeaseAndSlot(t *testing.T) {
 
 // TestFinalizeAndRetryDeleteSlotAtomically pins both ownership transitions
 // that free provider capacity: the terminal (finalize) and the non-terminal
-// (retry) write delete the attempt's slot rows in the SAME TiDB transaction
+// (retry) write delete the attempt's slot rows in the SAME MySQL transaction
 // as the canonical state change. Capacity therefore never depends on the
 // worker's deferred Release — "run stopped running ⇒ no provider slot"
 // (invariant M) holds at commit time.
@@ -1152,7 +1153,7 @@ func enqueueForTest(t *testing.T, rdb *redisx.Client, provider string, runIDs ..
 }
 
 // newSlotWorker builds a real worker for one provider: Redis wakeups plus a
-// one-second TiDB fallback scan, so even a flushed Redis cannot hide queued
+// one-second MySQL fallback scan, so even a flushed Redis cannot hide queued
 // work (capacity decisions never come from Redis anyway).
 func newSlotWorker(svc *execution.Service, rdb *redisx.Client, provider, workerID string, handler execution.Handler, slots *execution.ProviderSlots, concurrency int) *execution.Worker {
 	return &execution.Worker{
@@ -1318,13 +1319,13 @@ func TestReaperDeletesSlotsForRecoveredOwnership(t *testing.T) {
 // proof that Redis is no longer the provider capacity truth:
 //
 //	max_inflight = 2
-//	Run A → active, Run B → active   (TiDB active slots = 2)
+//	Run A → active, Run B → active   (MySQL active slots = 2)
 //	FLUSH the whole Redis logical DB
 //	create Run C → still rejected by provider admission
 //	remote handler entered concurrency NEVER exceeds 2
 //
 // The worker's Redis wakeups are destroyed by the flush on purpose: C is
-// found by the TiDB fallback scan, and the admission decision is taken from
+// found by the MySQL fallback scan, and the admission decision is taken from
 // the durable slot table.
 func TestRedisFlushDoesNotIncreaseProviderCapacity(t *testing.T) {
 	svc, rdb := testEnv(t)
@@ -1345,7 +1346,7 @@ func TestRedisFlushDoesNotIncreaseProviderCapacity(t *testing.T) {
 	runB := seedRun(t, svc, provider)
 	enqueueForTest(t, rdb, provider, runA, runB)
 
-	// Phase 1: both runs occupy the provider; TiDB confirms capacity 2/2.
+	// Phase 1: both runs occupy the provider; MySQL confirms capacity 2/2.
 	waitUntil(t, "two runs admitted and blocked", 30*time.Second, func() bool {
 		return handler.activeEntries() == max && activeSlotRows(t, svc, provider) == max
 	})
@@ -1354,7 +1355,7 @@ func TestRedisFlushDoesNotIncreaseProviderCapacity(t *testing.T) {
 	}
 
 	// Redis state loss: the entire logical DB disappears (failover without
-	// persistence / FLUSH as an operator would do). Only TiDB remains.
+	// persistence / FLUSH as an operator would do). Only MySQL remains.
 	if err := rdb.FlushDB(ctx).Err(); err != nil {
 		t.Fatalf("flush redis: %v", err)
 	}
@@ -1365,7 +1366,7 @@ func TestRedisFlushDoesNotIncreaseProviderCapacity(t *testing.T) {
 
 	// Phase 2: Run C is created after the flush. Its Redis wakeup is
 	// deliberately NOT published — the flush destroyed the queue and the
-	// stream stays gone, exactly like the production failure mode. The TiDB
+	// stream stays gone, exactly like the production failure mode. The MySQL
 	// fallback scan must still find C, and the durable capacity must still
 	// hold it back.
 	runC := seedRun(t, svc, provider)
@@ -1382,11 +1383,11 @@ func TestRedisFlushDoesNotIncreaseProviderCapacity(t *testing.T) {
 		t.Fatalf("concurrent handler entries reached %d after Redis loss, want <= %d", got, max)
 	}
 	if got := activeSlotRows(t, svc, provider); got != max {
-		t.Fatalf("TiDB active slots = %d after the flush, want %d", got, max)
+		t.Fatalf("MySQL active slots = %d after the flush, want %d", got, max)
 	}
 
 	// Phase 3: releasing the provider frees the capacity; C then runs once.
-	// Redis is never repopulated: every decision below comes from TiDB.
+	// Redis is never repopulated: every decision below comes from MySQL.
 	close(handler.release)
 	waitUntil(t, "run C executed after capacity returned", 60*time.Second, func() bool {
 		run, err := svc.GetRun(ctx, runC)
@@ -1402,7 +1403,7 @@ func TestRedisFlushDoesNotIncreaseProviderCapacity(t *testing.T) {
 		t.Fatalf("active slots after all runs finished = %d, want 0", got)
 	}
 	// The queue was never re-created: the entire post-flush outcome (claim,
-	// rejection, requeue, execution) was driven by TiDB.
+	// rejection, requeue, execution) was driven by MySQL.
 	if n, err := rdb.Exists(ctx, streamKey).Result(); err != nil || n != 0 {
 		t.Fatalf("redis queue was repopulated after the flush: exists=%d err=%v", n, err)
 	}
@@ -1435,7 +1436,7 @@ func TestWorkerRestartDoesNotIncreaseProviderCapacity(t *testing.T) {
 	})
 
 	// Restart: a brand-new DB handle, slot store and worker id. Nothing is
-	// shared with the first plane except TiDB and Redis.
+	// shared with the first plane except MySQL and Redis.
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatalf("config: %v", err)

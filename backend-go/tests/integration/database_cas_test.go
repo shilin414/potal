@@ -1,5 +1,5 @@
-// Package integration contains opt-in tests against the real TiDB and
-// Redis (STUDIO_TEST_TIDB=1, STUDIO_TEST_REDIS=1).
+// Package integration contains opt-in tests against the real MySQL 5.7 and
+// Redis (STUDIO_TEST_DB=1, STUDIO_TEST_REDIS=1).
 //
 // These prove the correctness core of the execution plane on the real
 // database — the exact class of bugs SQLite-style unit tests hide.
@@ -26,8 +26,8 @@ import (
 
 func testEnv(t *testing.T) (*execution.Service, *redisx.Client) {
 	t.Helper()
-	if os.Getenv("STUDIO_TEST_TIDB") != "1" {
-		t.Skip("set STUDIO_TEST_TIDB=1 (and STUDIO_TEST_REDIS=1) to run TiDB integration tests")
+	if os.Getenv("STUDIO_TEST_DB") != "1" {
+		t.Skip("set STUDIO_TEST_DB=1 (and STUDIO_TEST_REDIS=1) to run database integration tests")
 	}
 	cfg, err := config.Load()
 	if err != nil {
@@ -35,7 +35,7 @@ func testEnv(t *testing.T) (*execution.Service, *redisx.Client) {
 	}
 	db, err := database.Open(context.Background(), cfg.Database)
 	if err != nil {
-		t.Fatalf("tidb: %v", err)
+		t.Fatalf("database: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 	var rdb *redisx.Client
