@@ -52,6 +52,8 @@ integration  MySQL 5.7 + Redis 容器                                    ✅
              ...integration tests                                     ✅
 ```
 
+**注意这次不是「本来就绿」**：推送前 `dev` 的最新提交 `d659489` 在 GitHub 上是 **failure**（红），`c53f934` 是修好后的第一次 success——也就是说本轮同时把 CI 从红转绿。
+
 > 本机 git 引用写入缺陷再次出现：`git push` 实际成功（`git ls-remote` 确认远端已是 `c53f934`），
 > 但本地 `refs/remotes/origin/dev` 停留在旧 sha、`git status` 误报 `[ahead 9]`。
 > 已按既有办法写 loose ref + 双写 `packed-refs` 修复，现为 `## dev...origin/dev`（0 0）。
