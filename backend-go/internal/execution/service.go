@@ -706,19 +706,34 @@ func (s *Service) HeartbeatOwned(ctx context.Context, own ExecutionOwnership, le
 // alive ⇔ Provider Slot alive becomes an invariant instead of two
 // independently drifting leases.
 //
-// Contract:
+// Contract — once the run is in provider execution this is BOTH OR NEITHER:
 //
-//	err != nil      → nothing committed; the caller must treat the
-//	                  heartbeat as failed (retry next tick)
-//	leaseOK == false → ownership is gone; the caller must stop executing
-//	slotOK == false  → the slot expired or was released; the lease still
-//	                  stands, the slot is never recreated (XX-only) and
-//	                  capacity self-heals when the attempt finishes
-func (s *Service) HeartbeatOwnedWithSlot(ctx context.Context, own ExecutionOwnership, leaseSeconds time.Duration, slot *ProviderSlot, slotLease time.Duration) (bool, bool, error) {
+//	err == nil, leaseOK && slotOK   → both renewed in one commit
+//	err == nil, !leaseOK            → ownership gone; nothing committed
+//	err == ErrProviderSlotLost      → the DB PROVED the slot is gone; the
+//	                                  lease renewal was rolled back
+//	err != nil (infrastructure)     → nothing committed; the caller keeps
+//	                                  executing until the last confirmed TTL
+//	                                  and then fails closed
+//
+// A failed slot renewal never leaves a committed lease extension behind.
+// Committing one used to produce "run ownership alive, provider slot
+// missing", which silently breaks max_inflight: the freed capacity is
+// counted by the next admission (max_inflight - 1 < max), a new run is
+// admitted against a slot that is still busy, and real provider concurrency
+// reaches max_inflight + 1 — the capacity limit stops being a safety bound.
+//
+// The renewal stays XX-only: a lost slot is never recreated here. The
+// system cannot know whether a new admission already consumed the released
+// capacity, and recreating it would need the full admission serialization
+// (provider lock → run lock → lease lock) inside the heartbeat path.
+func (s *Service) HeartbeatOwnedWithSlot(ctx context.Context, own ExecutionOwnership, leaseSeconds time.Duration, slot *ProviderSlot, slotLease time.Duration) (leaseOK bool, slotOK bool, err error) {
 	if !own.Valid() {
 		return false, false, ErrLostOwnership
 	}
 	if slot == nil {
+		// No provider execution has started: the run lease is the only
+		// lease to keep alive, and there is no capacity to hold.
 		ok, err := s.HeartbeatOwned(ctx, own, leaseSeconds)
 		return ok, true, err
 	}
@@ -753,38 +768,48 @@ func (s *Service) HeartbeatOwnedWithSlot(ctx context.Context, own ExecutionOwner
 	}
 
 	if slot.Provider == "" {
-		// Malformed slot descriptor: never guess a provider, report it as
-		// lost instead of touching another provider's accounting.
-		if err := tx.Commit(); err != nil {
-			return false, false, err
-		}
-		return true, false, nil
+		// Malformed slot descriptor: never guess a provider, and never
+		// commit the lease renewal against a reservation that cannot be
+		// renewed. The whole merged heartbeat rolls back.
+		return false, false, errors.New("execution: provider slot has no provider")
 	}
 	slotLease = slotLeaseOrDefault(slotLease)
-	sres, serr := q.TouchProviderSlot(ctx, db.TouchProviderSlotParams{
+	sres, err := q.TouchProviderSlot(ctx, db.TouchProviderSlotParams{
 		LeaseMicros: slotLease.Microseconds(),
 		Provider:    slot.Provider,
 		RunID:       slot.RunID.Bytes(),
 		LeaseEpoch:  slot.LeaseEpoch,
 		LeaseToken:  slot.LeaseToken.Bytes(),
 	})
-	slotOK := false
-	switch {
-	case serr != nil:
-		// The lease renewal stands; only the slot accounting could not be
-		// refreshed. Log it without failing the heartbeat — the run must
-		// keep executing and the slot self-heals when the attempt ends.
-		s.Log.Warn("provider slot renew failed in merged heartbeat",
-			slogKey("run_id"), own.RunID.String(), slogKey("err"), serr)
-	default:
-		if sn, nerr := sres.RowsAffected(); nerr == nil && sn == 1 {
-			slotOK = true
-		}
+	if err != nil {
+		// Transient infrastructure failure (lock wait timeout, connection
+		// hiccup, ...): the DB could not confirm the reservation, which is
+		// NOT proof that it is gone. Roll the lease renewal back too — the
+		// caller keeps running on the last CONFIRMED TTL and retries on the
+		// next tick; a partial commit is exactly the unbounded-capacity
+		// state this function exists to prevent.
+		s.Log.Warn("provider slot renew failed in merged heartbeat — rolling the lease renewal back",
+			slogKey("run_id"), own.RunID.String(), slogKey("err"), err)
+		return false, false, err
 	}
+	sn, err := sres.RowsAffected()
+	if err != nil {
+		return false, false, err
+	}
+	if sn != 1 {
+		// The round-trip SUCCEEDED and reported 0 changed rows, which —
+		// now that the renewal writes heartbeat_at monotonically — means
+		// the ownership-scoped slot no longer exists (expired, released or
+		// superseded): confirmed capacity loss. Roll the lease extension
+		// back so this worker cannot keep executing provider calls that no
+		// longer count against max_inflight.
+		return false, false, ErrProviderSlotLost
+	}
+
 	if err := tx.Commit(); err != nil {
 		return false, false, err
 	}
-	return true, slotOK, nil
+	return true, true, nil
 }
 
 // slotLeaseOrDefault guarantees a positive slot TTL for the merged heartbeat

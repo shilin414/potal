@@ -726,9 +726,10 @@ func (w *Worker) attachProviderSlot(own ExecutionOwnership, slot *ProviderSlot) 
 // heartbeatOwned renews the run lease and (when the caller holds one) the
 // provider slot. With a slot attached both happen in ONE database transaction
 // (§20), so "Run Ownership alive ⇔ Provider Slot alive" is an invariant
-// rather than two independently drifting leases. The returned error is
-// non-nil only when the run-lease heartbeat itself failed (nothing was
-// committed); a lost slot merely reports slotOK=false.
+// rather than two independently drifting leases — BOTH OR NEITHER (第八轮 P1):
+// if the slot renewal cannot be confirmed, the lease renewal is rolled back
+// too and the error is returned (nothing committed). slotOK is therefore only
+// ever false together with a leaseOK=false or a non-nil error.
 func (w *Worker) heartbeatOwned(ctx context.Context, ctl *executionControl, slot *ProviderSlot) (leaseOK, slotOK bool, err error) {
 	if w.ProviderSlots != nil && slot != nil {
 		return w.Svc.HeartbeatOwnedWithSlot(ctx, ctl.own, w.Lease, slot, w.ProviderSlots.Lease)
@@ -772,7 +773,7 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 				leaseOK, slotOK, err := w.heartbeatOwned(ctx, ctl, snap.slot)
 				deadlineElapsed := leaseRenewalDeadlineElapsed(
 					snap.leaseRenewedAt, w.Lease, time.Now())
-				cancelForLoss := shouldCancelAfterHeartbeat(leaseOK, err, deadlineElapsed)
+				cancelForLoss := shouldCancelAfterHeartbeat(leaseOK, slotOK, err, deadlineElapsed)
 				if err != nil && !cancelForLoss {
 					// A transport/write-conflict failure does not prove ownership
 					// loss before the last confirmed TTL. Keep the provider
@@ -788,9 +789,20 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 					// this worker loses the right to write canonical state —
 					// fenced writes will reject it anyway; cancelling here
 					// also stops pointless polling).
-					reason := "heartbeat fence rejected ownership"
-					if err != nil {
-						reason = "heartbeat unavailable past local lease deadline"
+					//
+					// A CONFIRMED provider-capacity loss lands here too
+					// (第八轮 P1): the run lease renewal was rolled back with
+					// the lost slot, so this worker must stop executing
+					// instead of running calls that no longer count against
+					// max_inflight. The lease is deliberately left to expire
+					// on its own rather than requeued immediately — the
+					// provider request may already have been submitted, and a
+					// fresh worker submitting it again would duplicate it; the
+					// existing reaper/reconciliation converges it.
+					reason := heartbeatCancelReason(leaseOK, slotOK, err)
+					if confirmedProviderSlotLoss(leaseOK, slotOK, err) {
+						w.recordProviderAdmission("provider_slot_lost")
+						w.recordAdmission(telemetry.AdmissionProviderSlotLost)
 					}
 					w.Log.Warn("heartbeat lost lease — cancelling local execution",
 						"run_id", id.String(), "reason", reason, "err", err)
@@ -819,14 +831,6 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 					continue
 				}
 				w.recordHeartbeatSuccess(id, ctl, heartbeatStartedAt)
-				if !slotOK {
-					// The slot was released or expired (worker stalled longer
-					// than the slot lease). The run ownership fence is
-					// unaffected; capacity accounting self-heals when this
-					// attempt finishes (release is idempotent).
-					w.recordProviderAdmission("provider_slot_lost")
-					w.recordAdmission(telemetry.AdmissionProviderSlotLost)
-				}
 			}
 		}
 	}
@@ -843,17 +847,63 @@ func (w *Worker) recordHeartbeatSuccess(id ids.ID, ctl *executionControl, renewe
 	}
 }
 
-// shouldCancelAfterHeartbeat distinguishes a confirmed fence rejection from
-// an inconclusive infrastructure error. Only a successful DB round-trip that
-// reports leaseOK=false proves this worker is stale. Infrastructure errors
-// remain inconclusive only until the last confirmed lease TTL; after that
-// local monotonic time fails closed so a prolonged outage cannot overlap a
-// recovered owner indefinitely.
-func shouldCancelAfterHeartbeat(leaseOK bool, err error, leaseDeadlineElapsed bool) bool {
+// shouldCancelAfterHeartbeat distinguishes a confirmed safety loss (fence
+// rejection or lost provider-capacity reservation) from an inconclusive
+// infrastructure error.
+//
+//	A successful DB round-trip that reports leaseOK=false or slotOK=false
+//	proves this attempt lost something it must not keep executing with, so
+//	execution stops immediately.
+//
+//	ErrProviderSlotLost is specifically a PROVEN capacity loss (the DB
+//	answered 0 changed rows for a live renewal), so it cancels at once
+//	rather than at the run-lease deadline: waiting would leave this worker
+//	executing provider calls that no longer count against max_inflight,
+//	which lets the next admission exceed the limit.
+//
+//	Every other error is inconclusive — the merged heartbeat rolled back
+//	BOTH renewals, so the last confirmed TTL still holds and the next tick
+//	can retry. It only fails closed once local monotonic time passes that
+//	TTL, so a prolonged outage cannot overlap a recovered owner indefinitely.
+func shouldCancelAfterHeartbeat(leaseOK bool, slotOK bool, err error, leaseDeadlineElapsed bool) bool {
+	if errors.Is(err, ErrProviderSlotLost) {
+		return true
+	}
 	if err != nil {
 		return leaseDeadlineElapsed
 	}
-	return !leaseOK
+	return !leaseOK || !slotOK
+}
+
+// confirmedProviderSlotLoss reports whether the heartbeat PROVED the
+// ownership-scoped provider reservation is gone: either the DB answered 0
+// changed rows for a live renewal (ErrProviderSlotLost), or a successful
+// round-trip renewed the lease while reporting the slot missing.
+//
+// The leaseOK guard matters: a rejected lease fence also reports
+// slotOK=false, but there the LEASE is what went missing (the slot was never
+// touched), and attributing it to capacity would send the wrong signal.
+// A plain infrastructure error proves nothing at all.
+func confirmedProviderSlotLoss(leaseOK bool, slotOK bool, err error) bool {
+	if errors.Is(err, ErrProviderSlotLost) {
+		return true
+	}
+	return err == nil && leaseOK && !slotOK
+}
+
+// heartbeatCancelReason names why a heartbeat cancelled the local execution,
+// for operators reading the log. It is deliberately distinct from the
+// predicate: a lease-fence rejection must never be reported as a capacity
+// loss, and an inconclusive outage must not look like either.
+func heartbeatCancelReason(leaseOK bool, slotOK bool, err error) string {
+	switch {
+	case confirmedProviderSlotLoss(leaseOK, slotOK, err):
+		return "provider capacity reservation lost"
+	case err != nil:
+		return "heartbeat unavailable past local lease deadline"
+	default:
+		return "heartbeat fence rejected ownership"
+	}
 }
 
 func leaseRenewalDeadlineElapsed(lastRenewedAt time.Time, lease time.Duration, now time.Time) bool {

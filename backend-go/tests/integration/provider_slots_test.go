@@ -508,8 +508,10 @@ func TestExpiredOwnershipCannotMutateBeforeReaper(t *testing.T) {
 }
 
 // TestMergedHeartbeatRenewsLeaseAndSlot (§20): one transaction renews both,
-// so "Run Ownership alive ⇔ Provider Slot alive" holds; a lost slot is
-// reported without breaking the run lease.
+// so "Run Ownership alive ⇔ Provider Slot alive" holds. 第八轮 P1 tightens
+// the failure half of that invariant: the merged heartbeat is BOTH OR
+// NEITHER, so a slot that cannot be renewed rolls the run-lease renewal back
+// instead of committing a worker that executes outside capacity accounting.
 func TestMergedHeartbeatRenewsLeaseAndSlot(t *testing.T) {
 	svc, _ := testEnv(t)
 	ctx := context.Background()
@@ -530,19 +532,23 @@ func TestMergedHeartbeatRenewsLeaseAndSlot(t *testing.T) {
 		t.Fatal("run lease not renewed by the merged heartbeat")
 	}
 
-	// Slot disappears (e.g. released by an operator / expired): the lease
-	// heartbeat must still succeed and report the slot lost.
+	// Slot disappears (released by an operator / expired / reaped by a
+	// concurrent admission): the DB round-trip PROVES the capacity
+	// reservation is gone, so neither half of the merged heartbeat may be
+	// committed — otherwise this worker keeps calling the provider while the
+	// next admission counts its freed capacity and admits beyond max.
 	if _, err := svc.DB.ExecContext(ctx,
 		`DELETE FROM provider_execution_slots WHERE provider = ? AND run_id = ?`,
 		provider, claimed.Run.ID.Bytes()); err != nil {
 		t.Fatalf("drop slot: %v", err)
 	}
 	leaseOK, slotOK, err = svc.HeartbeatOwnedWithSlot(ctx, claimed.Ownership, time.Minute, slot, time.Minute)
-	if err != nil || !leaseOK {
-		t.Fatalf("merged heartbeat after slot loss: leaseOK=%v err=%v, want leaseOK=true", leaseOK, err)
+	if !errors.Is(err, execution.ErrProviderSlotLost) {
+		t.Fatalf("merged heartbeat after slot loss: err=%v, want ErrProviderSlotLost", err)
 	}
-	if slotOK {
-		t.Fatal("merged heartbeat reported a lost slot as renewed")
+	if leaseOK || slotOK {
+		t.Fatalf("merged heartbeat after slot loss: leaseOK=%v slotOK=%v, want false/false "+
+			"(BOTH OR NEITHER)", leaseOK, slotOK)
 	}
 	if got := activeSlotRows(t, svc, provider); got != 0 {
 		t.Fatalf("heartbeat recreated the lost slot: rows=%d", got)

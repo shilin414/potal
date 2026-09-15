@@ -20,7 +20,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"os"
 	"testing"
 	"time"
 
@@ -28,10 +27,7 @@ import (
 
 	"github.com/creation-agent-studio/backend-go/internal/execution"
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
-	"github.com/creation-agent-studio/backend-go/internal/platform/config"
-	"github.com/creation-agent-studio/backend-go/internal/platform/database"
 	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
-	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
 )
 
 // ── P2-1: a failing metric read can never roll back terminalization ──
@@ -263,36 +259,12 @@ func TestLiveRenewalReportsOneChangedRow(t *testing.T) {
 // statements compute identical CURRENT_TIMESTAMP(3) values.
 //
 // MySQL's `SET timestamp` is session-scoped, hence MaxOpenConns(1): every query
-// must go back to the one connection that carries the setting.
+// must go back to the one connection that carries the setting. The session
+// plumbing itself lives in newSessionTunedService (review8_fixes_test.go),
+// which the later rounds reuse for their own injected conditions.
 func newFrozenClockService(t *testing.T) *execution.Service {
 	t.Helper()
-	if os.Getenv("STUDIO_TEST_DB") != "1" {
-		t.Skip("set STUDIO_TEST_DB=1 to run database integration tests")
-	}
-	cfg, err := config.Load()
-	if err != nil {
-		t.Fatalf("config: %v", err)
-	}
-	ctx := context.Background()
-	d, err := database.Open(ctx, cfg.Database)
-	if err != nil {
-		t.Fatalf("database: %v", err)
-	}
-	t.Cleanup(func() { _ = d.Close() })
-	d.SetMaxOpenConns(1)
-	d.SetMaxIdleConns(1)
-
-	conn, err := d.Conn(ctx)
-	if err != nil {
-		t.Fatalf("conn: %v", err)
-	}
-	defer func() { _ = conn.Close() }() // back to the pool WITH the session variable set
-	if _, err := conn.ExecContext(ctx, "SET timestamp = ?", time.Now().Unix()); err != nil {
-		// Loud, never skipped: a silent skip here would hide exactly the
-		// regression this test exists to catch.
-		t.Fatalf("this test needs session-clock control (SET timestamp = ?): %v", err)
-	}
-	return execution.NewService(d, nil, silentLogger(), telemetry.NewMetrics("test"))
+	return newSessionTunedService(t, "SET timestamp = ?", time.Now().Unix())
 }
 
 // ── helpers ──

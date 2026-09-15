@@ -376,10 +376,19 @@ type Querier interface {
 	// 0 — indistinguishable from "this lease does not exist". Callers read 0 as
 	// lost ownership, so a perfectly healthy renewal would raise a false
 	// ownership-loss signal (observed in CI on provider slot renew). Writing
-	// GREATEST(now, stored + 1ms) always differs from the stored value while
-	// staying within 1ms of the DB clock, so changed rows == matched rows again.
-	// Same idea as provider_admission_locks.admissions, which increments instead
-	// of assigning, for exactly this reason.
+	// GREATEST(now, stored + 1ms) always differs from the stored value, so
+	// changed rows == matched rows again. Same idea as
+	// provider_admission_locks.admissions, which increments instead of assigning,
+	// for exactly this reason.
+	//
+	// 第八轮 P3 (documentation only): heartbeat_at is an OBSERVATIONAL column and
+	// does NOT participate in fencing — `expires_at` does, and it is always
+	// recomputed as CURRENT_TIMESTAMP + lease, never accumulated. Under repeated
+	// renewals inside one frozen DB millisecond (only reachable with a pinned
+	// session clock; real heartbeat periods are far larger than 1ms) the stored
+	// value can therefore drift a few ms ahead of DB now, one renewal at a time,
+	// rather than staying within a strict 1ms bound. That is harmless: nothing
+	// reads heartbeat_at for a correctness decision, and no caller may start.
 	HeartbeatLease(ctx context.Context, arg HeartbeatLeaseParams) (sql.Result, error)
 	// Ownership-checked by lease token (not worker_id): a recycled worker id
 	// cannot renew a lease it no longer owns. Extension is DB-clock based, so a
@@ -516,6 +525,11 @@ type Querier interface {
 	// for a slot that existed and was owned, and made Renew return
 	// ErrProviderSlotLost on CI (local runs never hit it — the LAN round trip
 	// always crossed a millisecond boundary, while a localhost MySQL does not).
+	//
+	// 第八轮 P1: because 0 now means "the row really is gone" (not "unchanged"),
+	// it is strong enough to act on — the merged heartbeat rolls the run-lease
+	// renewal back with it and the worker self-fences, instead of continuing to
+	// run provider calls that no longer count against max_inflight.
 	TouchProviderSlot(ctx context.Context, arg TouchProviderSlotParams) (sql.Result, error)
 	TouchScheduleRunTimes(ctx context.Context, arg TouchScheduleRunTimesParams) (sql.Result, error)
 	UnbindConversationAttachments(ctx context.Context, conversationID sql.NullInt64) error
