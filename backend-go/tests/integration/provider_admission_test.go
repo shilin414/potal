@@ -106,7 +106,7 @@ func TestProviderSubmissionConsumesAttemptAndIsFenced(t *testing.T) {
 	if err != nil || !won {
 		t.Fatalf("claim: won=%v err=%v", won, err)
 	}
-	sub, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, submissionFixtureHash(provider))
+	sub, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, submissionFixtureHash(provider), execution.ResendForbidden)
 	if err != nil {
 		t.Fatalf("begin submission: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestProviderSubmissionConsumesAttemptAndIsFenced(t *testing.T) {
 
 	// Second begin while the first is unresolved: the request may already be
 	// at the provider, so transmitting again is forbidden.
-	if _, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, submissionFixtureHash(provider)); !errors.Is(err, execution.ErrProviderSubmitUnknown) {
+	if _, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, submissionFixtureHash(provider), execution.ResendForbidden); !errors.Is(err, execution.ErrProviderSubmitUnknown) {
 		t.Fatalf("second begin over an unresolved submission: err=%v, want ErrProviderSubmitUnknown", err)
 	}
 	// The refusal must not have advanced the budget either.
@@ -139,7 +139,7 @@ func TestProviderSubmissionConsumesAttemptAndIsFenced(t *testing.T) {
 	if err := svc.MarkSubmissionStateOwned(ctx, claimed.Ownership, sub, execution.SubmissionRejected, "refused by provider"); err != nil {
 		t.Fatalf("mark rejected: %v", err)
 	}
-	sub2, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, submissionFixtureHash(provider))
+	sub2, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, submissionFixtureHash(provider), execution.ResendForbidden)
 	if err != nil {
 		t.Fatalf("begin after a definitive refusal: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestProviderSubmissionConsumesAttemptAndIsFenced(t *testing.T) {
 		LeaseEpoch: claimed.Ownership.LeaseEpoch + 1,
 		LeaseToken: claimed.Ownership.LeaseToken,
 	}
-	if _, err := svc.BeginProviderSubmissionOwned(ctx, stale, provider, submissionFixtureHash(provider)); !errors.Is(err, execution.ErrLostOwnership) {
+	if _, err := svc.BeginProviderSubmissionOwned(ctx, stale, provider, submissionFixtureHash(provider), execution.ResendForbidden); !errors.Is(err, execution.ErrLostOwnership) {
 		t.Fatalf("stale begin submission: err=%v, want ErrLostOwnership", err)
 	}
 }
@@ -185,7 +185,7 @@ func TestProviderAttemptExhaustionIsExplicit(t *testing.T) {
 	}
 	// The budget check runs BEFORE any submission row is touched, so an
 	// exhausted run can never even record an intent to transmit.
-	if _, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, submissionFixtureHash(provider)); !errors.Is(err, execution.ErrProviderAttemptsExhausted) {
+	if _, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, submissionFixtureHash(provider), execution.ResendForbidden); !errors.Is(err, execution.ErrProviderAttemptsExhausted) {
 		t.Fatalf("begin submission on exhausted budget: err=%v, want ErrProviderAttemptsExhausted", err)
 	}
 	var n int

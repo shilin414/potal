@@ -94,6 +94,19 @@ DELETE FROM run_commands WHERE run_id = ?;
 -- name: DeleteRunLeaseByRun :exec
 DELETE FROM run_leases WHERE run_id = ?;
 
+-- name: DeleteRunRequestsByRun :exec
+-- 第九轮 P1: the idempotency reservation table. Neither table added in
+-- round nine is reachable by an FK cascade from `runs`, so both are purged
+-- explicitly here — otherwise deleting a conversation would leave the
+-- client_request_id pointing at a run that no longer exists, and every later
+-- replay of that id would answer 500 instead of serving the run.
+DELETE FROM run_requests WHERE run_id = ?;
+
+-- name: DeleteProviderSubmissionsByRun :exec
+-- Same reason as DeleteRunRequestsByRun: the provider-side submission
+-- ledger outlives its run unless this cascade deletes it.
+DELETE FROM provider_submissions WHERE run_id = ?;
+
 -- name: DeleteRunsByConversation :exec
 DELETE FROM runs WHERE conversation_id = ?;
 

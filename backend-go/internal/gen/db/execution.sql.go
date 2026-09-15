@@ -2090,7 +2090,7 @@ func (q *Queries) MarkOutboxPublished(ctx context.Context, id uint64) error {
 const markProviderSubmissionAccepted = `-- name: MarkProviderSubmissionAccepted :execresult
 UPDATE provider_submissions
 SET state = 'accepted', external_run_id = ?, last_error = NULL
-WHERE run_id = ? AND submission_no = ?
+WHERE run_id = ? AND submission_no = ? AND state IN ('sending', 'unknown')
 `
 
 type MarkProviderSubmissionAcceptedParams struct {
@@ -2101,6 +2101,12 @@ type MarkProviderSubmissionAcceptedParams struct {
 
 // The provider answered with an external id: the outcome is now KNOWN, both
 // here and on the run row (written in the same transaction).
+//
+// The FROM guard makes 'accepted' MONOTONIC (第九轮复审 P1): only an
+// in-flight ('sending') or unconfirmed ('unknown') submission may become
+// accepted. A stale worker that lost its lease milliseconds ago must not be
+// able to overwrite a later 'rejected' with an external id it happened to
+// learn before it was fenced out.
 func (q *Queries) MarkProviderSubmissionAccepted(ctx context.Context, arg MarkProviderSubmissionAcceptedParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, markProviderSubmissionAccepted, arg.ExternalRunID, arg.RunID, arg.SubmissionNo)
 }
@@ -2108,7 +2114,7 @@ func (q *Queries) MarkProviderSubmissionAccepted(ctx context.Context, arg MarkPr
 const markProviderSubmissionState = `-- name: MarkProviderSubmissionState :execresult
 UPDATE provider_submissions
 SET state = ?, last_error = ?
-WHERE run_id = ? AND submission_no = ?
+WHERE run_id = ? AND submission_no = ? AND state = 'sending'
 `
 
 type MarkProviderSubmissionStateParams struct {
@@ -2118,10 +2124,15 @@ type MarkProviderSubmissionStateParams struct {
 	SubmissionNo uint32
 }
 
-// 'unknown' ('the request may have been delivered and the provider cannot
-// be asked') and 'rejected' ('the provider definitively refused, a retry is
-// legitimate') are the two outcomes a caller may record. 'sending' is only
-// ever written by CreateProviderSubmission.
+// The outcome of an in-flight submit: 'unknown' ('the request may have been
+// delivered and the provider cannot be asked') or 'rejected' ('the provider
+// definitively refused, a retry is legitimate').
+//
+// `AND state = 'sending'` IS the compare-and-swap (第九轮复审 P1). Without it
+// a general UPDATE could move a submission BACKWARDS — 'accepted' → 'unknown'
+// or 'rejected' → 'rejected' — which would either re-open a resend of an
+// action the provider already holds or silently re-enable one that had been
+// parked. The only legal predecessor of an outcome is 'sending'.
 func (q *Queries) MarkProviderSubmissionState(ctx context.Context, arg MarkProviderSubmissionStateParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, markProviderSubmissionState,
 		arg.State,
@@ -2163,6 +2174,55 @@ func (q *Queries) OldestPendingOutboxAgeSeconds(ctx context.Context) (int64, err
 	var n int64
 	err := row.Scan(&n)
 	return n, err
+}
+
+const reopenProviderSubmission = `-- name: ReopenProviderSubmission :execresult
+UPDATE provider_submissions
+SET state = 'sending', attempt = ?, last_error = NULL
+WHERE run_id = ? AND submission_no = ? AND state = 'rejected'
+`
+
+type ReopenProviderSubmissionParams struct {
+	Attempt      uint32
+	RunID        []byte
+	SubmissionNo uint32
+}
+
+// The one transition that goes BACK to 'sending': a previously REJECTED
+// submission is retransmitted under the same identity/key (第九轮 P0-2).
+//
+// It is deliberately a separate statement instead of a 'rejected' entry in
+// MarkProviderSubmissionState's FROM list, so "record an outcome" and "arm a
+// resend" can never be confused: only a definitive refusal arms a resend, and
+// writing it through the outcome query would make that invisible.
+func (q *Queries) ReopenProviderSubmission(ctx context.Context, arg ReopenProviderSubmissionParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, reopenProviderSubmission, arg.Attempt, arg.RunID, arg.SubmissionNo)
+}
+
+const reopenUnknownProviderSubmission = `-- name: ReopenUnknownProviderSubmission :execresult
+UPDATE provider_submissions
+SET state = 'sending', attempt = ?, last_error = NULL
+WHERE run_id = ? AND submission_no = ? AND state = 'unknown'
+`
+
+type ReopenUnknownProviderSubmissionParams struct {
+	Attempt      uint32
+	RunID        []byte
+	SubmissionNo uint32
+}
+
+// unknown → sending, the resend a NATIVELY IDEMPOTENT provider allows
+// (第九轮复审 P2).
+//
+// It is a separate statement on purpose. A provider that can collapse a
+// resend on the stable submission key is the ONE case in which an
+// unconfirmed request may be transmitted again, and it must stay visibly
+// distinct from the 'rejected' resend above: 'rejected' means "the provider
+// holds nothing", whereas here the provider may already hold the request and
+// is trusted to deduplicate it. Fusing them would let a capability
+// declaration silently turn an at-most-once ledger into at-least-once.
+func (q *Queries) ReopenUnknownProviderSubmission(ctx context.Context, arg ReopenUnknownProviderSubmissionParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, reopenUnknownProviderSubmission, arg.Attempt, arg.RunID, arg.SubmissionNo)
 }
 
 const requeueRun = `-- name: RequeueRun :exec

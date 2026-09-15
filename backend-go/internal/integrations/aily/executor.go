@@ -185,7 +185,8 @@ func (e *Executor) beginSubmit(ctx context.Context, claimed *execution.ClaimedRu
 		return &execution.ProviderSubmission{State: execution.SubmissionAccepted, ExternalRunID: claimed.Run.ExternalRunID}, submitResumeAccepted, nil
 	}
 
-	sub, err := e.Owned.BeginProviderSubmission(ctx, claimed, claimed.Run.Provider, submissionHash(claimed.Run))
+	sub, err := e.Owned.BeginProviderSubmission(ctx, claimed, claimed.Run.Provider,
+		submissionHash(claimed.Run), e.submissionResendPolicy())
 	if err != nil {
 		switch {
 		case errors.Is(err, execution.ErrProviderAttemptsExhausted):
@@ -207,6 +208,24 @@ func (e *Executor) beginSubmit(ctx context.Context, claimed *execution.ClaimedRu
 		return sub, submitResumeAccepted, nil
 	}
 	return sub, submitNow, nil
+}
+
+// submissionResendPolicy translates the ADAPTER's declared idempotency into
+// the single decision BeginProviderSubmission needs (第九轮复审 P2).
+//
+// Before this, classifySubmitFailure honoured IdempotencyNative ("may retry")
+// while BeginProviderSubmission refused every 'unknown' submission, so the
+// two halves disagreed and a native-idempotent provider could never actually
+// resend. The capability must be read from the same place both times, which
+// is why it is derived here rather than passed around.
+func (e *Executor) submissionResendPolicy() execution.SubmissionResend {
+	if catalog.SubmitIdempotencyOf(e.Adapter) == catalog.IdempotencyNative {
+		return execution.ResendOnUnknownSubmission
+	}
+	// Fail-closed: anything that is not a proof of native idempotency
+	// (including an adapter that does not implement the optional interface)
+	// stays at-most-once.
+	return execution.ResendForbidden
 }
 
 // submissionHash identifies the payload of this submission so a re-entry can
@@ -547,6 +566,29 @@ func (e *Executor) executeStreaming(ctx context.Context, claimed *execution.Clai
 
 	externalRunID := ""
 	coalescer := newDeltaCoalescer()
+	// parkIfUnconfirmed is the boundary the review found missing (第九轮
+	// 复审 P1). Once OpenStreamChat has succeeded the request has crossed
+	// the submit boundary, so "we never learned the chat id" is NOT proof
+	// that the provider holds nothing — the provider may already be running
+	// the agent. Any outcome that leaves externalRunID empty (transport
+	// error before the first frame, a first frame with no id, EOF, context
+	// timeout) is therefore UNKNOWN and must park the run rather than fail
+	// it. Before this, reconcile("") reported aily_no_chat_id and declared
+	// terminal-failed a run that was still executing upstream.
+	//
+	// The boolean is the whole point: after a park the run is RESOLVED, so
+	// the caller must return instead of falling through to reconciliation
+	// (which would try to fail a run that is already parked).
+	parkIfUnconfirmed := func(reason string) (bool, error) {
+		if externalRunID != "" {
+			return false, nil
+		}
+		e.recordSubmissionOutcome(ctx, claimed, sub, submitDisposition{
+			RecordOutcome: execution.SubmissionUnknown,
+			Reason:        reason,
+		})
+		return true, e.parkUnconfirmedSubmit(ctx, claimed, reason)
+	}
 	// NOTE (第九轮 P1-4): the durable chunk carries ONLY the incremental
 	// text plus its end offset. It used to also carry a cumulative
 	// `snapshot` of the whole answer, which made the run's event data
@@ -580,8 +622,13 @@ func (e *Executor) executeStreaming(ctx context.Context, claimed *execution.Clai
 				e.Log.Warn("bind thread/run failed", "run_id", run.ID.String(), "err", err)
 			}
 		case "aily.stream.transport_error":
-			// Break out; reconciliation decides the terminal state.
+			// Break out; reconciliation decides the terminal state — but
+			// only when the provider actually told us which chat it
+			// created.
 			e.Log.Warn("aily stream transport error", "run_id", run.ID.String(), "err", ev.Payload["error"])
+			if parked, perr := parkIfUnconfirmed("stream transport failed before the provider reported a chat id"); parked {
+				return perr
+			}
 			return e.reconcile(ctx, claimed, externalRunID)
 		case execution.EventContentDelta:
 			// Transient: live SSE consumers only — never persisted as-is.
@@ -612,6 +659,12 @@ func (e *Executor) executeStreaming(ctx context.Context, claimed *execution.Clai
 		e.Log.Warn("flush tail chunk failed", "err", err)
 	}
 	// Stream ended (normally or broken): final authority is the result API.
+	// A stream that closed without ever reporting a chat id is the same
+	// unknown as a transport error, not a failure we are entitled to
+	// declare (第九轮复审 P1).
+	if parked, perr := parkIfUnconfirmed("stream ended before the provider reported a chat id"); parked {
+		return perr
+	}
 	return e.reconcile(ctx, claimed, externalRunID)
 }
 

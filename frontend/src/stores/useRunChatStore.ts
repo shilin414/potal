@@ -64,6 +64,19 @@ export interface ChatMessage {
   retryNotice?: string;
   attachments?: { id: string; name: string }[];
   artifacts?: ChatArtifact[];
+  /**
+   * How many UTF-8 BYTES of `content` this bubble has already rendered.
+   *
+   * It exists because a durable content.chunk carries an INCREMENTAL slice
+   * plus its END offset, and the same text also arrives as transient
+   * content.delta frames: appending both duplicates the answer. Comparing
+   * against a byte counter (not `content.length`, which counts UTF-16 code
+   * units and therefore disagrees with the backend's byte offsets as soon as
+   * a Chinese character or an emoji appears) is what lets the reducer append
+   * only what is missing. Absent (history messages, re-seeded bubbles) means
+   * "derive it from content".
+   */
+  streamBytes?: number;
 }
 
 interface ConversationChat {
@@ -111,6 +124,48 @@ const TERMINAL = new Set(['run.completed', 'run.failed', 'run.cancelled']);
 
 /** Hard Kill 的用户文案：管理员撤销不是 Provider 故障，不能写成“执行失败”。 */
 const CANCELLED_NOTICE = '应用或运行配置已停用，本次执行已取消。';
+
+/**
+ * UTF-8 byte length of a JS string.
+ *
+ * `string.length` counts UTF-16 code units, so "你" is 1 there and 3 in the
+ * backend's byte offsets — using it would mis-align every chunk that follows
+ * a non-ASCII character. Iterating with for..of walks CODE POINTS, so an
+ * emoji (a surrogate pair) counts as its real 4 bytes instead of 2.
+ */
+export function utf8ByteLength(text: string): number {
+  let bytes = 0;
+  // eslint-disable-next-line no-restricted-syntax
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) as number;
+    bytes += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+}
+
+/**
+ * The tail of `text` starting at byte offset `skip`, never splitting a
+ * character: a byte position that lands inside a multi-byte character skips
+ * that character whole, so the rendered string can never contain a broken
+ * sequence (which would show up as U+FFFD).
+ */
+export function utf8SliceFromBytes(text: string, skip: number): string {
+  if (skip <= 0) return text;
+  let out = '';
+  let pos = 0;
+  // eslint-disable-next-line no-restricted-syntax
+  for (const ch of text) {
+    if (pos >= skip) out += ch;
+    const cp = ch.codePointAt(0) as number;
+    pos += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
+  }
+  return out;
+}
+
+/** Bytes of `content` already rendered (see ChatMessage.streamBytes). */
+function renderedBytes(message: ChatMessage): number {
+  return message.streamBytes ?? utf8ByteLength(message.content);
+}
 
 function cancelledNotice(errorCode?: string): string {
   return errorCode === 'execution_disabled' ? CANCELLED_NOTICE : '执行已取消';
@@ -300,6 +355,60 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
   },
 }));
 
+/**
+ * Fold one INCREMENTAL durable chunk into the bubble and return the new
+ * rendered-byte count.
+ *
+ * The same answer reaches the client twice: once as transient content.delta
+ * frames (live, never persisted) and once as durable content.chunk events
+ * (persisted, replayed after a reconnect). Appending both — what the reducer
+ * did before this fix — doubles every answer ("你好" becomes "你好你好").
+ *
+ * The durable cursor cannot dedupe this either: a transient frame has
+ * sequence 0 by definition and never advances it, so a client that saw the
+ * deltas and then replays the chunks is outside the cursor's reach entirely.
+ * The only reliable signal is the chunk's byte offset:
+ *
+ *   end <= rendered            the whole chunk was already shown → drop it
+ *   start <= rendered < end    partially shown → append only the missing tail
+ *   rendered < start           a real gap → keep the bytes we do have
+ *
+ * Offsets are UTF-8 BYTES, so every comparison goes through utf8ByteLength /
+ * utf8SliceFromBytes rather than string.length.
+ */
+function applyIncrementalChunk(
+  message: ChatMessage,
+  payload: Record<string, any>,
+): number {
+  const text = typeof payload.text === 'string' ? payload.text : '';
+  if (!text) return renderedBytes(message);
+  const rendered = renderedBytes(message);
+  const end = Number(payload.offset);
+  if (!Number.isFinite(end) || end < 0) {
+    // Pre-第九轮 incremental chunk without an offset: nothing to compare
+    // against, so append (the old behaviour).
+    message.content += text;
+    return rendered + utf8ByteLength(text);
+  }
+  const start = end - utf8ByteLength(text);
+  if (end <= rendered) {
+    // Already rendered via the transient path (or replayed after a
+    // reconnect that kept the rendered text).
+    return rendered;
+  }
+  if (start <= rendered) {
+    const tail = utf8SliceFromBytes(text, rendered - start);
+    message.content += tail;
+    return rendered + utf8ByteLength(tail);
+  }
+  // A gap: bytes between `rendered` and `start` never arrived (e.g. the
+  // client attached after the answer had begun). Dropping this chunk would
+  // lose real text, so append it and jump the counter to the chunk's end —
+  // the gap is closed by the terminal event, whose text is authoritative.
+  message.content += text;
+  return end;
+}
+
 /** Reduce one unified event into the streaming assistant message. */
 export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<RunChatState> {
   const runId = event.run_id || '';
@@ -329,6 +438,7 @@ export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<
           created_at: new Date().toISOString(),
           runId,
           status: 'streaming' as const,
+          streamBytes: 0,
           artifacts: [],
         },
       ],
@@ -340,9 +450,16 @@ export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<
   const conv = conversations[hostCid];
   const message = { ...conv.messages[idx] };
   switch (event.event_type) {
-      case 'content.delta':
-        message.content += event.payload?.text || '';
+      case 'content.delta': {
+        // Transient frame: never persisted, so it is the ONLY copy of these
+        // bytes until the coalescer flushes. Count them: the durable chunk
+        // that follows must not add them a second time.
+        const deltaText = event.payload?.text || '';
+        const deltaBefore = renderedBytes(message);
+        message.content += deltaText;
+        message.streamBytes = deltaBefore + utf8ByteLength(deltaText);
         break;
+      }
       case 'content.chunk':
         // Persisted coalesced chunk. Since 第九轮 P1-4 the backend writes only
         // the INCREMENTAL text plus an end offset — carrying the cumulative
@@ -352,9 +469,10 @@ export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<
         // replace is self-healing.
         if (typeof event.payload?.snapshot === 'string') {
           message.content = event.payload.snapshot;
-        } else {
-          message.content += event.payload?.text || '';
+          message.streamBytes = utf8ByteLength(message.content);
+          break;
         }
+        message.streamBytes = applyIncrementalChunk(message, event.payload || {});
         break;
       case 'artifact.discovered': {
         const artifacts = [...(message.artifacts || [])];
@@ -372,7 +490,10 @@ export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<
       }
       case 'run.completed':
         // Reconciliation text is authoritative when present.
-        if (event.payload?.text) message.content = event.payload.text;
+        if (event.payload?.text) {
+          message.content = event.payload.text;
+          message.streamBytes = utf8ByteLength(message.content);
+        }
         message.status = 'done';
         break;
       case 'run.failed':
@@ -519,9 +640,14 @@ export async function finalizeRun(runId: string, eventText?: string) {
       // done —— 用户会看到一个空白的“成功回答”。
       const cancelled = run.status === 'cancelled';
       const failed = run.status === 'failed' || run.status === 'interrupted';
+      // The reconciled text replaces whatever the stream accumulated, so the
+      // byte counter has to follow it — a stale counter would make a later
+      // replayed chunk look "already rendered" (or re-append it).
+      const content = (eventText ?? run.output?.text) || m.content;
       return {
         ...m,
-        content: (eventText ?? run.output?.text) || m.content,
+        content,
+        streamBytes: utf8ByteLength(content),
         status: cancelled
           ? 'cancelled' as const
           : failed

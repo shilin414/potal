@@ -27,6 +27,22 @@
 -- NOTE: the UPDATE assigns `next_event_sequence + 1` rather than a computed
 -- literal on purpose — MySQL reports CHANGED rows, and a same-value write
 -- would report 0 and be indistinguishable from a lost row lock.
+--
+-- ⚠ DEPLOYMENT CONSTRAINT (第九轮复审 P1-DEPLOY): THIS MIGRATION IS NOT
+-- MIXED-VERSION SAFE. Every worker must be drained BEFORE it is applied and
+-- only NEW workers may come up afterwards.
+--
+-- The two allocators do not agree. The old one computes COUNT(*) + 1 WITHOUT
+-- advancing next_event_sequence, so with an old worker still online:
+--
+--     migration applied, max sequence = 100, next_event_sequence = 101
+--     old worker writes  → INSERT sequence = 101, counter stays 101
+--     new worker writes  → allocate 101 → INSERT → 1062 duplicate key
+--
+-- The failure mode is a hard insert error on every subsequent event of that
+-- run, not a silent drift. Rolling releases and multi-pod canaries therefore
+-- need a maintenance window for this release (or the two-phase form: migrate
+-- the column after every pod runs code that advances it).
 ALTER TABLE runs
     ADD COLUMN next_event_sequence BIGINT UNSIGNED NOT NULL DEFAULT 1
         AFTER lease_epoch;

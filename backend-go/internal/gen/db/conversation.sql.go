@@ -218,6 +218,17 @@ func (q *Queries) DeleteConversationRuns(ctx context.Context, conversationID sql
 	return items, nil
 }
 
+const deleteProviderSubmissionsByRun = `-- name: DeleteProviderSubmissionsByRun :exec
+DELETE FROM provider_submissions WHERE run_id = ?
+`
+
+// Same reason as DeleteRunRequestsByRun: the provider-side submission
+// ledger outlives its run unless this cascade deletes it.
+func (q *Queries) DeleteProviderSubmissionsByRun(ctx context.Context, runID []byte) error {
+	_, err := q.db.ExecContext(ctx, deleteProviderSubmissionsByRun, runID)
+	return err
+}
+
 const deleteRunArtifacts = `-- name: DeleteRunArtifacts :exec
 DELETE FROM run_artifacts WHERE run_id = ?
 `
@@ -251,6 +262,20 @@ DELETE FROM run_leases WHERE run_id = ?
 
 func (q *Queries) DeleteRunLeaseByRun(ctx context.Context, runID []byte) error {
 	_, err := q.db.ExecContext(ctx, deleteRunLeaseByRun, runID)
+	return err
+}
+
+const deleteRunRequestsByRun = `-- name: DeleteRunRequestsByRun :exec
+DELETE FROM run_requests WHERE run_id = ?
+`
+
+// 第九轮 P1: the idempotency reservation table. Neither table added in
+// round nine is reachable by an FK cascade from `runs`, so both are purged
+// explicitly here — otherwise deleting a conversation would leave the
+// client_request_id pointing at a run that no longer exists, and every later
+// replay of that id would answer 500 instead of serving the run.
+func (q *Queries) DeleteRunRequestsByRun(ctx context.Context, runID []byte) error {
+	_, err := q.db.ExecContext(ctx, deleteRunRequestsByRun, runID)
 	return err
 }
 

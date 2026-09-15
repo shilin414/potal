@@ -98,10 +98,17 @@ func (w *WorkerOwnedService) Retry(ctx context.Context, claimed *ClaimedRun, rea
 //	State == accepted  do NOT transmit — reconcile with ExternalRunID
 //	ErrProviderSubmitUnknown  do NOT transmit — park the run
 //
+// (an 'unknown' predecessor is resendable ONLY when resendOnUnknown says the
+// provider can deduplicate the resend itself)
+//
 // and it updates the in-memory claim's attempt so the executor's retry-budget
 // decisions see the fresh count.
-func (w *WorkerOwnedService) BeginProviderSubmission(ctx context.Context, claimed *ClaimedRun, provider string, requestHash []byte) (*ProviderSubmission, error) {
-	sub, err := w.svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, requestHash)
+// resendOnUnknown is derived from the PROVIDER, not chosen by the caller:
+// it is the provider's declared ability to collapse a resend on the stable
+// submission key, and claiming it falsely turns an at-most-once ledger into
+// a duplicate external execution (第九轮复审 P2).
+func (w *WorkerOwnedService) BeginProviderSubmission(ctx context.Context, claimed *ClaimedRun, provider string, requestHash []byte, resendOnUnknown SubmissionResend) (*ProviderSubmission, error) {
+	sub, err := w.svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, requestHash, resendOnUnknown)
 	if err != nil {
 		return nil, err
 	}

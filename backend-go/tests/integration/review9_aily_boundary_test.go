@@ -12,14 +12,18 @@
 //	Test 3  a timeout at the submit boundary parks the run instead of retrying
 //	Test 4  a definitive refusal still follows the ordinary retry policy
 //	Test 5  durable content.chunk events stay INCREMENTAL (P1-4)
+//	Test 6  POST succeeded + EOF before the first frame ⇒ PARK, not fail
+//	Test 7  a first frame without agent_chat_id is the same unknown
 package integration
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/creation-agent-studio/backend-go/internal/execution"
 	"github.com/creation-agent-studio/backend-go/internal/integrations/aily"
@@ -51,7 +55,7 @@ func TestReclaimOfAcceptedSubmissionDoesNotReopenTheStream(t *testing.T) {
 	// A previous attempt that reached the provider and recorded its answer,
 	// then died before finishing.
 	sub, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, f.provKey,
-		execution.ProviderSubmissionHash(f.provKey, nil))
+		execution.ProviderSubmissionHash(f.provKey, nil), execution.ResendForbidden)
 	if err != nil {
 		t.Fatalf("begin submission: %v", err)
 	}
@@ -90,7 +94,7 @@ func TestUnresolvedSubmissionParksWithoutContactingTheProvider(t *testing.T) {
 
 	// The crashed worker: recorded the intent, never learned the outcome.
 	if _, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, f.provKey,
-		execution.ProviderSubmissionHash(f.provKey, nil)); err != nil {
+		execution.ProviderSubmissionHash(f.provKey, nil), execution.ResendForbidden); err != nil {
 		t.Fatalf("begin submission: %v", err)
 	}
 
@@ -244,5 +248,179 @@ func TestStreamingChunkEventsAreIncremental(t *testing.T) {
 	}
 	if lastOffset != len(answer) {
 		t.Fatalf("final offset = %d, want %d", lastOffset, len(answer))
+	}
+}
+
+// TestStreamEofBeforeChatIdParksInsteadOfFailing is the boundary the review
+// found unclosed (第九轮复审 P1).
+//
+// OpenStreamChat succeeding means the request has crossed the submit
+// boundary — the provider may already be running the agent. The chat id only
+// arrives with the FIRST SSE frame, so there is a real window in which we
+// have transmitted and hold no identity:
+//
+//	POST ok → body EOF before frame 1 → executor has no external id
+//
+// Failing the run there ("aily_no_chat_id") declares terminal-failed a run
+// the provider is still executing. The honest state is UNKNOWN, i.e. park
+// the run in waiting_external and let the bounded sweep resolve it.
+func TestStreamEofBeforeChatIdParksInsteadOfFailing(t *testing.T) {
+	f := newAilySubmitFixture(t, "r9eof", "interactive", "eof before first frame")
+	ctx := context.Background()
+	// POST succeeds, the body is already at EOF: no frame ever arrives.
+	f.rec.streamBody = ""
+
+	if err := f.exec.Execute(ctx, f.claimed); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	starts, opens := f.rec.counted()
+	if starts != 0 || opens != 1 {
+		t.Fatalf("provider calls: StartChat=%d OpenStreamChat=%d, want 0/1 "+
+			"(exactly one submit, never a resend)", starts, opens)
+	}
+	st := readRunState(t, f.env.db, f.runID)
+	if st.status != execution.StatusWaitingExternal {
+		t.Fatalf("status=%q, want waiting_external — the provider may hold this request, "+
+			"so it must be parked rather than failed", st.status)
+	}
+	state, externalID := submissionOf(t, f)
+	if state != execution.SubmissionUnknown {
+		t.Fatalf("submission state=%q, want unknown (an outcome nobody can confirm)", state)
+	}
+	if externalID != "" {
+		t.Fatalf("external_run_id=%q, want empty (it is exactly what we never learned)", externalID)
+	}
+	if n := countEvents(t, f.svc, f.runID, execution.EventRunRetrying); n != 0 {
+		t.Fatalf("run.retrying events = %d, want 0 (parked ≠ requeued)", n)
+	}
+	if n := countEvents(t, f.svc, f.runID, execution.EventRunFailed); n != 0 {
+		t.Fatalf("run.failed events = %d, want 0 — the run is NOT entitled to declare "+
+			"failure while the provider may still be executing", n)
+	}
+}
+
+// TestFirstFrameWithoutChatIdParks: a frame that arrived without an
+// agent_chat_id is not proof of anything. Emitting aily.stream.started for it
+// would let the executor believe it holds the external identity, so the
+// adapter waits for the id and the executor parks when it never comes.
+func TestFirstFrameWithoutChatIdParks(t *testing.T) {
+	f := newAilySubmitFixture(t, "r9nochat", "interactive", "frame without chat id")
+	ctx := context.Background()
+	f.rec.streamBody = "event: message\ndata: {\"session_id\":\"sess-1\"}\n\n"
+
+	if err := f.exec.Execute(ctx, f.claimed); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	starts, opens := f.rec.counted()
+	if starts != 0 || opens != 1 {
+		t.Fatalf("provider calls: StartChat=%d OpenStreamChat=%d, want 0/1", starts, opens)
+	}
+	st := readRunState(t, f.env.db, f.runID)
+	if st.status != execution.StatusWaitingExternal {
+		t.Fatalf("status=%q, want waiting_external (no external id ⇒ unknown, not failure)", st.status)
+	}
+	if state, externalID := submissionOf(t, f); state != execution.SubmissionUnknown || externalID != "" {
+		t.Fatalf("submission state=%q external=%q, want unknown/\"\"", state, externalID)
+	}
+}
+
+// TestMarkSubmissionStateRequiresLiveOwnershipAndLegalTransition is the
+// fencing invariant of 第九轮复审 P1.
+//
+// provider_submissions decides whether a provider action may be transmitted
+// again, i.e. whether a SECOND real execution can happen. A worker whose lease
+// expired mid-flight must therefore lose this write too — otherwise the
+// "Owned" suffix is a promise the code does not keep. The state transition is
+// additionally a CAS: 'accepted' is monotonic and an outcome may only replace
+// an in-flight 'sending', never another verdict.
+func TestMarkSubmissionStateRequiresLiveOwnershipAndLegalTransition(t *testing.T) {
+	f := newAilySubmitFixture(t, "r9fence", "interactive", "submission fencing")
+	ctx := context.Background()
+
+	// ── Worker A begins the submission (row = sending). ──
+	sub, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, f.provKey,
+		execution.ProviderSubmissionHash(f.provKey, nil), execution.ResendForbidden)
+	if err != nil {
+		t.Fatalf("begin submission: %v", err)
+	}
+	if state, _ := submissionOf(t, f); state != execution.SubmissionSending {
+		t.Fatalf("initial submission state=%q, want sending", state)
+	}
+
+	// ── A stalls: its lease expires, the reaper requeues, B takes over. ──
+	expireLease(t, f.svc, f.runID, "itest-r9fence")
+	_ = recoverRun(t, f.svc, f.runID)
+	claimedB, won, err := f.svc.ClaimRun(ctx, f.runID, "worker-b", time.Minute)
+	if err != nil || !won {
+		t.Fatalf("B claim: won=%v err=%v", won, err)
+	}
+	if claimedB.Ownership.LeaseEpoch <= f.claimed.Ownership.LeaseEpoch {
+		t.Fatalf("epoch did not increase on reclaim: A=%d B=%d",
+			f.claimed.Ownership.LeaseEpoch, claimedB.Ownership.LeaseEpoch)
+	}
+
+	// ── A's provider call returns now: its verdict must be refused. ──
+	if err := f.svc.MarkSubmissionStateOwned(ctx, f.claimed.Ownership, sub,
+		execution.SubmissionUnknown, "stale worker"); !errors.Is(err, execution.ErrLostOwnership) {
+		t.Fatalf("stale MarkSubmissionStateOwned: err=%v, want ErrLostOwnership "+
+			"(a fenced-out worker must not write the submission ledger)", err)
+	}
+	if state, _ := submissionOf(t, f); state != execution.SubmissionSending {
+		t.Fatalf("submission state=%q after the stale write, want unchanged sending", state)
+	}
+
+	// ── The live owner may record the outcome. ──
+	if err := f.svc.MarkSubmissionStateOwned(ctx, claimedB.Ownership, sub,
+		execution.SubmissionUnknown, "unconfirmed"); err != nil {
+		t.Fatalf("owner MarkSubmissionStateOwned: %v", err)
+	}
+	if state, _ := submissionOf(t, f); state != execution.SubmissionUnknown {
+		t.Fatalf("submission state=%q, want unknown", state)
+	}
+
+	// ── And the transition is one-way: 'unknown' is no longer 'sending'. ──
+	if err := f.svc.MarkSubmissionStateOwned(ctx, claimedB.Ownership, sub,
+		execution.SubmissionRejected, "try to rewrite history"); err == nil {
+		t.Fatal("a resolved submission was rewritten to 'rejected' — that re-opens a " +
+			"resend of an action whose fate is unknown")
+	}
+	if state, _ := submissionOf(t, f); state != execution.SubmissionUnknown {
+		t.Fatalf("submission state=%q after the illegal transition, want unknown", state)
+	}
+}
+
+// TestChatIdOnALaterFrameStillResumes pins the other half of the adapter fix:
+// waiting for the id must not mean MISSING it.
+//
+// The provider's first frame is not guaranteed to carry agent_chat_id, so the
+// adapter keeps listening instead of declaring "started". If it claimed
+// started on the first frame, a chat id that arrives on frame 2 would never be
+// emitted and the executor would park a run whose provider answered normally.
+func TestChatIdOnALaterFrameStillResumes(t *testing.T) {
+	f := newAilySubmitFixture(t, "r9latechat", "interactive", "chat id on frame 2")
+	ctx := context.Background()
+	f.rec.streamBody = "event: message\ndata: {\"session_id\":\"sess-1\"}\n\n" +
+		"event: message\ndata: {\"agent_chat_id\":\"chat-1\",\"session_id\":\"sess-1\"}\n\n"
+
+	if err := f.exec.Execute(ctx, f.claimed); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+
+	starts, opens := f.rec.counted()
+	if starts != 0 || opens != 1 {
+		t.Fatalf("provider calls: StartChat=%d OpenStreamChat=%d, want 0/1", starts, opens)
+	}
+	st := readRunState(t, f.env.db, f.runID)
+	if st.status == execution.StatusWaitingExternal {
+		t.Fatal("the run was parked although the provider DID report its chat id on a later " +
+			"frame — the adapter must not claim 'started' on a frame that carries no identity")
+	}
+	if st.status != execution.StatusSucceeded {
+		t.Fatalf("status=%q, want succeeded", st.status)
+	}
+	if state, externalID := submissionOf(t, f); externalID != "chat-1" || state != execution.SubmissionAccepted {
+		t.Fatalf("submission state=%q external=%q, want accepted/chat-1", state, externalID)
 	}
 }

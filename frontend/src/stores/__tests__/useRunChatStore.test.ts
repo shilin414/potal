@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { validateAttachment, ATTACHMENT_LIMITS, getRun, fetchRunArtifacts } from '@/services/runApi';
-import { applyEvent, finalizeRun, useRunChatStore } from '../useRunChatStore';
+import {
+  applyEvent, finalizeRun, useRunChatStore, utf8ByteLength,
+} from '../useRunChatStore';
 import type { RunEventRecord } from '@/services/runApi';
 import type { RunChatState } from '../useRunChatStore';
 
@@ -107,6 +109,65 @@ describe('applyEvent (unified event protocol rendering)', () => {
       artifact_id: 'art-1', provider_artifact_type: 'sandbox_file',
     }));
     expect(state.conversations[42].messages[1].artifacts).toHaveLength(1);
+  });
+
+  // 第九轮 P1-4（复审补丁）：durable chunk 是 INCREMENTAL，而同一段文本
+  // 也以 transient delta 的形式先到过一次。直接 append 会得到两份 ——
+  // "你好" 变成 "你好你好"。以下 5 个 case 锁死 offset 对账语义。
+  describe('content.chunk offset reconciliation (第九轮 P1-4)', () => {
+    const text = (state: RunChatState) => state.conversations[42].messages[1].content;
+
+    it('delta + delta + chunk must not duplicate the answer', () => {
+      let state = stateWithStream();
+      state = reduce(state, event('content.delta', { text: '你' }));
+      state = reduce(state, event('content.delta', { text: '好' }));
+      // "你好" is 6 UTF-8 bytes.
+      state = reduce(state, event('content.chunk', { text: '你好', offset: 6 }));
+      expect(text(state)).toBe('你好');
+    });
+
+    it('a replayed chunk alone renders the whole answer', () => {
+      const state = reduce(stateWithStream(), event('content.chunk', { text: '你好', offset: 6 }));
+      expect(text(state)).toBe('你好');
+    });
+
+    it('transient text followed by a durable replay of the same range keeps one copy', () => {
+      let state = stateWithStream();
+      state = reduce(state, event('content.delta', { text: 'A' }));
+      state = reduce(state, event('content.delta', { text: 'B' }));
+      state = reduce(state, event('content.delta', { text: 'C' }));
+      // The transport died after the deltas; the durable replay re-sends ABC.
+      state = reduce(state, event('content.chunk', { text: 'ABC', offset: 3 }));
+      expect(text(state)).toBe('ABC');
+    });
+
+    it('a partially rendered chunk appends only the missing suffix', () => {
+      let state = stateWithStream();
+      // chunk AB (offset 2), then a transient C that has NOT been coalesced
+      // yet, then chunk CD (offset 4): only "D" is new.
+      state = reduce(state, event('content.chunk', { text: 'AB', offset: 2 }));
+      state = reduce(state, event('content.delta', { text: 'C' }));
+      state = reduce(state, event('content.chunk', { text: 'CD', offset: 4 }));
+      expect(text(state)).toBe('ABCD');
+    });
+
+    it('survives multi-byte characters: 中文 and emoji offsets are UTF-8 bytes', () => {
+      let state = stateWithStream();
+      state = reduce(state, event('content.delta', { text: '中' })); // 3 bytes
+      state = reduce(state, event('content.delta', { text: '文' })); // 3 bytes
+      state = reduce(state, event('content.delta', { text: '🚀' })); // 4 bytes
+      expect(utf8ByteLength(text(state))).toBe(10);
+      // The coalescer flushed all three deltas as one chunk: end offset 10.
+      state = reduce(state, event('content.chunk', { text: '中文🚀', offset: 10 }));
+      expect(text(state)).toBe('中文🚀');
+    });
+
+    it('a historical chunk that still carries a snapshot replaces the content', () => {
+      let state = stateWithStream();
+      state = reduce(state, event('content.delta', { text: '过时的' }));
+      state = reduce(state, event('content.chunk', { text: 'x', snapshot: '权威答案' }));
+      expect(text(state)).toBe('权威答案');
+    });
   });
 
   it('run.completed replaces content with the reconciled text and closes the run', () => {

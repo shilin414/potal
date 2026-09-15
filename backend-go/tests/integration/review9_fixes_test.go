@@ -437,7 +437,7 @@ func TestSubmissionUnknownForbidsResend(t *testing.T) {
 	provider := "itest_parked"
 	hash := submissionFixtureHash(provider)
 
-	sub, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash)
+	sub, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash, execution.ResendForbidden)
 	if err != nil {
 		t.Fatalf("begin submission: %v", err)
 	}
@@ -445,13 +445,13 @@ func TestSubmissionUnknownForbidsResend(t *testing.T) {
 		t.Fatalf("state = %q, want %q", sub.State, execution.SubmissionSending)
 	}
 
-	if _, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash); !errors.Is(err, execution.ErrProviderSubmitUnknown) {
+	if _, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash, execution.ResendForbidden); !errors.Is(err, execution.ErrProviderSubmitUnknown) {
 		t.Fatalf("resend over an in-flight submission: err=%v, want ErrProviderSubmitUnknown", err)
 	}
 	// Even a different payload must not produce a second transmit while the
 	// first may be at the provider: the second key would be a second action.
 	if _, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider,
-		execution.ProviderSubmissionHash(provider, []byte(`{"content":[{"type":"text","text":"edited"}]}`))); !errors.Is(err, execution.ErrProviderSubmitUnknown) {
+		execution.ProviderSubmissionHash(provider, []byte(`{"content":[{"type":"text","text":"edited"}]}`)), execution.ResendForbidden); !errors.Is(err, execution.ErrProviderSubmitUnknown) {
 		t.Fatalf("resend with a changed payload over an in-flight submission: err=%v, want ErrProviderSubmitUnknown", err)
 	}
 
@@ -483,7 +483,7 @@ func TestSubmissionAcceptedIsResumedNotResubmitted(t *testing.T) {
 	provider := "itest_parked_accepted"
 	hash := submissionFixtureHash(provider)
 
-	sub, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash)
+	sub, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash, execution.ResendForbidden)
 	if err != nil {
 		t.Fatalf("begin submission: %v", err)
 	}
@@ -500,7 +500,7 @@ func TestSubmissionAcceptedIsResumedNotResubmitted(t *testing.T) {
 		t.Fatalf("run.external_run_id = %q, want chat-abc", run.ExternalRunID)
 	}
 
-	again, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash)
+	again, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash, execution.ResendForbidden)
 	if err != nil {
 		t.Fatalf("begin after acceptance: %v", err)
 	}
@@ -525,14 +525,14 @@ func TestSubmissionRejectedAllowsRetryWithTheSameKey(t *testing.T) {
 	provider := "itest_parked_rejected"
 	hash := submissionFixtureHash(provider)
 
-	first, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash)
+	first, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash, execution.ResendForbidden)
 	if err != nil {
 		t.Fatalf("begin submission: %v", err)
 	}
 	if err := f.svc.MarkSubmissionStateOwned(ctx, f.claimed.Ownership, first, execution.SubmissionRejected, "400"); err != nil {
 		t.Fatalf("mark rejected: %v", err)
 	}
-	second, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash)
+	second, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash, execution.ResendForbidden)
 	if err != nil {
 		t.Fatalf("retry after a refusal: %v", err)
 	}
@@ -545,6 +545,235 @@ func TestSubmissionRejectedAllowsRetryWithTheSameKey(t *testing.T) {
 	}
 }
 
+// TestNativeIdempotencyMayResendOnTheSameKey closes the loop the review found
+// missing (第九轮复审 P2).
+//
+// classifySubmitFailure already said "a native-idempotent provider may retry
+// after an unknown outcome", but BeginProviderSubmission refused EVERY
+// 'unknown' submission, so the two halves of the policy disagreed and that
+// branch was dead code. An unconfirmed submission is now resendable — under
+// the SAME submission number and the SAME provider-facing key, with attempt
+// incremented — but ONLY when the caller proves the provider can collapse a
+// resend on that key.
+func TestNativeIdempotencyMayResendOnTheSameKey(t *testing.T) {
+	f := newParkFixture(t, "itest_parked_native")
+	ctx := context.Background()
+	provider := "itest_parked_native"
+	hash := submissionFixtureHash(provider)
+
+	first, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash, execution.ResendOnUnknownSubmission)
+	if err != nil {
+		t.Fatalf("begin submission: %v", err)
+	}
+	if err := f.svc.MarkSubmissionStateOwned(ctx, f.claimed.Ownership, first, execution.SubmissionUnknown, "timeout"); err != nil {
+		t.Fatalf("mark unknown: %v", err)
+	}
+
+	// The provider deduplicates on the stable key, so transmitting again is
+	// allowed — as the SAME external action, not a new one.
+	second, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash, execution.ResendOnUnknownSubmission)
+	if err != nil {
+		t.Fatalf("resend for a native-idempotent provider: %v (the capability is "+
+			"declared, so an unconfirmed submit must be re-transmittable)", err)
+	}
+	if second.State != execution.SubmissionSending {
+		t.Fatalf("state = %q, want %q", second.State, execution.SubmissionSending)
+	}
+	if second.SubmissionNo != first.SubmissionNo || second.IdempotencyKey != first.IdempotencyKey {
+		t.Fatalf("a resend changed the external identity: no %d→%d key %q→%q — "+
+			"the whole point of the stable key is that a resend is the same action",
+			first.SubmissionNo, second.SubmissionNo, first.IdempotencyKey, second.IdempotencyKey)
+	}
+	if second.Attempt != 2 {
+		t.Fatalf("attempt = %d, want 2 (a resend still costs an attempt)", second.Attempt)
+	}
+	var n int64
+	if err := f.svc.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM provider_submissions WHERE run_id = ?`, f.runID.Bytes()).Scan(&n); err != nil {
+		t.Fatalf("count submissions: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("provider_submissions rows = %d, want 1 (a resend reuses the row)", n)
+	}
+
+	// …and the same capability is what makes it legal: with the ordinary
+	// (at-most-once) policy the very same state still refuses.
+	if err := f.svc.MarkSubmissionStateOwned(ctx, f.claimed.Ownership, second, execution.SubmissionUnknown, "timeout again"); err != nil {
+		t.Fatalf("mark unknown: %v", err)
+	}
+	if _, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash, execution.ResendForbidden); !errors.Is(err, execution.ErrProviderSubmitUnknown) {
+		t.Fatalf("resend without the capability: err=%v, want ErrProviderSubmitUnknown "+
+			"(at-most-once is the default; only a declared capability relaxes it)", err)
+	}
+}
+
+// TestResolveRunRequestWithWaitBridgesAnUncommittedReservation is the 第九轮
+// P1 replay-availability property, against a REAL uncommitted transaction.
+//
+// A single read cannot close it: request A may be milliseconds from
+// committing. So A holds the reservation inside an OPEN transaction (invisible
+// to everyone else), and the losing concurrent request must nevertheless end
+// up with A's run once A commits — instead of walking away into a 429.
+func TestResolveRunRequestWithWaitBridgesAnUncommittedReservation(t *testing.T) {
+	svc, _ := testEnv(t)
+	ctx := context.Background()
+	const userID = 90420099
+	seedAdmissionUser(t, svc, userID)
+
+	// The winner: created the ordinary way, so the row (and the FK the
+	// reservation needs) is real.
+	const reqID = "review9-wait"
+	convID := int64(0)
+	first, _, err := svc.CreateRunIdempotent(ctx, idempotentInputFor(userID, reqID, "one", convID), 5)
+	if err != nil {
+		t.Fatalf("seed first run: %v", err)
+	}
+	cleanupConversation(t, svc, conversationOf(t, svc, first))
+
+	// A SECOND connection holds an UNCOMMITTED reservation for a DIFFERENT
+	// run of the same identity — exactly what an in-flight duplicate looks
+	// like from the loser's side.
+	holder, err := svc.DB.Conn(ctx)
+	if err != nil {
+		t.Fatalf("holder conn: %v", err)
+	}
+	defer func() { _ = holder.Close() }()
+	if _, err := holder.ExecContext(ctx,
+		`DELETE FROM run_requests WHERE user_id = ? AND client_request_id = ?`, userID, reqID); err != nil {
+		t.Fatalf("clear earlier reservation: %v", err)
+	}
+	secondRun, _, err := svc.CreateRunIdempotent(ctx, idempotentInputFor(userID, "review9-wait-2", "two", convID), 5)
+	if err != nil {
+		t.Fatalf("seed second run: %v", err)
+	}
+	cleanupConversation(t, svc, conversationOf(t, svc, secondRun))
+	hash := execution.RunRequestHash(1, convID, "two", nil)
+	// One reservation per run (uniq_run_requests_run), so the row the second
+	// run created for its own id has to go before this fixture re-points the
+	// identity at it.
+	if _, err := holder.ExecContext(ctx, `DELETE FROM run_requests WHERE run_id = ?`, secondRun.ID.Bytes()); err != nil {
+		t.Fatalf("clear the second run's own reservation: %v", err)
+	}
+	tx, err := holder.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin holder tx: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO run_requests (user_id, client_request_id, run_id, request_hash)
+		 VALUES (?, ?, ?, ?)`, userID, reqID, secondRun.ID.Bytes(), hash); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("insert uncommitted reservation: %v", err)
+	}
+
+	// Uncommitted ⇒ invisible: one plain read must NOT see it, otherwise
+	// this test would not be exercising the wait at all.
+	if _, found, err := svc.ResolveRunRequest(ctx, userID, reqID, hash); err != nil || found {
+		_ = tx.Rollback()
+		t.Fatalf("ResolveRunRequest found=%v err=%v while the reservation is uncommitted — "+
+			"the fixture does not reproduce the race", found, err)
+	}
+
+	// The loser waits; the winner commits a moment later.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(150 * time.Millisecond)
+		_ = tx.Commit()
+	}()
+
+	run, found, err := svc.ResolveRunRequestWithWait(ctx, userID, reqID, hash, 3*time.Second)
+	if err != nil {
+		t.Fatalf("ResolveRunRequestWithWait: %v", err)
+	}
+	<-done
+	if !found {
+		t.Fatal("the loser never saw the winner's reservation: a duplicate would have been " +
+			"rejected with 429 for a request that actually succeeded")
+	}
+	if run.ID != secondRun.ID {
+		t.Fatalf("resolved run = %s, want %s (the ORIGINAL run of this identity)", run.ID, secondRun.ID)
+	}
+}
+
+// TestCascadeDeleteRemovesRoundNineChildTables (第九轮 P1): hard-deleting a
+// conversation must not leave run_requests or provider_submissions behind.
+//
+// Neither table is reachable by an FK cascade from `runs`, so omitting them
+// leaves a permanent idempotency reservation pointing at a run that no longer
+// exists: the next replay of that client_request_id resolves a row whose run
+// was deleted and answers 500 forever.
+func TestCascadeDeleteRemovesRoundNineChildTables(t *testing.T) {
+	f := newParkFixture(t, "itest_cascade9")
+	ctx := context.Background()
+	provider := "itest_cascade9"
+	hash := submissionFixtureHash(provider)
+
+	sub, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, hash, execution.ResendForbidden)
+	if err != nil {
+		t.Fatalf("begin submission: %v", err)
+	}
+	// A definitive refusal, so no row is left in an unresolved state that a
+	// later policy change could interpret.
+	if err := f.svc.MarkSubmissionStateOwned(ctx, f.claimed.Ownership, sub, execution.SubmissionRejected, "400"); err != nil {
+		t.Fatalf("mark rejected: %v", err)
+	}
+	if err := f.svc.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM provider_submissions WHERE run_id = ?`, f.runID.Bytes()).Scan(new(int64)); err != nil {
+		t.Fatalf("probe provider_submissions: %v", err)
+	}
+	// The identity is a fixed string, so clear any earlier attempt's row
+	// first: a leftover from a run whose cascade did NOT delete it is
+	// indistinguishable from the row this test is about to create.
+	if _, err := f.svc.DB.ExecContext(ctx,
+		`DELETE FROM run_requests WHERE client_request_id = ?`, "review9-cascade"); err != nil {
+		t.Fatalf("clear stale reservation: %v", err)
+	}
+	if _, err := f.svc.DB.ExecContext(ctx,
+		`INSERT INTO run_requests (user_id, client_request_id, run_id, request_hash)
+		 VALUES (42, ?, ?, ?) ON DUPLICATE KEY UPDATE run_id = run_id`,
+		"review9-cascade", f.runID.Bytes(), hash); err != nil {
+		t.Fatalf("seed run_requests: %v", err)
+	}
+
+	// A terminal run: the cascade refuses to delete live work.
+	if err := f.svc.FailOwnedRun(ctx, f.claimed.Run, f.claimed.Ownership, "itest_done", "done"); err != nil {
+		t.Fatalf("fail run: %v", err)
+	}
+	convID := f.convID
+	if err := f.svc.DeleteConversationCascade(ctx, convID, 42); err != nil {
+		t.Fatalf("DeleteConversationCascade: %v", err)
+	}
+
+	for _, tc := range []struct {
+		table string
+		stmt  string
+	}{
+		{"runs", `SELECT COUNT(*) FROM runs WHERE conversation_id = ?`},
+		{"run_events", `SELECT COUNT(*) FROM run_events e JOIN runs r ON r.id = e.run_id WHERE r.conversation_id = ?`},
+		{"provider_submissions", `SELECT COUNT(*) FROM provider_submissions p JOIN runs r ON r.id = p.run_id WHERE r.conversation_id = ?`},
+		{"run_requests", `SELECT COUNT(*) FROM run_requests q JOIN runs r ON r.id = q.run_id WHERE r.conversation_id = ?`},
+	} {
+		var n int64
+		if err := f.svc.DB.QueryRowContext(ctx, tc.stmt, convID).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", tc.table, err)
+		}
+		if n != 0 {
+			t.Fatalf("%s rows after the cascade = %d, want 0 — a stale row here leaves a "+
+				"client_request_id whose run no longer exists", tc.table, n)
+		}
+	}
+	// The reservation row itself must be gone, not merely orphaned.
+	var orphan int64
+	if err := f.svc.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run_requests WHERE client_request_id = ?`, "review9-cascade").Scan(&orphan); err != nil {
+		t.Fatalf("count orphan reservations: %v", err)
+	}
+	if orphan != 0 {
+		t.Fatalf("run_requests rows for 'review9-cascade' = %d, want 0: a replay of that id "+
+			"would resolve a deleted run and answer 500", orphan)
+	}
+}
+
 // TestParkedRunIsReleasedByTheGraceSweep closes the loop on waiting_external:
 // parking is only safe if it is BOUNDED. A parked run is non-settled, so it
 // blocks its conversation (409) and counts against the user's quota — an
@@ -554,7 +783,7 @@ func TestParkedRunIsReleasedByTheGraceSweep(t *testing.T) {
 	ctx := context.Background()
 	provider := "itest_parked_sweep"
 
-	if _, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, submissionFixtureHash(provider)); err != nil {
+	if _, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, submissionFixtureHash(provider), execution.ResendForbidden); err != nil {
 		t.Fatalf("begin submission: %v", err)
 	}
 	if err := f.svc.AwaitExternalOwned(ctx, f.claimed.Ownership, "provider submit outcome unknown"); err != nil {
@@ -644,7 +873,7 @@ func TestSweptParkedRunStaysFailed(t *testing.T) {
 	ctx := context.Background()
 	provider := "itest_parked_idempotent"
 
-	if _, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, submissionFixtureHash(provider)); err != nil {
+	if _, err := f.svc.BeginProviderSubmissionOwned(ctx, f.claimed.Ownership, provider, submissionFixtureHash(provider), execution.ResendForbidden); err != nil {
 		t.Fatalf("begin submission: %v", err)
 	}
 	if err := f.svc.AwaitExternalOwned(ctx, f.claimed.Ownership, "unknown"); err != nil {

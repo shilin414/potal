@@ -486,7 +486,7 @@ func TestExpiredOwnershipCannotMutateBeforeReaper(t *testing.T) {
 
 	t.Run("begin attempt", func(t *testing.T) {
 		claimed := freshExpired(t)
-		if _, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, claimed.Run.Provider, submissionFixtureHash(claimed.Run.Provider)); !errors.Is(err, execution.ErrLostOwnership) {
+		if _, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, claimed.Run.Provider, submissionFixtureHash(claimed.Run.Provider), execution.ResendForbidden); !errors.Is(err, execution.ErrLostOwnership) {
 			t.Fatalf("expired begin attempt: err=%v, want ErrLostOwnership", err)
 		}
 	})
@@ -687,7 +687,7 @@ func TestStaleEpochCannotMutateAfterLeaseRecovery(t *testing.T) {
 	if leaseOK, _, err := svc.HeartbeatOwnedWithSlot(ctx, claimedA.Ownership, time.Minute, slotA, time.Minute); err != nil || leaseOK {
 		t.Fatalf("stale heartbeat: leaseOK=%v err=%v, want false/nil", leaseOK, err)
 	}
-	if _, err := svc.BeginProviderSubmissionOwned(ctx, claimedA.Ownership, claimedA.Run.Provider, submissionFixtureHash(claimedA.Run.Provider)); !errors.Is(err, execution.ErrLostOwnership) {
+	if _, err := svc.BeginProviderSubmissionOwned(ctx, claimedA.Ownership, claimedA.Run.Provider, submissionFixtureHash(claimedA.Run.Provider), execution.ResendForbidden); !errors.Is(err, execution.ErrLostOwnership) {
 		t.Fatalf("stale begin attempt: err=%v, want ErrLostOwnership", err)
 	}
 	if err := slots.Renew(ctx, slotA); !errors.Is(err, execution.ErrProviderSlotLost) {

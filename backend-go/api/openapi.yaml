@@ -1998,10 +1998,12 @@ components:
 
     RunEvent:
       type: object
-      required: [id, run, sequence, event_type, payload, created_at]
+      # `run_id` (not `run`): this is the SAME record the SSE stream emits,
+      # so one reducer can consume both without a rename (第九轮复审 P2).
+      required: [id, run_id, sequence, event_type, payload, created_at]
       properties:
         id: { type: integer }
-        run: { type: string, format: uuid }
+        run_id: { type: string, format: uuid }
         sequence: { type: integer }
         event_type:
           type: string

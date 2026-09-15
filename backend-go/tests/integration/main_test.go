@@ -150,7 +150,7 @@ func submissionFixtureHash(provider string) []byte {
 // submission IN FLIGHT (state 'sending').
 func beginSubmission(t *testing.T, svc *execution.Service, own execution.ExecutionOwnership, provider string) *execution.ProviderSubmission {
 	t.Helper()
-	sub, err := svc.BeginProviderSubmissionOwned(context.Background(), own, provider, submissionFixtureHash(provider))
+	sub, err := svc.BeginProviderSubmissionOwned(context.Background(), own, provider, submissionFixtureHash(provider), execution.ResendForbidden)
 	if err != nil {
 		t.Fatalf("begin provider submission: %v", err)
 	}

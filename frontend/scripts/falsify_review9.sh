@@ -118,6 +118,23 @@ report "a replay does not duplicate the turn" FAIL "$(verdict src/stores/__tests
 mv src/stores/useRunChatStore.ts.orig src/stores/useRunChatStore.ts
 report "a replay does not duplicate the turn (restored)" PASS "$(verdict src/stores/__tests__/useRunChatStore.idempotency.test.ts)"
 
+echo "=== 7. append every durable chunk (ignore the byte offset) ==="
+cp src/stores/useRunChatStore.ts src/stores/useRunChatStore.ts.orig
+python - <<'PY'
+import io
+p = 'src/stores/useRunChatStore.ts'
+s = io.open(p, encoding='utf-8').read()
+old = "        message.streamBytes = applyIncrementalChunk(message, event.payload || {});"
+new = """        message.content += event.payload?.text || ''; // FALSIFICATION
+        message.streamBytes = utf8ByteLength(message.content);"""
+assert old in s
+with io.open(p, 'w', encoding='utf-8', newline='\n') as fh:
+    fh.write(s.replace(old, new, 1))
+PY
+report "durable chunks reconcile against the rendered offset" FAIL "$(verdict src/stores/__tests__/useRunChatStore.test.ts)"
+mv src/stores/useRunChatStore.ts.orig src/stores/useRunChatStore.ts
+report "durable chunks reconcile against the rendered offset (restored)" PASS "$(verdict src/stores/__tests__/useRunChatStore.test.ts)"
+
 echo
 echo "=== leftovers (must be empty) ==="
 find src -name '*.orig' -print

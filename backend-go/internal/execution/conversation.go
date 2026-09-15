@@ -33,8 +33,10 @@ var (
 //     delivery execution: schedule_occurrences.run_id and the delivery
 //     worker's GetRunByID both depend on those rows surviving.
 //
-// Every child delete is checked — a partial cascade is never reported as
-// success.
+// Per run it purges: run_events, run_artifacts, run_commands, run_leases,
+// run_requests and provider_submissions (the last two are the round-nine
+// tables; neither is reachable by an FK cascade). Every child delete is
+// checked — a partial cascade is never reported as success.
 func (s *Service) DeleteConversationCascade(ctx context.Context, conversationID, ownerUserID int64) error {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -87,6 +89,16 @@ func (s *Service) DeleteConversationCascade(ctx context.Context, conversationID,
 		}
 		if err := q.DeleteRunLeaseByRun(ctx, runID); err != nil {
 			return fmt.Errorf("conversation delete: leases: %w", err)
+		}
+		// Round-nine child tables: neither is reachable by an FK cascade
+		// from runs, so they are purged explicitly (第九轮 P1). Leaving
+		// run_requests behind would keep a dead client_request_id
+		// reservation whose replay answers "run not found" forever.
+		if err := q.DeleteRunRequestsByRun(ctx, runID); err != nil {
+			return fmt.Errorf("conversation delete: run requests: %w", err)
+		}
+		if err := q.DeleteProviderSubmissionsByRun(ctx, runID); err != nil {
+			return fmt.Errorf("conversation delete: provider submissions: %w", err)
 		}
 	}
 	if err := q.DeleteRunsByConversation(ctx, convArg); err != nil {

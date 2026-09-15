@@ -70,6 +70,28 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON xiaoan.* TO 'potal_app'@'%';
 Schema 权威来源是 `db/migrations`——**不要**把任何 dump 的 `SHOW CREATE TABLE`
 输出当作目标 Schema 权威；数据权威来源才是原 TiDB 库。
 
+### 迁移 0023 不是混合版本安全的（升级必须 drain worker）
+
+`0023_run_event_sequence_allocator` 把 run event 的 sequence 分配从
+`COUNT(*) + 1` 换成 `runs.next_event_sequence` 计数器。新旧两套分配器互不知情：
+
+```text
+迁移后：max(sequence) = 100，next_event_sequence = 101
+旧 worker 写入 → INSERT sequence = 101，且不推进计数器（仍是 101）
+新 worker 写入 → 分配 101 → INSERT → 1062 duplicate key
+```
+
+后果是该 run 之后每个事件都插入失败，而不是静默漂移。因此本次升级必须：
+
+```text
+1. 停止/排空所有旧 worker（api/stream/worker/scheduler）
+2. 执行迁移（go run ./cmd/api -migrate 或独立 migration Job）
+3. 全量启动新版本 worker
+```
+
+滚动发布、多 Pod 灰度在本次升级不适用。若以后必须无停机，应改为两阶段：
+先让所有 Pod 跑「会推进计数器」的代码，再切到「读取计数器」的代码。
+
 然后：
 
 ```bash

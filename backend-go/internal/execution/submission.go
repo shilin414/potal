@@ -95,6 +95,26 @@ func (s *Service) waitingExternalGrace() time.Duration {
 	return DefaultWaitingExternalGrace
 }
 
+// SubmissionResend states whether an UNCONFIRMED earlier attempt of the same
+// submission may be transmitted again (第九轮复审 P2).
+//
+// The default is at-most-once, because for a provider with neither a native
+// idempotency key nor a lookup-by-request-key, a resend is a SECOND real
+// execution. Only a provider that declares IdempotencyNative — i.e. one that
+// collapses a resend on the stable submission key itself — may resend, and
+// the executor derives that from the adapter rather than hard-coding it here.
+type SubmissionResend bool
+
+const (
+	// ResendForbidden: an 'unknown' submission parks the run. This is what
+	// every provider that cannot deduplicate gets.
+	ResendForbidden SubmissionResend = false
+	// ResendOnUnknownSubmission: 'unknown' may be re-transmitted under the
+	// SAME submission_no and idempotency key (never a new one), because the
+	// provider is trusted to collapse it.
+	ResendOnUnknownSubmission SubmissionResend = true
+)
+
 // BeginProviderSubmissionOwned is the FINAL durable checkpoint before the
 // provider sees a request (第九轮 P0-2). It replaces BeginProviderAttempt as
 // the attempt consumer and adds the submission record, in ONE transaction
@@ -118,13 +138,17 @@ func (s *Service) waitingExternalGrace() time.Duration {
 //   - a submission in 'sending' or 'unknown' means a previous attempt may
 //     already have put THIS action on the wire. Nothing local can undo that,
 //     and the provider cannot be asked, so transmitting again is forbidden —
-//     this is where the old code created a second provider chat;
+//     this is where the old code created a second provider chat. The one
+//     exception is a provider declared IdempotencyNative (resendOnUnknown):
+//     it collapses a resend on the stable key itself, so 'unknown' may be
+//     transmitted again — under the SAME submission number and key, never
+//     under a new one;
 //   - 'rejected' is a definitive refusal: the provider has nothing, so the
 //     same key may be transmitted again;
 //   - a different payload hash gets a NEW submission_no (and therefore a new
 //     key) — but only from a non-sending state, so a possibly-delivered
 //     action is never duplicated.
-func (s *Service) BeginProviderSubmissionOwned(ctx context.Context, own ExecutionOwnership, provider string, requestHash []byte) (*ProviderSubmission, error) {
+func (s *Service) BeginProviderSubmissionOwned(ctx context.Context, own ExecutionOwnership, provider string, requestHash []byte, resendOnUnknown SubmissionResend) (*ProviderSubmission, error) {
 	if !own.Valid() {
 		return nil, ErrLostOwnership
 	}
@@ -167,8 +191,37 @@ func (s *Service) BeginProviderSubmissionOwned(ctx context.Context, own Executio
 		// transaction as this state). Transmitting again would create a
 		// second provider chat — resume from the recorded id instead.
 		return submissionFromRow(latest), tx.Commit()
-	case SubmissionSending, SubmissionUnknown:
+	case SubmissionSending:
+		// In flight right now (or a crashed attempt that never learned its
+		// fate): nothing may be transmitted, not even by a native-idempotent
+		// provider, because the concurrent attempt is already on the wire.
 		return nil, ErrProviderSubmitUnknown
+	case SubmissionUnknown:
+		if !resendOnUnknown {
+			return nil, ErrProviderSubmitUnknown
+		}
+		// The provider deduplicates on the stable key, so the same
+		// submission may go out again — SAME number, SAME key, attempt+1.
+		attempt, err := consumeAttemptTx(ctx, tx, own)
+		if err != nil {
+			return nil, err
+		}
+		res, err := q.ReopenUnknownProviderSubmission(ctx, db.ReopenUnknownProviderSubmissionParams{
+			Attempt:      uint32(attempt),
+			RunID:        own.RunID.Bytes(),
+			SubmissionNo: latest.SubmissionNo,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			// A concurrent attempt or a reconciler resolved it first.
+			return nil, ErrProviderSubmitUnknown
+		}
+		out := submissionFromRow(latest)
+		out.State = SubmissionSending
+		out.Attempt = attempt
+		return out, tx.Commit()
 	}
 
 	// latest.State == rejected: definitively not on the provider side.
@@ -187,13 +240,24 @@ func (s *Service) BeginProviderSubmissionOwned(ctx context.Context, own Executio
 		return sub, tx.Commit()
 	}
 	// Same payload, previously refused: reuse the identity (and the key).
-	if _, err := q.MarkProviderSubmissionState(ctx, db.MarkProviderSubmissionStateParams{
-		State:        SubmissionSending,
-		LastError:    sql.NullString{},
+	//
+	// ReopenProviderSubmission is the ONE statement allowed to move a row
+	// back to 'sending', and it only matches 'rejected'. Recording an
+	// outcome has the opposite guard (only from 'sending'), so a resend can
+	// never be armed from a state whose fate is unknown (第九轮复审 P1).
+	res, err := q.ReopenProviderSubmission(ctx, db.ReopenProviderSubmissionParams{
+		Attempt:      uint32(attempt),
 		RunID:        own.RunID.Bytes(),
 		SubmissionNo: latest.SubmissionNo,
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		// Someone resolved this submission between our read and this write
+		// (another attempt, a reconciler). Its decision wins — we know
+		// nothing about the wire, so we must not transmit.
+		return nil, ErrProviderSubmitUnknown
 	}
 	out := submissionFromRow(latest)
 	out.State = SubmissionSending
@@ -291,12 +355,29 @@ func (s *Service) MarkSubmissionAcceptedOwned(ctx context.Context, own Execution
 		return err
 	}
 	q := db.New(tx)
-	if _, err := q.MarkProviderSubmissionAccepted(ctx, db.MarkProviderSubmissionAcceptedParams{
+	res, err := q.MarkProviderSubmissionAccepted(ctx, db.MarkProviderSubmissionAcceptedParams{
 		ExternalRunID: externalRunID,
 		RunID:         own.RunID.Bytes(),
 		SubmissionNo:  sub.SubmissionNo,
-	}); err != nil {
+	})
+	if err != nil {
 		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		// 'accepted' is monotonic, so a miss is only tolerable when the row
+		// is already accepted with the SAME id (an idempotent re-entry
+		// after a re-claim). Anything else — a different id, or a state the
+		// CAS refused — must be reported, because accepting is what binds
+		// the run to a provider chat and a silent no-op would leave the
+		// run believing it was accepted when it was not.
+		cur, rerr := q.GetLatestProviderSubmission(ctx, own.RunID.Bytes())
+		if rerr != nil {
+			return fmt.Errorf("provider submission not accepted: %w", rerr)
+		}
+		if cur.State != SubmissionAccepted || cur.ExternalRunID != externalRunID {
+			return fmt.Errorf("provider submission %d is %q (external %q): cannot be "+
+				"accepted as %q", sub.SubmissionNo, cur.State, cur.ExternalRunID, externalRunID)
+		}
 	}
 	if err := updateExternalRunIDTx(ctx, tx, row, own, externalRunID); err != nil {
 		return err
@@ -308,9 +389,21 @@ func (s *Service) MarkSubmissionAcceptedOwned(ctx context.Context, own Execution
 // 'rejected' (the provider definitively refused) or 'unknown' (it may have
 // been delivered and cannot be confirmed).
 //
-// A failure to write this must not be swallowed: 'unknown' is exactly the
-// fact that stops the next attempt from resubmitting, so the caller treats an
-// error here as a failure to park the run safely and fails closed.
+// It is a CANONICAL WRITE and therefore fenced exactly like every other one
+// (第九轮复审 P1): inside the run row lock, the ownership (epoch + token) is
+// re-verified against the database before the ledger is touched. Checking
+// own.Valid() alone only proves the token is well-formed — a worker whose
+// lease expired while its provider call was in flight would still be able to
+// rewrite provider_submissions, which is precisely the stale-writer hole the
+// rest of this package closes.
+//
+// The write is also a COMPARE-AND-SWAP: the SQL only matches a submission in
+// 'sending'. A failure to write must not be swallowed: 'unknown' is exactly
+// the fact that stops the next attempt from resubmitting, so the caller
+// treats an error here as a failure to park the run safely and fails closed.
+//
+// The caller must pass the submission it is resolving; a nil submission is a
+// programming error, not a silent no-op.
 func (s *Service) MarkSubmissionStateOwned(ctx context.Context, own ExecutionOwnership, sub *ProviderSubmission, state, lastError string) error {
 	if !own.Valid() {
 		return ErrLostOwnership
@@ -318,7 +411,18 @@ func (s *Service) MarkSubmissionStateOwned(ctx context.Context, own ExecutionOwn
 	if sub == nil {
 		return errors.New("execution: no provider submission to mark")
 	}
-	res, err := s.q(ctx).MarkProviderSubmissionState(ctx, db.MarkProviderSubmissionStateParams{
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	// The fence: without this the "Owned" suffix would be a promise the
+	// code does not keep.
+	if _, err := verifyActiveOwnershipTx(ctx, tx, own); err != nil {
+		return err
+	}
+	q := db.New(tx)
+	res, err := q.MarkProviderSubmissionState(ctx, db.MarkProviderSubmissionStateParams{
 		State:        state,
 		LastError:    sql.NullString{String: lastError, Valid: lastError != ""},
 		RunID:        own.RunID.Bytes(),
@@ -328,15 +432,26 @@ func (s *Service) MarkSubmissionStateOwned(ctx context.Context, own ExecutionOwn
 		return err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
-		// The row must exist; 0 changed rows means either it is missing or
-		// the values were already identical (MySQL reports CHANGED rows).
-		// Distinguish "already in that state" (fine, idempotent re-entry)
-		// from "missing" with a read, because a missing row would silently
-		// re-enable a resubmit on the next attempt.
-		cur, rerr := s.q(ctx).GetLatestProviderSubmission(ctx, own.RunID.Bytes())
-		if rerr != nil || cur.State != state {
+		// The CAS missed: either the row is gone (nothing was ever
+		// submitted under this number — a caller bug) or it is no longer
+		// 'sending'. MySQL reports CHANGED rows, so "already in this state"
+		// and "moved on" both land here and must be told apart with a read:
+		// the former is a harmless re-entry, the latter means someone else
+		// resolved this submission and its verdict must stand.
+		cur, rerr := q.GetLatestProviderSubmission(ctx, own.RunID.Bytes())
+		if rerr != nil {
 			return fmt.Errorf("provider submission state not recorded (want %q): %w", state, rerr)
 		}
+		if cur.State == state {
+			// Idempotent re-entry. Nothing left to do — and no metric
+			// increment either, or one parked run would be counted twice.
+			return nil
+		}
+		return fmt.Errorf("provider submission %d is %q, not 'sending': the outcome "+
+			"cannot be rewritten to %q", sub.SubmissionNo, cur.State, state)
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	if state == SubmissionUnknown && s.Metrics != nil {
 		s.Metrics.ProviderSubmissionUnknownTotal.Inc()

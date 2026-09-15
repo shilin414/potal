@@ -1,7 +1,7 @@
 # Creation Agent Studio — 项目长期记忆
 
 ## 当前状态
-- 仓库 `shilin414/potal`，分支 `dev`。第九轮专项整改的**批次一–三**已完成（P0-1/P0-2 闭环 + P1-1/P1-3/P1-4 落地），本机全绿，提交 `b81ee8f`。CI 全绿：backend run **34983530376**（`check` 含 `-race` + `integration` 含二次迁移 no-op）、frontend run **34983530457**。报告见 `docs/potal 第九轮专项整改变更报告（…）.md`。
+- 仓库 `shilin414/potal`，分支 `dev`。第九轮专项整改的**批次一–三**已完成（P0-1/P0-2 闭环 + P1-1/P1-3/P1-4 落地），提交 `b81ee8f`；**补丁批次 3.1** 已按复审报告关闭 3 个 blocker + 4 项工程一致性（报告见 `docs/potal 第九轮补丁批次3.1整改变更报告（…）.md`）。CI：第九轮 backend run **34983530376**、frontend run **34983530457** 全绿。
 - 第八轮起执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot）**定型冻结**，不再微调 Gate/Lease/ProviderSlot/Retry·Defer/SSE terminal。
 - migration version 基线 = **23**（0021 run_requests / 0022 provider_submissions / 0023 next_event_sequence）。0018/0019/0020 禁止修改。
 - **仍开放（批次四–七）**：SSE Hub 多连接、Worker Dispatcher（poller→dispatcher + claim 后即 ACK）、Conversation lifecycle（generation / 异步 purge）、message keyset 分页 + sidebar 冗余字段、前端长对话（active turn 隔离 / 虚拟列表 / rAF 批处理 / smart auto-scroll）。
@@ -15,9 +15,21 @@
 - **SSE 帧**：durable 写 `id: <seq>`，**transient(seq 0) 绝不写 id**（否则浏览器 Last-Event-ID 归零→全量重放）；优先级 `query after > Last-Event-ID > 0`；网关逐页 replay；`WriteHeader` 后必须 `Flush`（否则无事件的流不给响应头）。
 - **`content.chunk` 只写增量** `text`+`offset`，不再写累计 `snapshot`（曾使事件数据量随回答长度平方增长）。前端 reducer 保留 snapshot 分支兼容旧事件。
 
+### 第九轮 3.1 新增硬性约定
+- **前端必须按 UTF-8 字节 offset 对账**：同一段答案会走 transient delta（不落库）与 durable chunk（落库+重放）两条路，**durable cursor 管不了 transient**（其 sequence 恒 0）。reducer 用 `ChatMessage.streamBytes` 与 chunk 的 `offset`（字节 end offset）三分支：已渲染→丢弃 / 部分→只补 suffix / gap→保留并跳计数器。中文 3 字节、emoji 4 字节，**绝不能用 `string.length`**（UTF-16 code unit）。
+- **提交边界 = POST 成功，不是拿到 chat id**：`aily.stream.started` 只在 `agent_chat_id != ""` 时 emit；已提交但无 external id 的任何收尾（transport_error / EOF / 首帧无 id）→ submission=`unknown` + run=`waiting_external`，**绝不 `failRun("aily_no_chat_id")`**。park 之后 run 已结算，必须 return（再走 reconcile 会去 fail 一个已 park 的 run）。
+- **每次 submission 写都是 canonical write**：`MarkSubmissionStateOwned` 必须在事务内 `verifyActiveOwnershipTx` + SQL CAS。四条 query 语义互斥：结果只从 `sending` 来；重发只从 `rejected` 来（或 `unknown` + native 幂等能力）；`accepted` 只从 `sending`/`unknown` 来且单调。「记录结果」与「武装重发」必须是两条语句。
+- **native 幂等能力要传进状态机**：`BeginProviderSubmission*(..., resendOnUnknown)`，由 executor 从 `catalog.SubmitIdempotencyOf(adapter)` 现场推导（与 `classifySubmitFailure` 同源），否则两半策略会互相矛盾、分支变死代码。
+- **hard-delete cascade 必须显式带上 `run_requests` / `provider_submissions`**（两表都无 FK 级联），否则留下永久失效的幂等预留（replay → `GetRun` 找不到 → 500）。
+- **REST 与 SSE 同一个 Event schema**：`run_id`（不是 `run`），否则 REST 分页数据不能喂给前端 `applyEvent()`。
+- **0023 不是 mixed-version-safe**：升级必须 drain 全部旧 worker → 迁移 → 全量启动新 worker（旧代码 `COUNT(*)+1` 不推进计数器 → 新 worker 撞 `UNIQUE(run_id,sequence)`）。已写入迁移注释与 README。
+
 ## 工具与踩坑补充
 - **前端**：`frontend/` 用 `npx tsc --noEmit` / `npx vitest run` / `npx vite build`（CI 跑这三个，不跑 eslint）；`npx` 在 PATH 可见。仓库既有 6 个 eslint error 属历史遗留，与 CI 无关。
-- **反证脚本化**：`backend-go/scripts/falsify_review9.sh`、`frontend/scripts/falsify_review9.sh` —— 逐个还原修复→确认 FAIL→还原→确认 PASS。**反证会暴露"断言正确但从未被执行"的假测试**（本轮抓到 2 例），必须做。
+- **反证脚本化**：`backend-go/scripts/falsify_review9.sh`、`backend-go/scripts/falsify_review9_patch.sh`、`frontend/scripts/falsify_review9.sh` —— 逐个还原修复→确认 FAIL→还原→确认 PASS。**反证会暴露"断言正确但从未被执行"的假测试**（本轮抓到 2 例），必须做。
+- **反证脚本必须加 `trap cleanup EXIT` 把 `.orig` 还原回去**：脚本被超时中断会把「临时还原」留在工作区并可能被当成正常代码提交（3.1 批次实际踩到）。跑完一律 `grep -rn FALSIFICATION` + `find -name '*.orig'` 双查。改了代码后要同步更新旧脚本的匹配锚点。
+- **共享 dev 库上的固定字符串断言要先清残留**：失败一次留下的 orphan row（run 已删、cleanup 的 `run_id IN (SELECT…)` 找不到）会让下次直接假红。
+- **bash 嵌套 heredoc 会被内层定界符提前截断**（`python - <<'PY'` 里再出现 `PY`），用不同定界符或改用 Write 工具写脚本。
 
 ## 硬性约定（违反会复发 P0/事故）
 

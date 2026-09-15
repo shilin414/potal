@@ -296,9 +296,22 @@ func (a *AgentAdapter) StreamPrepared(ctx context.Context, in *catalog.SubmitInp
 		mapper := Mapper{}
 		err := pumpSSE(cctx, body, func(eventName string, data []byte) error {
 			parsed := mapper.ParseSSEData(data)
+			// 'started' means "the provider told us which chat this is",
+			// not merely "a frame arrived" (第九轮复审 P1). A first frame
+			// without an agent_chat_id is NOT proof of acceptance: the
+			// provider may already be running the agent while we still have
+			// no way to ask about it. Emitting stream.started there would
+			// let the executor believe it holds the external identity and
+			// reconcile against "" — i.e. declare a run failed that the
+			// provider is still executing. Keep waiting for the id instead.
 			if !started {
-				started = true
 				chatID, _ := parsed["agent_chat_id"].(string)
+				if chatID == "" {
+					// Fall through: this frame's own events are still
+					// delivered, we just do not claim to have started.
+					return emitParsed(mapper, eventName, parsed, cctx, out)
+				}
+				started = true
 				sessionID, _ := parsed["session_id"].(string)
 				if err := emitStreamEvent(cctx, out, catalog.StreamEvent{
 					EventType: "aily.stream.started",
@@ -310,15 +323,7 @@ func (a *AgentAdapter) StreamPrepared(ctx context.Context, in *catalog.SubmitInp
 					return err
 				}
 			}
-			for _, ev := range mapper.ToUnified(eventName, parsed) {
-				if err := emitStreamEvent(cctx, out, catalog.StreamEvent{
-					EventType: ev.Type,
-					Payload:   ev.Payload,
-				}); err != nil {
-					return err
-				}
-			}
-			return nil
+			return emitParsed(mapper, eventName, parsed, cctx, out)
 		})
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			// Transport-level failure: emit a failed event? No — the
@@ -330,6 +335,20 @@ func (a *AgentAdapter) StreamPrepared(ctx context.Context, in *catalog.SubmitInp
 		}
 	}()
 	return out, stop, nil
+}
+
+// emitParsed forwards one SSE frame's unified events, respecting context
+// cancellation so a consumer that walked away cannot strand this goroutine.
+func emitParsed(m Mapper, eventName string, parsed map[string]any, ctx context.Context, out chan<- catalog.StreamEvent) error {
+	for _, ev := range m.ToUnified(eventName, parsed) {
+		if err := emitStreamEvent(ctx, out, catalog.StreamEvent{
+			EventType: ev.Type,
+			Payload:   ev.Payload,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // emitStreamEvent is the ONLY way the stream producer may hand an event to

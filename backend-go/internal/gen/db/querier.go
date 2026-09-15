@@ -274,10 +274,19 @@ type Querier interface {
 	// slots (current and older epochs) in the SAME transaction as the canonical
 	// state write, so "run stopped running ⇒ no provider slot" holds.
 	DeleteProviderSlotsUpToEpoch(ctx context.Context, arg DeleteProviderSlotsUpToEpochParams) (sql.Result, error)
+	// Same reason as DeleteRunRequestsByRun: the provider-side submission
+	// ledger outlives its run unless this cascade deletes it.
+	DeleteProviderSubmissionsByRun(ctx context.Context, runID []byte) error
 	DeleteRunArtifacts(ctx context.Context, runID []byte) error
 	DeleteRunCommands(ctx context.Context, runID []byte) error
 	DeleteRunEvents(ctx context.Context, runID []byte) error
 	DeleteRunLeaseByRun(ctx context.Context, runID []byte) error
+	// 第九轮 P1: the idempotency reservation table. Neither table added in
+	// round nine is reachable by an FK cascade from `runs`, so both are purged
+	// explicitly here — otherwise deleting a conversation would leave the
+	// client_request_id pointing at a run that no longer exists, and every later
+	// replay of that id would answer 500 instead of serving the run.
+	DeleteRunRequestsByRun(ctx context.Context, runID []byte) error
 	DeleteRunsByConversation(ctx context.Context, conversationID sql.NullInt64) error
 	// Soft delete (评测 §十二): pending delivery executions still resolve
 	// schedule.Name to build their message; the row must survive. The
@@ -528,11 +537,22 @@ type Querier interface {
 	MarkOutboxPublished(ctx context.Context, id uint64) error
 	// The provider answered with an external id: the outcome is now KNOWN, both
 	// here and on the run row (written in the same transaction).
+	//
+	// The FROM guard makes 'accepted' MONOTONIC (第九轮复审 P1): only an
+	// in-flight ('sending') or unconfirmed ('unknown') submission may become
+	// accepted. A stale worker that lost its lease milliseconds ago must not be
+	// able to overwrite a later 'rejected' with an external id it happened to
+	// learn before it was fenced out.
 	MarkProviderSubmissionAccepted(ctx context.Context, arg MarkProviderSubmissionAcceptedParams) (sql.Result, error)
-	// 'unknown' ('the request may have been delivered and the provider cannot
-	// be asked') and 'rejected' ('the provider definitively refused, a retry is
-	// legitimate') are the two outcomes a caller may record. 'sending' is only
-	// ever written by CreateProviderSubmission.
+	// The outcome of an in-flight submit: 'unknown' ('the request may have been
+	// delivered and the provider cannot be asked') or 'rejected' ('the provider
+	// definitively refused, a retry is legitimate').
+	//
+	// `AND state = 'sending'` IS the compare-and-swap (第九轮复审 P1). Without it
+	// a general UPDATE could move a submission BACKWARDS — 'accepted' → 'unknown'
+	// or 'rejected' → 'rejected' — which would either re-open a resend of an
+	// action the provider already holds or silently re-enable one that had been
+	// parked. The only legal predecessor of an outcome is 'sending'.
 	MarkProviderSubmissionState(ctx context.Context, arg MarkProviderSubmissionStateParams) (sql.Result, error)
 	// Stamps started_at once, fenced by the current lease epoch, at the point
 	// the run is actually allowed to execute (第四轮 P2). COALESCE keeps the
@@ -546,6 +566,25 @@ type Querier interface {
 	// Crash recovery: rows stuck in 'sending' (worker died before ACK/commit)
 	// return to pending when their DB-clock lease lapsed.
 	ReclaimStuckDeliveries(ctx context.Context, leaseMicros interface{}) (sql.Result, error)
+	// The one transition that goes BACK to 'sending': a previously REJECTED
+	// submission is retransmitted under the same identity/key (第九轮 P0-2).
+	//
+	// It is deliberately a separate statement instead of a 'rejected' entry in
+	// MarkProviderSubmissionState's FROM list, so "record an outcome" and "arm a
+	// resend" can never be confused: only a definitive refusal arms a resend, and
+	// writing it through the outcome query would make that invisible.
+	ReopenProviderSubmission(ctx context.Context, arg ReopenProviderSubmissionParams) (sql.Result, error)
+	// unknown → sending, the resend a NATIVELY IDEMPOTENT provider allows
+	// (第九轮复审 P2).
+	//
+	// It is a separate statement on purpose. A provider that can collapse a
+	// resend on the stable submission key is the ONE case in which an
+	// unconfirmed request may be transmitted again, and it must stay visibly
+	// distinct from the 'rejected' resend above: 'rejected' means "the provider
+	// holds nothing", whereas here the provider may already hold the request and
+	// is trusted to deduplicate it. Fusing them would let a capability
+	// declaration silently turn an at-most-once ledger into at-least-once.
+	ReopenUnknownProviderSubmission(ctx context.Context, arg ReopenUnknownProviderSubmissionParams) (sql.Result, error)
 	// Retry time = DB clock + the worker's backoff in microseconds (Clock
 	// Authority, Phase 3): the due-scan below compares against the DB clock, so
 	// a skewed worker clock can neither delay nor rush a delivery retry.

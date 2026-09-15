@@ -1097,10 +1097,16 @@ func (s *Service) ListEventPage(ctx context.Context, runID ids.ID, after uint64,
 	return page, nil
 }
 
-// EventRecord is the wire shape of a run event.
+// EventRecord is the wire shape of a run event — THE SAME shape REST and SSE
+// emit (第九轮复审 P2).
+//
+// `run_id` used to be `run` on REST only, which meant a page from
+// GET /api/v2/runs/{id}/events could not be fed to the same reducer that
+// consumes SSE frames: the obvious-looking "unified event protocol" silently
+// required a field rename at every boundary. One key, no adapter.
 type EventRecord struct {
 	ID        int64          `json:"id"`
-	RunID     string         `json:"run"`
+	RunID     string         `json:"run_id"`
 	Sequence  uint64         `json:"sequence"`
 	EventType string         `json:"event_type"`
 	Payload   map[string]any `json:"payload"`

@@ -150,7 +150,7 @@ func TestExecutionFencingMatrix(t *testing.T) {
 		}},
 
 		{"begin_attempt", func(t *testing.T, leg string, f *fenceFixture) {
-			_, err := svc.BeginProviderSubmissionOwned(ctx, f.own, "itest_fence", submissionFixtureHash("itest_fence"))
+			_, err := svc.BeginProviderSubmissionOwned(ctx, f.own, "itest_fence", submissionFixtureHash("itest_fence"), execution.ResendForbidden)
 			if leg == legCurrent {
 				if err != nil {
 					t.Fatalf("current owner begin attempt: %v", err)

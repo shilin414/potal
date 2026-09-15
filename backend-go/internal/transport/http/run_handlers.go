@@ -226,6 +226,17 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 		if ctx.Err() != nil {
 			return
 		}
+		// A CONCURRENT RETRY of an already accepted request can land here
+		// (第九轮 P1). The original may be inside its creation transaction,
+		// so its reservation is invisible to this request's earlier resolve
+		// while its own run already occupies the outstanding cap. Give the
+		// identity a bounded moment to appear before declaring 429 for a
+		// request that actually succeeded — otherwise the client's retry of
+		// a lost response creates a second turn.
+		if s.serveReplayAfterRefusal(ctx, w, clientRequestID,
+			s.replayResolver(caller.ID, clientRequestID, requestHash)) {
+			return
+		}
 		writeDetail(w, http.StatusTooManyRequests, err.Error())
 		return
 	}
@@ -374,6 +385,55 @@ func (s *Server) admitUserRun(ctx context.Context, userID int64) error {
 		secs = 1
 	}
 	return fmt.Errorf("too many requests, retry in %ds", secs)
+}
+
+// ReplayResolveWait is how long a request refused by admission waits for its
+// own earlier attempt's reservation to commit (第九轮 P1). See
+// serveReplayAfterRefusal for why that window exists at all.
+const ReplayResolveWait = execution.DefaultResolveRunRequestWait
+
+// serveReplayAfterRefusal answers a request that admission just refused with
+// the ORIGINAL run, when client_request_id turns out to belong to an attempt
+// that DID commit. It reports whether it wrote a response.
+//
+// The ordering matters: this only runs when the per-user QPS budget is
+// exhausted, i.e. exactly when the earlier attempt's own run is likely to be
+// the reason. A replay must outrank every limit the original request already
+// consumed (第九轮 P0-1).
+//
+// `resolve` is injected rather than called directly so the semantics can be
+// pinned without a database (see RunHandlersReplay test): the property under
+// test is "answer 200 with the original run if the identity appears inside the
+// budget, otherwise write nothing and let the caller report 429".
+func (s *Server) serveReplayAfterRefusal(
+	ctx context.Context,
+	w http.ResponseWriter,
+	clientRequestID string,
+	resolve func(context.Context) (*execution.Run, bool, error),
+) bool {
+	if clientRequestID == "" || resolve == nil {
+		return false
+	}
+	run, found, err := resolve(ctx)
+	if err != nil || !found || run == nil {
+		return false
+	}
+	if s.Metric != nil {
+		s.Metric.RunIdempotencyReplayTotal.Inc()
+	}
+	rec := toRunRecord(run)
+	rec.ClientRequestID = clientRequestID
+	rec.IdempotencyReplayed = true
+	// 200, not 201: nothing was created by THIS request.
+	writeJSON(w, http.StatusOK, rec)
+	return true
+}
+
+// replayResolver binds this request's identity to the execution-layer wait.
+func (s *Server) replayResolver(userID int64, clientRequestID string, requestHash []byte) func(context.Context) (*execution.Run, bool, error) {
+	return func(ctx context.Context) (*execution.Run, bool, error) {
+		return s.Runs.ResolveRunRequestWithWait(ctx, userID, clientRequestID, requestHash, ReplayResolveWait)
+	}
 }
 
 func dedupe(in []string) []string {

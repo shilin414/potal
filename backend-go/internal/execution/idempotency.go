@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"hash"
 	"sort"
+	"time"
 
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
@@ -128,6 +129,58 @@ func (s *Service) ResolveRunRequest(ctx context.Context, userID int64, clientReq
 		return nil, false, err
 	}
 	return run, true, nil
+}
+
+// ResolveRunRequestWait bounds how long a caller may wait for an in-flight
+// duplicate to become visible (第九轮复审 P1).
+//
+// The window it exists for: request A has passed admission and is inside its
+// creation transaction, so its reservation is not committed yet. Request B
+// (the same client_request_id) resolves BEFORE that commit, sees nothing, and
+// walks on into the per-user QPS limiter — where it can be rejected with 429
+// for a request that actually SUCCEEDED. A single re-read is not enough
+// either, because A may still be a few milliseconds from committing.
+//
+// The wait is bounded and short by design: it only has to cover a commit, not
+// a slow request. A caller whose own request really is new pays the whole
+// budget before being told 429 — which is why the budget is a few hundred
+// milliseconds and not a second.
+const (
+	DefaultResolveRunRequestWait = 400 * time.Millisecond
+	resolveRunRequestPollEvery   = 20 * time.Millisecond
+)
+
+// ResolveRunRequestWithWait polls ResolveRunRequest until the identity
+// appears or the budget runs out. It answers the same three ways as
+// ResolveRunRequest; (nil, false, nil) simply means "still new after waiting".
+//
+// A losing duplicate uses it AFTER an admission refusal, so the required
+// semantics hold:
+//
+//	same id + same payload + winner eventually commits → the ORIGINAL run
+//	same id + winner rolled back                      → continue as a new
+//	                                                    request (and 429 is
+//	                                                    then the right answer)
+func (s *Service) ResolveRunRequestWithWait(ctx context.Context, userID int64, clientRequestID string, requestHash []byte, wait time.Duration) (*Run, bool, error) {
+	if clientRequestID == "" {
+		return nil, false, nil
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		run, found, err := s.ResolveRunRequest(ctx, userID, clientRequestID, requestHash)
+		if err != nil || found {
+			return run, found, err
+		}
+		if !time.Now().Before(deadline) {
+			return nil, false, nil
+		}
+		select {
+		case <-ctx.Done():
+			// The client is gone; there is no answer to give.
+			return nil, false, ctx.Err()
+		case <-time.After(resolveRunRequestPollEvery):
+		}
+	}
 }
 
 // CreateRunIdempotent is the submit path for requests that carry a

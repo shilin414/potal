@@ -72,12 +72,11 @@ python - <<'PY'
 import io
 p = 'internal/execution/submission.go'
 s = io.open(p, encoding='utf-8').read()
-old = '''	case SubmissionSending, SubmissionUnknown:
+old = '''		// provider, because the concurrent attempt is already on the wire.
 		return nil, ErrProviderSubmitUnknown
-	}'''
-new = '''	case SubmissionSending, SubmissionUnknown:
-		return submissionFromRow(latest), tx.Commit() // FALSIFICATION
-	}'''
+	case SubmissionUnknown:'''
+new = '''		return submissionFromRow(latest), tx.Commit() // FALSIFICATION
+	case SubmissionUnknown:'''
 assert old in s
 s = s.replace(old, new, 1)
 io.open(p, 'w', encoding='utf-8', newline='\n').write(s)

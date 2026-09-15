@@ -736,18 +736,56 @@ LIMIT 1;
 -- name: MarkProviderSubmissionAccepted :execresult
 -- The provider answered with an external id: the outcome is now KNOWN, both
 -- here and on the run row (written in the same transaction).
+--
+-- The FROM guard makes 'accepted' MONOTONIC (第九轮复审 P1): only an
+-- in-flight ('sending') or unconfirmed ('unknown') submission may become
+-- accepted. A stale worker that lost its lease milliseconds ago must not be
+-- able to overwrite a later 'rejected' with an external id it happened to
+-- learn before it was fenced out.
 UPDATE provider_submissions
 SET state = 'accepted', external_run_id = ?, last_error = NULL
-WHERE run_id = ? AND submission_no = ?;
+WHERE run_id = ? AND submission_no = ? AND state IN ('sending', 'unknown');
 
 -- name: MarkProviderSubmissionState :execresult
--- 'unknown' ('the request may have been delivered and the provider cannot
--- be asked') and 'rejected' ('the provider definitively refused, a retry is
--- legitimate') are the two outcomes a caller may record. 'sending' is only
--- ever written by CreateProviderSubmission.
+-- The outcome of an in-flight submit: 'unknown' ('the request may have been
+-- delivered and the provider cannot be asked') or 'rejected' ('the provider
+-- definitively refused, a retry is legitimate').
+--
+-- `AND state = 'sending'` IS the compare-and-swap (第九轮复审 P1). Without it
+-- a general UPDATE could move a submission BACKWARDS — 'accepted' → 'unknown'
+-- or 'rejected' → 'rejected' — which would either re-open a resend of an
+-- action the provider already holds or silently re-enable one that had been
+-- parked. The only legal predecessor of an outcome is 'sending'.
 UPDATE provider_submissions
 SET state = ?, last_error = ?
-WHERE run_id = ? AND submission_no = ?;
+WHERE run_id = ? AND submission_no = ? AND state = 'sending';
+
+-- name: ReopenProviderSubmission :execresult
+-- The one transition that goes BACK to 'sending': a previously REJECTED
+-- submission is retransmitted under the same identity/key (第九轮 P0-2).
+--
+-- It is deliberately a separate statement instead of a 'rejected' entry in
+-- MarkProviderSubmissionState's FROM list, so "record an outcome" and "arm a
+-- resend" can never be confused: only a definitive refusal arms a resend, and
+-- writing it through the outcome query would make that invisible.
+UPDATE provider_submissions
+SET state = 'sending', attempt = ?, last_error = NULL
+WHERE run_id = ? AND submission_no = ? AND state = 'rejected';
+
+-- name: ReopenUnknownProviderSubmission :execresult
+-- unknown → sending, the resend a NATIVELY IDEMPOTENT provider allows
+-- (第九轮复审 P2).
+--
+-- It is a separate statement on purpose. A provider that can collapse a
+-- resend on the stable submission key is the ONE case in which an
+-- unconfirmed request may be transmitted again, and it must stay visibly
+-- distinct from the 'rejected' resend above: 'rejected' means "the provider
+-- holds nothing", whereas here the provider may already hold the request and
+-- is trusted to deduplicate it. Fusing them would let a capability
+-- declaration silently turn an at-most-once ledger into at-least-once.
+UPDATE provider_submissions
+SET state = 'sending', attempt = ?, last_error = NULL
+WHERE run_id = ? AND submission_no = ? AND state = 'unknown';
 
 -- name: CountProviderSubmissionsByRun :one
 SELECT COUNT(*) AS n FROM provider_submissions WHERE run_id = ?;
