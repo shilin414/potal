@@ -2,8 +2,10 @@
 
 ## 当前状态（2026-09-15 第七轮复审整改后）
 
-第七轮 97/A（P0=0，P1=1，P2=2）→ 报告 §二十四 批次一/二 **全部完成**：P1 SSE terminal replay 立即关闭、P2-1 duration metric post-commit、P2-2 前端同 chunk 终态停止，本机全绿（后端单测+集成 55.9s、前端 tsc/vitest 131/vite build）。报告预期三件套后该块达 98/A+。
+第七轮 97/A（P0=0，P1=1，P2=2）→ 报告 §二十四 批次一/二 **全部完成**：P1 SSE terminal replay 立即关闭、P2-1 duration metric post-commit、P2-2 前端同 chunk 终态停止，本机全绿（后端单测+集成 60.1s、前端 tsc/vitest 131/vite build）。报告预期三件套后该块达 98/A+。
 基线 dev `fc255f5`（第六轮功能提交 `ecbc83f`）。变更报告按主题命名放 `docs/`。
+
+推送后 CI 首轮红（integration / `TestExecutionFencingMatrix`）→ 定位到一条**独立于三件套的缺陷**：同毫秒续约被读成所有权丢失（见下面「事务与时钟」第一条），已修复 + 确定性反证，作为**附加项**记在变更报告 §六。
 
 **执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot）已定型。**
 第七轮报告明确：三件套完成后，**停止**对 Gate1/Gate2/Provider submit boundary/Lease fencing/Retry·Defer/Schedule admission/legacy interrupted migration 继续微调；下轮转向新架构风险（client_request_id 幂等、SSE Hub、长历史 event 分页、Worker dispatcher、Conversation 生命周期、前端长对话性能）。
@@ -21,6 +23,8 @@
 - **terminal event = 硬边界**：SSE replay 遇到立即 `break` 并 `return`（**不看 `run.Status` 快照**——快照是开流前读的，正常终态竞争即可 stale）；前端同一 chunk 内 terminal 后停止 dispatch。synthetic terminal 必须按状态映射（succeeded→completed / cancelled→cancelled / failed|interrupted→failed），未知或非 settled **不合成**，绝不默认 `run.completed`。
 
 ### 事务与时钟
+- **续约类 UPDATE 必须单调写**（第七轮 CI 血的教训）：MySQL 的 `UPDATE` 返回 **changed rows，不是 matched rows**。`SET heartbeat_at = CURRENT_TIMESTAMP(3), expires_at = CURRENT_TIMESTAMP(3)+lease` 这种形状，若续约与建行落在**同一毫秒**（CI 回环 MySQL 会，本机 LAN 不会）→ 值完全相同 → `RowsAffected=0`，与"行不存在"不可区分 → 被读成 `ErrProviderSlotLost` / `HeartbeatOwned=false`（worker 会放弃健康 Run）。修法：`heartbeat_at = GREATEST(CURRENT_TIMESTAMP(3), DATE_ADD(heartbeat_at, INTERVAL 1000 MICROSECOND))`（**注意 sqlc 不认 `1 MILLISECOND`，要写 `1000 MICROSECOND`**）。先例：`provider_admission_locks.admissions = admissions + 1`。**不要**用 `ClientFoundRows=true`（会改变 `BindAgentThreadSessionOwned` 与 delivery 的重复检测语义），也**不要**用 `GREATEST(expires_at,…)`（过期时间逐次漂移）。
+- **`SET timestamp = <second>` 可钉死 session 时钟**（`CURRENT_TIMESTAMP(3)` → `.000`），配 `MaxOpenConns(1)` 即可把"恰好同一毫秒"变成确定性条件 —— 时序类栅栏 bug 的确定性复现手段。
 - **metrics / Redis fan-out / delivery hook 一律 post-commit，绝不能在正确性事务内做观测读**：观测读失败不得回滚终态。`studio_run_duration` 两端都取 DB 时钟（`dbClockDuration`，NULL/非单调丢弃），在 commit 后重读行（`GetRunTimestamps`），用 `NewCleanupContext`（detached + 有界）+ 只告警。
 - **Clock Authority 无兜底**：`dbNow/dbNowTx` 出错就中止/跳 tick，绝不回落本机时钟；Scheduler/TriggerNow 一律 `DBNow`。
 - `MarkRunStartedOwned` 返回 **DB 时间**，worker 必须 `claimed.Run.StartedAt = &t`；started_at 在 Gate1 allow 后才写（`CASClaimRun` 不写）；`finalize.go` 先判 `StartedAt != nil` 再 `IsZero()`。
