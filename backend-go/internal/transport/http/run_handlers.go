@@ -223,6 +223,11 @@ func writeExecutionDenied(w http.ResponseWriter, err error) {
 		writeBare(w, http.StatusBadRequest, "application does not support chat runs")
 	case errors.Is(err, catalog.ErrExecutionProviderInactive):
 		writeDetail(w, http.StatusConflict, "provider is not active")
+	// 第四轮 P2: without this case the sentinel fell through to the
+	// default 404 "application not found", hiding a registration problem
+	// from the only caller allowed to see it (staff).
+	case errors.Is(err, catalog.ErrExecutionProviderMissing):
+		writeDetail(w, http.StatusConflict, "provider is not registered")
 	case errors.Is(err, catalog.ErrNoBinding):
 		writeDetail(w, http.StatusConflict, "application has no enabled runtime binding")
 	default:
@@ -240,10 +245,18 @@ func writeExecutionDenied(w http.ResponseWriter, err error) {
 // with the insert.
 func (s *Server) admitUserRun(ctx context.Context, userID int64) error {
 	limiter := s.RunAdmission
-	if limiter == nil || s.Redis == nil || s.Config == nil {
+	if limiter == nil || s.Config == nil {
 		return nil
 	}
-	key := s.Redis.Key("rate", "runs", "user", strconv.FormatInt(userID, 10))
+	// A nil Redis client must NOT bypass admission (第四轮 P2): AllowKey
+	// already degrades to the in-process GCRA when no client is
+	// configured, which still bounds the rate on this node. Only the key
+	// needs a fallback namespace.
+	userKey := strconv.FormatInt(userID, 10)
+	key := s.Config.Redis.Key("rate", "runs", "user", userKey)
+	if s.Redis != nil {
+		key = s.Redis.Key("rate", "runs", "user", userKey)
+	}
 	ok, wait, err := limiter.AllowKey(ctx, key)
 	if err != nil || ok {
 		// AllowKey degrades to the in-process limiter on Redis errors and

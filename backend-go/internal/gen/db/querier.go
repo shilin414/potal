@@ -39,6 +39,12 @@ type Querier interface {
 	// Provider admission requeues (inflight limit / limiter outage) must not
 	// burn retry budget; only BeginProviderAttemptFenced consumes an attempt,
 	// immediately before the provider submit.
+	//
+	// NOTE (第四轮 P2): the claim does NOT stamp started_at either. started_at
+	// means "this run was allowed to execute", not "a worker touched it" — a
+	// run killed by the execution gate must not carry a start time it never
+	// earned. The owner stamps it with MarkRunStartedFenced after the gate
+	// allows the run (same point as the run.started event).
 	CASClaimRun(ctx context.Context, id []byte) (sql.Result, error)
 	CASFinishDelivery(ctx context.Context, arg CASFinishDeliveryParams) (sql.Result, error)
 	// Run terminal fan-out: occurrence converges with the run's outcome
@@ -68,8 +74,13 @@ type Querier interface {
 	CountActiveOccurrencesExcluding(ctx context.Context, arg CountActiveOccurrencesExcludingParams) (int64, error)
 	// Active = not past its DB-clock expiry.
 	CountActiveProviderSlots(ctx context.Context, provider string) (int64, error)
-	// Active-run count under the conversations row lock. Backed by
-	// idx_runs_conversation_status (migration 0014).
+	// ACTIVE = NON-TERMINAL (第四轮 P2). The status list used to be hard-coded
+	// to ('queued','running'); the domain has nine states and only
+	// cancelled/succeeded/failed are terminal (execution.TerminalStatuses), so
+	// a run in waiting_input / waiting_external / cancelling / interrupted
+	// would have looked "inactive" and let a SECOND run into a conversation
+	// that must stay serialized. Backed by idx_runs_conversation_status
+	// (migration 0014).
 	CountActiveRunsByConversation(ctx context.Context, conversationID sql.NullInt64) (int64, error)
 	CountConversationByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
 	// Same guard, direct: any delivery execution hanging off this
@@ -83,7 +94,10 @@ type Querier interface {
 	// Invariant M: an ACTIVE provider slot must belong to a running run at the
 	// matching lease epoch.
 	CountOrphanProviderSlots(ctx context.Context) (int64, error)
-	// Per-user admission (评测 P1-7): queued + running runs against the cap.
+	// Per-user admission (评测 P1-7): every NON-TERMINAL run counts against
+	// the cap (第四轮 P2) — same predicate as CountActiveRunsByConversation, so
+	// a waiting_input / waiting_external / cancelling / interrupted run can no
+	// longer slip past the outstanding limit.
 	CountOutstandingRunsByUser(ctx context.Context, userID sql.NullInt64) (int64, error)
 	// Run-now pending cap (复审 P1-3): pending occurrences are future work no
 	// outstanding-run limit sees, so the manual queue must be bounded.
@@ -400,6 +414,12 @@ type Querier interface {
 	MarkOccurrenceRunningByRun(ctx context.Context, runID sql.NullString) (sql.Result, error)
 	MarkOccurrenceStatus(ctx context.Context, arg MarkOccurrenceStatusParams) (sql.Result, error)
 	MarkOutboxPublished(ctx context.Context, id uint64) error
+	// Stamps started_at once, fenced by the current lease epoch, at the point
+	// the run is actually allowed to execute (第四轮 P2). COALESCE keeps the
+	// FIRST start time: a run deferred for a paused provider and later
+	// re-claimed keeps its original start, so RunDuration measures wall-clock
+	// execution rather than the last requeue.
+	MarkRunStartedFenced(ctx context.Context, arg MarkRunStartedFencedParams) (sql.Result, error)
 	// Invariant G: the outbox relay must not lag (pending events older than
 	// the threshold mean dispatch is stuck).
 	OldestPendingOutboxAgeSeconds(ctx context.Context) (int64, error)

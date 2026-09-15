@@ -167,7 +167,10 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 	s.publishLive(ctx, own.RunID, sequence, terminalEvent, terminalPayload)
 	if s.Metrics != nil {
 		s.Metrics.RunTotal.WithLabelValues(run.Provider, in.Status).Inc()
-		if !run.StartedAt.IsZero() {
+		// started_at is NULL for a run killed before it was allowed to
+		// execute (第四轮 P2) — such a run has no duration to observe.
+		// The pointer must be nil-checked before the deref.
+		if run.StartedAt != nil && !run.StartedAt.IsZero() {
 			s.Metrics.RunDuration.
 				WithLabelValues(run.Provider, in.Status).
 				Observe(timeSinceSeconds(*run.StartedAt))

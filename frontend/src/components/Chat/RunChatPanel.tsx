@@ -479,6 +479,11 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
               {msg.status === 'streaming' && !msg.retryNotice && <span className="run-chat-dotting">生成中…</span>}
               {msg.status === 'streaming' && msg.retryNotice && <span className="run-chat-dotting">{msg.retryNotice}</span>}
               {msg.status === 'failed' && <span className="run-chat-error-tag">失败</span>}
+              {msg.status === 'cancelled' && (
+                <Tooltip title={msg.error || '应用或运行配置已停用，本次执行已取消。'}>
+                  <span className="run-chat-cancelled-tag">已取消</span>
+                </Tooltip>
+              )}
               {!selectMode && isShareable(msg) && (
                 <Tooltip title="转发这条消息">
                   <button
@@ -510,7 +515,13 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
               ))}
             </div>
           ) : null}
-          {msg.error && <div className="run-chat-error-text">{msg.error}</div>}
+          {msg.error && (
+            <div
+              className={`run-chat-error-text${msg.status === 'cancelled' ? ' run-chat-error-text--cancelled' : ''}`}
+            >
+              {msg.error}
+            </div>
+          )}
           {msg.artifacts?.length ? (
             <div className="run-chat-artifacts">
               {msg.artifacts.map((a) => <ArtifactCard key={a.artifactId} artifact={a} />)}

@@ -5,10 +5,30 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 
 	"github.com/creation-agent-studio/backend-go/internal/catalog"
 )
+
+// ProviderAPI is the Aily HTTP surface the adapter depends on. It exists
+// so the SUBMIT boundary is injectable: the executor must be able to
+// prove that a gated run never reaches the provider, which is only
+// observable at the real StartChat / OpenStreamChat call (第四轮 P1-1 —
+// a mocked executor handler proves nothing about HTTP).
+type ProviderAPI interface {
+	// StartChat is the async (non-streaming) submit: one HTTP POST.
+	StartChat(ctx context.Context, agentID, token string, contentItems []map[string]any, attachmentIDs []string, sessionID string) (chatID, newSession string, err error)
+	// OpenStreamChat sends the streaming POST synchronously and returns
+	// the opened SSE body (provider already reached on success).
+	OpenStreamChat(ctx context.Context, agentID, token string, contentItems []map[string]any, attachmentIDs []string, sessionID string) (io.ReadCloser, error)
+	GetChatResult(ctx context.Context, agentID, token, chatID string) (json.RawMessage, error)
+	UploadAttachment(ctx context.Context, agentID, token string, data []byte, filename, attachmentType, docURL string) (string, error)
+	GetArtifact(ctx context.Context, agentID, token, artifactID string) (*ArtifactDownload, error)
+	CheckVisibility(ctx context.Context, agentID, uat string) (bool, error)
+}
+
+var _ ProviderAPI = (*Client)(nil)
 
 func jsonUnmarshal(raw json.RawMessage, out any) error {
 	return json.Unmarshal(raw, out)
@@ -24,17 +44,28 @@ func jsonUnmarshal(raw json.RawMessage, out any) error {
 //	attachment.external id       = Aily agent_attachment_id
 //	artifact.external id         = Aily agent_artifact_id
 type AgentAdapter struct {
-	client *Client
-	auth   *AuthResolver
+	api  ProviderAPI
+	auth *AuthResolver
 
 	mu       sync.Mutex
 	capables catalog.Capabilities
 }
 
 func NewAgentAdapter(client *Client, auth *AuthResolver) *AgentAdapter {
+	return newAgentAdapter(client, auth)
+}
+
+// NewAgentAdapterWithAPI wires an explicit ProviderAPI — used by the
+// submit-boundary tests (and any future transport) that must observe the
+// real provider calls instead of a mocked executor handler.
+func NewAgentAdapterWithAPI(api ProviderAPI, auth *AuthResolver) *AgentAdapter {
+	return newAgentAdapter(api, auth)
+}
+
+func newAgentAdapter(api ProviderAPI, auth *AuthResolver) *AgentAdapter {
 	return &AgentAdapter{
-		client: client,
-		auth:   auth,
+		api:  api,
+		auth: auth,
 		capables: catalog.Capabilities{
 			"streaming":       true,
 			"async_execution": true,
@@ -119,15 +150,31 @@ func ValidateAttachments(ids []string) error {
 	return nil
 }
 
-// Submit issues an async (non-streaming) chat.
-func (a *AgentAdapter) Submit(ctx context.Context, in *catalog.SubmitInput) (*catalog.SubmitResult, error) {
+// ValidateSubmit enforces every LOCAL submit rule (content limits,
+// attachment count). It performs no IO, so it belongs BEFORE the
+// pre-submit gate: an invalid payload must never consume a provider
+// attempt and never reach the provider (第四轮 P1-1).
+func (a *AgentAdapter) ValidateSubmit(in *catalog.SubmitInput) error {
 	if err := ValidateContent(contentFromPayload(in.Payload)); err != nil {
+		return err
+	}
+	return ValidateAttachments(in.ExternalAttachmentIDs)
+}
+
+// Submit issues an async (non-streaming) chat: validate, then submit.
+func (a *AgentAdapter) Submit(ctx context.Context, in *catalog.SubmitInput) (*catalog.SubmitResult, error) {
+	if err := a.ValidateSubmit(in); err != nil {
 		return nil, err
 	}
-	if err := ValidateAttachments(in.ExternalAttachmentIDs); err != nil {
-		return nil, err
-	}
-	chatID, sessionID, err := a.client.StartChat(ctx, in.ExternalResourceID, in.Auth.Token,
+	return a.SubmitPrepared(ctx, in)
+}
+
+// SubmitPrepared submits a chat whose payload already passed
+// ValidateSubmit. It performs no local work, so the caller can place the
+// pre-submit kill switch immediately before it: after this call the only
+// remaining steps are the attempt CAS and the HTTP request.
+func (a *AgentAdapter) SubmitPrepared(ctx context.Context, in *catalog.SubmitInput) (*catalog.SubmitResult, error) {
+	chatID, sessionID, err := a.api.StartChat(ctx, in.ExternalResourceID, in.Auth.Token,
 		contentFromPayload(in.Payload), in.ExternalAttachmentIDs, in.SessionID)
 	if err != nil {
 		return nil, err
@@ -157,7 +204,7 @@ func contentFromPayload(payload map[string]any) []map[string]any {
 
 // Status polls 获取对话结果 and normalizes the outcome.
 func (a *AgentAdapter) Status(ctx context.Context, auth *catalog.ProviderAuthContext, externalResourceID, externalRunID string) (*catalog.StatusResult, error) {
-	raw, err := a.client.GetChatResult(ctx, externalResourceID, auth.Token, externalRunID)
+	raw, err := a.api.GetChatResult(ctx, externalResourceID, auth.Token, externalRunID)
 	if err != nil {
 		return nil, err
 	}
@@ -195,36 +242,56 @@ func (a *AgentAdapter) Status(ctx context.Context, auth *catalog.ProviderAuthCon
 // channel. The first event always surfaces run/session identity so the
 // caller can persist agent_chat_id / session_id even if the stream breaks.
 func (a *AgentAdapter) Stream(ctx context.Context, in *catalog.SubmitInput) (<-chan catalog.StreamEvent, func(), error) {
-	if err := ValidateContent(contentFromPayload(in.Payload)); err != nil {
+	if err := a.ValidateSubmit(in); err != nil {
 		return nil, nil, err
 	}
-	if err := ValidateAttachments(in.ExternalAttachmentIDs); err != nil {
+	return a.StreamPrepared(ctx, in)
+}
+
+// StreamPrepared opens the stream SYNCHRONOUSLY and then pumps the
+// frames in a goroutine. The HTTP POST happens on the calling goroutine
+// (第四轮 P1-1): the caller can therefore run the pre-submit kill switch
+// on the line immediately above this call and still be the last
+// checkpoint before the provider sees the request.
+//
+// The returned cancel closes the SSE body as well as the derived context,
+// so a cancelled handler cannot leak the provider connection.
+func (a *AgentAdapter) StreamPrepared(ctx context.Context, in *catalog.SubmitInput) (<-chan catalog.StreamEvent, func(), error) {
+	body, err := a.api.OpenStreamChat(ctx, in.ExternalResourceID, in.Auth.Token,
+		contentFromPayload(in.Payload), in.ExternalAttachmentIDs, in.SessionID)
+	if err != nil {
 		return nil, nil, err
 	}
 	out := make(chan catalog.StreamEvent, 64)
 	cctx, cancel := context.WithCancel(ctx)
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			_ = body.Close()
+		})
+	}
 	go func() {
 		defer close(out)
+		defer stop()
 		started := false
 		mapper := Mapper{}
-		err := a.client.StreamChat(cctx, in.ExternalResourceID, in.Auth.Token,
-			contentFromPayload(in.Payload), in.ExternalAttachmentIDs, in.SessionID,
-			func(eventName string, data []byte) error {
-				parsed := mapper.ParseSSEData(data)
-				if !started {
-					started = true
-					chatID, _ := parsed["agent_chat_id"].(string)
-					sessionID, _ := parsed["session_id"].(string)
-					out <- catalog.StreamEvent{EventType: "aily.stream.started", Payload: map[string]any{
-						"agent_chat_id": chatID,
-						"session_id":    sessionID,
-					}}
-				}
-				for _, ev := range mapper.ToUnified(eventName, parsed) {
-					out <- catalog.StreamEvent{EventType: ev.Type, Payload: ev.Payload}
-				}
-				return nil
-			})
+		err := pumpSSE(cctx, body, func(eventName string, data []byte) error {
+			parsed := mapper.ParseSSEData(data)
+			if !started {
+				started = true
+				chatID, _ := parsed["agent_chat_id"].(string)
+				sessionID, _ := parsed["session_id"].(string)
+				out <- catalog.StreamEvent{EventType: "aily.stream.started", Payload: map[string]any{
+					"agent_chat_id": chatID,
+					"session_id":    sessionID,
+				}}
+			}
+			for _, ev := range mapper.ToUnified(eventName, parsed) {
+				out <- catalog.StreamEvent{EventType: ev.Type, Payload: ev.Payload}
+			}
+			return nil
+		})
 		if err != nil && !errors.Is(err, context.Canceled) {
 			// Transport-level failure: emit a failed event? No — the
 			// executor reconciles via GetChatResult instead (§26).
@@ -233,7 +300,7 @@ func (a *AgentAdapter) Stream(ctx context.Context, in *catalog.SubmitInput) (<-c
 			}}
 		}
 	}()
-	return out, cancel, nil
+	return out, stop, nil
 }
 
 // UploadAttachment streams bytes to Aily under the caller's UAT.
@@ -250,13 +317,13 @@ func (a *AgentAdapter) UploadAttachment(ctx context.Context, auth *catalog.Provi
 			return "", fmt.Errorf("%w: file exceeds 40MB", ErrCapability)
 		}
 	}
-	return a.client.UploadAttachment(ctx, externalResourceID, auth.Token,
+	return a.api.UploadAttachment(ctx, externalResourceID, auth.Token,
 		in.Data, in.Filename, in.AttachmentType, in.DocURL)
 }
 
 // ResolveArtifact fetches a fresh 24h signed URL for an artifact.
 func (a *AgentAdapter) ResolveArtifact(ctx context.Context, auth *catalog.ProviderAuthContext, externalResourceID, externalArtifactID string) (*catalog.ArtifactRef, error) {
-	art, err := a.client.GetArtifact(ctx, externalResourceID, auth.Token, externalArtifactID)
+	art, err := a.api.GetArtifact(ctx, externalResourceID, auth.Token, externalArtifactID)
 	if err != nil {
 		return nil, err
 	}
@@ -272,7 +339,7 @@ func (a *AgentAdapter) CheckVisibility(ctx context.Context, auth *catalog.Provid
 	if auth.IdentityMode != "user" {
 		return false, fmt.Errorf("%w: Aily visibility check requires user identity (UAT)", ErrCapability)
 	}
-	return a.client.CheckVisibility(ctx, externalResourceID, auth.Token)
+	return a.api.CheckVisibility(ctx, externalResourceID, auth.Token)
 }
 
 func fileExt(name string) string {

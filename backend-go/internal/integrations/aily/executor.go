@@ -47,7 +47,12 @@ type Executor struct {
 	// run may still wait here for auth resolution and a limiter token
 	// while an admin disables the application or the provider — a run
 	// that has not been SUBMITTED yet must still obey the kill switch.
-	// Nil disables the check (tests / non-gated deployments).
+	//
+	// 第四轮 P1-1: the checkpoint moved OUT of Execute into the two real
+	// submit paths, AFTER every local preparation step (thread
+	// resolution, payload build, local validation) and immediately
+	// before the provider HTTP call. Nil disables the check (tests /
+	// non-gated deployments).
 	Gate execution.RunGate
 }
 
@@ -83,28 +88,10 @@ func (e *Executor) Execute(ctx context.Context, claimed *execution.ClaimedRun) e
 		return e.failRun(ctx, claimed, "aily_rate_limit", "waiting for provider rate limit cancelled")
 	}
 
-	// Pre-submit kill switch (第三轮 P1-B, Gate 2): placed AFTER the rate
-	// limiter (which itself may wait) and IMMEDIATELY before
-	// BeginProviderAttempt — the closest possible checkpoint to the
-	// provider submit. kill → cancelled, pause/infra → deferred with the
-	// original priority, unknown verdict → fail closed. No attempt is
-	// consumed on any gated path: the provider never saw this run.
-	if execution.PreSubmitGate(ctx, e.Owned, claimed, e.Gate, e.Log) {
-		return nil
-	}
-
-	// Attempt accounting (P0-2): attempt counts PROVIDER EXECUTIONS. The
-	// claim no longer consumes one, and neither does provider admission —
-	// only reaching this point (auth resolved, rate limit granted, about
-	// to submit) does.
-	if err := e.Owned.BeginProviderAttempt(ctx, claimed); err != nil {
-		if errors.Is(err, execution.ErrProviderAttemptsExhausted) {
-			return e.failRun(ctx, claimed, "aily_attempts_exhausted",
-				"provider retry budget exhausted before submit")
-		}
-		return err // ErrLostOwnership → stop writing
-	}
-
+	// NOTE: the pre-submit gate and the attempt counter used to live
+	// here. 第四轮 P1-1 moved them INTO executeStreaming /
+	// executeBackground, after thread resolution and payload validation
+	// and immediately before the provider HTTP call — see beginSubmit.
 	if run.ExecutionMode() == "interactive" {
 		if err := e.executeStreaming(ctx, claimed, auth, agentID); err != nil {
 			return e.classifyError(ctx, claimed, err)
@@ -137,7 +124,57 @@ func parseAilySnapshot(snapshot map[string]any) (agentID, identityMode string, e
 	return v, mode, nil
 }
 
+// preSubmitStop carries the outcome of the pre-submit checkpoint out of
+// executeStreaming/executeBackground. The run was already resolved there
+// (gate kill → cancelled, gate pause/infra → deferred, attempt budget
+// exhausted → failed), so the provider-error classifier must NOT touch
+// it: classifyError unwraps and returns the enclosed error verbatim.
+type preSubmitStop struct{ err error }
+
+func (p *preSubmitStop) Error() string { return "aily: run stopped before provider submit" }
+func (p *preSubmitStop) Unwrap() error { return p.err }
+
+// beginSubmit is the FINAL checkpoint before the provider sees a request
+// (第四轮 P1-1). It is called by both submit paths only after every local
+// preparation step has succeeded:
+//
+//	thread() → build SubmitInput → ValidateSubmit → ★ Gate 2
+//	        → BeginProviderAttempt → HTTP submit
+//
+// Anything that can fail locally (DB IO for the agent thread, payload
+// validation) already happened, so after Gate 2 only the attempt CAS and
+// the network call remain — the kill switch window is as small as a
+// level-triggered check can make it.
+//
+// Returns proceed=true when the caller may submit. On false the run is
+// already resolved and err carries that outcome (nil = the gate handled
+// it); the caller must return &preSubmitStop{err}.
+func (e *Executor) beginSubmit(ctx context.Context, claimed *execution.ClaimedRun) (proceed bool, err error) {
+	// kill → cancelled, pause/infra/unknown → deferred with the ORIGINAL
+	// priority, fail closed. No attempt is consumed on any gated path.
+	if execution.PreSubmitGate(ctx, e.Owned, claimed, e.Gate, e.Log) {
+		return false, nil
+	}
+	// Attempt accounting (P0-2): attempt counts PROVIDER EXECUTIONS, so
+	// it is consumed only now — every local failure above (thread DB IO,
+	// validation) leaves the budget untouched.
+	if err := e.Owned.BeginProviderAttempt(ctx, claimed); err != nil {
+		if errors.Is(err, execution.ErrProviderAttemptsExhausted) {
+			return false, e.failRun(ctx, claimed, "aily_attempts_exhausted",
+				"provider retry budget exhausted before submit")
+		}
+		return false, err // ErrLostOwnership → stop writing
+	}
+	return true, nil
+}
+
 func (e *Executor) classifyError(ctx context.Context, claimed *execution.ClaimedRun, err error) error {
+	// A gated / budget-exhausted run is already resolved by the
+	// checkpoint: never re-classify it as a provider failure.
+	var stopped *preSubmitStop
+	if errors.As(err, &stopped) {
+		return stopped.err
+	}
 	if errors.Is(err, execution.ErrLostOwnership) {
 		return err // fence verdict: stop writing, never retry from here
 	}
@@ -153,6 +190,13 @@ func (e *Executor) classifyError(ctx context.Context, claimed *execution.Claimed
 			return e.retryOrFail(ctx, claimed, "aily_server_error")
 		}
 		return e.failRun(ctx, claimed, "aily_"+kindName(apiErr.Kind), apiErr.Msg)
+	}
+	if errors.Is(err, ErrCapability) {
+		// Local input/capability rejection (content limits, attachment
+		// count, unsupported file type): the provider never saw the
+		// request, so this is a customer-input failure — NOT an internal
+		// error, and (第四轮 P1-1) not a consumed attempt.
+		return e.failRun(ctx, claimed, "aily_capability_error", err.Error())
 	}
 	return e.failRun(ctx, claimed, "aily_internal_error", err.Error())
 }
@@ -265,8 +309,19 @@ func (e *Executor) executeStreaming(ctx context.Context, claimed *execution.Clai
 		Stream:                true,
 		TimeoutSeconds:        run.SnapshotInt("timeout_seconds", 300),
 	}
+	// Local validation BEFORE the gate: an invalid payload is not a
+	// provider execution and must not consume an attempt (第四轮 P1-1).
+	if err := e.Adapter.ValidateSubmit(submit); err != nil {
+		return err
+	}
+	ok, err := e.beginSubmit(ctx, claimed)
+	if err != nil || !ok {
+		return &preSubmitStop{err: err}
+	}
 
-	events, cancel, err := e.Adapter.Stream(ctx, submit)
+	// StreamPrepared opens the HTTP POST synchronously on this
+	// goroutine — the gate above is the last checkpoint before it.
+	events, cancel, err := e.Adapter.StreamPrepared(ctx, submit)
 	if err != nil {
 		return err
 	}
@@ -353,7 +408,16 @@ func (e *Executor) executeBackground(ctx context.Context, claimed *execution.Cla
 		ExternalAttachmentIDs: run.AttachmentIDs(),
 		TimeoutSeconds:        run.SnapshotInt("timeout_seconds", 300),
 	}
-	result, err := e.Adapter.Submit(ctx, submit)
+	// Local validation BEFORE the gate (第四轮 P1-1): no attempt, no
+	// provider call for a locally invalid payload.
+	if err := e.Adapter.ValidateSubmit(submit); err != nil {
+		return err
+	}
+	ok, err := e.beginSubmit(ctx, claimed)
+	if err != nil || !ok {
+		return &preSubmitStop{err: err}
+	}
+	result, err := e.Adapter.SubmitPrepared(ctx, submit)
 	if err != nil {
 		return err
 	}

@@ -352,6 +352,19 @@ func (w *Worker) claimAndExecute(ctx context.Context, runID ids.ID, ack func()) 
 		}
 		return
 	}
+	// started_at is stamped at exactly this point (第四轮 P2): after the
+	// gate ALLOWED the run, before the run.started event. A run killed by
+	// the gate therefore has no start time at all, and COALESCE keeps the
+	// first start across provider-pause deferrals.
+	if err := w.Svc.MarkRunStartedOwned(ctx, claimed.Ownership); err != nil {
+		if err == ErrLostOwnership {
+			if ack != nil {
+				ack()
+			}
+			return
+		}
+		w.Log.Warn("mark run started failed", "run_id", runID.String(), "err", err)
+	}
 	// Claim event: matches the reference protocol (SSE consumers render
 	// the streaming bubble from run.started). Fenced: only the owner.
 	// Emitted only after the gate ALLOWED the run (第三轮 P2-D).

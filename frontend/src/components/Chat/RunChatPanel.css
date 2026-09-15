@@ -159,10 +159,23 @@
   font-size: 11px;
 }
 
+/* 管理员撤销（Hard Kill）≠ 执行失败：用中性提示色，不用错误红。 */
+.run-chat-cancelled-tag {
+  padding: 0 6px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--color-warning, #faad14) 16%, transparent);
+  color: var(--color-warning, #faad14);
+  font-size: 11px;
+}
+
 .run-chat-error-text {
   margin-top: 6px;
   color: var(--color-error, #ff4d4f);
   font-size: 12px;
+}
+
+.run-chat-error-text--cancelled {
+  color: var(--color-warning, #faad14);
 }
 
 .run-chat-artifacts {

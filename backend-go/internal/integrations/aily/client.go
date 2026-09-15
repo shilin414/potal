@@ -175,10 +175,19 @@ func buildUserMessage(contentItems []map[string]any, attachmentIDs []string) map
 	return msg
 }
 
-// StreamChat starts a streaming chat and yields raw SSE `data:` JSON
-// payloads with the current event name. The transport caps at ~5 minutes
-// per the docs: timeouts are reconciliation triggers, not run failures.
-func (c *Client) StreamChat(ctx context.Context, agentID, token string, contentItems []map[string]any, attachmentIDs []string, sessionID string, fn func(eventName string, data []byte) error) error {
+// OpenStreamChat synchronously sends the streaming chat POST and returns
+// the opened SSE body — the provider has RECEIVED the request (or is
+// receiving it) the moment this returns without error.
+//
+// It exists because the streaming submit must sit IMMEDIATELY after the
+// pre-submit kill switch (第四轮 P1-1): the previous implementation
+// started the HTTP call inside a goroutine, so a run could be gated and
+// then still reach the provider while the goroutine waited to be
+// scheduled. Splitting "open" (synchronous network call) from "consume"
+// (goroutine pumping SSE frames) removes that window.
+//
+// The caller owns the returned body and MUST close it.
+func (c *Client) OpenStreamChat(ctx context.Context, agentID, token string, contentItems []map[string]any, attachmentIDs []string, sessionID string) (io.ReadCloser, error) {
 	body := map[string]any{
 		"user_message": buildUserMessage(contentItems, attachmentIDs),
 		"stream":       true,
@@ -188,11 +197,11 @@ func (c *Client) StreamChat(ctx context.Context, agentID, token string, contentI
 	}
 	buf, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/aily/v1/agents/"+agentID+"/chats", bytes.NewReader(buf))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
@@ -201,21 +210,41 @@ func (c *Client) StreamChat(ctx context.Context, agentID, token string, contentI
 	resp, err := c.http.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			return &APIError{Kind: ErrTimeout, Msg: err.Error()}
+			return nil, &APIError{Kind: ErrTimeout, Msg: err.Error()}
 		}
-		return err
+		return nil, err
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		if apiErr := c.classify(resp, raw); apiErr != nil {
-			return apiErr
+			return nil, apiErr
 		}
-		return &APIError{Kind: ErrServer, Msg: "stream HTTP " + resp.Status, HTTPStatus: resp.StatusCode}
+		return nil, &APIError{Kind: ErrServer, Msg: "stream HTTP " + resp.Status, HTTPStatus: resp.StatusCode}
 	}
+	return resp.Body, nil
+}
 
+// StreamChat starts a streaming chat and yields raw SSE `data:` JSON
+// payloads with the current event name. The transport caps at ~5 minutes
+// per the docs: timeouts are reconciliation triggers, not run failures.
+//
+// It is OpenStreamChat + pumpSSE: only the SSE consumption is
+// asynchronous, the HTTP POST itself is not.
+func (c *Client) StreamChat(ctx context.Context, agentID, token string, contentItems []map[string]any, attachmentIDs []string, sessionID string, fn func(eventName string, data []byte) error) error {
+	body, err := c.OpenStreamChat(ctx, agentID, token, contentItems, attachmentIDs, sessionID)
+	if err != nil {
+		return err
+	}
+	defer body.Close()
+	return pumpSSE(ctx, body, fn)
+}
+
+// pumpSSE parses one OPENED SSE body into (eventName, data) callbacks.
+// EOF is a normal end of stream (reconciliation follows upstream).
+func pumpSSE(ctx context.Context, body io.Reader, fn func(eventName string, data []byte) error) error {
 	currentEvent := ""
-	br := newSSEReader(resp.Body)
+	br := newSSEReader(body)
 	for {
 		line, ok, err := br.Next(ctx)
 		if err != nil {

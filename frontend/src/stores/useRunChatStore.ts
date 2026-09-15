@@ -53,7 +53,11 @@ export interface ChatMessage {
   content: string;
   created_at: string;
   runId?: string;
-  status?: 'streaming' | 'done' | 'failed';
+  /**
+   * 'cancelled' 是管理员撤销（Hard Kill）的终态：它不是 Provider 故障，
+   * 因此不能折叠进 'failed'，更不能当成 'done'（第四轮 P1-2）。
+   */
+  status?: 'streaming' | 'done' | 'failed' | 'cancelled';
   error?: string;
   /** Non-terminal retry hint (run.retrying keeps the stream alive). */
   retryNotice?: string;
@@ -96,6 +100,13 @@ export interface RunChatState {
  * run.retrying, terminal failures emit run.failed.
  */
 const TERMINAL = new Set(['run.completed', 'run.failed', 'run.cancelled']);
+
+/** Hard Kill 的用户文案：管理员撤销不是 Provider 故障，不能写成“执行失败”。 */
+const CANCELLED_NOTICE = '应用或运行配置已停用，本次执行已取消。';
+
+function cancelledNotice(errorCode?: string): string {
+  return errorCode === 'execution_disabled' ? CANCELLED_NOTICE : '执行已取消';
+}
 
 function emptyConversation(id: number, title = ''): ConversationChat {
   return { id, title, messages: [], activeRunId: null };
@@ -296,6 +307,32 @@ export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<
         message.error = event.payload?.error_message
           || event.payload?.error_code || '执行失败';
         break;
+      case 'run.cancelled':
+        // Hard Kill（应用/绑定被停用）：终态，但不是失败 —— 管理员主动
+        // 撤销。折叠成 done 会让用户看到一个空白的“成功回答”。
+        message.status = 'cancelled';
+        message.error = cancelledNotice(event.payload?.error_code);
+        break;
+      case 'run.started':
+        // 真正开始生成：清掉重试/暂缓提示，回到「生成中…」。
+        message.retryNotice = undefined;
+        break;
+      case 'run.deferred':
+        // 非终态：Provider 暂停或执行检查不可用，Run 被原优先级推迟。
+        // 流保持打开，activeRunId 保持（与 run.retrying 同一语义）。
+        if (message.status === 'streaming') {
+          switch (event.payload?.reason) {
+            case 'provider_disabled':
+              message.retryNotice = '服务暂时停用，等待恢复…';
+              break;
+            case 'run_gate_unavailable':
+              message.retryNotice = '执行检查暂不可用，正在等待重试…';
+              break;
+            default:
+              message.retryNotice = '执行暂缓，正在等待重试…';
+          }
+        }
+        break;
       case 'run.retrying':
         // Non-terminal: the run was requeued for another attempt. Keep
         // streaming — activeRunId stays, status stays 'streaming'.
@@ -352,7 +389,9 @@ export function closeRunStream(runId: string) {
   activeStreams.delete(runId);
 }
 
-async function finalizeRun(runId: string, eventText?: string) {
+// Exported for tests: the GET-Run reconciliation must not turn a
+// cancelled run into a successful one (第四轮 P1-2).
+export async function finalizeRun(runId: string, eventText?: string) {
   closeRunStream(runId);
   let run: RunRecord;
   try {
@@ -367,14 +406,24 @@ async function finalizeRun(runId: string, eventText?: string) {
 
   const messages = conv.messages.map((m) => {
     if (m.id !== `run-${runId}`) return m;
+    // 'cancelled' 必须保持 cancelled：管理员撤销不是成功，也不是 Provider
+    // 故障（第四轮 P1-2）。此前只有 failed 分支，cancelled 会被映射成
+    // done —— 用户会看到一个空白的“成功回答”。
+    const cancelled = run.status === 'cancelled';
     const failed = run.status === 'failed' || run.status === 'interrupted';
     return {
       ...m,
       content: (eventText ?? run.output?.text) || m.content,
-      status: failed ? 'failed' as const : 'done' as const,
-      error: failed
-        ? (run.error_message || run.error_code || '执行失败')
-        : undefined,
+      status: cancelled
+        ? 'cancelled' as const
+        : failed
+          ? 'failed' as const
+          : 'done' as const,
+      error: cancelled
+        ? cancelledNotice(run.error_code)
+        : failed
+          ? (run.error_message || run.error_code || '执行失败')
+          : undefined,
     };
   });
 

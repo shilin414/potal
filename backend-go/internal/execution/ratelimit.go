@@ -129,6 +129,13 @@ func (l *RateLimiter) AllowKey(ctx context.Context, key string) (ok bool, wait t
 	res, err := gcraLua.Run(ctx, l.rdb.Client, []string{key},
 		emissionMicro, burstOffset, ttlMillis).Slice()
 	if err != nil {
+		// A CANCELLED or expired caller context is NOT a Redis outage
+		// (第四轮 P2): the request is already gone, so admitting it would
+		// burn a token for work that will never run. Propagate ctx.Err()
+		// and let the caller abort (Acquire returns ctx.Err()).
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, 0, ctxErr
+		}
 		// Degraded mode: fall back to the in-process limiter with the
 		// same GCRA parameters. Never fail open (评测 P1). The local
 		// fallback necessarily uses the local clock — it only guards this

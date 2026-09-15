@@ -150,10 +150,13 @@ func (s *Service) CreateRun(ctx context.Context, in *CreateRunInput) (*Run, erro
 }
 
 // CreateRunAdmitted creates a run under the per-user outstanding cap
-// (评测 P1-7). The user row is locked, the queued+running count is read
+// (评测 P1-7). The user row is locked, the NON-TERMINAL run count is read
 // under that lock and the run is inserted in the SAME transaction, so N
 // concurrent submits can no longer all observe the same count and
 // overshoot the cap. maxOutstanding <= 0 disables the cap.
+//
+// NON-TERMINAL means "not cancelled/succeeded/failed" (第四轮 P2): the
+// cap is a concurrency bound on live work, not on two specific statuses.
 func (s *Service) CreateRunAdmitted(ctx context.Context, in *CreateRunInput, maxOutstanding int) (*Run, error) {
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -610,6 +613,40 @@ func (s *Service) BeginProviderAttemptOwned(ctx context.Context, own ExecutionOw
 		return 0, err
 	}
 	return int64(row.Attempt) + 1, nil
+}
+
+// MarkRunStartedOwned stamps started_at for the owning worker (第四轮 P2).
+//
+// Semantics: started_at means "this run was allowed to execute", not "a
+// worker claimed it". The claim no longer stamps it, so a run killed by the
+// execution gate stays NULL instead of advertising a start it never had.
+//
+// It is fenced by the lease epoch and idempotent (COALESCE): a run deferred
+// for a paused provider and later re-claimed keeps its FIRST start time, so
+// RunDuration measures execution wall-clock rather than the last requeue.
+//
+// Failure here is an observability loss, not a correctness loss — the caller
+// logs and continues.
+func (s *Service) MarkRunStartedOwned(ctx context.Context, own ExecutionOwnership) error {
+	if !own.Valid() {
+		return ErrLostOwnership
+	}
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := verifyActiveOwnershipTx(ctx, tx, own); err != nil {
+		return err
+	}
+	if _, err := db.New(tx).MarkRunStartedFenced(ctx, db.MarkRunStartedFencedParams{
+		ID:         own.RunID.Bytes(),
+		LeaseEpoch: own.LeaseEpoch,
+	}); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // HeartbeatOwned extends the lease; the WHERE carries the lease token so

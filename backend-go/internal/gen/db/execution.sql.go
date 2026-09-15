@@ -85,7 +85,7 @@ func (q *Queries) BindAttachmentToRun(ctx context.Context, arg BindAttachmentToR
 
 const cASClaimRun = `-- name: CASClaimRun :execresult
 UPDATE runs
-SET status = 'running', started_at = CURRENT_TIMESTAMP(3),
+SET status = 'running',
     lease_epoch = lease_epoch + 1
 WHERE id = ? AND status = 'queued'
   AND (available_at IS NULL OR available_at <= CURRENT_TIMESTAMP(3))
@@ -99,6 +99,12 @@ WHERE id = ? AND status = 'queued'
 // Provider admission requeues (inflight limit / limiter outage) must not
 // burn retry budget; only BeginProviderAttemptFenced consumes an attempt,
 // immediately before the provider submit.
+//
+// NOTE (第四轮 P2): the claim does NOT stamp started_at either. started_at
+// means "this run was allowed to execute", not "a worker touched it" — a
+// run killed by the execution gate must not carry a start time it never
+// earned. The owner stamps it with MarkRunStartedFenced after the gate
+// allows the run (same point as the run.started event).
 func (q *Queries) CASClaimRun(ctx context.Context, id []byte) (sql.Result, error) {
 	return q.db.ExecContext(ctx, cASClaimRun, id)
 }
@@ -270,10 +276,13 @@ func (q *Queries) CountOrphanProviderSlots(ctx context.Context) (int64, error) {
 
 const countOutstandingRunsByUser = `-- name: CountOutstandingRunsByUser :one
 SELECT COUNT(*) AS n FROM runs
-WHERE user_id = ? AND status IN ('queued', 'running')
+WHERE user_id = ? AND status NOT IN ('cancelled', 'succeeded', 'failed')
 `
 
-// Per-user admission (评测 P1-7): queued + running runs against the cap.
+// Per-user admission (评测 P1-7): every NON-TERMINAL run counts against
+// the cap (第四轮 P2) — same predicate as CountActiveRunsByConversation, so
+// a waiting_input / waiting_external / cancelling / interrupted run can no
+// longer slip past the outstanding limit.
 func (q *Queries) CountOutstandingRunsByUser(ctx context.Context, userID sql.NullInt64) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countOutstandingRunsByUser, userID)
 	var n int64
@@ -1753,6 +1762,26 @@ UPDATE outbox_events SET status = 'published', published_at = CURRENT_TIMESTAMP(
 func (q *Queries) MarkOutboxPublished(ctx context.Context, id uint64) error {
 	_, err := q.db.ExecContext(ctx, markOutboxPublished, id)
 	return err
+}
+
+const markRunStartedFenced = `-- name: MarkRunStartedFenced :execresult
+UPDATE runs
+SET started_at = COALESCE(started_at, CURRENT_TIMESTAMP(3))
+WHERE id = ? AND status = 'running' AND lease_epoch = ?
+`
+
+type MarkRunStartedFencedParams struct {
+	ID         []byte
+	LeaseEpoch uint64
+}
+
+// Stamps started_at once, fenced by the current lease epoch, at the point
+// the run is actually allowed to execute (第四轮 P2). COALESCE keeps the
+// FIRST start time: a run deferred for a paused provider and later
+// re-claimed keeps its original start, so RunDuration measures wall-clock
+// execution rather than the last requeue.
+func (q *Queries) MarkRunStartedFenced(ctx context.Context, arg MarkRunStartedFencedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, markRunStartedFenced, arg.ID, arg.LeaseEpoch)
 }
 
 const oldestPendingOutboxAgeSeconds = `-- name: OldestPendingOutboxAgeSeconds :one

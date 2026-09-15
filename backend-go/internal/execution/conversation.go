@@ -12,7 +12,8 @@ import (
 // Conversation lifecycle errors (评测 P1).
 var (
 	// ErrConversationHasActiveRun: the conversation still has a
-	// queued/running run; deleting it would race the worker's finalize.
+	// NON-TERMINAL run (anything not cancelled/succeeded/failed —
+	// 第四轮 P2); deleting it would race the worker's finalize.
 	ErrConversationHasActiveRun = errors.New("execution: conversation has an active run")
 	// ErrConversationHasScheduledRuns: the conversation holds Runs created
 	// by the scheduler (they own an occurrence and may still owe a
@@ -27,7 +28,7 @@ var (
 // Guards (评测 P1-4 + P1 lifetime):
 //   - takes the conversations row lock first, which serializes with
 //     CreateRunInTx, so no run can appear between the checks and the delete;
-//   - refuses while a run is queued/running;
+//   - refuses while any run is non-terminal;
 //   - refuses when the conversation holds scheduler-created runs or any
 //     delivery execution: schedule_occurrences.run_id and the delivery
 //     worker's GetRunByID both depend on those rows surviving.

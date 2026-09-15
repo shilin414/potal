@@ -1,8 +1,19 @@
-import { describe, expect, it } from 'vitest';
-import { validateAttachment, ATTACHMENT_LIMITS } from '@/services/runApi';
-import { applyEvent, useRunChatStore } from '../useRunChatStore';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { validateAttachment, ATTACHMENT_LIMITS, getRun, fetchRunArtifacts } from '@/services/runApi';
+import { applyEvent, finalizeRun, useRunChatStore } from '../useRunChatStore';
 import type { RunEventRecord } from '@/services/runApi';
 import type { RunChatState } from '../useRunChatStore';
+
+// finalizeRun reconciles against GET /runs/:id; only that call is faked,
+// the pure validators above stay real.
+vi.mock('@/services/runApi', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/services/runApi')>();
+  return {
+    ...actual,
+    getRun: vi.fn(),
+    fetchRunArtifacts: vi.fn(async () => []),
+  };
+});
 
 const fiveMb = 5 * 1024 * 1024;
 const fortyMb = 40 * 1024 * 1024;
@@ -153,6 +164,59 @@ describe('applyEvent (unified event protocol rendering)', () => {
     expect(conv.activeRunId).toBeNull();
   });
 
+  // 第四轮 P1-2: run.cancelled 是管理员撤销（Hard Kill）的终态。
+  // 此前 reducer 没有该分支、finalizeRun 也只认 failed/interrupted，
+  // 于是 cancelled 被映射成 done —— 用户看到空白的“成功回答”。
+  it('run.cancelled closes the run as cancelled, not done', () => {
+    const state = reduce(
+      stateWithStream(),
+      event('run.cancelled', {
+        status: 'cancelled',
+        error_code: 'execution_disabled',
+        error_message: 'application or runtime binding was disabled before execution',
+      }),
+    );
+    const msg = state.conversations[42].messages[1];
+    expect(msg.status).toBe('cancelled');
+    expect(msg.error).toBe('应用或运行配置已停用，本次执行已取消。');
+    expect(state.conversations[42].activeRunId).toBeNull();
+  });
+
+  it('run.cancelled without a kill reason falls back to a generic notice', () => {
+    const state = reduce(stateWithStream(), event('run.cancelled', { status: 'cancelled' }));
+    expect(state.conversations[42].messages[1].status).toBe('cancelled');
+    expect(state.conversations[42].messages[1].error).toBe('执行已取消');
+  });
+
+  // 第四轮: run.deferred（Provider 暂停 / 执行检查不可用）是非终态。
+  it('run.deferred keeps the run streaming and shows a waiting notice', () => {
+    let state = stateWithStream();
+    state = reduce(state, event('content.delta', { text: '部分回答' }));
+    state = reduce(state, event('run.deferred', { reason: 'provider_disabled' }));
+    const conv = state.conversations[42];
+    expect(conv.messages[1].status).toBe('streaming');
+    expect(conv.activeRunId).toBe(runId);
+    expect(conv.messages[1].content).toBe('部分回答');
+    expect(conv.messages[1].retryNotice).toBe('服务暂时停用，等待恢复…');
+  });
+
+  it('run.deferred for an unavailable gate explains the wait', () => {
+    const state = reduce(
+      stateWithStream(),
+      event('run.deferred', { reason: 'run_gate_unavailable' }),
+    );
+    expect(state.conversations[42].messages[1].retryNotice)
+      .toBe('执行检查暂不可用，正在等待重试…');
+  });
+
+  it('run.started clears the deferred/retry notice', () => {
+    let state = stateWithStream();
+    state = reduce(state, event('run.deferred', { reason: 'provider_disabled' }));
+    expect(state.conversations[42].messages[1].retryNotice).toBeTruthy();
+    state = reduce(state, event('run.started', {}));
+    expect(state.conversations[42].messages[1].retryNotice).toBeUndefined();
+  });
+
   it('legacy run.interrupted (historical replay) renders as failure', () => {
     const state = reduce(
       stateWithStream(),
@@ -161,6 +225,59 @@ describe('applyEvent (unified event protocol rendering)', () => {
     const msg = state.conversations[42].messages[1];
     expect(msg.status).toBe('failed');
     expect(state.conversations[42].activeRunId).toBeNull();
+  });
+
+  // 第四轮 P1-2: 事件流可能没送到 run.cancelled（断线/重连），此时
+  // finalizeRun 用 GET Run 兜底 —— status=cancelled 绝不能被写成 done。
+  describe('finalizeRun (GET Run reconciliation)', () => {
+    beforeEach(() => {
+      vi.mocked(fetchRunArtifacts).mockResolvedValue([]);
+      useRunChatStore.setState({
+        ...useRunChatStore.getState(),
+        conversations: {
+          42: {
+            id: 42,
+            title: 't',
+            messages: [
+              { id: 'user-run-1', role: 'user', content: 'hi', created_at: '' },
+              {
+                id: 'run-run-1', role: 'assistant', content: '',
+                created_at: '', runId, status: 'streaming', artifacts: [],
+              },
+            ],
+            activeRunId: runId,
+          },
+        },
+      });
+    });
+
+    it('keeps a cancelled run cancelled (never done)', async () => {
+      vi.mocked(getRun).mockResolvedValue({
+        id: runId,
+        conversation: 42,
+        status: 'cancelled',
+        error_code: 'execution_disabled',
+      } as any);
+      await finalizeRun(runId);
+      const conv = useRunChatStore.getState().conversations[42];
+      expect(conv.messages[1].status).toBe('cancelled');
+      expect(conv.messages[1].error).toBe('应用或运行配置已停用，本次执行已取消。');
+      expect(conv.activeRunId).toBeNull();
+    });
+
+    it('maps a failed run to failed and a succeeded run to done', async () => {
+      vi.mocked(getRun).mockResolvedValue({
+        id: runId, conversation: 42, status: 'failed', error_message: 'boom',
+      } as any);
+      await finalizeRun(runId);
+      expect(useRunChatStore.getState().conversations[42].messages[1].status).toBe('failed');
+
+      vi.mocked(getRun).mockResolvedValue({
+        id: runId, conversation: 42, status: 'succeeded',
+      } as any);
+      await finalizeRun(runId);
+      expect(useRunChatStore.getState().conversations[42].messages[1].status).toBe('done');
+    });
   });
 
   it('re-seeds the streaming bubble when a history reload wiped it', () => {

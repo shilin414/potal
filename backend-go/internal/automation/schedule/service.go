@@ -83,6 +83,30 @@ func NewService(d *sql.DB, check ApplicationChecker, log *slog.Logger) *Service 
 
 func (s *Service) q(ctx context.Context) db.Querier { return db.New(s.DB) }
 
+// dbNow resolves "now" from MySQL (Clock Authority, 评测 §十七; 第四轮
+// P2): next_run_at and the "run_at must be in the future" check must not
+// depend on the API host's local clock — two nodes with a little clock
+// skew would otherwise compute different first slots for the same
+// schedule. Falls back to the process clock only when the DB read fails
+// (degraded, same policy as the scheduler).
+func (s *Service) dbNow(ctx context.Context) time.Time {
+	if s.DB == nil {
+		return s.nowFunc().UTC()
+	}
+	return s.dbNowTx(ctx, db.New(s.DB))
+}
+
+// dbNowTx is dbNow inside a caller-owned transaction (CREATE/UPDATE/ENABLE
+// compute the next slot under a lock, so the clock read belongs to the
+// same snapshot).
+func (s *Service) dbNowTx(ctx context.Context, q db.Querier) time.Time {
+	t, err := q.DBNow(ctx)
+	if err != nil || t.IsZero() {
+		return s.nowFunc().UTC()
+	}
+	return t.UTC()
+}
+
 // ─────────────────────────────────────────────────────────── validation ──
 
 func (in *CreateInput) defaults() {
@@ -116,7 +140,14 @@ func policyValid(kind, v string) bool { return policyValues[kind][v] }
 // validate enforces domain rules; caller identity checks happen upstream.
 // ownerUserID feeds the AuthorizeExecution gate (评测 P0-1).
 func (s *Service) validate(ctx context.Context, in *CreateInput, ownerUserID int64) error {
-	return validateInput(ctx, in, ownerUserID, s.nowFunc, s.Check)
+	return s.validateAt(ctx, in, ownerUserID, s.dbNow(ctx))
+}
+
+// validateAt validates against an explicit instant (the DB clock), so the
+// "run_at must be in the future" check and the next-slot computation of
+// the same request share ONE clock reading (第四轮 P2).
+func (s *Service) validateAt(ctx context.Context, in *CreateInput, ownerUserID int64, now time.Time) error {
+	return validateInput(ctx, in, ownerUserID, func() time.Time { return now }, s.Check)
 }
 
 func validateInput(ctx context.Context, in *CreateInput, ownerUserID int64, now func() time.Time, check ApplicationChecker) error {
@@ -186,12 +217,16 @@ func validateInput(ctx context.Context, in *CreateInput, ownerUserID int64, now 
 
 // Create inserts a schedule (enabled by default) with its deliveries in
 // one transaction. next_run_at is derived from the trigger.
+//
+// The whole request is anchored to ONE DB-clock reading (第四轮 P2):
+// validation ("run_at must be in the future") and NextRunAfter see the
+// same instant, and it is the database's instant — never the API host's.
 func (s *Service) Create(ctx context.Context, ownerUserID int64, in *CreateInput) (*Schedule, error) {
 	in.defaults()
-	if err := s.validate(ctx, in, ownerUserID); err != nil {
+	now := s.dbNow(ctx)
+	if err := s.validateAt(ctx, in, ownerUserID, now); err != nil {
 		return nil, err
 	}
-	now := s.nowFunc().UTC()
 	next, err := NextRunAfter(in.ScheduleType, in.TriggerConfig, in.RunAt, in.Timezone, now)
 	if err != nil {
 		return nil, &ValidationError{Msg: err.Error()}
@@ -530,12 +565,14 @@ func (s *Service) Update(ctx context.Context, id, userID int64, isStaff bool, in
 	// the caller (评测 P2): a staff member editing someone else's schedule
 	// must not point it at an application the owner cannot execute — that
 	// would save successfully and then fail on every fire.
-	if err := s.validate(ctx, next, cur.OwnerUserID); err != nil {
+	// DB clock, read under the locked row (第四轮 P2).
+	now := s.dbNowTx(ctx, q)
+	if err := s.validateAt(ctx, next, cur.OwnerUserID, now); err != nil {
 		return nil, err
 	}
 	// Recompute from now, from the LOCKED row's merged state; missed slots
 	// while editing are not replayed.
-	nr, err := NextRunAfter(next.ScheduleType, next.TriggerConfig, next.RunAt, next.Timezone, s.nowFunc().UTC())
+	nr, err := NextRunAfter(next.ScheduleType, next.TriggerConfig, next.RunAt, next.Timezone, now)
 	if err != nil {
 		return nil, &ValidationError{Msg: err.Error()}
 	}
@@ -611,7 +648,8 @@ func (s *Service) SetEnabled(ctx context.Context, id, userID int64, isStaff, ena
 
 	if enabled {
 		cur := FromDBRow(row)
-		nr, err := NextRunAfter(cur.ScheduleType, cur.TriggerConfig, cur.RunAt, cur.Timezone, s.nowFunc().UTC())
+		// DB clock, read under the schedules row lock (第四轮 P2).
+		nr, err := NextRunAfter(cur.ScheduleType, cur.TriggerConfig, cur.RunAt, cur.Timezone, s.dbNowTx(ctx, q))
 		if err != nil {
 			return nil, err
 		}

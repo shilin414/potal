@@ -136,10 +136,17 @@ func (s *Service) RunGateState(ctx context.Context, runID []byte) (*RunGateState
 // SAME Binding shape bindingFromRow produces.
 //
 // This is load-bearing (评测 P0): Binding.Snapshot() is frozen onto every
-// Run, and it writes timeout_seconds / config / capabilities
-// unconditionally. Dropping any of them silently zeroes the run's runtime
-// budget — a background run with timeout_seconds=0 fails immediately and
-// an interactive run loses its extended deadline.
+// Run, and it writes timeout_seconds / config unconditionally. Dropping
+// either silently zeroes the run's runtime budget — a background run with
+// timeout_seconds=0 fails immediately and an interactive run loses its
+// extended deadline.
+//
+// Field ownership, stated exactly (第四轮 P2 — the old comment claimed
+// Snapshot writes capabilities, which it does not):
+//
+//	bindingFromExecutionAuthRow restores timeout / config / capabilities;
+//	Snapshot freezes timeout / config and the runtime identity fields;
+//	capabilities stay on the Binding itself for EffectiveCapabilities().
 func bindingFromExecutionAuthRow(row db.GetExecutionAuthBundleRow) *Binding {
 	b := &Binding{
 		ID:                 int64(row.BindingID),
@@ -179,10 +186,11 @@ func (s *Service) explainRejection(ctx context.Context, applicationID int64, isS
 	if app.Kind != "chat" {
 		return ErrExecutionNotChat
 	}
-	if !app.IsPublic {
-		return ErrExecutionForbidden
-	}
-	// Enabled + public + chat: the only remaining reason is the binding.
+	// Staff bypass VISIBILITY only (第四轮 P2): a private application must
+	// still reach the binding diagnosis below — the old `!app.IsPublic`
+	// check returned a vague forbidden/404 and hid the real reason
+	// (missing binding) from exactly the people who can fix it.
+	// Enabled + chat: the only remaining reason is the binding.
 	b, err := s.EnabledBinding(ctx, applicationID)
 	if err != nil || b == nil {
 		return ErrNoBinding
