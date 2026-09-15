@@ -1,10 +1,28 @@
 # Creation Agent Studio — 项目长期记忆
 
-## Admission 状态（截至 2026-09-15 三轮复审整改后）
+## 当前状态（截至 2026-09-15 第六轮复审整改后）
 
-三轮复审 84/B+（二轮引入 P0）→ 五项已全部修复，预期回到 94~95/A（待复审确认）。基线 dev `12d98f8`。历次变更报告都在 `docs/` 下（按主题命名）。
+第六轮 90/B+ **BLOCKED**（唯一阻断项 = 0018 改写历史事件事实）→ P0 迁移 0020 + P1 SSE cancelled fallback + P2 duration 已全部修复，本机全绿，预期解除阻断回到 96/A。基线 dev `78d2793`（第五轮功能提交 `0bdcf30`）。历次变更报告都在 `docs/` 下（按主题命名）。
 
 **执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot）已定型，不要改。**
+
+### 第六轮新增约定（2026-09-15）
+- **`runs.status='interrupted'` 与 `run_events.event_type='run.interrupted'` 是两件事，永远不要合并处理**：
+  status=interrupted 是终态别名（≈failed，见 IsSettled/IsTerminal）；而 **event `run.interrupted` 是 overloaded 的**——
+  旧 `releaseInterrupted` 先写事件再判 attempt，所以 `{"reason":...}`（无 status）= retry 标记（Run 还会回来、可能成功），
+  只有旧 `Finish(StatusInterrupted)` 写的 `{"status":...}` 才是真终态。**判别信号：有 reason 且无 status → retry-origin**
+- 0018 **禁止修改**（已执行）；它的 over-conversion 由 **0020** 前向修复（reason-only → `run.retrying`；终态 run 缺 canonical terminal event 则补一条）。0020 扫描集合**不含 interrupted**（避免与 0018 竞争重复）。0020 down = `SELECT 1;`
+- 新增 migration 时 `MAX(sequence)` 一定要 `COALESCE(MAX(...),0)+1`（MAX 在空集返回 NULL）
+- **SSE synthetic terminal 必须按状态映射**：`syntheticTerminalEventName`（succeeded→completed / cancelled→cancelled / failed|interrupted→failed），未知或非 settled 返回 `ok=false` 且**不合成**——绝不允许默认 `run.completed`（会把 cancelled 变成成功）
+- **`studio_run_duration` 两端都必须取 DB 时钟**：`dbClockDuration(sql.NullTime, sql.NullTime)`；finalize 在 CAS **之后重读行**拿 finished_at（不信调用方传入的 `run.StartedAt` 快照），负值丢弃。不要再用 `time.Since`
+- finalize 写 terminal event 用 `AppendRunEventAtSequence` + `nextEventSequenceTx`（持 run 行锁下 COUNT，不再重复读）
+
+### ⚠️ 报告类「全库 COUNT 期望 0」校验的必读前车之鉴
+第六轮报告 §25 给了两条全库扫描 SQL（期望 0），第一轮跑出非零却不是迁移问题，而是**集成 fixture 残留**：
+`seedConversation` / `seedUser` 都不注册清理；用 `seedInterruptedRun` + `seedUser` 组合会把 FK 父行先删掉留下孤儿 Run；
+表驱动子测试每个都会泄一行。**跑这类校验前必须先确认/补齐 fixture 清理**，否则既可能假红也可能掩盖真回归。
+清理时用 `provider LIKE 'itest%'` + `username LIKE 'itest%'` 圈定，别误删真实数据。新增 seed helper 一律自带
+`t.Cleanup`（按 FK 顺序：events→leases→slots→outbox→run→conversation→user）。
 
 ### 硬性约定（违反会复发 P0/事故）
 - `bindingFromExecutionAuthRow` 与 `bindingFromRow` 输出形状必须一致；`Binding.Snapshot()` 无条件写 timeout/config/capabilities（回归测试 `TestAuthorizeExecutionPreservesRuntimeSnapshot` 锁定）
