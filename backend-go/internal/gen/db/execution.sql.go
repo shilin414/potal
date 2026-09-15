@@ -1246,6 +1246,36 @@ func (q *Queries) GetRunForUpdate(ctx context.Context, id []byte) (GetRunForUpda
 	return i, err
 }
 
+const getRunGateState = `-- name: GetRunGateState :one
+SELECT a.enabled AS app_enabled,
+       b.enabled AS binding_enabled,
+       p.status  AS provider_status
+FROM runs r
+LEFT JOIN applications a ON a.id = r.application_id
+LEFT JOIN runtime_bindings b ON b.id = r.runtime_binding_id
+LEFT JOIN providers p ON p.provider_key = b.provider_key
+WHERE r.id = ?
+`
+
+type GetRunGateStateRow struct {
+	AppEnabled     sql.NullBool
+	BindingEnabled sql.NullBool
+	ProviderStatus sql.NullString
+}
+
+// Execution-time kill switch (复审 P1-2): the ONLY mutable facts re-checked
+// after the claim and before any provider interaction. Deliberately does
+// NOT read runtime_snapshot — the frozen snapshot stays authoritative for
+// HOW to execute; this only answers whether the run MAY still start.
+// Semantics: missing/disabled application or binding → kill (cancel);
+// missing or inactive provider → pause (requeue, keep waiting).
+func (q *Queries) GetRunGateState(ctx context.Context, id []byte) (GetRunGateStateRow, error) {
+	row := q.db.QueryRowContext(ctx, getRunGateState, id)
+	var i GetRunGateStateRow
+	err := row.Scan(&i.AppEnabled, &i.BindingEnabled, &i.ProviderStatus)
+	return i, err
+}
+
 const getRunLeaseEpoch = `-- name: GetRunLeaseEpoch :one
 SELECT lease_epoch FROM runs WHERE id = ?
 `

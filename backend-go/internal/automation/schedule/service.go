@@ -15,6 +15,14 @@ import (
 // ErrNotFound marks missing/foreign schedules (identical to callers).
 var ErrNotFound = errors.New("schedule: not found")
 
+// ErrApplicationNotSchedulable is the POLICY refusal the ApplicationChecker
+// returns when the owner may not execute the application (复审 P1-1).
+// validate maps it to a 400-grade ValidationError; any OTHER error from
+// the checker is an infrastructure failure and propagates untouched —
+// a MySQL outage during create/update must surface as a 500, never as
+// "application is not schedulable".
+var ErrApplicationNotSchedulable = errors.New("schedule: application is not schedulable")
+
 // ErrValidation marks rejected input (maps to 400/422 upstream).
 type ValidationError struct{ Msg string }
 
@@ -162,9 +170,13 @@ func validateInput(ctx context.Context, in *CreateInput, ownerUserID int64, now 
 	}
 	if check != nil {
 		// AuthorizeExecution gate (评测 P0-1): who may run it is decided by
-		// the application, validated under the owner's identity.
+		// the application, validated under the owner's identity. Only the
+		// policy refusal becomes a ValidationError (复审 P1-1).
 		if err := check.SchedulableApplication(ctx, in.ApplicationID, ownerUserID); err != nil {
-			return &ValidationError{Msg: "application is not schedulable"}
+			if errors.Is(err, ErrApplicationNotSchedulable) {
+				return &ValidationError{Msg: "application is not schedulable"}
+			}
+			return err
 		}
 	}
 	return nil
@@ -422,11 +434,39 @@ type UpdateInput struct {
 }
 
 // Update applies the patch and recomputes next_run_at from now.
+//
+// Row-lock unification (复审 §七): the WHOLE decision — ownership,
+// merge of the patch onto the CURRENT row, validation and next_run_at
+// computation — happens inside ONE transaction that holds the schedules
+// row lock (the same GetScheduleRowForUpdate the scheduler admission
+// uses). Two concurrent PATCHes used to read the same old row in Go and
+// the later full-struct UPDATE clobbered the earlier writer's fields
+// (lost update); SetEnabled could also compute next_run_at from a stale
+// trigger_config. Rule: any business-state change to a schedule first
+// takes the schedule row lock.
 func (s *Service) Update(ctx context.Context, id, userID int64, isStaff bool, in *UpdateInput) (*Schedule, error) {
-	cur, err := s.Get(ctx, id, userID, isStaff)
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = tx.Rollback() }()
+	q := db.New(tx)
+
+	// Ownership + current state under the row lock. A soft-deleted
+	// schedule has no locked row (deleted_at IS NULL predicate) and looks
+	// exactly like a missing one.
+	row, err := q.GetScheduleRowForUpdate(ctx, uint64(id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if row.OwnerUserID != uint64(userID) && !isStaff {
+		return nil, ErrNotFound
+	}
+	cur := FromDBRow(row)
+
 	next := &CreateInput{
 		Name:                   cur.Name,
 		Description:            cur.Description,
@@ -493,7 +533,8 @@ func (s *Service) Update(ctx context.Context, id, userID int64, isStaff bool, in
 	if err := s.validate(ctx, next, cur.OwnerUserID); err != nil {
 		return nil, err
 	}
-	// Recompute from now; missed slots while editing are not replayed.
+	// Recompute from now, from the LOCKED row's merged state; missed slots
+	// while editing are not replayed.
 	nr, err := NextRunAfter(next.ScheduleType, next.TriggerConfig, next.RunAt, next.Timezone, s.nowFunc().UTC())
 	if err != nil {
 		return nil, &ValidationError{Msg: err.Error()}
@@ -513,13 +554,6 @@ func (s *Service) Update(ctx context.Context, id, userID int64, isStaff bool, in
 	if cur.ConversationID != nil && next.ConversationPolicy == ConversationReuse {
 		convArg = sql.NullInt64{Int64: *cur.ConversationID, Valid: true}
 	}
-
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	q := db.New(tx)
 	if _, err := q.UpdateSchedule(ctx, db.UpdateScheduleParams{
 		Name:                   next.Name,
 		Description:            nullString(next.Description),
@@ -552,13 +586,31 @@ func (s *Service) Update(ctx context.Context, id, userID int64, isStaff bool, in
 }
 
 // SetEnabled flips the switch; enabling recomputes next_run_at from now
-// (slots missed while disabled are not replayed).
+// (slots missed while disabled are not replayed). The decision runs under
+// the schedules row lock (复审 §七): the trigger config the next slot is
+// computed from is the committed one, and a concurrent PATCH cannot
+// interleave between the read and the enable.
 func (s *Service) SetEnabled(ctx context.Context, id, userID int64, isStaff, enabled bool) (*Schedule, error) {
-	cur, err := s.Get(ctx, id, userID, isStaff)
+	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = tx.Rollback() }()
+	q := db.New(tx)
+
+	row, err := q.GetScheduleRowForUpdate(ctx, uint64(id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if row.OwnerUserID != uint64(userID) && !isStaff {
+		return nil, ErrNotFound
+	}
+
 	if enabled {
+		cur := FromDBRow(row)
 		nr, err := NextRunAfter(cur.ScheduleType, cur.TriggerConfig, cur.RunAt, cur.Timezone, s.nowFunc().UTC())
 		if err != nil {
 			return nil, err
@@ -567,22 +619,16 @@ func (s *Service) SetEnabled(ctx context.Context, id, userID int64, isStaff, ena
 		if !nr.IsZero() {
 			nextArg = sql.NullTime{Time: nr, Valid: true}
 		}
-		tx, err := s.DB.BeginTx(ctx, nil)
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = tx.Rollback() }()
-		q := db.New(tx)
 		if _, err := q.SetScheduleEnabled(ctx, db.SetScheduleEnabledParams{Enabled: true, ID: uint64(id)}); err != nil {
 			return nil, err
 		}
 		if _, err := q.SetScheduleNextRun(ctx, db.SetScheduleNextRunParams{NextRunAt: nextArg, ID: uint64(id)}); err != nil {
 			return nil, err
 		}
-		if err := tx.Commit(); err != nil {
-			return nil, err
-		}
-	} else if _, err := s.q(ctx).SetScheduleEnabled(ctx, db.SetScheduleEnabledParams{Enabled: false, ID: uint64(id)}); err != nil {
+	} else if _, err := q.SetScheduleEnabled(ctx, db.SetScheduleEnabledParams{Enabled: false, ID: uint64(id)}); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return s.Get(ctx, id, userID, isStaff)

@@ -84,6 +84,10 @@ const (
 	AdmissionCapacityRejected = "capacity_rejected"
 	AdmissionLostOwnership    = "lost_ownership"
 	AdmissionProviderSlotLost = "provider_slot_lost"
+	// Execution-time kill switch (复审 P1-2): the gate blocked the run
+	// before any provider interaction.
+	AdmissionGateKilled = "gate_killed"
+	AdmissionGatePaused = "gate_paused"
 )
 
 func NewMetrics(service string) *Metrics {

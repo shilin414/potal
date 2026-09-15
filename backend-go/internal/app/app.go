@@ -5,6 +5,7 @@ package app
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -170,6 +171,8 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 	schedSvc := schedule.NewService(dbh, &schedulableChecker{Catalog: catalogSvc, Users: identityRepo}, log)
 	schedSvc.MaxSchedules = cfg.Runner.UserMaxSchedules
 	schedJob := scheduler.New(dbh, runs, &bindingResolver{Catalog: catalogSvc, Users: identityRepo}, log, metrics)
+	// Run-now pending cap (复审 P1-3): bounded manual queue per schedule.
+	schedJob.MaxPendingManual = cfg.Runner.UserMaxPendingManual
 
 	// Provider concurrency cap: the provider catalog row is the source of
 	// truth; AILY_MAX_INFLIGHT is only a bootstrap/default (and a
@@ -211,8 +214,15 @@ type schedulableChecker struct {
 // application — public + enabled for regular owners, anything for staff.
 // The ownerUserID parameter is authoritative (schedule.Service passes the
 // real owner on create; update passes the caller).
+//
+// Error contract (复审 P1-1): only policy refusals are reported as
+// schedule.ErrApplicationNotSchedulable (→ 400); infrastructure errors
+// propagate raw so a DB outage cannot masquerade as invalid user input.
 func (c *schedulableChecker) SchedulableApplication(ctx context.Context, appID, ownerUserID int64) error {
 	_, err := authorizeForOwner(ctx, c.Catalog, c.Users, appID, ownerUserID)
+	if executionDenied(err) {
+		return schedule.ErrApplicationNotSchedulable
+	}
 	return err
 }
 
@@ -231,8 +241,11 @@ type bindingResolver struct {
 // rules apply.
 func (r *bindingResolver) EnabledBinding(ctx context.Context, appID int64) (*scheduler.BindingView, error) {
 	exe, err := authorizeForOwner(ctx, r.Catalog, r.Users, appID, 0)
-	if err != nil {
+	if executionDenied(err) {
 		return nil, nil // not executable → scheduler treats as not schedulable
+	}
+	if err != nil {
+		return nil, err // infrastructure failure: never disguised as a denial
 	}
 	return bindingViewOf(exe), nil
 }
@@ -241,19 +254,52 @@ func (r *bindingResolver) EnabledBinding(ctx context.Context, appID int64) (*sch
 // identity (used by the scheduler's per-fire authorization).
 func (r *bindingResolver) EnabledBindingFor(ctx context.Context, appID, ownerUserID int64) (*scheduler.BindingView, error) {
 	exe, err := authorizeForOwner(ctx, r.Catalog, r.Users, appID, ownerUserID)
-	if err != nil {
+	if executionDenied(err) {
 		return nil, nil
+	}
+	if err != nil {
+		return nil, err
 	}
 	return bindingViewOf(exe), nil
 }
 
+// executionDenied reports whether err is a POLICY rejection — the
+// application/binding/provider state itself refuses execution — as
+// opposed to an infrastructure failure (MySQL down, connection pool
+// exhausted, context deadline). The scheduler treats only the former as
+// "not schedulable" (failed occurrence, slot advances); the latter must
+// abort the current tick so the SAME slot is retried on the next scan
+// (复审 P1-1). Swallowing a transient DB error used to permanently fail
+// the occurrence and lose the scheduled slot.
+func executionDenied(err error) bool {
+	return err == nil ||
+		errors.Is(err, catalog.ErrExecutionForbidden) ||
+		errors.Is(err, catalog.ErrExecutionNotFound) ||
+		errors.Is(err, catalog.ErrExecutionDisabled) ||
+		errors.Is(err, catalog.ErrExecutionNotChat) ||
+		errors.Is(err, catalog.ErrNoBinding) ||
+		errors.Is(err, catalog.ErrExecutionProviderInactive) ||
+		errors.Is(err, catalog.ErrExecutionProviderMissing)
+}
+
 // authorizeForOwner runs the unified execution gate for one owner,
-// resolving the owner's staff flag through the identity repo (unknown
-// owner → strictest non-staff rules).
+// resolving the owner's staff flag through the identity repo.
+//
+// Error classification (复审 P1-1): an unknown owner is a policy fact
+// (strictest non-staff rules apply), but a FAILED identity lookup is an
+// infrastructure error that must propagate — silently demoting a staff
+// owner to non-staff used to turn a DB outage into a fake "private app"
+// rejection, which the scheduler then treated as a permanent denial.
 func authorizeForOwner(ctx context.Context, svc *catalog.Service, users *identity.Repo, appID, ownerUserID int64) (*catalog.Executable, error) {
 	isStaff := false
 	if ownerUserID > 0 && users != nil {
-		if u, _, err := users.UserWithIdentity(ctx, ownerUserID); err == nil && u != nil {
+		u, _, err := users.UserWithIdentity(ctx, ownerUserID)
+		switch {
+		case errors.Is(err, identity.ErrNotFound):
+			// Owner gone → strictest non-staff rules (policy, not failure).
+		case err != nil:
+			return nil, err
+		case u != nil:
 			isStaff = u.IsStaff
 		}
 	}
@@ -269,6 +315,40 @@ func bindingViewOf(exe *catalog.Executable) *scheduler.BindingView {
 		ExecutionMode: b.ExecutionMode,
 		Snapshot:      b.Snapshot(),
 	}
+}
+
+// ExecutionGate adapts the catalog to the worker's execution-time kill
+// switch (复审 P1-2). It reads ONLY the mutable revocable state — one
+// indexed join — and never touches the frozen runtime snapshot.
+//
+// Classification (product decision 2026-09-15):
+//
+//	application missing/disabled          → GateKill (cancel)
+//	binding missing/disabled              → GateKill (cancel)
+//	provider missing/not active           → GatePause (requeue, keep waiting)
+//	gate query itself fails               → raw error (worker requeues as
+//	                                       an infrastructure outage)
+type ExecutionGate struct {
+	Catalog *catalog.Service
+}
+
+func NewExecutionGate(svc *catalog.Service) *ExecutionGate { return &ExecutionGate{Catalog: svc} }
+
+func (g *ExecutionGate) CheckRun(ctx context.Context, run *execution.Run) (execution.GateAction, error) {
+	st, err := g.Catalog.RunGateState(ctx, run.ID.Bytes())
+	if err != nil {
+		return "", err
+	}
+	if !st.AppEnabled.Valid || !st.AppEnabled.Bool {
+		return execution.GateKill, nil
+	}
+	if !st.BindingEnabled.Valid || !st.BindingEnabled.Bool {
+		return execution.GateKill, nil
+	}
+	if !st.ProviderStatus.Valid || st.ProviderStatus.String != "active" {
+		return execution.GatePause, nil
+	}
+	return execution.GateAllow, nil
 }
 
 // Close releases shared resources.

@@ -113,6 +113,21 @@ func (q *Queries) CountActiveOccurrencesExcluding(ctx context.Context, arg Count
 	return n, err
 }
 
+const countPendingOccurrences = `-- name: CountPendingOccurrences :one
+SELECT COUNT(*) AS n FROM schedule_occurrences
+WHERE schedule_id = ? AND status = 'pending'
+`
+
+// Run-now pending cap (复审 P1-3): pending occurrences are future work no
+// outstanding-run limit sees, so the manual queue must be bounded.
+// Counted under the schedules row lock by the caller.
+func (q *Queries) CountPendingOccurrences(ctx context.Context, scheduleID uint64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countPendingOccurrences, scheduleID)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
 const countSchedulesByOwner = `-- name: CountSchedulesByOwner :one
 SELECT COUNT(*) AS n FROM schedules WHERE owner_user_id = ? AND deleted_at IS NULL
 `

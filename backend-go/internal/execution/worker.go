@@ -46,6 +46,40 @@ var DefaultPriorityWeights = []int{7, 1, 2}
 // attempt (P0-2) and stays independent of the provider-retry backoff.
 const AdmissionRequeueDelay = time.Second
 
+// GatePauseRequeueDelay is the pause before a run blocked by the
+// execution-time gate because its PROVIDER is paused (复审 P1-2) becomes
+// claimable again. Deliberately much longer than AdmissionRequeueDelay:
+// an admin pause lasts minutes/hours, and a 1s hot loop would churn the
+// gate query (and the run's retry event stream) for nothing. It does not
+// consume a provider attempt, so the run resumes untouched once the
+// provider is reactivated.
+const GatePauseRequeueDelay = 30 * time.Second
+
+// GateAction is the decision of the execution-time kill switch (复审 P1-2):
+// the admission gate cannot stop runs that are already queued, so the
+// worker re-checks the REVOCABLE state once per claim — before any
+// provider interaction and before any provider slot is taken.
+//
+// Semantics (product decision 2026-09-15):
+//
+//	Application or binding disabled → GateKill   (cancel the run)
+//	Provider inactive/missing       → GatePause  (requeue, keep waiting)
+//	Runs already SUBMITTED to the provider are never force-killed.
+type GateAction string
+
+const (
+	GateAllow GateAction = "allow"
+	GatePause GateAction = "pause"
+	GateKill  GateAction = "kill"
+)
+
+// RunGate is the execution-time kill switch. It must be cheap (one
+// indexed read of mutable state) and must NOT recompute the runtime
+// snapshot — the snapshot is frozen at admission by design.
+type RunGate interface {
+	CheckRun(ctx context.Context, run *Run) (GateAction, error)
+}
+
 // PriorityClassOf maps a run priority to its admission class.
 func PriorityClassOf(priority string) string {
 	switch priority {
@@ -98,6 +132,10 @@ type Worker struct {
 	// instances. Slots are durable in MySQL and ownership-scoped, so the cap
 	// survives Redis restarts and worker clock skew (Phase 2).
 	ProviderSlots *ProviderSlots
+	// Gate is the execution-time kill switch (复审 P1-2). Nil disables the
+	// check (tests / delivery worker). Checked once per claim, before the
+	// provider slot is acquired and before the handler runs.
+	Gate RunGate
 	// PriorityWeights per class [interactive, retry, scheduled]; zero
 	// value falls back to DefaultPriorityWeights.
 	PriorityWeights []int
@@ -331,6 +369,50 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun, leaseRenewedA
 	// Heartbeat registration: losing the lease cancels execCtx.
 	w.trackInflight(claimed.Ownership, cancel, leaseRenewedAt)
 	defer w.trackInflight(claimed.Ownership, nil, time.Time{})
+
+	// Execution-time kill switch (复审 P1-2): the admission gate cannot
+	// reach runs that are already queued, so the claim re-checks the
+	// revocable state. Placed BEFORE the provider slot acquire — a gated
+	// run never holds capacity — and before the handler, so nothing has
+	// been submitted to the provider yet (submitted runs are never
+	// force-killed). The frozen runtime snapshot is not consulted.
+	if w.Gate != nil {
+		action, err := w.Gate.CheckRun(ctx, claimed.Run)
+		switch {
+		case err != nil:
+			// Gate unavailable = infrastructure failure: behave like every
+			// other admission outage — pause briefly, never destroy work.
+			w.Log.Warn("run gate unavailable; requeueing run",
+				"run_id", claimed.Run.ID.String(), "err", err)
+			w.requeueForAdmission(claimed, "run_gate_unavailable")
+			return
+		case action == GateKill:
+			// Application/binding disabled: hard kill — cancel the run.
+			w.recordAdmission(telemetry.AdmissionGateKilled)
+			w.Log.Info("run gate killed run (application/binding disabled)",
+				"run_id", claimed.Run.ID.String())
+			if err := w.Svc.FinalizeOwnedRun(ctx, claimed.Run, claimed.Ownership, &FinishInput{
+				Status:       StatusCancelled,
+				ErrorCode:    "execution_disabled",
+				ErrorMessage: "application or runtime binding was disabled before execution",
+			}); err != nil && err != ErrLostOwnership {
+				w.Log.Error("gate kill finalize failed", "run_id", claimed.Run.ID.String(), "err", err)
+			}
+			return
+		case action == GatePause:
+			// Provider paused: keep the run, retry later — reactivating the
+			// provider resumes it without data loss.
+			w.recordAdmission(telemetry.AdmissionGatePaused)
+			w.recordProviderAdmission("provider_disabled")
+			w.Log.Info("run gate paused run (provider inactive); requeueing",
+				"run_id", claimed.Run.ID.String(), "delay", GatePauseRequeueDelay.String())
+			if err := w.Svc.RetryOwnedRunAfter(ctx, claimed.Run, claimed.Ownership,
+				"provider_disabled", GatePauseRequeueDelay); err != nil && err != ErrLostOwnership {
+				w.Log.Error("gate pause requeue failed", "run_id", claimed.Run.ID.String(), "err", err)
+			}
+			return
+		}
+	}
 
 	if w.ProviderSlots != nil {
 		// Ownership-scoped, durable acquire: the row is keyed by the

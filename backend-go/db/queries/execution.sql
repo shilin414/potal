@@ -55,6 +55,22 @@ WHERE id = ? AND status = 'running' AND lease_epoch = ?;
 -- name: GetRunLeaseEpoch :one
 SELECT lease_epoch FROM runs WHERE id = ?;
 
+-- name: GetRunGateState :one
+-- Execution-time kill switch (复审 P1-2): the ONLY mutable facts re-checked
+-- after the claim and before any provider interaction. Deliberately does
+-- NOT read runtime_snapshot — the frozen snapshot stays authoritative for
+-- HOW to execute; this only answers whether the run MAY still start.
+-- Semantics: missing/disabled application or binding → kill (cancel);
+-- missing or inactive provider → pause (requeue, keep waiting).
+SELECT a.enabled AS app_enabled,
+       b.enabled AS binding_enabled,
+       p.status  AS provider_status
+FROM runs r
+LEFT JOIN applications a ON a.id = r.application_id
+LEFT JOIN runtime_bindings b ON b.id = r.runtime_binding_id
+LEFT JOIN providers p ON p.provider_key = b.provider_key
+WHERE r.id = ?;
+
 -- name: CASFinishRunFenced :execresult
 -- Fenced terminal transition: only the current lease epoch may finish a
 -- running run. 0 rows = already terminal (idempotent) OR lost ownership.

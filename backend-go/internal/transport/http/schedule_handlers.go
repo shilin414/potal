@@ -362,6 +362,10 @@ func (s *Server) RunScheduleNow(w http.ResponseWriter, r *http.Request, id genap
 			writeDetail(w, http.StatusNotFound, "Not found.")
 		case errors.Is(err, scheduler.ErrNotSchedulable):
 			writeDetail(w, http.StatusConflict, "application has no enabled runtime binding")
+		case errors.Is(err, scheduler.ErrPendingCapReached):
+			// 复审 P1-3: the schedule's manual queue is full.
+			writeDetail(w, http.StatusTooManyRequests,
+				"this schedule already has a queued manual trigger; try again after it runs")
 		default:
 			writeDetail(w, http.StatusConflict, err.Error())
 		}

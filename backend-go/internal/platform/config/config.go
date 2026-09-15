@@ -123,6 +123,12 @@ type RunnerConfig struct {
 	UserRunQPS         int
 	UserMaxOutstanding int
 	UserMaxSchedules   int
+	// UserMaxPendingManual caps the run-now pending queue per schedule
+	// (复审 P1-3): a run-now behind an active execution creates a PENDING
+	// occurrence that no outstanding-run limit sees, so without this cap
+	// a loop on /run-now could enqueue unbounded future work.
+	// 1 = "already queued one for you" UI semantics.
+	UserMaxPendingManual int
 }
 
 type SessionConfig struct {
@@ -206,18 +212,19 @@ func Load(searchPaths ...string) (*Config, error) {
 			RequestTimeout:       getEnvDuration("AILY_REQUEST_TIMEOUT", 30*time.Second),
 		},
 		Runner: RunnerConfig{
-			LeaseSeconds:       getEnvDuration("RUN_LEASE_SECONDS", 120*time.Second),
-			HeartbeatInterval:  getEnvDuration("RUN_LEASE_HEARTBEAT_SECONDS", 30*time.Second),
-			ClaimBatch:         getEnvInt("RUN_CLAIM_BATCH_SIZE", 10),
-			WorkerID:           getEnv("WORKER_ID", ""),
-			Concurrency:        getEnvInt("WORKER_CONCURRENCY", 10),
-			ReaperInterval:     getEnvDuration("RUN_REAPER_INTERVAL", 20*time.Second),
-			RelayInterval:      getEnvDuration("OUTBOX_RELAY_INTERVAL", 500*time.Millisecond),
-			RequeueDelay:       getEnvDuration("RUN_REQUEUE_DELAY", 5*time.Second),
-			PriorityWeights:    parseWeights(getEnv("RUN_PRIORITY_WEIGHTS", "7,1,2")),
-			UserRunQPS:         getEnvInt("RUN_USER_QPS", 5),
-			UserMaxOutstanding: getEnvInt("RUN_USER_MAX_OUTSTANDING", 20),
-			UserMaxSchedules:   getEnvInt("SCHEDULE_USER_MAX", 50),
+			LeaseSeconds:         getEnvDuration("RUN_LEASE_SECONDS", 120*time.Second),
+			HeartbeatInterval:    getEnvDuration("RUN_LEASE_HEARTBEAT_SECONDS", 30*time.Second),
+			ClaimBatch:           getEnvInt("RUN_CLAIM_BATCH_SIZE", 10),
+			WorkerID:             getEnv("WORKER_ID", ""),
+			Concurrency:          getEnvInt("WORKER_CONCURRENCY", 10),
+			ReaperInterval:       getEnvDuration("RUN_REAPER_INTERVAL", 20*time.Second),
+			RelayInterval:        getEnvDuration("OUTBOX_RELAY_INTERVAL", 500*time.Millisecond),
+			RequeueDelay:         getEnvDuration("RUN_REQUEUE_DELAY", 5*time.Second),
+			PriorityWeights:      parseWeights(getEnv("RUN_PRIORITY_WEIGHTS", "7,1,2")),
+			UserRunQPS:           getEnvInt("RUN_USER_QPS", 5),
+			UserMaxOutstanding:   getEnvInt("RUN_USER_MAX_OUTSTANDING", 20),
+			UserMaxSchedules:     getEnvInt("SCHEDULE_USER_MAX", 50),
+			UserMaxPendingManual: getEnvInt("SCHEDULE_MAX_PENDING_MANUAL", 1),
 		},
 		Session: SessionConfig{
 			TTL:        getEnvDuration("SESSION_TTL", 12*time.Hour),

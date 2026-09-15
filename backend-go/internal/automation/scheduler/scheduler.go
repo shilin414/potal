@@ -58,6 +58,10 @@ type BindingView struct {
 // ErrNotSchedulable marks an application without an enabled binding.
 var ErrNotSchedulable = errors.New("scheduler: application has no enabled runtime binding")
 
+// ErrPendingCapReached marks a run-now rejected because the schedule's
+// manual pending queue is full (复审 P1-3). Transport maps it to 429.
+var ErrPendingCapReached = errors.New("scheduler: too many queued manual triggers for this schedule")
+
 // Scheduler drives the due-scan loop.
 type Scheduler struct {
 	DB      *sql.DB
@@ -68,6 +72,13 @@ type Scheduler struct {
 
 	Interval time.Duration
 	Batch    int
+
+	// MaxPendingManual caps the run-now pending queue per schedule
+	// (复审 P1-3): a pending occurrence is future work that no
+	// outstanding-run limit sees, so a loop on /run-now could otherwise
+	// enqueue unbounded work. 0 disables the cap. Enforced under the
+	// schedules row lock, so concurrent run-nows cannot overshoot it.
+	MaxPendingManual int
 
 	nowFunc func() time.Time
 }
@@ -680,7 +691,21 @@ func (s *Scheduler) TriggerNow(ctx context.Context, scheduleID, userID int64, is
 // admitPending converts it into a run later. Runs in the caller's
 // transaction (the schedules row lock is already held — the pending row
 // and the active check are serialized together).
+//
+// Pending cap (复审 P1-3): the count runs under the same lock, so N
+// concurrent run-nows can never all observe the same "0 pending" and
+// overshoot MaxPendingManual — exactly the pattern the per-user schedule
+// quota uses.
 func (s *Scheduler) enqueuePendingOccurrenceTx(ctx context.Context, q db.Querier, sch *schedule.Schedule, now time.Time) (db.ScheduleOccurrence, error) {
+	if s.MaxPendingManual > 0 {
+		n, err := q.CountPendingOccurrences(ctx, uint64(sch.ID))
+		if err != nil {
+			return db.ScheduleOccurrence{}, err
+		}
+		if n >= int64(s.MaxPendingManual) {
+			return db.ScheduleOccurrence{}, ErrPendingCapReached
+		}
+	}
 	if _, err := q.CreateScheduleOccurrence(ctx, db.CreateScheduleOccurrenceParams{
 		ScheduleID: uint64(sch.ID), ScheduledAt: now,
 	}); err != nil {

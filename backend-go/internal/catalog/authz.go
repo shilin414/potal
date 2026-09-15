@@ -106,6 +106,32 @@ func (s *Service) AuthorizeExecution(ctx context.Context, applicationID, userID 
 	}, nil
 }
 
+// RunGateState is the mutable execution-permission state of one run,
+// read by the worker's execution-time kill switch (复审 P1-2). NULL
+// joined rows mean the referenced application/binding/provider no longer
+// exists — the caller fails closed on those.
+type RunGateState struct {
+	AppEnabled     sql.NullBool
+	BindingEnabled sql.NullBool
+	ProviderStatus sql.NullString
+}
+
+// RunGateState loads the gate facts for one run (by raw BINARY(16) id).
+// It deliberately reads NOTHING from runtime_snapshot: the frozen
+// snapshot decides HOW a run executes; this decides only whether it may
+// still start.
+func (s *Service) RunGateState(ctx context.Context, runID []byte) (*RunGateState, error) {
+	row, err := s.repo().q(ctx).GetRunGateState(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	return &RunGateState{
+		AppEnabled:     row.AppEnabled,
+		BindingEnabled: row.BindingEnabled,
+		ProviderStatus: row.ProviderStatus,
+	}, nil
+}
+
 // bindingFromExecutionAuthRow converts the authorization row into the
 // SAME Binding shape bindingFromRow produces.
 //

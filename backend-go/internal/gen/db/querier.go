@@ -85,6 +85,10 @@ type Querier interface {
 	CountOrphanProviderSlots(ctx context.Context) (int64, error)
 	// Per-user admission (评测 P1-7): queued + running runs against the cap.
 	CountOutstandingRunsByUser(ctx context.Context, userID sql.NullInt64) (int64, error)
+	// Run-now pending cap (复审 P1-3): pending occurrences are future work no
+	// outstanding-run limit sees, so the manual queue must be bounded.
+	// Counted under the schedules row lock by the caller.
+	CountPendingOccurrences(ctx context.Context, scheduleID uint64) (int64, error)
 	CountPendingOutbox(ctx context.Context) (int64, error)
 	// Invariant B: a queued run must NOT hold a lease.
 	CountQueuedWithLease(ctx context.Context) (int64, error)
@@ -278,6 +282,13 @@ type Querier interface {
 	// retry / recovery). Returns the lease_epoch so the caller can verify
 	// the fence under the lock.
 	GetRunForUpdate(ctx context.Context, id []byte) (GetRunForUpdateRow, error)
+	// Execution-time kill switch (复审 P1-2): the ONLY mutable facts re-checked
+	// after the claim and before any provider interaction. Deliberately does
+	// NOT read runtime_snapshot — the frozen snapshot stays authoritative for
+	// HOW to execute; this only answers whether the run MAY still start.
+	// Semantics: missing/disabled application or binding → kill (cancel);
+	// missing or inactive provider → pause (requeue, keep waiting).
+	GetRunGateState(ctx context.Context, id []byte) (GetRunGateStateRow, error)
 	GetRunLeaseEpoch(ctx context.Context, id []byte) (uint64, error)
 	GetRunStatus(ctx context.Context, id []byte) (string, error)
 	GetScheduleByID(ctx context.Context, id uint64) (Schedule, error)

@@ -97,6 +97,7 @@ func main() {
 			ScanEvery:       cfg.Runner.ReaperInterval,
 			Log:             logger,
 			ProviderSlots:   a.ProviderSlots,
+			Gate:            app.NewExecutionGate(a.Catalog),
 			PriorityWeights: cfg.Runner.PriorityWeights,
 		}
 		wg.Add(1)

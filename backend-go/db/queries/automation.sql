@@ -171,6 +171,13 @@ WHERE run_id = ? AND status IN ('queued', 'running');
 SELECT COUNT(*) AS n FROM schedule_occurrences
 WHERE schedule_id = ? AND status IN ('pending', 'queued', 'running');
 
+-- name: CountPendingOccurrences :one
+-- Run-now pending cap (复审 P1-3): pending occurrences are future work no
+-- outstanding-run limit sees, so the manual queue must be bounded.
+-- Counted under the schedules row lock by the caller.
+SELECT COUNT(*) AS n FROM schedule_occurrences
+WHERE schedule_id = ? AND status = 'pending';
+
 -- name: CountActiveOccurrencesExcluding :one
 -- Admission check for a pending occurrence: does anything OTHER than
 -- itself still hold the schedule's execution slot (queued/running)?
