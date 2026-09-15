@@ -5,7 +5,7 @@
 第七轮 97/A（P0=0，P1=1，P2=2）→ 报告 §二十四 批次一/二 **全部完成**：P1 SSE terminal replay 立即关闭、P2-1 duration metric post-commit、P2-2 前端同 chunk 终态停止，本机全绿（后端单测+集成 60.1s、前端 tsc/vitest 131/vite build）。报告预期三件套后该块达 98/A+。
 基线 dev `fc255f5`（第六轮功能提交 `ecbc83f`）。变更报告按主题命名放 `docs/`。
 
-推送后 CI 首轮红（integration / `TestExecutionFencingMatrix`）→ 定位到一条**独立于三件套的缺陷**：同毫秒续约被读成所有权丢失（见下面「事务与时钟」第一条），已修复 + 确定性反证，作为**附加项**记在变更报告 §六。
+推送后 CI 首轮红（integration / `TestExecutionFencingMatrix`）→ 定位到一条**独立于三件套的缺陷**：同毫秒续约被读成所有权丢失（见下面「事务与时钟」第一条），已修复 + 确定性反证，作为**附加项**记在变更报告 §六。修复推送后 CI 全绿（backend run 34956053704：check 含 `-race` + integration 全 success；frontend 无改动未重跑）。当前 dev HEAD `a7889db`。
 
 **执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot）已定型。**
 第七轮报告明确：三件套完成后，**停止**对 Gate1/Gate2/Provider submit boundary/Lease fencing/Retry·Defer/Schedule admission/legacy interrupted migration 继续微调；下轮转向新架构风险（client_request_id 幂等、SSE Hub、长历史 event 分页、Worker dispatcher、Conversation 生命周期、前端长对话性能）。
