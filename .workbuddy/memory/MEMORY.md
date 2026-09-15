@@ -1,7 +1,7 @@
 # Creation Agent Studio — 项目长期记忆
 
 ## 当前状态
-- 仓库 `shilin414/potal`，分支 `dev`。第九轮专项整改的**批次一–三**已完成（P0-1/P0-2 闭环 + P1-1/P1-3/P1-4 落地），本机全绿，报告见 `docs/potal 第九轮专项整改变更报告（…）.md`。
+- 仓库 `shilin414/potal`，分支 `dev`。第九轮专项整改的**批次一–三**已完成（P0-1/P0-2 闭环 + P1-1/P1-3/P1-4 落地），本机全绿，提交 `b81ee8f`。CI 全绿：backend run **34983530376**（`check` 含 `-race` + `integration` 含二次迁移 no-op）、frontend run **34983530457**。报告见 `docs/potal 第九轮专项整改变更报告（…）.md`。
 - 第八轮起执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot）**定型冻结**，不再微调 Gate/Lease/ProviderSlot/Retry·Defer/SSE terminal。
 - migration version 基线 = **23**（0021 run_requests / 0022 provider_submissions / 0023 next_event_sequence）。0018/0019/0020 禁止修改。
 - **仍开放（批次四–七）**：SSE Hub 多连接、Worker Dispatcher（poller→dispatcher + claim 后即 ACK）、Conversation lifecycle（generation / 异步 purge）、message keyset 分页 + sidebar 冗余字段、前端长对话（active turn 隔离 / 虚拟列表 / rAF 批处理 / smart auto-scroll）。
