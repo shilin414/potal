@@ -16,6 +16,7 @@ import {
   createRun,
   fetchRunArtifacts,
   getRun,
+  newClientRequestId,
 } from '@/services/runApi';
 import { openRunStream } from '@/services/runStream';
 import { useConversationStore } from './useConversationStore';
@@ -88,6 +89,13 @@ export interface RunChatState {
     conversationId?: number | null;
     content: string;
     attachments?: { id: string; name: string }[];
+    /**
+     * Retry of a previous send with the SAME id (第九轮 P0-1). Omit it for a
+     * new send action; the store keeps the id of the last failed attempt and
+     * reuses it automatically when the retried payload is identical, so a
+     * manual retry after a lost response replays instead of duplicating.
+     */
+    clientRequestId?: string;
   }) => Promise<number | null>;
   clearError: () => void;
 }
@@ -110,6 +118,48 @@ function cancelledNotice(errorCode?: string): string {
 
 function emptyConversation(id: number, title = ''): ConversationChat {
   return { id, title, messages: [], activeRunId: null };
+}
+
+/**
+ * The idempotency identity of the LAST send that failed (第九轮 P0-1).
+ *
+ * It exists so a manual retry is a replay rather than a second turn. The
+ * hazard it closes is invisible from the UI's side: when POST /v2/runs
+ * commits but the response is lost (timeout, proxy reset), the user sees
+ * "发送失败" and clicks send again — with a fresh id that creates a second
+ * run, a second user message and a second provider chat for one message.
+ *
+ * The identity is released as soon as the send SUCCEEDS: from that point the
+ * action is over, so the next click is a new action and gets a new id. Two
+ * rapid clicks of the same text therefore produce two identities, which the
+ * backend resolves properly (the second is refused with 409
+ * "previous turn is still running" while the first is live) — deliberately
+ * NOT by silently swallowing the second click, which would be
+ * indistinguishable from dropping a real message.
+ *
+ * A caller that owns its own retry loop can pass `clientRequestId` explicitly
+ * and keep the identity itself.
+ *
+ * Kept in a module-level slot rather than in the store so it survives a
+ * component remount and never leaks into persisted state.
+ */
+let pendingSend: { fingerprint: string; clientRequestId: string } | null = null;
+
+/** Identifies a send ACTION: same fields ⇒ the same user intent. */
+function sendFingerprint(
+  applicationId: number,
+  conversationId: number | null,
+  content: string,
+  attachmentIds: string[],
+): string {
+  // Attachment ORDER is not part of the intent, so it is normalized away —
+  // the backend hashes the same set the same way.
+  return JSON.stringify([
+    applicationId,
+    conversationId || 0,
+    content,
+    [...attachmentIds].sort(),
+  ]);
 }
 
 export const useRunChatStore = create<RunChatState>()((set, get) => ({
@@ -171,15 +221,29 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
 
   clearError: () => set({ error: null }),
 
-  sendMessage: async ({ applicationId, conversationId, content, attachments }) => {
+  sendMessage: async ({
+    applicationId, conversationId, content, attachments, clientRequestId,
+  }) => {
     set({ error: null });
+    const attachmentIds = attachments?.map((a) => a.id) || [];
+    const fingerprint = sendFingerprint(applicationId, conversationId || null, content, attachmentIds);
+    // Same action → same id. Only a request the user actually CHANGED gets a
+    // new identity, which is exactly the boundary the backend enforces.
+    const requestId = clientRequestId
+      || (pendingSend && pendingSend.fingerprint === fingerprint
+        ? pendingSend.clientRequestId
+        : newClientRequestId());
     let run: RunRecord;
     try {
       run = await createRun(applicationId, content, {
         conversationId: conversationId || null,
-        attachmentIds: attachments?.map((a) => a.id) || [],
+        attachmentIds,
+        clientRequestId: requestId,
       });
+      pendingSend = null;
     } catch (error: any) {
+      // Remember the identity so the retry replays instead of duplicating.
+      pendingSend = { fingerprint, clientRequestId: requestId };
       const detail = error?.response?.data
         ? (typeof error.response.data === 'string' ? error.response.data
           : Object.values(error.response.data)[0])
@@ -207,22 +271,28 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
       artifacts: [],
     };
 
-    set((state) => ({
-      conversations: {
-        ...state.conversations,
-        [cid]: {
-          ...(state.conversations[cid] || emptyConversation(cid)),
-          messages: [
-            ...(state.conversations[cid]?.messages || []),
-            userMsg,
-            assistantMsg,
-          ],
-          activeRunId: run.id,
+    set((state) => {
+      const conv = state.conversations[cid] || emptyConversation(cid);
+      // An IDEMPOTENT REPLAY returns a run whose messages this store may
+      // already hold (the earlier attempt did commit; only its response was
+      // lost). Inserting them again would show the same turn twice, so the
+      // optimistic insert is keyed on the run id.
+      const alreadyPresent = conv.messages.some((m) => m.id === userMsg.id);
+      return {
+        conversations: {
+          ...state.conversations,
+          [cid]: {
+            ...conv,
+            messages: alreadyPresent
+              ? conv.messages
+              : [...conv.messages, userMsg, assistantMsg],
+            activeRunId: run.id,
+          },
         },
-      },
-      activeConversationId: cid,
-      lastConversationId: cid,
-    }));
+        activeConversationId: cid,
+        lastConversationId: cid,
+      };
+    });
 
     refreshSidebarDebounced();
     consumeRunEvents(run.id);
@@ -274,9 +344,12 @@ export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<
         message.content += event.payload?.text || '';
         break;
       case 'content.chunk':
-        // Persisted coalesced chunk: carries a cumulative `snapshot` when
-        // available (replace = self-healing, no dup on replay), else the
-        // incremental text (append).
+        // Persisted coalesced chunk. Since 第九轮 P1-4 the backend writes only
+        // the INCREMENTAL text plus an end offset — carrying the cumulative
+        // answer on every chunk made a run's durable event data quadratic in
+        // the answer length. The `snapshot` branch is kept because historical
+        // events (written before this round) still carry one, and for those
+        // replace is self-healing.
         if (typeof event.payload?.snapshot === 'string') {
           message.content = event.payload.snapshot;
         } else {
@@ -342,6 +415,17 @@ export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<
           message.retryNotice = attempt > 0
             ? `执行中断（${reason}），正在进行第 ${attempt + 1} 次尝试…`
             : '执行中断，正在重试…';
+        }
+        break;
+      case 'run.waiting_external':
+        // NON-terminal park (第九轮 P0-2): the provider may already have
+        // received the request and cannot be asked, so the run is suspended
+        // rather than retried. The stream stays open, the run keeps its
+        // conversation, and the backend resolves it (or fails it with
+        // provider_submit_unknown) after a bounded grace window — so this is
+        // a "waiting", never a silent infinite spinner with no explanation.
+        if (message.status === 'streaming') {
+          message.retryNotice = '请求结果待确认，正在等待外部响应…';
         }
         break;
       case 'run.interrupted':

@@ -86,6 +86,14 @@ const (
 	EventRunRetrying        = "run.retrying"
 	EventRunPoll            = "run.poll"
 
+	// EventRunWaitingExternal is the PARKED marker (第九轮 P0-2): the run has
+	// been suspended because a provider submit may have been delivered and
+	// cannot be confirmed. It is NON-terminal on purpose — the run is not
+	// finished, it is waiting for a resolution — so it must NOT be added to
+	// IsTerminalEventName and must NOT be treated as a terminal status by
+	// admission (`waiting_external` is a live state, like waiting_input).
+	EventRunWaitingExternal = "run.waiting_external"
+
 	// EventRunInterrupted is the LEGACY terminal event emitted by the old
 	// retry path. It is kept only so historical replayed events still
 	// resolve; new code never emits it (retry uses run.retrying, terminal

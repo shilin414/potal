@@ -625,6 +625,14 @@ func (w *Worker) scanLoop(ctx context.Context) {
 			if n, err := w.Svc.RecoverExpiredLeases(ctx, 100); err == nil && n > 0 {
 				w.Log.Info("reaper recovered runs", "count", n)
 			}
+			// Parked provider submissions (第九轮 P0-2): a run whose submit
+			// could not be confirmed holds its conversation and its per-user
+			// outstanding slot until it is resolved, so resolution cannot be
+			// left to an operator alone — a bounded grace, then the honest
+			// verdict (failed / provider_submit_unknown).
+			if n, err := w.Svc.ExpireParkedExternalRuns(ctx, 50); err == nil && n > 0 {
+				w.Log.Info("resolved parked provider submissions", "count", n)
+			}
 			// Provider slot hygiene: expired slots are already ignored on
 			// every read; this bounds table growth.
 			if w.ProviderSlots != nil {

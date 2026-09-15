@@ -206,6 +206,20 @@ type ProviderExecutionSlot struct {
 	ExpiresAt   time.Time
 }
 
+type ProviderSubmission struct {
+	RunID          []byte
+	SubmissionNo   uint32
+	Provider       string
+	IdempotencyKey string
+	RequestHash    []byte
+	State          string
+	Attempt        uint32
+	ExternalRunID  string
+	LastError      sql.NullString
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
 type QuotaPolicy struct {
 	ID         uint64
 	Scope      string
@@ -248,6 +262,7 @@ type Run struct {
 	Priority             string
 	AvailableAt          sql.NullTime
 	LeaseEpoch           uint64
+	NextEventSequence    uint64
 }
 
 type RunArtifact struct {
@@ -298,6 +313,14 @@ type RunLease struct {
 	HeartbeatAt sql.NullTime
 	ExpiresAt   time.Time
 	LeaseEpoch  uint64
+}
+
+type RunRequest struct {
+	UserID          uint64
+	ClientRequestID string
+	RunID           []byte
+	RequestHash     []byte
+	CreatedAt       time.Time
 }
 
 type RuntimeAttachment struct {

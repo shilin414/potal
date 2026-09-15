@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -86,28 +87,70 @@ func TestThreeAdmissionRequeuesStillLeavesAttemptZero(t *testing.T) {
 	}
 }
 
-// TestProviderAttemptConsumesAttemptAndIsFenced: only the owner may begin
-// a provider attempt, and it consumes exactly one unit of budget.
-func TestProviderAttemptConsumesAttemptAndIsFenced(t *testing.T) {
+// TestProviderSubmissionConsumesAttemptAndIsFenced: only the owner may begin a
+// provider submission, it consumes exactly one unit of budget, and a SECOND
+// begin is REFUSED while the first submission's fate is unknown (第九轮 P0-2).
+//
+// The refusal is the whole point of the state machine. The previous contract
+// ("begin attempt twice → attempt 2") was only correct if a resubmit were
+// harmless, which it is not: the provider may already hold the first request,
+// and a second POST creates a second provider chat. Attempt budget therefore
+// advances only along an outcome the provider has DEFINITIVELY answered.
+func TestProviderSubmissionConsumesAttemptAndIsFenced(t *testing.T) {
 	svc, _ := testEnv(t)
 	ctx := context.Background()
-	runID := seedRun(t, svc, "itest_admission")
+	provider := "itest_admission"
+	runID := seedRun(t, svc, provider)
 
 	claimed, won, err := svc.ClaimRun(ctx, runID, "worker-a", time.Minute)
 	if err != nil || !won {
 		t.Fatalf("claim: won=%v err=%v", won, err)
 	}
-	attempt, err := svc.BeginProviderAttemptOwned(ctx, claimed.Ownership)
+	sub, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, submissionFixtureHash(provider))
 	if err != nil {
-		t.Fatalf("begin attempt: %v", err)
+		t.Fatalf("begin submission: %v", err)
 	}
-	if attempt != 1 {
-		t.Fatalf("attempt = %d, want 1", attempt)
+	if sub.Attempt != 1 {
+		t.Fatalf("attempt = %d, want 1", sub.Attempt)
 	}
-	attempt, err = svc.BeginProviderAttemptOwned(ctx, claimed.Ownership)
-	if err != nil || attempt != 2 {
-		t.Fatalf("second begin: attempt=%d err=%v, want 2", attempt, err)
+	if sub.State != execution.SubmissionSending {
+		t.Fatalf("state = %q, want %q (a fresh submission is in flight)", sub.State, execution.SubmissionSending)
 	}
+	if sub.IdempotencyKey == "" {
+		t.Fatal("a submission must carry a stable provider idempotency key")
+	}
+	if !strings.HasSuffix(sub.IdempotencyKey, ":submit:1") {
+		t.Fatalf("idempotency key = %q, want the stable ...:submit:1 form", sub.IdempotencyKey)
+	}
+
+	// Second begin while the first is unresolved: the request may already be
+	// at the provider, so transmitting again is forbidden.
+	if _, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, submissionFixtureHash(provider)); !errors.Is(err, execution.ErrProviderSubmitUnknown) {
+		t.Fatalf("second begin over an unresolved submission: err=%v, want ErrProviderSubmitUnknown", err)
+	}
+	// The refusal must not have advanced the budget either.
+	if run, rerr := svc.GetRun(ctx, runID); rerr != nil || run.Attempt != 1 {
+		t.Fatalf("attempt after a refused begin = %d (err=%v), want 1", run.Attempt, rerr)
+	}
+
+	// A DEFINITIVE provider refusal is different: nothing exists on the
+	// provider side, so the submission re-opens — and only then does a new
+	// attempt get consumed.
+	if err := svc.MarkSubmissionStateOwned(ctx, claimed.Ownership, sub, execution.SubmissionRejected, "refused by provider"); err != nil {
+		t.Fatalf("mark rejected: %v", err)
+	}
+	sub2, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, submissionFixtureHash(provider))
+	if err != nil {
+		t.Fatalf("begin after a definitive refusal: %v", err)
+	}
+	if sub2.Attempt != 2 {
+		t.Fatalf("attempt after a definitive refusal = %d, want 2", sub2.Attempt)
+	}
+	if sub2.IdempotencyKey != sub.IdempotencyKey {
+		t.Fatalf("idempotency key changed across retries (%q → %q): the key must stay STABLE "+
+			"across transport retries of one external action", sub.IdempotencyKey, sub2.IdempotencyKey)
+	}
+
 	// A stale worker (reclaimed attempt → older epoch) can never consume
 	// the new owner's budget: the lease EPOCH is the write fence.
 	// (The token is not re-checked here on purpose — epoch and token are
@@ -119,18 +162,19 @@ func TestProviderAttemptConsumesAttemptAndIsFenced(t *testing.T) {
 		LeaseEpoch: claimed.Ownership.LeaseEpoch + 1,
 		LeaseToken: claimed.Ownership.LeaseToken,
 	}
-	if _, err := svc.BeginProviderAttemptOwned(ctx, stale); !errors.Is(err, execution.ErrLostOwnership) {
-		t.Fatalf("stale begin attempt: err=%v, want ErrLostOwnership", err)
+	if _, err := svc.BeginProviderSubmissionOwned(ctx, stale, provider, submissionFixtureHash(provider)); !errors.Is(err, execution.ErrLostOwnership) {
+		t.Fatalf("stale begin submission: err=%v, want ErrLostOwnership", err)
 	}
 }
 
 // TestProviderAttemptExhaustionIsExplicit: once the budget is used up the
-// attempt call fails with ErrProviderAttemptsExhausted so the executor
+// submission call fails with ErrProviderAttemptsExhausted so the executor
 // fails the run instead of looping.
 func TestProviderAttemptExhaustionIsExplicit(t *testing.T) {
 	svc, _ := testEnv(t)
 	ctx := context.Background()
-	runID := seedRun(t, svc, "itest_admission")
+	provider := "itest_admission"
+	runID := seedRun(t, svc, provider)
 	if _, err := svc.DB.ExecContext(ctx,
 		`UPDATE runs SET attempt = max_attempts WHERE id = ?`, runID.Bytes()); err != nil {
 		t.Fatal(err)
@@ -139,8 +183,18 @@ func TestProviderAttemptExhaustionIsExplicit(t *testing.T) {
 	if err != nil || !won {
 		t.Fatalf("claim: won=%v err=%v", won, err)
 	}
-	if _, err := svc.BeginProviderAttemptOwned(ctx, claimed.Ownership); !errors.Is(err, execution.ErrProviderAttemptsExhausted) {
-		t.Fatalf("begin attempt on exhausted budget: err=%v, want ErrProviderAttemptsExhausted", err)
+	// The budget check runs BEFORE any submission row is touched, so an
+	// exhausted run can never even record an intent to transmit.
+	if _, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, submissionFixtureHash(provider)); !errors.Is(err, execution.ErrProviderAttemptsExhausted) {
+		t.Fatalf("begin submission on exhausted budget: err=%v, want ErrProviderAttemptsExhausted", err)
+	}
+	var n int
+	if err := svc.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM provider_submissions WHERE run_id = ?`, runID.Bytes()).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("provider_submissions rows = %d, want 0 (an exhausted run must not record a submission)", n)
 	}
 }
 

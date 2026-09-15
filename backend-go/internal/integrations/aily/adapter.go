@@ -92,6 +92,20 @@ var allowedFileExts = map[string]bool{"png": true, "jpg": true, "jpeg": true, "p
 
 func (a *AgentAdapter) Key() string { return ProviderKey + ":agent" }
 
+// SubmitIdempotency reports the weakest class on purpose (第九轮 P0-2).
+//
+// The Aily custom-agent API exposes `POST /agents/:agent_id/chats` with no
+// idempotency key and no request-key lookup: a chat can only be resolved by
+// the `agent_chat_id` the create call returned, and that id is exactly what
+// is missing when the outcome is unknown. So a resend after an ambiguous
+// failure is an INDEPENDENT second chat — it cannot be deduplicated by the
+// provider.
+//
+// Returning "none" makes the executor park the run in waiting_external
+// instead of retrying. A future adapter whose provider does accept a key
+// implements catalog.IdempotencyAware and returns IdempotencyNative.
+func (a *AgentAdapter) SubmitIdempotency() catalog.IdempotencyClass { return catalog.IdempotencyNone }
+
 func (a *AgentAdapter) Capabilities() catalog.Capabilities { return a.capables }
 
 func (a *AgentAdapter) DisplayLabel() string      { return "飞书 Aily 自定义智能体" }
@@ -173,6 +187,10 @@ func (a *AgentAdapter) Submit(ctx context.Context, in *catalog.SubmitInput) (*ca
 // ValidateSubmit. It performs no local work, so the caller can place the
 // pre-submit kill switch immediately before it: after this call the only
 // remaining steps are the attempt CAS and the HTTP request.
+//
+// in.ProviderIdempotencyKey is intentionally NOT sent: the Aily API has no
+// field to carry it (see SubmitIdempotency). Passed through the neutral
+// contract anyway so the executor's call shape is provider-independent.
 func (a *AgentAdapter) SubmitPrepared(ctx context.Context, in *catalog.SubmitInput) (*catalog.SubmitResult, error) {
 	chatID, sessionID, err := a.api.StartChat(ctx, in.ExternalResourceID, in.Auth.Token,
 		contentFromPayload(in.Payload), in.ExternalAttachmentIDs, in.SessionID)

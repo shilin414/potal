@@ -53,6 +53,13 @@ type submitRecorder struct {
 	// goroutine) so the test can observe the run state at the exact
 	// moment the provider receives the request.
 	onSubmit func(kind string)
+
+	// streamErr / chatErr make the fake fail like a real transport. They are
+	// what the 第九轮 submit-boundary tests need: the executor's decision
+	// about a FAILED submit (retry vs park) can only be observed if the
+	// provider call can fail with a specific APIError kind.
+	streamErr error
+	chatErr   error
 }
 
 // cannedSSE is a minimal stream: it carries the chat identity and then
@@ -78,9 +85,13 @@ func (r *submitRecorder) counted() (int, int) {
 func (r *submitRecorder) StartChat(ctx context.Context, agentID, token string, contentItems []map[string]any, attachmentIDs []string, sessionID string) (string, string, error) {
 	r.mu.Lock()
 	r.startChats++
+	fail := r.chatErr
 	r.mu.Unlock()
 	if h := r.hook("start_chat"); h != nil {
 		h()
+	}
+	if fail != nil {
+		return "", "", fail
 	}
 	return "chat-1", "sess-1", nil
 }
@@ -89,9 +100,13 @@ func (r *submitRecorder) OpenStreamChat(ctx context.Context, agentID, token stri
 	r.mu.Lock()
 	r.openStreams++
 	body := r.streamBody
+	fail := r.streamErr
 	r.mu.Unlock()
 	if h := r.hook("open_stream"); h != nil {
 		h()
+	}
+	if fail != nil {
+		return nil, fail
 	}
 	return io.NopCloser(strings.NewReader(body)), nil
 }

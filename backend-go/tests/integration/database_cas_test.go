@@ -224,7 +224,7 @@ func (h countingHandler) Execute(ctx context.Context, claimed *execution.Claimed
 // TestLeaseExpiryAndReaper: a claimed run whose worker dies (lease never
 // renewed) is requeued by the reaper with its PROVIDER ATTEMPTS retained,
 // and fails once attempts are exhausted. attempt counts provider
-// executions (BeginProviderAttemptOwned), never claims (P0-2).
+// executions (BeginProviderSubmissionOwned), never claims (P0-2).
 func TestLeaseExpiryAndReaper(t *testing.T) {
 	svc, _ := testEnv(t)
 	ctx := context.Background()
@@ -234,10 +234,10 @@ func TestLeaseExpiryAndReaper(t *testing.T) {
 	if err != nil || !won {
 		t.Fatalf("claim: won=%v err=%v", won, err)
 	}
-	// The worker reached the provider, then died.
-	if _, err := svc.BeginProviderAttemptOwned(ctx, claimed.Ownership); err != nil {
-		t.Fatalf("begin provider attempt: %v", err)
-	}
+	// The worker reached the provider (which DEFINITIVELY refused the
+	// request), then died. A definitive refusal is the only outcome that
+	// leaves the submission re-transmittable (第九轮 P0-2).
+	beginSubmissionRefused(t, svc, claimed.Ownership, claimed.Run.Provider)
 	// Simulate the worker dying: force the lease into the past.
 	if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
 		t.Fatalf("force expire: %v", err)
@@ -267,9 +267,7 @@ func TestLeaseExpiryAndReaper(t *testing.T) {
 		if err != nil || !won {
 			t.Fatalf("reclaim %d: won=%v err=%v", i, won, err)
 		}
-		if _, err := svc.BeginProviderAttemptOwned(ctx, claimed.Ownership); err != nil {
-			t.Fatalf("begin provider attempt %d: %v", i, err)
-		}
+		beginSubmissionRefused(t, svc, claimed.Ownership, claimed.Run.Provider)
 		if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
 			t.Fatal(err)
 		}

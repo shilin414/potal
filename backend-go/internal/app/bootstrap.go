@@ -37,6 +37,6 @@ func NewServer(cfg *config.Config, a *App) *transporthttp.Server {
 		Schedules: a.Schedules,
 		Scheduler: a.Scheduler,
 
-		SSE: &sse.Gateway{Runs: a.Runs, Redis: a.Redis},
+		SSE: &sse.Gateway{Runs: a.Runs, Redis: a.Redis, Metrics: a.Metrics},
 	}
 }

@@ -177,3 +177,166 @@ describe('openRunStream same-chunk terminal boundary', () => {
     expect(events).toEqual(['run.retrying', 'run.completed']);
   });
 });
+
+/**
+ * 第九轮 P1-1/P1-2: the durable cursor.
+ *
+ * Reconnecting used to ask for the run from sequence 0 every time, so a long
+ * answer was re-rendered from the beginning on every transport hiccup. The
+ * gateway now tags durable frames with `id: <sequence>`, the client keeps the
+ * highest sequence it has dispatched, and the resume must carry it — with a
+ * local dedupe covering the overlap.
+ *
+ * The dedupe is not cosmetic once chunks are INCREMENTAL (P1-4): a replayed
+ * chunk fed to the reducer twice appends its text twice, so the duplicate is
+ * visible output rather than a harmless rewrite.
+ */
+describe('openRunStream durable cursor', () => {
+  /** Each call returns the next scripted response; URLs are recorded. */
+  function mockFetchSequence(responses: string[][], urls: string[]) {
+    const encoder = new TextEncoder();
+    let call = 0;
+    const fetchMock = vi.fn(async (input: unknown) => {
+      urls.push(String(input));
+      const chunks = responses[Math.min(call, responses.length - 1)] || [];
+      call += 1;
+      const remaining = chunks.slice();
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          const next = remaining.shift();
+          if (!next) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(encoder.encode(next));
+        },
+      });
+      return { ok: true, status: 200, body: stream } as unknown as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('reconnects from the highest durable sequence it already dispatched', async () => {
+    vi.useFakeTimers();
+    const urls: string[] = [];
+    mockFetchSequence(
+      [
+        [frame('content.delta', 1, { text: 'a' }), frame('content.chunk', 2, { text: 'b' })],
+        [frame('run.completed', 3, {})],
+      ],
+      urls,
+    );
+
+    const h = openRunStream('r1', { onEvent: () => {} });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(3000);
+    h.close();
+
+    expect(urls.length).toBeGreaterThanOrEqual(2);
+    expect(urls[0]).not.toContain('after=');
+    expect(urls[1]).toContain('after=2');
+  });
+
+  it('drops frames at or below the cursor instead of rendering them twice', async () => {
+    vi.useFakeTimers();
+    const urls: string[] = [];
+    const events: string[] = [];
+    // The second response deliberately repeats 1 and 2 (what a replay from a
+    // stale cursor would look like) before the terminal frame.
+    mockFetchSequence(
+      [
+        [frame('content.delta', 1, { text: 'a' }), frame('content.chunk', 2, { text: 'b' })],
+        [
+          frame('content.delta', 1, { text: 'a' }),
+          frame('content.chunk', 2, { text: 'b' }),
+          frame('run.completed', 3, {}),
+        ],
+      ],
+      urls,
+    );
+
+    const h = openRunStream('r1', {
+      onEvent: (e) => events.push(`${e.event_type}:${e.sequence}`),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(3000);
+    h.close();
+
+    expect(events).toEqual([
+      'content.delta:1',
+      'content.chunk:2',
+      'run.completed:3',
+    ]);
+  });
+
+  it('does not advance the cursor for a transient frame (sequence 0)', async () => {
+    vi.useFakeTimers();
+    const urls: string[] = [];
+    // A transient frame is fanned out live and never persisted: its sequence
+    // is a SENTINEL, not a position. The dangerous ordering is durable →
+    // transient: if the sentinel were allowed to move the cursor it would
+    // RESET it, and the reconnect would ask the server to resume from 0 —
+    // re-rendering the whole answer. (A transient arriving first, when the
+    // cursor is still 0, changes nothing either way, so it would not test
+    // anything.)
+    mockFetchSequence(
+      [
+        [frame('content.chunk', 1, { text: 'durable' }), frame('content.delta', 0, { text: 'live only' })],
+        [frame('run.completed', 2, {})],
+      ],
+      urls,
+    );
+
+    const h = openRunStream('r1', { onEvent: () => {} });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(3000);
+    h.close();
+
+    expect(urls.length).toBeGreaterThanOrEqual(2);
+    expect(urls[1]).toContain('after=1');
+  });
+
+  it('falls back to the SSE id line when the body carries no sequence', async () => {
+    vi.useFakeTimers();
+    const urls: string[] = [];
+    const idOnly =
+      'event: run.event\nid: 7\n'
+      + `data: ${JSON.stringify({
+        run_id: 'r1', event_type: 'content.chunk', payload: { text: 'c' },
+      })}\n\n`;
+    mockFetchSequence([[idOnly], [frame('run.completed', 8, {})]], urls);
+
+    const h = openRunStream('r1', { onEvent: () => {} });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(3000);
+    h.close();
+
+    expect(urls[1]).toContain('after=7');
+  });
+
+  it('still stops at a repeated terminal frame without re-dispatching it', async () => {
+    vi.useFakeTimers();
+    const urls: string[] = [];
+    const events: string[] = [];
+    mockFetchSequence(
+      [[frame('content.delta', 1, { text: 'a' })], [frame('run.completed', 2, {})]],
+      urls,
+    );
+
+    const h = openRunStream('r1', { onEvent: (e) => events.push(e.event_type) });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(3000);
+    // The run ended: no further reconnect may be attempted.
+    await vi.advanceTimersByTimeAsync(10000);
+    h.close();
+
+    expect(events.filter((e) => e === 'run.completed')).toHaveLength(1);
+    expect(urls).toHaveLength(2);
+  });
+});

@@ -486,7 +486,7 @@ func TestExpiredOwnershipCannotMutateBeforeReaper(t *testing.T) {
 
 	t.Run("begin attempt", func(t *testing.T) {
 		claimed := freshExpired(t)
-		if _, err := svc.BeginProviderAttemptOwned(ctx, claimed.Ownership); !errors.Is(err, execution.ErrLostOwnership) {
+		if _, err := svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, claimed.Run.Provider, submissionFixtureHash(claimed.Run.Provider)); !errors.Is(err, execution.ErrLostOwnership) {
 			t.Fatalf("expired begin attempt: err=%v, want ErrLostOwnership", err)
 		}
 	})
@@ -687,7 +687,7 @@ func TestStaleEpochCannotMutateAfterLeaseRecovery(t *testing.T) {
 	if leaseOK, _, err := svc.HeartbeatOwnedWithSlot(ctx, claimedA.Ownership, time.Minute, slotA, time.Minute); err != nil || leaseOK {
 		t.Fatalf("stale heartbeat: leaseOK=%v err=%v, want false/nil", leaseOK, err)
 	}
-	if _, err := svc.BeginProviderAttemptOwned(ctx, claimedA.Ownership); !errors.Is(err, execution.ErrLostOwnership) {
+	if _, err := svc.BeginProviderSubmissionOwned(ctx, claimedA.Ownership, claimedA.Run.Provider, submissionFixtureHash(claimedA.Run.Provider)); !errors.Is(err, execution.ErrLostOwnership) {
 		t.Fatalf("stale begin attempt: err=%v, want ErrLostOwnership", err)
 	}
 	if err := slots.Renew(ctx, slotA); !errors.Is(err, execution.ErrProviderSlotLost) {
@@ -1019,7 +1019,7 @@ func admissionFacts(t *testing.T, svc *execution.Service, handler *blockingHandl
 		if leaseRemaining.Valid {
 			lease = fmt.Sprintf("%+dms", leaseRemaining.Int64/1000)
 		}
-		events, _ := svc.ListEventsAfter(ctx, runID, 0)
+		events, _ := svc.ListEventsAfter(ctx, runID, 0, execution.MaxEventPageSize)
 		kinds := make([]string, 0, len(events))
 		for _, ev := range events {
 			kind := ev.EventType
@@ -1075,7 +1075,7 @@ func (h *blockingHandler) countFor(runID ids.ID) int {
 // runRetryingReason returns the reason of the run's last run.retrying event.
 func runRetryingReason(t *testing.T, svc *execution.Service, runID ids.ID) string {
 	t.Helper()
-	events, err := svc.ListEventsAfter(context.Background(), runID, 0)
+	events, err := svc.ListEventsAfter(context.Background(), runID, 0, execution.MaxEventPageSize)
 	if err != nil {
 		t.Fatalf("list events: %v", err)
 	}

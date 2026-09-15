@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	openapi_types "github.com/oapi-codegen/runtime/types"
@@ -48,6 +49,12 @@ type runRecord struct {
 	ErrorMessage         string         `json:"error_message"`
 	CreatedAt            string         `json:"created_at"`
 	UpdatedAt            string         `json:"updated_at"`
+
+	// Idempotency envelope (第九轮 P0-1). Both fields are omitted for the
+	// ordinary (non-idempotent) create so the existing 201 body is unchanged
+	// for clients that do not send a client_request_id.
+	ClientRequestID     string `json:"client_request_id,omitempty"`
+	IdempotencyReplayed bool   `json:"idempotency_replayed,omitempty"`
 }
 
 func iso(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05.000Z") }
@@ -100,6 +107,25 @@ func toRunRecord(run *execution.Run) runRecord {
 
 // CreateRun implements POST /api/v2/runs: validation + lazy conversation +
 // atomic (message, run, outbox).
+//
+// Idempotency (第九轮 P0-1): when the caller supplies a client_request_id the
+// whole submit becomes replayable. The ORDER below is part of the contract,
+// not an implementation detail:
+//
+//  1. authentication
+//  2. JSON / basic validation
+//  3. client_request_id + request_hash
+//  4. resolve the reservation  ← BEFORE authorization and admission
+//  5. application execution authorization
+//  6. QPS admission
+//  7. conversation + attachment validation
+//  8. create (message, run, attachment claim, outbox) + reserve, one tx
+//
+// Step 4 must come before steps 5-7. The first attempt of a request ALREADY
+// consumed those: its attachments were claimed by its run, and its run counts
+// against the per-user outstanding cap. A replay that ran them first would be
+// told "attachment already used" (400/409) or "too many outstanding runs"
+// (429) for a request that had actually SUCCEEDED.
 func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 	caller := userFrom(r.Context())
 	if caller == nil {
@@ -107,10 +133,11 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		ApplicationID  *int64   `json:"application_id"`
-		Content        string   `json:"content"`
-		ConversationID *int64   `json:"conversation_id"`
-		AttachmentIDs  []string `json:"attachment_ids"`
+		ApplicationID   *int64   `json:"application_id"`
+		Content         string   `json:"content"`
+		ConversationID  *int64   `json:"conversation_id"`
+		AttachmentIDs   []string `json:"attachment_ids"`
+		ClientRequestID string   `json:"client_request_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeBare(w, http.StatusBadRequest, "invalid json")
@@ -124,8 +151,57 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 		writeBare(w, http.StatusBadRequest, "content is required")
 		return
 	}
+	// The id is an opaque client token; it is rejected rather than truncated
+	// when too long, because truncation would fuse two distinct request
+	// identities into one (see execution.MaxClientRequestIDLen).
+	clientRequestID := strings.TrimSpace(body.ClientRequestID)
+	if len(clientRequestID) > execution.MaxClientRequestIDLen {
+		writeBare(w, http.StatusBadRequest, "client_request_id exceeds 64 characters")
+		return
+	}
 	ctx := r.Context()
 	appID := *body.ApplicationID
+
+	// Pure input normalization, hoisted above the admission steps because the
+	// request hash is computed from it.
+	attachmentIDs := dedupe(body.AttachmentIDs)
+	if len(attachmentIDs) > 8 {
+		writeBare(w, http.StatusBadRequest, "one or more attachments are invalid")
+		return
+	}
+	targetConvID := int64(0)
+	if body.ConversationID != nil && *body.ConversationID > 0 {
+		targetConvID = *body.ConversationID
+	}
+	// conversation_id is hashed as REQUESTED (0 = lazy), not as resolved:
+	// the first attempt does not know the conversation it is about to create,
+	// so a retry of that same request hashes 0 as well and replays.
+	requestHash := execution.RunRequestHash(appID, targetConvID, body.Content, attachmentIDs)
+
+	if clientRequestID != "" {
+		run, found, err := s.Runs.ResolveRunRequest(ctx, caller.ID, clientRequestID, requestHash)
+		switch {
+		case errors.Is(err, execution.ErrIdempotencyKeyReused):
+			if s.Metric != nil {
+				s.Metric.RunIdempotencyConflictTotal.Inc()
+			}
+			writeDetail(w, http.StatusConflict, "idempotency_key_reused")
+			return
+		case err != nil:
+			writeSimpleError(w, http.StatusInternalServerError, err.Error())
+			return
+		case found:
+			if s.Metric != nil {
+				s.Metric.RunIdempotencyReplayTotal.Inc()
+			}
+			rec := toRunRecord(run)
+			rec.ClientRequestID = clientRequestID
+			rec.IdempotencyReplayed = true
+			// 200, not 201: nothing was created by THIS request.
+			writeJSON(w, http.StatusOK, rec)
+			return
+		}
+	}
 
 	// Execution authorization (评测 P0-1): the ONE gate shared with the
 	// scheduler. Visibility is not authorization — a regular caller must
@@ -157,16 +233,16 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 	// Conversation target: reuse the caller's own conversation, or create
 	// one inside the run transaction (lazy, atomic — no orphan rows).
 	convID := int64(0)
-	if body.ConversationID != nil && *body.ConversationID > 0 {
+	if targetConvID > 0 {
 		var owner, appCol int64
 		err := s.DB.QueryRowContext(ctx,
 			`SELECT user_id, application_id FROM conversations WHERE id = ?`,
-			*body.ConversationID).Scan(&owner, &appCol)
+			targetConvID).Scan(&owner, &appCol)
 		if err != nil || owner != caller.ID || appCol != appID {
 			writeBare(w, http.StatusBadRequest, "conversation not found")
 			return
 		}
-		convID = *body.ConversationID
+		convID = targetConvID
 	}
 	title := body.Content
 	if len([]rune(title)) > 80 {
@@ -174,17 +250,12 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Attachments: only the caller's own unbound pending attachments.
-	attachmentIDs := dedupe(body.AttachmentIDs)
-	if len(attachmentIDs) > 8 {
-		writeBare(w, http.StatusBadRequest, "one or more attachments are invalid")
-		return
-	}
 	if err := s.validateAttachments(ctx, attachmentIDs, caller.ID, binding.ProviderKey); err != nil {
 		writeBare(w, http.StatusBadRequest, "one or more attachments are invalid")
 		return
 	}
 
-	run, err := s.Runs.CreateRunAdmitted(ctx, &execution.CreateRunInput{
+	run, replayed, err := s.Runs.CreateRunIdempotent(ctx, &execution.CreateRunInput{
 		UserID:             caller.ID,
 		ApplicationID:      appID,
 		ConversationID:     convID,
@@ -197,9 +268,16 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 		ConversationTitle:  title,
 		CreateConversation: convID == 0,
 		RuntimeSnapshot:    binding.Snapshot(),
+		ClientRequestID:    clientRequestID,
+		RequestHash:        requestHash,
 	}, s.Config.Runner.UserMaxOutstanding)
 	if err != nil {
 		switch {
+		case errors.Is(err, execution.ErrIdempotencyKeyReused):
+			if s.Metric != nil {
+				s.Metric.RunIdempotencyConflictTotal.Inc()
+			}
+			writeDetail(w, http.StatusConflict, "idempotency_key_reused")
 		case errors.Is(err, execution.ErrConversationBusy):
 			// 评测 P0-2: one conversation executes one turn at a time.
 			writeDetail(w, http.StatusConflict, "previous turn is still running")
@@ -216,7 +294,21 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, toRunRecord(run))
+	rec := toRunRecord(run)
+	if clientRequestID != "" {
+		rec.ClientRequestID = clientRequestID
+	}
+	if replayed {
+		// A concurrent duplicate: the winner committed between our resolve
+		// and our insert, and this request is that same request.
+		if s.Metric != nil {
+			s.Metric.RunIdempotencyReplayTotal.Inc()
+		}
+		rec.IdempotencyReplayed = true
+		writeJSON(w, http.StatusOK, rec)
+		return
+	}
+	writeJSON(w, http.StatusCreated, rec)
 }
 
 // writeExecutionDenied maps the unified execution gate's errors to the
@@ -336,6 +428,17 @@ func (s *Server) GetRun(w http.ResponseWriter, r *http.Request, runID genapi.Run
 	writeJSON(w, http.StatusOK, toRunRecord(run))
 }
 
+// ListRunEvents implements GET /api/v2/runs/{id}/events — one KEYSET page
+// (第九轮 P1-3).
+//
+// Query: after (exclusive lower bound, default 0), limit (default 200, max
+// 1000). The response is an envelope rather than a bare array so a client can
+// walk a long history without guessing where it stopped:
+//
+//	{"items":[...],"next_after":1400,"has_more":true}
+//
+// The request is answered in bounded time and memory for a run with 100k
+// events, which an unbounded read could not be.
 func (s *Server) ListRunEvents(w http.ResponseWriter, r *http.Request, runID genapi.RunId, params genapi.ListRunEventsParams) {
 	caller := userFrom(r.Context())
 	if caller == nil {
@@ -355,16 +458,35 @@ func (s *Server) ListRunEvents(w http.ResponseWriter, r *http.Request, runID gen
 	if params.After != nil {
 		after = uint64(*params.After)
 	}
-	events, err := s.Runs.ListEventsAfter(r.Context(), id, after)
+	limit := 0
+	if params.Limit != nil {
+		limit = int(*params.Limit)
+	}
+	page, err := s.Runs.ListEventPage(r.Context(), id, after, limit)
 	if err != nil {
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, events)
+	items := page.Items
+	if items == nil {
+		items = []execution.EventRecord{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":      items,
+		"next_after": page.NextAfter,
+		"has_more":   page.HasMore,
+	})
 }
 
 // StreamRun delegates to the SSE gateway.
-func (s *Server) StreamRun(w http.ResponseWriter, r *http.Request, runID genapi.RunId) {
+//
+// The resume cursor is resolved by the gateway (sse.ResumeCursor) rather than
+// from params here, because it must combine TWO sources with a defined
+// precedence: the `after` query parameter and the `Last-Event-ID` header that
+// EventSource replays automatically. The generated params type only models
+// the query half, so passing it through would split one decision across two
+// places.
+func (s *Server) StreamRun(w http.ResponseWriter, r *http.Request, runID genapi.RunId, _ genapi.StreamRunParams) {
 	caller := userFrom(r.Context())
 	if caller == nil {
 		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")

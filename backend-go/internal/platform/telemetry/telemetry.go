@@ -76,6 +76,33 @@ type Metrics struct {
 	RunOwnershipLostTotal prometheus.Counter
 	PriorityDispatchTotal *prometheus.CounterVec // {class}
 	DeliveryRetryTotal    prometheus.Counter
+
+	// 第九轮 P0/P1 surface.
+	//
+	//	RunIdempotencyReplayTotal   — a resend of an identical POST /v2/runs
+	//	                              was answered from the original run
+	//	RunIdempotencyConflictTotal — the same client_request_id arrived with
+	//	                              a DIFFERENT payload (a client bug or a
+	//	                              shared id); the client is told 409
+	//	ProviderSubmissionUnknownTotal
+	//	                            — ALERT ON > 0: a provider request may
+	//	                              have been delivered and cannot be
+	//	                              confirmed. This is the only series that
+	//	                              reports a genuinely uncertain EXTERNAL
+	//	                              side effect.
+	//	ProviderSubmissionDedupTotal
+	//	                            — a re-claim found an already-accepted
+	//	                              submission and reconciled instead of
+	//	                              submitting a second provider chat
+	//	SSEReplayEventsTotal        — durable events served by the SSE replay
+	//	                              path (per-connection, so a healthy Hub
+	//	                              keeps this near the event count rather
+	//	                              than multiplying it by viewers)
+	RunIdempotencyReplayTotal      prometheus.Counter
+	RunIdempotencyConflictTotal    prometheus.Counter
+	ProviderSubmissionUnknownTotal prometheus.Counter
+	ProviderSubmissionDedupTotal   prometheus.Counter
+	SSEReplayEventsTotal           prometheus.Counter
 }
 
 // Provider admission results (ProviderAdmission label values).
@@ -225,6 +252,27 @@ func NewMetrics(service string) *Metrics {
 			Name: "studio_delivery_retry_total",
 			Help: "Feishu delivery attempts requeued with backoff after a send failure.",
 		}),
+		RunIdempotencyReplayTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_run_idempotency_replay_total",
+			Help: "POST /v2/runs resends answered from the original run (same client_request_id, same payload).",
+		}),
+		RunIdempotencyConflictTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_run_idempotency_conflict_total",
+			Help: "POST /v2/runs rejected because a client_request_id was reused with a different payload.",
+		}),
+		ProviderSubmissionUnknownTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_provider_submission_unknown_total",
+			Help: "Provider submits whose outcome could not be confirmed; the run is parked in waiting_external " +
+				"instead of being retried (alert on > 0: an external side effect may exist).",
+		}),
+		ProviderSubmissionDedupTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_provider_submission_dedup_total",
+			Help: "Re-claims that found an already-accepted provider submission and reconciled instead of resubmitting.",
+		}),
+		SSEReplayEventsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_sse_replay_events_total",
+			Help: "Durable run events served by the SSE replay path.",
+		}),
 	}
 	reg.MustRegister(
 		m.HTTPDuration, m.HTTPRequests, m.SSEActive, m.QueueDepth,
@@ -237,6 +285,9 @@ func NewMetrics(service string) *Metrics {
 		m.ProviderInflight, m.ProviderInflightRejected,
 		m.ProviderAdmission, m.RunReaperTotal, m.RunOwnershipLostTotal,
 		m.PriorityDispatchTotal, m.DeliveryRetryTotal,
+		m.RunIdempotencyReplayTotal, m.RunIdempotencyConflictTotal,
+		m.ProviderSubmissionUnknownTotal, m.ProviderSubmissionDedupTotal,
+		m.SSEReplayEventsTotal,
 	)
 	return m
 }

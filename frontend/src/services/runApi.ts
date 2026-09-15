@@ -20,6 +20,13 @@ export interface RunRecord {
   error_code?: string;
   error_message?: string;
   created_at: string;
+  /**
+   * Idempotency envelope (第九轮 P0-1). Present only on a create request that
+   * carried a `client_request_id`: `idempotency_replayed` marks a response
+   * that returned an ALREADY existing run instead of creating one.
+   */
+  client_request_id?: string;
+  idempotency_replayed?: boolean;
 }
 
 export interface RunArtifactRecord {
@@ -297,12 +304,52 @@ export function setApplicationFavorite(
     : api.delete(`/v2/applications/${applicationId}/favorite`);
 }
 
+/**
+ * A fresh idempotency identity for ONE SEND ACTION (第九轮 P0-1).
+ *
+ * The caller owns this value's lifecycle, and the rule is about USER
+ * actions, not HTTP attempts:
+ *
+ *   user hits send            → one id
+ *   transport retry of that   → SAME id (a replay, not a second turn)
+ *   user edits and sends again→ new id
+ *
+ * That distinction is the whole point: a second id would create a second
+ * run, a second user message and a second provider chat for what the user
+ * experienced as one message.
+ *
+ * `crypto.randomUUID` needs a secure context, so a v4-shaped id is built
+ * from `getRandomValues` when the page is served over plain http (a LAN
+ * host or an IP origin) — the backend treats the value as opaque and only
+ * caps its length at 64.
+ */
+export function newClientRequestId(): string {
+  const c = globalThis.crypto;
+  if (c && typeof c.randomUUID === 'function') return c.randomUUID();
+  const bytes = new Uint8Array(16);
+  if (c && typeof c.getRandomValues === 'function') {
+    c.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40; // version 4
+  bytes[8] = (bytes[8] & 0x3f) | 0x80; // variant 10
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export function createRun(
   applicationId: number,
   content: string,
   options: {
     conversationId?: number | null;
     attachmentIds?: string[];
+    /**
+     * Idempotency token for this send action (see newClientRequestId). When
+     * omitted the request is NOT idempotent and a lost response can produce
+     * a duplicate turn — callers that can be retried must pass one.
+     */
+    clientRequestId?: string;
   } = {},
 ): Promise<RunRecord> {
   return api.post<RunRecord>('/v2/runs', {
@@ -310,6 +357,7 @@ export function createRun(
     ...(options.conversationId ? { conversation_id: options.conversationId } : {}),
     content,
     attachment_ids: options.attachmentIds || [],
+    ...(options.clientRequestId ? { client_request_id: options.clientRequestId } : {}),
   });
 }
 
@@ -317,11 +365,24 @@ export function getRun(runId: string): Promise<RunRecord> {
   return api.get<RunRecord>(`/v2/runs/${runId}`);
 }
 
+/** One keyset page of a run's persisted events (第八轮→第九轮 P1-3). */
+export interface RunEventPage {
+  items: RunEventRecord[];
+  /** Highest sequence in this page; feed back as `after` to continue. */
+  next_after: number;
+  /** True when the page was full, so more events may follow. */
+  has_more: boolean;
+}
+
 export function fetchRunEvents(
   runId: string,
   after = 0,
-): Promise<RunEventRecord[]> {
-  return api.get<RunEventRecord[]>(`/v2/runs/${runId}/events`, { after });
+  limit?: number,
+): Promise<RunEventPage> {
+  return api.get<RunEventPage>(`/v2/runs/${runId}/events`, {
+    after,
+    ...(limit ? { limit } : {}),
+  });
 }
 
 export function fetchRunArtifacts(runId: string): Promise<RunArtifactRecord[]> {

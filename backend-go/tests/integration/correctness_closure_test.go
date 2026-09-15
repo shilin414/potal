@@ -35,7 +35,7 @@ import (
 // countEvents counts persisted run events of one type.
 func countEvents(t *testing.T, svc *execution.Service, runID ids.ID, eventType string) int {
 	t.Helper()
-	events, err := svc.ListEventsAfter(context.Background(), runID, 0)
+	events, err := svc.ListEventsAfter(context.Background(), runID, 0, execution.MaxEventPageSize)
 	if err != nil {
 		t.Fatalf("list events: %v", err)
 	}
@@ -155,10 +155,10 @@ func TestReaperRecoveryAtomicFail(t *testing.T) {
 		// attempt counts PROVIDER EXECUTIONS (P0-2): the claim alone no
 		// longer burns retry budget, so the dead worker must have reached
 		// the provider — exactly what the executor does right before the
-		// submit.
-		if _, err := svc.BeginProviderAttemptOwned(ctx, claimed.Ownership); err != nil {
-			t.Fatalf("begin provider attempt %d: %v", i, err)
-		}
+		// submit. The provider's answer is recorded as a DEFINITIVE refusal,
+		// which is the only outcome that leaves the submission
+		// re-transmittable on the next claim (第九轮 P0-2).
+		beginSubmissionRefused(t, svc, claimed.Ownership, claimed.Run.Provider)
 		if _, err := svc.Querier().HeartbeatLease(ctx, dbForceExpireParams(runID.Bytes())); err != nil {
 			t.Fatalf("force expire %d: %v", i, err)
 		}
@@ -335,7 +335,7 @@ func TestArtifactFencing(t *testing.T) {
 // mustEvents lists event type names.
 func mustEvents(t *testing.T, svc *execution.Service, runID ids.ID) []string {
 	t.Helper()
-	evs, err := svc.ListEventsAfter(context.Background(), runID, 0)
+	evs, err := svc.ListEventsAfter(context.Background(), runID, 0, execution.MaxEventPageSize)
 	if err != nil {
 		t.Fatalf("list events: %v", err)
 	}

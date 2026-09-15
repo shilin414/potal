@@ -231,7 +231,7 @@ func TestLeaseFencingStaleWorker(t *testing.T) {
 	}
 
 	// Exactly one content.delta event may exist (B's) — A's never landed.
-	events, err := svc.ListEventsAfter(ctx, runID, 0)
+	events, err := svc.ListEventsAfter(ctx, runID, 0, execution.MaxEventPageSize)
 	if err != nil {
 		t.Fatal(err)
 	}

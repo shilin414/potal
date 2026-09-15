@@ -124,3 +124,60 @@ func dbFinishRunParams(runID []byte, status, output string) db.CASFinishRunParam
 }
 
 var _ = context.Background
+
+// ───────────────────────── provider submission fixtures (第九轮 P0-2) ──
+//
+// Since 第九轮 the ONLY path that consumes a provider-execution attempt is
+// BeginProviderSubmissionOwned, and it answers "may I transmit?" as well as
+// "how much budget is left?". Tests must go through it rather than through a
+// bare attempt counter, because the extra answer is the safety property under
+// test: a submission whose fate is unknown must NOT be transmitted again.
+//
+// A test that models "the worker reached the provider and then died" has to
+// say WHICH outcome the provider gave, so the helpers below make the two
+// cases explicit:
+//
+//	beginSubmission          the outcome is still unknown (in flight / died)
+//	beginSubmissionRefused   the provider DEFINITIVELY refused, so a later
+//	                         attempt may transmit again
+
+// submissionFixtureHash is the payload identity a fixture submission uses.
+func submissionFixtureHash(provider string) []byte {
+	return execution.ProviderSubmissionHash(provider, []byte(`{"content":[{"type":"text","text":"itest"}]}`))
+}
+
+// beginSubmission consumes one provider-execution attempt and leaves the
+// submission IN FLIGHT (state 'sending').
+func beginSubmission(t *testing.T, svc *execution.Service, own execution.ExecutionOwnership, provider string) *execution.ProviderSubmission {
+	t.Helper()
+	sub, err := svc.BeginProviderSubmissionOwned(context.Background(), own, provider, submissionFixtureHash(provider))
+	if err != nil {
+		t.Fatalf("begin provider submission: %v", err)
+	}
+	return sub
+}
+
+// beginSubmissionRefused consumes one attempt and records a DEFINITIVE
+// provider refusal, which is what legitimately re-opens the submission for a
+// retry (see BeginProviderSubmissionOwned). Tests that need "attempts are
+// retained across reclaims" use this, because an unresolved submission can
+// never be re-transmitted by design.
+func beginSubmissionRefused(t *testing.T, svc *execution.Service, own execution.ExecutionOwnership, provider string) *execution.ProviderSubmission {
+	t.Helper()
+	sub := beginSubmission(t, svc, own, provider)
+	if err := svc.MarkSubmissionStateOwned(context.Background(), own, sub, execution.SubmissionRejected, "itest: refused"); err != nil {
+		t.Fatalf("mark submission rejected: %v", err)
+	}
+	return sub
+}
+
+// listAllEvents reads one maximum-size page; the fixtures here never come
+// close to the page bound.
+func listAllEvents(t *testing.T, svc *execution.Service, runID ids.ID) []execution.EventRecord {
+	t.Helper()
+	events, err := svc.ListEventsAfter(context.Background(), runID, 0, execution.MaxEventPageSize)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	return events
+}

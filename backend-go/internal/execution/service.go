@@ -84,6 +84,16 @@ type Service struct {
 	// terminal transition", and the only way to prove that against a real
 	// database is to fail the read on purpose.
 	RunDurationTimestamps func(ctx context.Context, runID ids.ID) (startedAt, finishedAt sql.NullTime, err error)
+
+	// WaitingExternalGrace bounds how long a run parked in
+	// waiting_external may stay unresolved before the sweep resolves it as
+	// failed/provider_submit_unknown (第九轮 P0-2). Zero falls back to
+	// DefaultWaitingExternalGrace.
+	//
+	// It is a Service field rather than a config lookup so tests can drive
+	// the sweep deterministically instead of sleeping out the production
+	// window.
+	WaitingExternalGrace time.Duration
 }
 
 // DefaultRequeueDelay is used when Service.RequeueDelay is unset.
@@ -129,6 +139,18 @@ type CreateRunInput struct {
 	TriggerID   int64  // schedule_occurrences.id for scheduled runs
 	Priority    string // "interactive_user" | "scheduled_normal" | ...
 	AvailableAt time.Time
+
+	// ClientRequestID is the caller's idempotency identity for this submit
+	// (第九轮 P0-1). Non-empty turns the creation into an idempotent
+	// operation: the identity is reserved inside the run transaction and a
+	// repeat of the identical request replays the original run instead of
+	// creating a second turn. Empty (scheduler, internal callers) keeps the
+	// original unconditional-create behaviour.
+	ClientRequestID string
+	// RequestHash is the canonical hash of the normalized request payload
+	// (see RunRequestHash). It is what lets a reused id be told apart from
+	// a reused id carrying a DIFFERENT request.
+	RequestHash []byte
 }
 
 // DefaultTriggerType is used when a run input omits trigger info.
@@ -211,6 +233,19 @@ func (s *Service) CreateRunAdmitted(ctx context.Context, in *CreateRunInput, max
 func (s *Service) CreateRunInTx(ctx context.Context, tx *sql.Tx, in *CreateRunInput) (ids.ID, error) {
 	runID := ids.New()
 	q := db.New(tx)
+
+	// Request idempotency reservation (第九轮 P0-1), FIRST and in the SAME
+	// transaction as everything below. Two properties follow from that
+	// placement:
+	//
+	//   - a reserved identity always HAS its run: any later failure (busy
+	//     conversation, lost attachment claim, insert error) rolls the
+	//     reservation back with it, so the client can safely retry;
+	//   - it is taken before the rows it guards, so the identity — not the
+	//     conversation — is what two concurrent duplicates serialize on.
+	if err := reserveRunRequestTx(ctx, q, in, runID); err != nil {
+		return runID, err
+	}
 
 	convID := in.ConversationID
 	// Lazy conversation creation INSIDE the transaction: a failed run
@@ -581,50 +616,6 @@ func (s *Service) ClaimCandidates(ctx context.Context, provider string, limit in
 	return out, nil
 }
 
-// BeginProviderAttemptOwned consumes ONE provider execution attempt for
-// the owning worker (P0-2). Semantics:
-//
-//	attempt == provider execution count — NOT a claim count
-//	claim / admission requeue / inflight rejection never consume one
-//
-// It runs in one transaction under the run row lock:
-//
-//	verify ownership (running + epoch)
-//	attempt >= max_attempts → ErrProviderAttemptsExhausted
-//	attempt++ → return the new count
-//
-// The caller invokes it immediately before the real provider submit
-// (Auth → rate limit → BeginProviderAttempt → StartChat/Submit), so a run
-// that never reached the provider never burns retry budget.
-func (s *Service) BeginProviderAttemptOwned(ctx context.Context, own ExecutionOwnership) (int64, error) {
-	if !own.Valid() {
-		return 0, ErrLostOwnership
-	}
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	row, err := verifyActiveOwnershipTx(ctx, tx, own)
-	if err != nil {
-		return 0, err
-	}
-	if int64(row.Attempt) >= int64(row.MaxAttempts) {
-		return 0, ErrProviderAttemptsExhausted
-	}
-	if _, err := db.New(tx).BeginProviderAttemptFenced(ctx, db.BeginProviderAttemptFencedParams{
-		ID:         own.RunID.Bytes(),
-		LeaseEpoch: own.LeaseEpoch,
-	}); err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return int64(row.Attempt) + 1, nil
-}
-
 // MarkRunStartedOwned stamps started_at for the owning worker (第四轮 P2).
 //
 // Semantics: started_at means "this run was allowed to execute", not "a
@@ -927,58 +918,80 @@ func (s *Service) appendEvent(ctx context.Context, runID ids.ID, epoch uint64, e
 }
 
 // appendEventTx appends one event inside a caller-owned transaction.
-// The run row is locked (SELECT ... FOR UPDATE) to serialize sequence
-// allocation per run; with epoch > 0 the lock statement also verifies
-// ownership — no row = the caller lost the run.
+//
+// Sequence allocation and ownership verification happen in ONE locking read
+// of the run row (AllocRunEventSequence*): the caller must already hold that
+// lock — or take it here — because the read IS the serialization point
+// between concurrent writers of the same run (第九轮 P1-3).
+//
+// The counter is bumped with `next_event_sequence + 1` rather than by
+// assigning the value that was just read: MySQL reports CHANGED rows, so a
+// same-value write would report 0 and look exactly like a missing run row.
 func appendEventTx(ctx context.Context, tx *sql.Tx, runID ids.ID, epoch uint64, eventType string, payload map[string]any) (uint64, error) {
+	sequence, err := allocEventSequenceTx(ctx, tx, runID, epoch)
+	if err != nil {
+		return 0, err
+	}
+	if err := insertRunEventTx(ctx, tx, runID, sequence, eventType, payload); err != nil {
+		return 0, err
+	}
+	return sequence, nil
+}
+
+// insertRunEventTx writes one event at an ALREADY ALLOCATED sequence. The
+// allocation must have come from allocEventSequenceTx in this transaction;
+// inserting at a sequence nobody allocated is caught by UNIQUE(run_id,
+// sequence) rather than silently renumbering an existing event.
+func insertRunEventTx(ctx context.Context, tx *sql.Tx, runID ids.ID, sequence uint64, eventType string, payload map[string]any) error {
 	if payload == nil {
 		payload = map[string]any{}
 	}
 	payloadJSON, _ := json.Marshal(payload)
-
-	var lockEpoch uint64
-	lockSQL := `SELECT id FROM runs WHERE id = ? FOR UPDATE`
-	if epoch > 0 {
-		lockSQL = `SELECT lease_epoch FROM runs WHERE id = ? AND status = 'running' AND lease_epoch = ? FOR UPDATE`
-		if err := tx.QueryRowContext(ctx, lockSQL, runID.Bytes(), epoch).Scan(&lockEpoch); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return 0, ErrLostOwnership
-			}
-			return 0, err
-		}
-	} else if _, err := tx.ExecContext(ctx, lockSQL, runID.Bytes()); err != nil {
-		return 0, err
-	}
-	var count uint64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_events WHERE run_id = ?`, runID.Bytes()).Scan(&count); err != nil {
-		return 0, err
-	}
-	if _, err := db.New(tx).AppendRunEvent(ctx, db.AppendRunEventParams{
+	_, err := db.New(tx).AppendRunEvent(ctx, db.AppendRunEventParams{
 		RunID:     runID.Bytes(),
-		Sequence:  count + 1,
+		Sequence:  sequence,
 		EventType: eventType,
 		Payload:   dbtypes.JSONText(payloadJSON),
-	}); err != nil {
-		return 0, err
-	}
-	return count + 1, nil
+	})
+	return err
 }
 
-// nextEventSequenceTx returns the sequence a new event must use, from the
-// count read under the caller's run-row lock.
+// allocEventSequenceTx returns the next sequence for this run and consumes it.
 //
-// COUNT(*)+1 is only valid because EVERY event writer takes the run row
-// FOR UPDATE first (see appendEventTx): the count cannot change between
-// the read and the INSERT, so sequence stays gap-free and unique. Callers
-// that already hold the lock may compute it themselves and pass it to
-// AppendRunEventAtSequence.
-func nextEventSequenceTx(ctx context.Context, tx *sql.Tx, runID ids.ID) (uint64, error) {
-	var count uint64
-	if err := tx.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM run_events WHERE run_id = ?`, runID.Bytes()).Scan(&count); err != nil {
+// With epoch > 0 the locking read also verifies ownership — no row means the
+// caller lost the run (ErrLostOwnership) and must not write at all. With
+// epoch == 0 the caller is on the system plane (reaper, retry bookkeeping)
+// and already verified ownership under the same lock.
+//
+// Cost is O(1) per append. Replacing COUNT(*)+1 (第六轮 P2-1) matters most
+// for exactly the runs that produce the most events: the old form scanned the
+// run's entire event history on every durable write, so a long streaming
+// answer got progressively slower as it grew.
+func allocEventSequenceTx(ctx context.Context, tx *sql.Tx, runID ids.ID, epoch uint64) (uint64, error) {
+	q := db.New(tx)
+	var sequence uint64
+	var err error
+	if epoch > 0 {
+		sequence, err = q.AllocRunEventSequenceFenced(ctx, db.AllocRunEventSequenceFencedParams{
+			ID:         runID.Bytes(),
+			LeaseEpoch: epoch,
+		})
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrLostOwnership
+		}
+	} else {
+		sequence, err = q.AllocRunEventSequence(ctx, runID.Bytes())
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, ErrNotFound
+		}
+	}
+	if err != nil {
 		return 0, err
 	}
-	return count + 1, nil
+	if _, err := q.BumpRunEventSequence(ctx, runID.Bytes()); err != nil {
+		return 0, err
+	}
+	return sequence, nil
 }
 
 // PublishTransient fans a HIGH-FREQUENCY event (content.delta) to live
@@ -1009,11 +1022,41 @@ func (s *Service) publishLive(ctx context.Context, runID ids.ID, sequence uint64
 	}
 }
 
-// ListEventsAfter returns persisted events with sequence > after.
-func (s *Service) ListEventsAfter(ctx context.Context, runID ids.ID, after uint64) ([]EventRecord, error) {
+// DefaultEventPageSize / MaxEventPageSize bound every event read (第九轮
+// P1-3). A run can hold 100k events; a page is what makes replay bounded in
+// both time and memory for the HTTP endpoint AND for the SSE gateway's
+// initial replay.
+const (
+	DefaultEventPageSize = 200
+	MaxEventPageSize     = 1000
+)
+
+// EventPage is one keyset page of a run's events.
+type EventPage struct {
+	Items     []EventRecord
+	NextAfter uint64
+	HasMore   bool
+}
+
+// clampEventPageSize normalizes a caller-supplied limit.
+func clampEventPageSize(limit int) int {
+	switch {
+	case limit <= 0:
+		return DefaultEventPageSize
+	case limit > MaxEventPageSize:
+		return MaxEventPageSize
+	default:
+		return limit
+	}
+}
+
+// ListEventsAfter returns up to `limit` persisted events with sequence > after.
+func (s *Service) ListEventsAfter(ctx context.Context, runID ids.ID, after uint64, limit int) ([]EventRecord, error) {
+	size := clampEventPageSize(limit)
 	rows, err := s.q(ctx).ListRunEventsAfter(ctx, db.ListRunEventsAfterParams{
 		RunID:    runID.Bytes(),
 		Sequence: after,
+		Limit:    int32(size),
 	})
 	if err != nil {
 		return nil, err
@@ -1032,6 +1075,26 @@ func (s *Service) ListEventsAfter(ctx context.Context, runID ids.ID, after uint6
 		})
 	}
 	return out, nil
+}
+
+// ListEventPage reads one page and reports whether more events follow.
+//
+// "More" is derived from a FULL page rather than from a COUNT: asking the
+// database how many events remain would reintroduce exactly the O(history)
+// read this page size exists to remove. A full page therefore means "ask
+// again with next_after"; the follow-up read returns the remainder (possibly
+// zero rows), which is the same convergence the SSE replay loop relies on.
+func (s *Service) ListEventPage(ctx context.Context, runID ids.ID, after uint64, limit int) (*EventPage, error) {
+	events, err := s.ListEventsAfter(ctx, runID, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	page := &EventPage{Items: events, NextAfter: after}
+	for _, ev := range events {
+		page.NextAfter = ev.Sequence
+	}
+	page.HasMore = len(events) == clampEventPageSize(limit)
+	return page, nil
 }
 
 // EventRecord is the wire shape of a run event.

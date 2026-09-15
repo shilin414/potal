@@ -13,6 +13,45 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
 )
 
+const allocRunEventSequence = `-- name: AllocRunEventSequence :one
+SELECT next_event_sequence FROM runs WHERE id = ? FOR UPDATE
+`
+
+// System-plane allocation: takes the run row lock (serializing every event
+// writer for this run) and hands back the next sequence. O(1) — the old
+// COUNT(*)+1 grew with the run's event history and got slower exactly when
+// a long streaming answer was producing the most events.
+//
+// The read is a locking read on purpose: it IS the serialization point, so
+// "read the counter, then INSERT" cannot interleave with another writer.
+func (q *Queries) AllocRunEventSequence(ctx context.Context, id []byte) (uint64, error) {
+	row := q.db.QueryRowContext(ctx, allocRunEventSequence, id)
+	var next_event_sequence uint64
+	err := row.Scan(&next_event_sequence)
+	return next_event_sequence, err
+}
+
+const allocRunEventSequenceFenced = `-- name: AllocRunEventSequenceFenced :one
+SELECT next_event_sequence FROM runs
+WHERE id = ? AND status = 'running' AND lease_epoch = ?
+FOR UPDATE
+`
+
+type AllocRunEventSequenceFencedParams struct {
+	ID         []byte
+	LeaseEpoch uint64
+}
+
+// Worker-owned allocation: the same locking read plus the lease fence, so
+// a stale worker (lease reclaimed elsewhere) is rejected before any write
+// instead of appending to a run it no longer owns.
+func (q *Queries) AllocRunEventSequenceFenced(ctx context.Context, arg AllocRunEventSequenceFencedParams) (uint64, error) {
+	row := q.db.QueryRowContext(ctx, allocRunEventSequenceFenced, arg.ID, arg.LeaseEpoch)
+	var next_event_sequence uint64
+	err := row.Scan(&next_event_sequence)
+	return next_event_sequence, err
+}
+
 const appendRunEvent = `-- name: AppendRunEvent :execresult
 INSERT INTO run_events (run_id, sequence, event_type, payload)
 VALUES (?, ?, ?, ?)
@@ -25,35 +64,15 @@ type AppendRunEventParams struct {
 	Payload   dbtypes.JSONText
 }
 
+// The ONE event writer. The sequence is ALWAYS supplied by the caller,
+// which obtained it from AllocRunEventSequence* under the run row lock it
+// already holds (第六轮 P2-1, 第九轮 P1-3). No writer may ask the database
+// for "the next value" here: a COUNT(*)+1 computed at INSERT time would be
+// both O(history) and a second source of truth. A mismatch between the
+// allocated and the stored sequence can only mean a lost fence and fails
+// loudly on uniq_run_event_sequence instead of silently renumbering.
 func (q *Queries) AppendRunEvent(ctx context.Context, arg AppendRunEventParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, appendRunEvent,
-		arg.RunID,
-		arg.Sequence,
-		arg.EventType,
-		arg.Payload,
-	)
-}
-
-const appendRunEventAtSequence = `-- name: AppendRunEventAtSequence :execresult
-INSERT INTO run_events (run_id, sequence, event_type, payload)
-VALUES (?, ?, ?, ?)
-`
-
-type AppendRunEventAtSequenceParams struct {
-	RunID     []byte
-	Sequence  uint64
-	EventType string
-	Payload   dbtypes.JSONText
-}
-
-// Explicit-sequence append for writers that must NOT ask the database for
-// the next value (第六轮 P2-1): the finalize transaction holds the run row
-// lock and already knows how many events the run has (CountRunEvents read
-// under that same lock), so COUNT(*)+1 is applied in Go instead of on
-// every durable write. A mismatch can only mean a lost fence and fails
-// loudly on uniq_run_event_sequence rather than silently renumbering.
-func (q *Queries) AppendRunEventAtSequence(ctx context.Context, arg AppendRunEventAtSequenceParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, appendRunEventAtSequence,
 		arg.RunID,
 		arg.Sequence,
 		arg.EventType,
@@ -74,6 +93,29 @@ type AppendUserAttachmentToRunInputParams struct {
 // Late-attachment race guard: only while queued.
 func (q *Queries) AppendUserAttachmentToRunInput(ctx context.Context, arg AppendUserAttachmentToRunInputParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, appendUserAttachmentToRunInput, arg.JSONARRAYAPPEND, arg.ID)
+}
+
+const awaitExternalRunFenced = `-- name: AwaitExternalRunFenced :execresult
+
+UPDATE runs
+SET status = 'waiting_external'
+WHERE id = ? AND status = 'running' AND lease_epoch = ?
+`
+
+type AwaitExternalRunFencedParams struct {
+	ID         []byte
+	LeaseEpoch uint64
+}
+
+// ─────────────────────────────────────────────── waiting_external ──
+// Parked-unknown lifecycle (第九轮 P0-2). A run whose provider submit may
+// have been delivered but cannot be confirmed is parked, NOT retried: for a
+// provider with neither a native idempotency key nor a lookup-by-request
+// capability, at-most-once is the only honest option.
+// Fenced running → waiting_external. Non-terminal: the run still holds its
+// conversation and its outstanding slot until the sweep below resolves it.
+func (q *Queries) AwaitExternalRunFenced(ctx context.Context, arg AwaitExternalRunFencedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, awaitExternalRunFenced, arg.ID, arg.LeaseEpoch)
 }
 
 const beginProviderAttemptFenced = `-- name: BeginProviderAttemptFenced :execresult
@@ -108,6 +150,17 @@ type BindAttachmentToRunParams struct {
 func (q *Queries) BindAttachmentToRun(ctx context.Context, arg BindAttachmentToRunParams) error {
 	_, err := q.db.ExecContext(ctx, bindAttachmentToRun, arg.RunID, arg.ConversationID, arg.ID)
 	return err
+}
+
+const bumpRunEventSequence = `-- name: BumpRunEventSequence :execresult
+UPDATE runs SET next_event_sequence = next_event_sequence + 1 WHERE id = ?
+`
+
+// Claims the sequence read above. Written as `x + 1` rather than a computed
+// literal because MySQL reports CHANGED rows: assigning the already-read
+// value would report 0 and be indistinguishable from a missing run row.
+func (q *Queries) BumpRunEventSequence(ctx context.Context, id []byte) (sql.Result, error) {
+	return q.db.ExecContext(ctx, bumpRunEventSequence, id)
 }
 
 const cASClaimRun = `-- name: CASClaimRun :execresult
@@ -331,6 +384,17 @@ func (q *Queries) CountPendingOutbox(ctx context.Context) (int64, error) {
 	return n, err
 }
 
+const countProviderSubmissionsByRun = `-- name: CountProviderSubmissionsByRun :one
+SELECT COUNT(*) AS n FROM provider_submissions WHERE run_id = ?
+`
+
+func (q *Queries) CountProviderSubmissionsByRun(ctx context.Context, runID []byte) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countProviderSubmissionsByRun, runID)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
 const countQueuedWithLease = `-- name: CountQueuedWithLease :one
 SELECT COUNT(*) AS n FROM runs r
 JOIN run_leases l ON l.run_id = r.id
@@ -340,17 +404,6 @@ WHERE r.status = 'queued'
 // Invariant B: a queued run must NOT hold a lease.
 func (q *Queries) CountQueuedWithLease(ctx context.Context) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countQueuedWithLease)
-	var n int64
-	err := row.Scan(&n)
-	return n, err
-}
-
-const countRunEvents = `-- name: CountRunEvents :one
-SELECT COUNT(*) AS n FROM run_events WHERE run_id = ?
-`
-
-func (q *Queries) CountRunEvents(ctx context.Context, runID []byte) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countRunEvents, runID)
 	var n int64
 	err := row.Scan(&n)
 	return n, err
@@ -598,6 +651,40 @@ func (q *Queries) CreateProviderSlot(ctx context.Context, arg CreateProviderSlot
 		arg.LeaseMicros,
 	)
 	return err
+}
+
+const createProviderSubmission = `-- name: CreateProviderSubmission :execresult
+
+INSERT INTO provider_submissions
+    (run_id, submission_no, provider, idempotency_key, request_hash, state, attempt)
+VALUES (?, ?, ?, ?, ?, 'sending', ?)
+ON DUPLICATE KEY UPDATE run_id = run_id
+`
+
+type CreateProviderSubmissionParams struct {
+	RunID          []byte
+	SubmissionNo   uint32
+	Provider       string
+	IdempotencyKey string
+	RequestHash    []byte
+	Attempt        uint32
+}
+
+// ───────────────────────────────────────────── provider submissions ──
+// Durable record of the external side effect (第九轮 P0-2). Written BEFORE
+// the HTTP submit and updated after it, so the "provider may already have
+// the request" window is recoverable instead of invisible.
+// 1 changed row = a new submission row; 0 = this (run, submission_no) is
+// already recorded (see ReserveRunRequest for the same idiom).
+func (q *Queries) CreateProviderSubmission(ctx context.Context, arg CreateProviderSubmissionParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, createProviderSubmission,
+		arg.RunID,
+		arg.SubmissionNo,
+		arg.Provider,
+		arg.IdempotencyKey,
+		arg.RequestHash,
+		arg.Attempt,
+	)
 }
 
 const createRun = `-- name: CreateRun :execresult
@@ -951,6 +1038,25 @@ func (q *Queries) FailOutboxEvent(ctx context.Context, arg FailOutboxEventParams
 	return err
 }
 
+const failParkedExternalRun = `-- name: FailParkedExternalRun :execresult
+UPDATE runs
+SET status = 'failed', error_code = 'provider_submit_unknown', error_message = ?,
+    finished_at = CURRENT_TIMESTAMP(3)
+WHERE id = ? AND status = 'waiting_external'
+`
+
+type FailParkedExternalRunParams struct {
+	ErrorMessage sql.NullString
+	ID           []byte
+}
+
+// Terminal resolution of an unconfirmable submit. Guarded on
+// status = 'waiting_external' so a concurrent resolution (cancel, a
+// reconciler that DID manage to confirm the call) wins cleanly.
+func (q *Queries) FailParkedExternalRun(ctx context.Context, arg FailParkedExternalRunParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, failParkedExternalRun, arg.ErrorMessage, arg.ID)
+}
+
 const failRunFenced = `-- name: FailRunFenced :execresult
 UPDATE runs
 SET status = 'failed', error_code = ?, error_message = ?,
@@ -1084,6 +1190,36 @@ func (q *Queries) GetExpiredLeaseForUpdate(ctx context.Context, runID []byte) (G
 		&i.AcquiredAt,
 		&i.HeartbeatAt,
 		&i.ExpiresAt,
+	)
+	return i, err
+}
+
+const getLatestProviderSubmission = `-- name: GetLatestProviderSubmission :one
+SELECT run_id, submission_no, provider, idempotency_key, request_hash, state,
+       attempt, external_run_id, last_error, created_at, updated_at
+FROM provider_submissions
+WHERE run_id = ?
+ORDER BY submission_no DESC
+LIMIT 1
+`
+
+// The newest submission for a run. sql.ErrNoRows means this run has never
+// been submitted to a provider.
+func (q *Queries) GetLatestProviderSubmission(ctx context.Context, runID []byte) (ProviderSubmission, error) {
+	row := q.db.QueryRowContext(ctx, getLatestProviderSubmission, runID)
+	var i ProviderSubmission
+	err := row.Scan(
+		&i.RunID,
+		&i.SubmissionNo,
+		&i.Provider,
+		&i.IdempotencyKey,
+		&i.RequestHash,
+		&i.State,
+		&i.Attempt,
+		&i.ExternalRunID,
+		&i.LastError,
+		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
@@ -1222,7 +1358,7 @@ SELECT id, user_id, application_id, conversation_id, runtime_binding_id, organiz
        provider, runtime_type, external_run_id, status, provider_status, provider_finish_reason,
        input, output, runtime_snapshot, attempt, max_attempts, queued_at, started_at,
        finished_at, error_code, error_message, created_at, updated_at,
-       trigger_type, trigger_id, priority, available_at, lease_epoch
+       trigger_type, trigger_id, priority, available_at, lease_epoch, next_event_sequence
 FROM runs WHERE id = ?
 `
 
@@ -1259,6 +1395,7 @@ func (q *Queries) GetRunByID(ctx context.Context, id []byte) (Run, error) {
 		&i.Priority,
 		&i.AvailableAt,
 		&i.LeaseEpoch,
+		&i.NextEventSequence,
 	)
 	return i, err
 }
@@ -1370,6 +1507,30 @@ func (q *Queries) GetRunLeaseEpoch(ctx context.Context, id []byte) (uint64, erro
 	var lease_epoch uint64
 	err := row.Scan(&lease_epoch)
 	return lease_epoch, err
+}
+
+const getRunRequest = `-- name: GetRunRequest :one
+SELECT run_id, request_hash FROM run_requests
+WHERE user_id = ? AND client_request_id = ?
+`
+
+type GetRunRequestParams struct {
+	UserID          uint64
+	ClientRequestID string
+}
+
+type GetRunRequestRow struct {
+	RunID       []byte
+	RequestHash []byte
+}
+
+// Replay lookup. request_hash is returned so the caller can distinguish
+// "same request" (replay) from "same key, different payload" (409).
+func (q *Queries) GetRunRequest(ctx context.Context, arg GetRunRequestParams) (GetRunRequestRow, error) {
+	row := q.db.QueryRowContext(ctx, getRunRequest, arg.UserID, arg.ClientRequestID)
+	var i GetRunRequestRow
+	err := row.Scan(&i.RunID, &i.RequestHash)
+	return i, err
 }
 
 const getRunStartedAt = `-- name: GetRunStartedAt :one
@@ -1552,6 +1713,51 @@ func (q *Queries) ListExpiredLeaseRunIDs(ctx context.Context, limit int32) ([][]
 			return nil, err
 		}
 		items = append(items, run_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listParkedWaitingExternalRunIDs = `-- name: ListParkedWaitingExternalRunIDs :many
+SELECT id FROM runs
+WHERE status = 'waiting_external'
+  AND updated_at <= ?
+ORDER BY updated_at
+LIMIT ?
+`
+
+type ListParkedWaitingExternalRunIDsParams struct {
+	QuietBefore time.Time
+	Limit       int32
+}
+
+// The sweep's input. updated_at is the parking instant: the run row is
+// written exactly once when it enters waiting_external and nothing touches
+// it afterwards, so the grace window measures from the park (not from a
+// later unrelated write), and runs touched by hand are naturally excluded
+// until they go quiet again.
+//
+// The cutoff is an absolute instant derived from the DB clock by the caller
+// (CurrentDBTime minus the grace), never from the application clock — the
+// same rule every other timing decision in this package follows.
+func (q *Queries) ListParkedWaitingExternalRunIDs(ctx context.Context, arg ListParkedWaitingExternalRunIDsParams) ([][]byte, error) {
+	rows, err := q.db.QueryContext(ctx, listParkedWaitingExternalRunIDs, arg.QuietBefore, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := [][]byte{}
+	for rows.Next() {
+		var id []byte
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -1745,15 +1951,22 @@ const listRunEventsAfter = `-- name: ListRunEventsAfter :many
 SELECT id, run_id, sequence, event_type, payload, created_at
 FROM run_events WHERE run_id = ? AND sequence > ?
 ORDER BY sequence
+LIMIT ?
 `
 
 type ListRunEventsAfterParams struct {
 	RunID    []byte
 	Sequence uint64
+	Limit    int32
 }
 
+// Keyset pagination over (run_id, sequence) — the existing UNIQUE index is
+// exactly the right shape, so no OFFSET is ever needed. The LIMIT is
+// mandatory for long histories (第九轮 P1-3): an unbounded read of a run
+// with 100k events would materialize the whole log in one query, both for
+// the HTTP replay endpoint and for the SSE gateway's initial replay.
 func (q *Queries) ListRunEventsAfter(ctx context.Context, arg ListRunEventsAfterParams) ([]RunEvent, error) {
-	rows, err := q.db.QueryContext(ctx, listRunEventsAfter, arg.RunID, arg.Sequence)
+	rows, err := q.db.QueryContext(ctx, listRunEventsAfter, arg.RunID, arg.Sequence, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1787,7 +2000,7 @@ SELECT id, user_id, application_id, conversation_id, runtime_binding_id, organiz
        provider, runtime_type, external_run_id, status, provider_status, provider_finish_reason,
        input, output, runtime_snapshot, attempt, max_attempts, queued_at, started_at,
        finished_at, error_code, error_message, created_at, updated_at,
-       trigger_type, trigger_id, priority, available_at, lease_epoch
+       trigger_type, trigger_id, priority, available_at, lease_epoch, next_event_sequence
 FROM runs WHERE conversation_id = ?
 ORDER BY created_at DESC
 `
@@ -1831,6 +2044,7 @@ func (q *Queries) ListRunsByConversation(ctx context.Context, conversationID sql
 			&i.Priority,
 			&i.AvailableAt,
 			&i.LeaseEpoch,
+			&i.NextEventSequence,
 		); err != nil {
 			return nil, err
 		}
@@ -1871,6 +2085,50 @@ UPDATE outbox_events SET status = 'published', published_at = CURRENT_TIMESTAMP(
 func (q *Queries) MarkOutboxPublished(ctx context.Context, id uint64) error {
 	_, err := q.db.ExecContext(ctx, markOutboxPublished, id)
 	return err
+}
+
+const markProviderSubmissionAccepted = `-- name: MarkProviderSubmissionAccepted :execresult
+UPDATE provider_submissions
+SET state = 'accepted', external_run_id = ?, last_error = NULL
+WHERE run_id = ? AND submission_no = ?
+`
+
+type MarkProviderSubmissionAcceptedParams struct {
+	ExternalRunID string
+	RunID         []byte
+	SubmissionNo  uint32
+}
+
+// The provider answered with an external id: the outcome is now KNOWN, both
+// here and on the run row (written in the same transaction).
+func (q *Queries) MarkProviderSubmissionAccepted(ctx context.Context, arg MarkProviderSubmissionAcceptedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, markProviderSubmissionAccepted, arg.ExternalRunID, arg.RunID, arg.SubmissionNo)
+}
+
+const markProviderSubmissionState = `-- name: MarkProviderSubmissionState :execresult
+UPDATE provider_submissions
+SET state = ?, last_error = ?
+WHERE run_id = ? AND submission_no = ?
+`
+
+type MarkProviderSubmissionStateParams struct {
+	State        string
+	LastError    sql.NullString
+	RunID        []byte
+	SubmissionNo uint32
+}
+
+// 'unknown' ('the request may have been delivered and the provider cannot
+// be asked') and 'rejected' ('the provider definitively refused, a retry is
+// legitimate') are the two outcomes a caller may record. 'sending' is only
+// ever written by CreateProviderSubmission.
+func (q *Queries) MarkProviderSubmissionState(ctx context.Context, arg MarkProviderSubmissionStateParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, markProviderSubmissionState,
+		arg.State,
+		arg.LastError,
+		arg.RunID,
+		arg.SubmissionNo,
+	)
 }
 
 const markRunStartedFenced = `-- name: MarkRunStartedFenced :execresult
@@ -1958,6 +2216,39 @@ type RequeueRunFencedImmediateParams struct {
 // Outbox.available_at regardless of app/DB clock skew.
 func (q *Queries) RequeueRunFencedImmediate(ctx context.Context, arg RequeueRunFencedImmediateParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, requeueRunFencedImmediate, arg.ID, arg.LeaseEpoch)
+}
+
+const reserveRunRequest = `-- name: ReserveRunRequest :execresult
+
+INSERT INTO run_requests (user_id, client_request_id, run_id, request_hash)
+VALUES (?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE user_id = user_id
+`
+
+type ReserveRunRequestParams struct {
+	UserID          uint64
+	ClientRequestID string
+	RunID           []byte
+	RequestHash     []byte
+}
+
+// ───────────────────────────────────────────────── request idempotency ──
+// POST /api/v2/runs replay protection (第九轮 P0-1). The reservation is
+// taken INSIDE the run-creation transaction, so a crash between the two
+// rolls both back: a reserved request identity always has its run.
+// ON DUPLICATE KEY UPDATE is deliberate: a duplicate reports 0 changed
+// rows (the assigned column keeps its value) instead of raising MySQL 1062,
+// so the caller gets a clean "already reserved" signal on the same
+// round-trip as the success case. A concurrent duplicate blocks until the
+// winning transaction commits or rolls back — if it rolled back, this
+// INSERT simply succeeds and takes the identity over.
+func (q *Queries) ReserveRunRequest(ctx context.Context, arg ReserveRunRequestParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, reserveRunRequest,
+		arg.UserID,
+		arg.ClientRequestID,
+		arg.RunID,
+		arg.RequestHash,
+	)
 }
 
 const setAttachmentUploaded = `-- name: SetAttachmentUploaded :exec

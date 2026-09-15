@@ -87,17 +87,15 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 	if err != nil {
 		return err
 	}
-	sequence, err := nextEventSequenceTx(ctx, tx, own.RunID)
+	// The terminal event is written first, at an explicitly allocated
+	// sequence: the run row is already locked by this transaction, so the
+	// allocation is O(1) and cannot interleave with another writer
+	// (第九轮 P1-3).
+	sequence, err := allocEventSequenceTx(ctx, tx, own.RunID, 0)
 	if err != nil {
 		return err
 	}
-	terminalPayloadJSON, _ := json.Marshal(terminalPayload)
-	if _, err := q.AppendRunEventAtSequence(ctx, db.AppendRunEventAtSequenceParams{
-		RunID:     own.RunID.Bytes(),
-		Sequence:  sequence,
-		EventType: terminalEvent,
-		Payload:   dbtypes.JSONText(terminalPayloadJSON),
-	}); err != nil {
+	if err := insertRunEventTx(ctx, tx, own.RunID, sequence, terminalEvent, terminalPayload); err != nil {
 		return err
 	}
 

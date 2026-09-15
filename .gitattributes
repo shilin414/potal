@@ -1,0 +1,11 @@
+# Line-ending policy.
+#
+# This repository is developed on Windows and built on Linux. Shell scripts
+# are the one file type where that combination actually breaks: a CRLF bash
+# script fails on Linux/macOS with `bad interpreter` or `$'\r': command not
+# found`, and the failure looks like a broken script rather than a broken
+# checkout.
+#
+# Only *.sh is pinned. Everything else keeps the repository's existing
+# behaviour, so this file cannot create a mass re-normalization diff.
+*.sh text eol=lf

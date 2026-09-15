@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/creation-agent-studio/backend-go/internal/catalog"
@@ -134,38 +133,230 @@ type preSubmitStop struct{ err error }
 func (p *preSubmitStop) Error() string { return "aily: run stopped before provider submit" }
 func (p *preSubmitStop) Unwrap() error { return p.err }
 
+// submitAction is beginSubmit's verdict on the provider submit.
+type submitAction int
+
+const (
+	// submitStop: the run is already resolved (gate verdict, exhausted
+	// budget, or an unconfirmable submission parked in waiting_external).
+	// The caller must return &preSubmitStop{err} and touch nothing else.
+	submitStop submitAction = iota
+	// submitNow: transmit. The submission is durably recorded as in-flight.
+	submitNow
+	// submitResumeAccepted: this run already has an ACCEPTED provider chat
+	// (第九轮 P0-2). Transmitting again would create a second one, so the
+	// caller reconciles/polls the recorded external id instead.
+	submitResumeAccepted
+)
+
 // beginSubmit is the FINAL checkpoint before the provider sees a request
-// (第四轮 P1-1). It is called by both submit paths only after every local
-// preparation step has succeeded:
+// (第四轮 P1-1, extended by 第九轮 P0-2). It is called by both submit paths
+// only after every local preparation step has succeeded:
 //
 //	thread() → build SubmitInput → ValidateSubmit → ★ Gate 2
-//	        → BeginProviderAttempt → HTTP submit
+//	        → BeginProviderSubmission → HTTP submit
 //
 // Anything that can fail locally (DB IO for the agent thread, payload
-// validation) already happened, so after Gate 2 only the attempt CAS and
+// validation) already happened, so after Gate 2 only the submission CAS and
 // the network call remain — the kill switch window is as small as a
 // level-triggered check can make it.
 //
-// Returns proceed=true when the caller may submit. On false the run is
-// already resolved and err carries that outcome (nil = the gate handled
-// it); the caller must return &preSubmitStop{err}.
-func (e *Executor) beginSubmit(ctx context.Context, claimed *execution.ClaimedRun) (proceed bool, err error) {
+// The submission step is what closes the "provider accepted, we crashed
+// before recording it" hole. It answers three cases:
+//
+//	no record            → record it as 'sending' and transmit
+//	last outcome unknown → DO NOT transmit; park the run (submitStop)
+//	already accepted     → DO NOT transmit; resume from the recorded chat id
+//
+// On submitStop the run is already resolved and err carries that outcome
+// (nil = the gate handled it); the caller must return &preSubmitStop{err}.
+func (e *Executor) beginSubmit(ctx context.Context, claimed *execution.ClaimedRun) (*execution.ProviderSubmission, submitAction, error) {
 	// kill → cancelled, pause/infra/unknown → deferred with the ORIGINAL
 	// priority, fail closed. No attempt is consumed on any gated path.
 	if execution.PreSubmitGate(ctx, e.Owned, claimed, e.Gate, e.Log) {
-		return false, nil
+		return nil, submitStop, nil
 	}
-	// Attempt accounting (P0-2): attempt counts PROVIDER EXECUTIONS, so
-	// it is consumed only now — every local failure above (thread DB IO,
-	// validation) leaves the budget untouched.
-	if err := e.Owned.BeginProviderAttempt(ctx, claimed); err != nil {
-		if errors.Is(err, execution.ErrProviderAttemptsExhausted) {
-			return false, e.failRun(ctx, claimed, "aily_attempts_exhausted",
+	// A run that already carries an external id has ALREADY been submitted
+	// and accepted: the id is set-once and written only from the provider's
+	// own answer. Re-entering the submit path here (a re-claim after a crash
+	// or a lease expiry) used to create a second provider chat.
+	if claimed.Run.ExternalRunID != "" {
+		e.noteSubmissionDedup()
+		return &execution.ProviderSubmission{State: execution.SubmissionAccepted, ExternalRunID: claimed.Run.ExternalRunID}, submitResumeAccepted, nil
+	}
+
+	sub, err := e.Owned.BeginProviderSubmission(ctx, claimed, claimed.Run.Provider, submissionHash(claimed.Run))
+	if err != nil {
+		switch {
+		case errors.Is(err, execution.ErrProviderAttemptsExhausted):
+			return nil, submitStop, e.failRun(ctx, claimed, "aily_attempts_exhausted",
 				"provider retry budget exhausted before submit")
+		case errors.Is(err, execution.ErrProviderSubmitUnknown):
+			// A previous attempt already put this submission on the wire and
+			// its fate is unknown. Nothing local can undo that and the
+			// provider cannot be asked, so this run is parked rather than
+			// retried (at-most-once).
+			e.noteSubmissionDedup()
+			return nil, submitStop, e.parkUnconfirmedSubmit(ctx, claimed,
+				"a previous attempt may already have submitted this request")
 		}
-		return false, err // ErrLostOwnership → stop writing
+		return nil, submitStop, err // ErrLostOwnership → stop writing
 	}
-	return true, nil
+	if sub.State == execution.SubmissionAccepted {
+		e.noteSubmissionDedup()
+		return sub, submitResumeAccepted, nil
+	}
+	return sub, submitNow, nil
+}
+
+// submissionHash identifies the payload of this submission so a re-entry can
+// tell "the same external action" from a genuinely different one.
+func submissionHash(run *execution.Run) []byte {
+	raw, err := json.Marshal(run.Input)
+	if err != nil {
+		// An unmarshalable run input cannot be transmitted either; hash the
+		// empty payload so the outcome is deterministic rather than random.
+		raw = nil
+	}
+	return execution.ProviderSubmissionHash(run.Provider, raw)
+}
+
+// acceptedChatID resolves the provider chat id of an already-accepted
+// submission, preferring the SUBMISSION RECORD over the in-memory run: the
+// submission carries the id that was written together with the 'accepted'
+// state, while a claim snapshot can predate that write (第九轮 P0-2).
+func acceptedChatID(sub *execution.ProviderSubmission, claimed *execution.ClaimedRun) string {
+	if sub != nil && sub.ExternalRunID != "" {
+		return sub.ExternalRunID
+	}
+	return claimed.Run.ExternalRunID
+}
+
+// submitDisposition is the DECISION the submit boundary makes about a failed
+// provider POST (第九轮 P0-2). It is computed by a pure function so the
+// safety-critical half of the executor can be table-tested without a
+// database, a worker or a provider.
+type submitDisposition struct {
+	// Park: this submission must NEVER be transmitted again; the run is
+	// parked in waiting_external.
+	Park bool
+	// RecordOutcome is the submission state to persist before acting
+	// ("" = nothing to record).
+	RecordOutcome string
+	// Reason explains the outcome for the event payload and the logs.
+	Reason string
+}
+
+// classifySubmitFailure decides what a failed provider SUBMIT means.
+//
+// The default is "we do not know whether the provider received it", and for a
+// provider that cannot deduplicate a resend that means PARK — never retry.
+//
+// Only a DEFINITIVE refusal keeps the ordinary retry policy, because only then
+// is it certain the provider holds nothing:
+//
+//	4xx business error, auth failure, 429 → the provider looked at the
+//	    request and refused it. Nothing was created, so a retry is a retry.
+//	5xx                                  → NOT an answer. A 500 can be raised
+//	    after the provider already accepted and started the work.
+//	timeout / transport / unknown error  → the response never arrived; the
+//	    only evidence is that we sent something.
+//
+// A provider declared IdempotencyNative collapses a resend on the stable
+// submission key, so even an unknown outcome stays on the ordinary policy
+// there — which is the entire reason the class exists.
+func classifySubmitFailure(err error, class catalog.IdempotencyClass) submitDisposition {
+	var apiErr *APIError
+	definitive := errors.As(err, &apiErr) &&
+		!errors.Is(apiErr.Kind, ErrTimeout) &&
+		!errors.Is(apiErr.Kind, ErrServer)
+
+	if definitive {
+		// Recording 'rejected' BEFORE acting is what re-opens the submission
+		// for the retry the caller may now legitimately perform.
+		return submitDisposition{
+			RecordOutcome: execution.SubmissionRejected,
+			Reason:        "provider definitively refused the submission: " + apiErr.Error(),
+		}
+	}
+	reason := submitUnknownReason(err)
+	if class == catalog.IdempotencyNative {
+		// The provider deduplicates a resend on the stable key, so the
+		// pre-existing policy stays safe.
+		return submitDisposition{RecordOutcome: execution.SubmissionUnknown, Reason: reason}
+	}
+	return submitDisposition{Park: true, RecordOutcome: execution.SubmissionUnknown, Reason: reason}
+}
+
+// onSubmitFailure applies classifySubmitFailure. A wrapped outcome has already
+// been resolved by the disposition (a run parked, failed or requeued), so the
+// caller returns it as a preSubmitStop and classifyError must not re-classify
+// it.
+func (e *Executor) onSubmitFailure(ctx context.Context, claimed *execution.ClaimedRun, sub *execution.ProviderSubmission, err error) error {
+	if errors.Is(err, execution.ErrLostOwnership) {
+		return err
+	}
+	// A cancellation is not a provider answer: the run is being wound down
+	// (lease loss, shutdown) and nothing about the submission changed.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	d := classifySubmitFailure(err, catalog.SubmitIdempotencyOf(e.Adapter))
+	e.recordSubmissionOutcome(ctx, claimed, sub, d)
+	if d.Park {
+		return e.parkUnconfirmedSubmit(ctx, claimed, d.Reason)
+	}
+	// Not parked: the outcome is durable and the ordinary provider policy
+	// takes over — retry for a rate limit or a native-idempotent provider,
+	// terminal failure for an auth or capability error. That policy is only
+	// safe here because the submission was recorded as definitively refused
+	// (or the provider can collapse a resend itself).
+	return e.classifyError(ctx, claimed, err)
+}
+
+// recordSubmissionOutcome persists the submission state the disposition asks
+// for. Failure to write it is reported but never fatal:
+//
+//   - a submission left in 'sending' is ALREADY treated as unknown by the next
+//     attempt, so the safety property (never resend after an ambiguous
+//     outcome) holds either way;
+//   - 'rejected' is the only outcome that must be durable for a retry to
+//     happen, and its absence makes the next attempt PARK the run instead of
+//     retrying — a safe (if less available) direction to fail in.
+func (e *Executor) recordSubmissionOutcome(ctx context.Context, claimed *execution.ClaimedRun, sub *execution.ProviderSubmission, d submitDisposition) {
+	if d.RecordOutcome == "" {
+		return
+	}
+	if err := e.Owned.MarkSubmissionState(ctx, claimed, sub, d.RecordOutcome, d.Reason); err != nil {
+		e.Log.Warn("mark provider submission state failed",
+			"run_id", claimed.Run.ID.String(), "state", d.RecordOutcome, "err", err)
+	}
+}
+
+// parkUnconfirmedSubmit moves the run to waiting_external: the provider may
+// hold this request, so the run must not be retried.
+func (e *Executor) parkUnconfirmedSubmit(ctx context.Context, claimed *execution.ClaimedRun, reason string) error {
+	if err := e.Owned.AwaitExternal(ctx, claimed, reason); err != nil {
+		return err
+	}
+	e.Log.Warn("run parked in waiting_external",
+		"run_id", claimed.Run.ID.String(), "provider", claimed.Run.Provider, "reason", reason)
+	return nil
+}
+
+func (e *Executor) noteSubmissionDedup() {
+	if e.Metrics != nil {
+		e.Metrics.ProviderSubmissionDedupTotal.Inc()
+	}
+}
+
+// submitUnknownReason renders a submit failure for the run event payload.
+func submitUnknownReason(err error) string {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return "provider submit outcome unknown: " + apiErr.Error()
+	}
+	return "provider submit outcome unknown: " + err.Error()
 }
 
 func (e *Executor) classifyError(ctx context.Context, claimed *execution.ClaimedRun, err error) error {
@@ -232,11 +423,17 @@ func (e *Executor) thread(ctx context.Context, claimed *execution.ClaimedRun) (t
 	return e.Owned.EnsureAgentThread(ctx, *run.ConversationID, ProviderKey, expectedMode, expectedSubject)
 }
 
-func (e *Executor) bindThreadAndRun(ctx context.Context, claimed *execution.ClaimedRun, threadID ids.ID, agentChatID, sessionID string) error {
+func (e *Executor) bindThreadAndRun(ctx context.Context, claimed *execution.ClaimedRun, threadID ids.ID, sub *execution.ProviderSubmission, agentChatID, sessionID string) error {
 	if agentChatID != "" && claimed.Run.ExternalRunID == "" {
-		if err := e.Owned.UpdateExternalRunID(ctx, claimed, agentChatID); err != nil {
+		// One transaction records BOTH the provider's acceptance and the
+		// run's external id (第九轮 P0-2): splitting them would let a crash
+		// leave an accepted submission whose chat id is unreadable, or a
+		// chat id that cannot be proven accepted — either half alone cannot
+		// be resumed safely.
+		if err := e.Owned.MarkSubmissionAccepted(ctx, claimed, sub, agentChatID); err != nil {
 			return err // includes ErrLostOwnership
 		}
+		claimed.Run.ExternalRunID = agentChatID
 	}
 	if !threadID.IsZero() && sessionID != "" {
 		if err := e.Owned.BindProviderSession(ctx, claimed, threadID, sessionID); err != nil {
@@ -256,6 +453,10 @@ func (e *Executor) bindThreadAndRun(ctx context.Context, claimed *execution.Clai
 // content.chunk events (评测 P1: run_events write amplification). Live
 // consumers still see every delta via the transient Redis channel; MySQL
 // only receives a chunk every flushInterval / flushBytes.
+//
+// Each durable chunk is INCREMENTAL (第九轮 P1-4): text plus the end offset,
+// never the cumulative answer. Storing the cumulative text on every chunk
+// made a run's event payload volume quadratic in the answer length.
 type deltaCoalescer struct {
 	buf          []byte
 	flushBytes   int
@@ -274,9 +475,10 @@ func (c *deltaCoalescer) add(text string) bool {
 	return len(c.buf) >= c.flushBytes || time.Since(c.lastFlush) >= 500*time.Millisecond
 }
 
-// chunk drains the buffer into a persisted-chunk payload. The payload
-// carries the incremental text; the caller adds the cumulative snapshot
-// so live consumers can replace (not append) and always self-heal.
+// chunk drains the buffer into a persisted-chunk payload: the incremental
+// text and the number of bytes emitted so far. Consumers concatenate chunks
+// in ascending sequence; `offset` lets them detect a gap without holding the
+// whole answer in memory.
 func (c *deltaCoalescer) chunk() (payload map[string]any, ok bool) {
 	if len(c.buf) == 0 {
 		return nil, false
@@ -314,28 +516,52 @@ func (e *Executor) executeStreaming(ctx context.Context, claimed *execution.Clai
 	if err := e.Adapter.ValidateSubmit(submit); err != nil {
 		return err
 	}
-	ok, err := e.beginSubmit(ctx, claimed)
-	if err != nil || !ok {
+	sub, action, err := e.beginSubmit(ctx, claimed)
+	if err != nil || action == submitStop {
 		return &preSubmitStop{err: err}
 	}
+	if action == submitResumeAccepted {
+		// This run was already accepted by the provider, so the stream must
+		// NOT be re-opened — that would create a second provider chat. The
+		// result API is the authority anyway (§26), so converge from it.
+		//
+		// The chat id comes from the SUBMISSION RECORD when it is available,
+		// not from the in-memory run: the run snapshot was loaded at claim
+		// time and can predate the acceptance, while provider_submissions
+		// carries the id written together with that state (第九轮 P0-2).
+		return e.reconcile(ctx, claimed, acceptedChatID(sub, claimed))
+	}
+	submit.ProviderIdempotencyKey = sub.IdempotencyKey
 
 	// StreamPrepared opens the HTTP POST synchronously on this
 	// goroutine — the gate above is the last checkpoint before it.
 	events, cancel, err := e.Adapter.StreamPrepared(ctx, submit)
 	if err != nil {
-		return err
+		// The POST itself failed. Whether the provider received the request
+		// is unknowable from here, so the outcome is classified at the
+		// SUBMIT boundary rather than by the generic provider policy
+		// (第九轮 P0-2).
+		return &preSubmitStop{err: e.onSubmitFailure(ctx, claimed, sub, err)}
 	}
 	defer cancel()
 
 	externalRunID := ""
 	coalescer := newDeltaCoalescer()
-	snapshotText := &strings.Builder{} // cumulative answer text
+	// NOTE (第九轮 P1-4): the durable chunk carries ONLY the incremental
+	// text plus its end offset. It used to also carry a cumulative
+	// `snapshot` of the whole answer, which made the run's event data
+	// quadratic in the output length: a 1 MB answer stored
+	// 2KB + 4KB + ... + 1MB ≈ 250 MB of snapshots.
+	//
+	// Deployment order matters. A client that reconnects and replays from
+	// sequence 0 reconstructs the text by APPENDING incremental chunks, so
+	// the durable cursor (and the frontend's local dedupe guard) must be in
+	// place before this stops being written; the two ship together.
 	flushChunk := func() error {
 		payload, ok := coalescer.chunk()
 		if !ok {
 			return nil
 		}
-		payload["snapshot"] = snapshotText.String()
 		return e.Owned.AppendEvent(ctx, claimed, execution.EventContentChunk, payload)
 	}
 	for ev := range events {
@@ -347,7 +573,7 @@ func (e *Executor) executeStreaming(ctx context.Context, claimed *execution.Clai
 			if newSession == "" {
 				newSession = sessionID
 			}
-			if err := e.bindThreadAndRun(ctx, claimed, threadID, chatID, newSession); err != nil {
+			if err := e.bindThreadAndRun(ctx, claimed, threadID, sub, chatID, newSession); err != nil {
 				if errors.Is(err, execution.ErrLostOwnership) {
 					return err
 				}
@@ -360,9 +586,6 @@ func (e *Executor) executeStreaming(ctx context.Context, claimed *execution.Clai
 		case execution.EventContentDelta:
 			// Transient: live SSE consumers only — never persisted as-is.
 			e.Owned.PublishTransient(ctx, claimed, execution.EventContentDelta, ev.Payload)
-			if text, ok := ev.Payload["text"].(string); ok {
-				snapshotText.WriteString(text)
-			}
 			if coalescer.add(strOf(ev.Payload["text"], "")) {
 				if err := flushChunk(); err != nil {
 					if errors.Is(err, execution.ErrLostOwnership) {
@@ -413,15 +636,31 @@ func (e *Executor) executeBackground(ctx context.Context, claimed *execution.Cla
 	if err := e.Adapter.ValidateSubmit(submit); err != nil {
 		return err
 	}
-	ok, err := e.beginSubmit(ctx, claimed)
-	if err != nil || !ok {
+	sub, action, err := e.beginSubmit(ctx, claimed)
+	if err != nil || action == submitStop {
 		return &preSubmitStop{err: err}
 	}
+	if action == submitResumeAccepted {
+		// Already submitted and accepted earlier: poll the recorded chat
+		// instead of creating a second one (第九轮 P0-2). The run data is
+		// refreshed first so chatIDForResult and the terminal checks see the
+		// current row; ownership stays on claimed.Ownership.
+		if refreshed, rerr := e.Owned.GetRun(ctx, run.ID); rerr == nil {
+			claimed.RefreshRun(refreshed)
+		}
+		chatID := acceptedChatID(sub, claimed)
+		if chatID == "" {
+			return e.failRun(ctx, claimed, "aily_no_chat_id",
+				"submission is accepted but no external id could be resolved")
+		}
+		return e.pollUntilTerminal(ctx, claimed, auth, agentID, chatID)
+	}
+	submit.ProviderIdempotencyKey = sub.IdempotencyKey
 	result, err := e.Adapter.SubmitPrepared(ctx, submit)
 	if err != nil {
-		return err
+		return &preSubmitStop{err: e.onSubmitFailure(ctx, claimed, sub, err)}
 	}
-	if err := e.bindThreadAndRun(ctx, claimed, threadID, result.ExternalRunID, result.SessionID); err != nil {
+	if err := e.bindThreadAndRun(ctx, claimed, threadID, sub, result.ExternalRunID, result.SessionID); err != nil {
 		if errors.Is(err, execution.ErrLostOwnership) {
 			return err
 		}

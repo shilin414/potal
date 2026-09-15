@@ -51,6 +51,51 @@ type ProviderAuthContext struct {
 	Token         string
 }
 
+// IdempotencyClass describes what a provider can do about a submission whose
+// outcome is UNKNOWN to the caller (第九轮 P0-2 §6): the HTTP request may have
+// been delivered, and the caller has no way to tell.
+//
+//	IdempotencyNative  the provider accepts a stable idempotency key and will
+//	                   collapse a resend, so resending is safe
+//	IdempotencyNone    nothing: a resend is an independent external action
+//
+// NOTE — deliberately TWO classes, not the three the review sketched. The
+// middle class ("can be looked up by a stable request key") has no
+// implementation in this codebase: the only provider client resolves a chat
+// by `agent_chat_id`, which is precisely the value missing in the unknown
+// case. Declaring a class that no client can execute would add an untestable
+// branch to the most safety-critical decision in the executor. A provider
+// that can only be looked up therefore behaves like the weakest class until a
+// request-key lookup actually exists: park the run, never resend.
+type IdempotencyClass string
+
+const (
+	IdempotencyNone   IdempotencyClass = "none"
+	IdempotencyNative IdempotencyClass = "native"
+)
+
+// IdempotencyAware is an OPTIONAL adapter capability, probed by type
+// assertion (same pattern as Service.RunDurationTimestamps): adding it to the
+// RuntimeAdapter interface would force every adapter — including test
+// doubles — to answer a question most providers do not need to answer.
+type IdempotencyAware interface {
+	SubmitIdempotency() IdempotencyClass
+}
+
+// SubmitIdempotencyOf reports the adapter's submit idempotency class.
+// FAIL-CLOSED: an adapter that does not implement the interface is treated as
+// the weakest class, so a NEW provider silently inherits the safe policy
+// (park on unknown) instead of the dangerous one (resend blindly).
+func SubmitIdempotencyOf(a RuntimeAdapter) IdempotencyClass {
+	if a == nil {
+		return IdempotencyNone
+	}
+	if aware, ok := a.(IdempotencyAware); ok {
+		return aware.SubmitIdempotency()
+	}
+	return IdempotencyNone
+}
+
 // SubmitInput is the neutral submission contract.
 type SubmitInput struct {
 	RunID                 string
@@ -61,6 +106,14 @@ type SubmitInput struct {
 	ExternalAttachmentIDs []string
 	Stream                bool
 	TimeoutSeconds        int
+
+	// ProviderIdempotencyKey is the STABLE key for this external action
+	// (第九轮 P0-2 §5). It is the same value across every transport retry of
+	// one submission and is deliberately NOT derived from the attempt
+	// counter, so a provider that supports idempotency keys can collapse
+	// them. Adapters whose provider has no such notion must ignore it —
+	// the guarantee is provided by provider_submissions instead.
+	ProviderIdempotencyKey string
 }
 
 // SubmitResult carries the provider-side identifiers.

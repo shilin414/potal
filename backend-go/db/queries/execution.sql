@@ -12,7 +12,7 @@ SELECT id, user_id, application_id, conversation_id, runtime_binding_id, organiz
        provider, runtime_type, external_run_id, status, provider_status, provider_finish_reason,
        input, output, runtime_snapshot, attempt, max_attempts, queued_at, started_at,
        finished_at, error_code, error_message, created_at, updated_at,
-       trigger_type, trigger_id, priority, available_at, lease_epoch
+       trigger_type, trigger_id, priority, available_at, lease_epoch, next_event_sequence
 FROM runs WHERE id = ?;
 
 -- name: ListRunsByConversation :many
@@ -20,7 +20,7 @@ SELECT id, user_id, application_id, conversation_id, runtime_binding_id, organiz
        provider, runtime_type, external_run_id, status, provider_status, provider_finish_reason,
        input, output, runtime_snapshot, attempt, max_attempts, queued_at, started_at,
        finished_at, error_code, error_message, created_at, updated_at,
-       trigger_type, trigger_id, priority, available_at, lease_epoch
+       trigger_type, trigger_id, priority, available_at, lease_epoch, next_event_sequence
 FROM runs WHERE conversation_id = ?
 ORDER BY created_at DESC;
 
@@ -213,27 +213,51 @@ SET status = 'failed', error_code = ?, error_message = ?,
     finished_at = CURRENT_TIMESTAMP(3)
 WHERE id = ? AND status = 'running' AND lease_epoch = ?;
 
--- name: AppendRunEventAtSequence :execresult
--- Explicit-sequence append for writers that must NOT ask the database for
--- the next value (第六轮 P2-1): the finalize transaction holds the run row
--- lock and already knows how many events the run has (CountRunEvents read
--- under that same lock), so COUNT(*)+1 is applied in Go instead of on
--- every durable write. A mismatch can only mean a lost fence and fails
--- loudly on uniq_run_event_sequence rather than silently renumbering.
-INSERT INTO run_events (run_id, sequence, event_type, payload)
-VALUES (?, ?, ?, ?);
-
 -- name: AppendRunEvent :execresult
+-- The ONE event writer. The sequence is ALWAYS supplied by the caller,
+-- which obtained it from AllocRunEventSequence* under the run row lock it
+-- already holds (第六轮 P2-1, 第九轮 P1-3). No writer may ask the database
+-- for "the next value" here: a COUNT(*)+1 computed at INSERT time would be
+-- both O(history) and a second source of truth. A mismatch between the
+-- allocated and the stored sequence can only mean a lost fence and fails
+-- loudly on uniq_run_event_sequence instead of silently renumbering.
 INSERT INTO run_events (run_id, sequence, event_type, payload)
 VALUES (?, ?, ?, ?);
 
--- name: CountRunEvents :one
-SELECT COUNT(*) AS n FROM run_events WHERE run_id = ?;
+-- name: AllocRunEventSequence :one
+-- System-plane allocation: takes the run row lock (serializing every event
+-- writer for this run) and hands back the next sequence. O(1) — the old
+-- COUNT(*)+1 grew with the run's event history and got slower exactly when
+-- a long streaming answer was producing the most events.
+--
+-- The read is a locking read on purpose: it IS the serialization point, so
+-- "read the counter, then INSERT" cannot interleave with another writer.
+SELECT next_event_sequence FROM runs WHERE id = ? FOR UPDATE;
+
+-- name: AllocRunEventSequenceFenced :one
+-- Worker-owned allocation: the same locking read plus the lease fence, so
+-- a stale worker (lease reclaimed elsewhere) is rejected before any write
+-- instead of appending to a run it no longer owns.
+SELECT next_event_sequence FROM runs
+WHERE id = ? AND status = 'running' AND lease_epoch = ?
+FOR UPDATE;
+
+-- name: BumpRunEventSequence :execresult
+-- Claims the sequence read above. Written as `x + 1` rather than a computed
+-- literal because MySQL reports CHANGED rows: assigning the already-read
+-- value would report 0 and be indistinguishable from a missing run row.
+UPDATE runs SET next_event_sequence = next_event_sequence + 1 WHERE id = ?;
 
 -- name: ListRunEventsAfter :many
+-- Keyset pagination over (run_id, sequence) — the existing UNIQUE index is
+-- exactly the right shape, so no OFFSET is ever needed. The LIMIT is
+-- mandatory for long histories (第九轮 P1-3): an unbounded read of a run
+-- with 100k events would materialize the whole log in one query, both for
+-- the HTTP replay endpoint and for the SSE gateway's initial replay.
 SELECT id, run_id, sequence, event_type, payload, created_at
 FROM run_events WHERE run_id = ? AND sequence > ?
-ORDER BY sequence;
+ORDER BY sequence
+LIMIT ?;
 
 -- name: ListAllRunEvents :many
 SELECT id, run_id, sequence, event_type, payload, created_at
@@ -663,3 +687,105 @@ WHERE id = ? AND created_by = ? AND status = 'pending' AND run_id IS NULL;
 -- legacy `interrupted` run no longer consumes a slot forever.
 SELECT COUNT(*) AS n FROM runs
 WHERE user_id = ? AND status NOT IN ('cancelled', 'succeeded', 'failed', 'interrupted');
+
+-- ───────────────────────────────────────────────── request idempotency ──
+-- POST /api/v2/runs replay protection (第九轮 P0-1). The reservation is
+-- taken INSIDE the run-creation transaction, so a crash between the two
+-- rolls both back: a reserved request identity always has its run.
+
+-- name: ReserveRunRequest :execresult
+-- ON DUPLICATE KEY UPDATE is deliberate: a duplicate reports 0 changed
+-- rows (the assigned column keeps its value) instead of raising MySQL 1062,
+-- so the caller gets a clean "already reserved" signal on the same
+-- round-trip as the success case. A concurrent duplicate blocks until the
+-- winning transaction commits or rolls back — if it rolled back, this
+-- INSERT simply succeeds and takes the identity over.
+INSERT INTO run_requests (user_id, client_request_id, run_id, request_hash)
+VALUES (?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE user_id = user_id;
+
+-- name: GetRunRequest :one
+-- Replay lookup. request_hash is returned so the caller can distinguish
+-- "same request" (replay) from "same key, different payload" (409).
+SELECT run_id, request_hash FROM run_requests
+WHERE user_id = ? AND client_request_id = ?;
+
+-- ───────────────────────────────────────────── provider submissions ──
+-- Durable record of the external side effect (第九轮 P0-2). Written BEFORE
+-- the HTTP submit and updated after it, so the "provider may already have
+-- the request" window is recoverable instead of invisible.
+
+-- name: CreateProviderSubmission :execresult
+-- 1 changed row = a new submission row; 0 = this (run, submission_no) is
+-- already recorded (see ReserveRunRequest for the same idiom).
+INSERT INTO provider_submissions
+    (run_id, submission_no, provider, idempotency_key, request_hash, state, attempt)
+VALUES (?, ?, ?, ?, ?, 'sending', ?)
+ON DUPLICATE KEY UPDATE run_id = run_id;
+
+-- name: GetLatestProviderSubmission :one
+-- The newest submission for a run. sql.ErrNoRows means this run has never
+-- been submitted to a provider.
+SELECT run_id, submission_no, provider, idempotency_key, request_hash, state,
+       attempt, external_run_id, last_error, created_at, updated_at
+FROM provider_submissions
+WHERE run_id = ?
+ORDER BY submission_no DESC
+LIMIT 1;
+
+-- name: MarkProviderSubmissionAccepted :execresult
+-- The provider answered with an external id: the outcome is now KNOWN, both
+-- here and on the run row (written in the same transaction).
+UPDATE provider_submissions
+SET state = 'accepted', external_run_id = ?, last_error = NULL
+WHERE run_id = ? AND submission_no = ?;
+
+-- name: MarkProviderSubmissionState :execresult
+-- 'unknown' ('the request may have been delivered and the provider cannot
+-- be asked') and 'rejected' ('the provider definitively refused, a retry is
+-- legitimate') are the two outcomes a caller may record. 'sending' is only
+-- ever written by CreateProviderSubmission.
+UPDATE provider_submissions
+SET state = ?, last_error = ?
+WHERE run_id = ? AND submission_no = ?;
+
+-- name: CountProviderSubmissionsByRun :one
+SELECT COUNT(*) AS n FROM provider_submissions WHERE run_id = ?;
+
+-- ─────────────────────────────────────────────── waiting_external ──
+-- Parked-unknown lifecycle (第九轮 P0-2). A run whose provider submit may
+-- have been delivered but cannot be confirmed is parked, NOT retried: for a
+-- provider with neither a native idempotency key nor a lookup-by-request
+-- capability, at-most-once is the only honest option.
+
+-- name: AwaitExternalRunFenced :execresult
+-- Fenced running → waiting_external. Non-terminal: the run still holds its
+-- conversation and its outstanding slot until the sweep below resolves it.
+UPDATE runs
+SET status = 'waiting_external'
+WHERE id = ? AND status = 'running' AND lease_epoch = ?;
+
+-- name: ListParkedWaitingExternalRunIDs :many
+-- The sweep's input. updated_at is the parking instant: the run row is
+-- written exactly once when it enters waiting_external and nothing touches
+-- it afterwards, so the grace window measures from the park (not from a
+-- later unrelated write), and runs touched by hand are naturally excluded
+-- until they go quiet again.
+--
+-- The cutoff is an absolute instant derived from the DB clock by the caller
+-- (CurrentDBTime minus the grace), never from the application clock — the
+-- same rule every other timing decision in this package follows.
+SELECT id FROM runs
+WHERE status = 'waiting_external'
+  AND updated_at <= sqlc.arg(quiet_before)
+ORDER BY updated_at
+LIMIT ?;
+
+-- name: FailParkedExternalRun :execresult
+-- Terminal resolution of an unconfirmable submit. Guarded on
+-- status = 'waiting_external' so a concurrent resolution (cancel, a
+-- reconciler that DID manage to confirm the call) wins cleanly.
+UPDATE runs
+SET status = 'failed', error_code = 'provider_submit_unknown', error_message = ?,
+    finished_at = CURRENT_TIMESTAMP(3)
+WHERE id = ? AND status = 'waiting_external';

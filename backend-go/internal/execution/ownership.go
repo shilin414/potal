@@ -88,17 +88,44 @@ func (w *WorkerOwnedService) Retry(ctx context.Context, claimed *ClaimedRun, rea
 	return w.svc.RetryOwnedRun(ctx, claimed.Run, claimed.Ownership, reason)
 }
 
-// BeginProviderAttempt consumes one provider execution attempt under the
-// ownership fence and updates the in-memory claim so the executor's
-// retry-budget decisions see the fresh count (P0-2). Call it immediately
-// before the provider submit, never at claim time.
-func (w *WorkerOwnedService) BeginProviderAttempt(ctx context.Context, claimed *ClaimedRun) error {
-	attempt, err := w.svc.BeginProviderAttemptOwned(ctx, claimed.Ownership)
+// BeginProviderSubmission consumes one provider execution attempt AND records
+// the provider submission under the ownership fence (第九轮 P0-2). Call it
+// immediately before the provider submit, never at claim time.
+//
+// It returns the durable decision, which is NOT simply "go ahead":
+//
+//	State == sending   transmit (the submission is recorded as in-flight)
+//	State == accepted  do NOT transmit — reconcile with ExternalRunID
+//	ErrProviderSubmitUnknown  do NOT transmit — park the run
+//
+// and it updates the in-memory claim's attempt so the executor's retry-budget
+// decisions see the fresh count.
+func (w *WorkerOwnedService) BeginProviderSubmission(ctx context.Context, claimed *ClaimedRun, provider string, requestHash []byte) (*ProviderSubmission, error) {
+	sub, err := w.svc.BeginProviderSubmissionOwned(ctx, claimed.Ownership, provider, requestHash)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	claimed.Run.Attempt = attempt
-	return nil
+	claimed.Run.Attempt = sub.Attempt
+	return sub, nil
+}
+
+// MarkSubmissionAccepted durably records "the provider answered with this
+// external id", together with runs.external_run_id, in one transaction.
+func (w *WorkerOwnedService) MarkSubmissionAccepted(ctx context.Context, claimed *ClaimedRun, sub *ProviderSubmission, externalRunID string) error {
+	return w.svc.MarkSubmissionAcceptedOwned(ctx, claimed.Ownership, sub, externalRunID)
+}
+
+// MarkSubmissionState records 'rejected' (definitively refused) or 'unknown'
+// (may have been delivered, cannot be confirmed) for this attempt.
+func (w *WorkerOwnedService) MarkSubmissionState(ctx context.Context, claimed *ClaimedRun, sub *ProviderSubmission, state, lastError string) error {
+	return w.svc.MarkSubmissionStateOwned(ctx, claimed.Ownership, sub, state, lastError)
+}
+
+// AwaitExternal parks the run in waiting_external (non-terminal) after an
+// unconfirmable provider submit. Never a retry: the provider may hold the
+// request.
+func (w *WorkerOwnedService) AwaitExternal(ctx context.Context, claimed *ClaimedRun, reason string) error {
+	return w.svc.AwaitExternalOwned(ctx, claimed.Ownership, reason)
 }
 
 // Fail drives the run into the terminal failed state.

@@ -11,17 +11,37 @@ import (
 )
 
 type Querier interface {
+	// System-plane allocation: takes the run row lock (serializing every event
+	// writer for this run) and hands back the next sequence. O(1) — the old
+	// COUNT(*)+1 grew with the run's event history and got slower exactly when
+	// a long streaming answer was producing the most events.
+	//
+	// The read is a locking read on purpose: it IS the serialization point, so
+	// "read the counter, then INSERT" cannot interleave with another writer.
+	AllocRunEventSequence(ctx context.Context, id []byte) (uint64, error)
+	// Worker-owned allocation: the same locking read plus the lease fence, so
+	// a stale worker (lease reclaimed elsewhere) is rejected before any write
+	// instead of appending to a run it no longer owns.
+	AllocRunEventSequenceFenced(ctx context.Context, arg AllocRunEventSequenceFencedParams) (uint64, error)
+	// The ONE event writer. The sequence is ALWAYS supplied by the caller,
+	// which obtained it from AllocRunEventSequence* under the run row lock it
+	// already holds (第六轮 P2-1, 第九轮 P1-3). No writer may ask the database
+	// for "the next value" here: a COUNT(*)+1 computed at INSERT time would be
+	// both O(history) and a second source of truth. A mismatch between the
+	// allocated and the stored sequence can only mean a lost fence and fails
+	// loudly on uniq_run_event_sequence instead of silently renumbering.
 	AppendRunEvent(ctx context.Context, arg AppendRunEventParams) (sql.Result, error)
-	// Explicit-sequence append for writers that must NOT ask the database for
-	// the next value (第六轮 P2-1): the finalize transaction holds the run row
-	// lock and already knows how many events the run has (CountRunEvents read
-	// under that same lock), so COUNT(*)+1 is applied in Go instead of on
-	// every durable write. A mismatch can only mean a lost fence and fails
-	// loudly on uniq_run_event_sequence rather than silently renumbering.
-	AppendRunEventAtSequence(ctx context.Context, arg AppendRunEventAtSequenceParams) (sql.Result, error)
 	// Late-attachment race guard: only while queued.
 	AppendUserAttachmentToRunInput(ctx context.Context, arg AppendUserAttachmentToRunInputParams) (sql.Result, error)
 	ApplicationSlugExists(ctx context.Context, slug string) (int64, error)
+	// ─────────────────────────────────────────────── waiting_external ──
+	// Parked-unknown lifecycle (第九轮 P0-2). A run whose provider submit may
+	// have been delivered but cannot be confirmed is parked, NOT retried: for a
+	// provider with neither a native idempotency key nor a lookup-by-request
+	// capability, at-most-once is the only honest option.
+	// Fenced running → waiting_external. Non-terminal: the run still holds its
+	// conversation and its outstanding slot until the sweep below resolves it.
+	AwaitExternalRunFenced(ctx context.Context, arg AwaitExternalRunFencedParams) (sql.Result, error)
 	// Consumes ONE provider execution attempt, fenced by the current lease
 	// epoch. Called by the owner right before the provider submit; claim /
 	// admission requeues never touch attempt. attempt < max_attempts is
@@ -34,6 +54,10 @@ type Querier interface {
 	// caller must treat that as a conflict, never overwrite.
 	BindAgentThreadSessionOwned(ctx context.Context, arg BindAgentThreadSessionOwnedParams) (sql.Result, error)
 	BindAttachmentToRun(ctx context.Context, arg BindAttachmentToRunParams) error
+	// Claims the sequence read above. Written as `x + 1` rather than a computed
+	// literal because MySQL reports CHANGED rows: assigning the already-read
+	// value would report 0 and be indistinguishable from a missing run row.
+	BumpRunEventSequence(ctx context.Context, id []byte) (sql.Result, error)
 	// CAS claim: one delivery worker wins; 0 rows = someone else got it.
 	// Only pending→sending: a duplicate stream message can never re-claim a
 	// row another worker is already sending (no double Feishu messages).
@@ -118,10 +142,10 @@ type Querier interface {
 	// Counted under the schedules row lock by the caller.
 	CountPendingOccurrences(ctx context.Context, scheduleID uint64) (int64, error)
 	CountPendingOutbox(ctx context.Context) (int64, error)
+	CountProviderSubmissionsByRun(ctx context.Context, runID []byte) (int64, error)
 	// Invariant B: a queued run must NOT hold a lease.
 	CountQueuedWithLease(ctx context.Context) (int64, error)
 	CountRunByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
-	CountRunEvents(ctx context.Context, runID []byte) (int64, error)
 	// Invariant E: a running run's lease_epoch must equal its lease row's.
 	CountRunningLeaseEpochMismatch(ctx context.Context) (int64, error)
 	// ──────────────────────────────────────────────── invariant checks ──
@@ -174,6 +198,13 @@ type Querier interface {
 	// the DB clock as the single authority for both (Phase 3).
 	CreateOutboxEventAt(ctx context.Context, arg CreateOutboxEventAtParams) (sql.Result, error)
 	CreateProviderSlot(ctx context.Context, arg CreateProviderSlotParams) error
+	// ───────────────────────────────────────────── provider submissions ──
+	// Durable record of the external side effect (第九轮 P0-2). Written BEFORE
+	// the HTTP submit and updated after it, so the "provider may already have
+	// the request" window is recoverable instead of invisible.
+	// 1 changed row = a new submission row; 0 = this (run, submission_no) is
+	// already recorded (see ReserveRunRequest for the same idiom).
+	CreateProviderSubmission(ctx context.Context, arg CreateProviderSubmissionParams) (sql.Result, error)
 	// ─────────────────────────────────────────────────────────── execution ──
 	CreateRun(ctx context.Context, arg CreateRunParams) (sql.Result, error)
 	CreateRunArtifact(ctx context.Context, arg CreateRunArtifactParams) error
@@ -266,6 +297,10 @@ type Querier interface {
 	EnsureProviderAdmissionLock(ctx context.Context, provider string) error
 	FailExpiredRun(ctx context.Context, arg FailExpiredRunParams) (sql.Result, error)
 	FailOutboxEvent(ctx context.Context, arg FailOutboxEventParams) error
+	// Terminal resolution of an unconfirmable submit. Guarded on
+	// status = 'waiting_external' so a concurrent resolution (cancel, a
+	// reconciler that DID manage to confirm the call) wins cleanly.
+	FailParkedExternalRun(ctx context.Context, arg FailParkedExternalRunParams) (sql.Result, error)
 	FailRunFenced(ctx context.Context, arg FailRunFencedParams) (sql.Result, error)
 	FailStuckDeliveries(ctx context.Context, arg FailStuckDeliveriesParams) (sql.Result, error)
 	FindBinding(ctx context.Context, arg FindBindingParams) (RuntimeBinding, error)
@@ -309,6 +344,9 @@ type Querier interface {
 	GetFeishuIdentityByFeishuUserID(ctx context.Context, feishuUserID sql.NullString) (FeishuIdentity, error)
 	GetFeishuIdentityByLocalUser(ctx context.Context, userID uint64) (FeishuIdentity, error)
 	GetFeishuIdentityByOpenID(ctx context.Context, openID sql.NullString) (FeishuIdentity, error)
+	// The newest submission for a run. sql.ErrNoRows means this run has never
+	// been submitted to a provider.
+	GetLatestProviderSubmission(ctx context.Context, runID []byte) (ProviderSubmission, error)
 	GetLease(ctx context.Context, runID []byte) (GetLeaseRow, error)
 	// Ownership + state check happens per id in Go (≤8 per run, Aily limit).
 	GetPendingOwnedAttachment(ctx context.Context, arg GetPendingOwnedAttachmentParams) (RuntimeAttachment, error)
@@ -335,6 +373,9 @@ type Querier interface {
 	// missing or inactive provider → pause (requeue, keep waiting).
 	GetRunGateState(ctx context.Context, id []byte) (GetRunGateStateRow, error)
 	GetRunLeaseEpoch(ctx context.Context, id []byte) (uint64, error)
+	// Replay lookup. request_hash is returned so the caller can distinguish
+	// "same request" (replay) from "same key, different payload" (409).
+	GetRunRequest(ctx context.Context, arg GetRunRequestParams) (GetRunRequestRow, error)
 	// Reads back the canonical started_at the UPDATE above just wrote
 	// (第五轮 P2-4). The caller needs the DATABASE's timestamp, not a
 	// locally generated one: started_at is already DB-clock authoritative and
@@ -434,12 +475,27 @@ type Querier interface {
 	ListMessagesByConversation(ctx context.Context, conversationID uint64) ([]Message, error)
 	ListOccurrenceDeliveryExpectations(ctx context.Context, occurrenceID uint64) ([]OccurrenceDeliveryExpectation, error)
 	ListOccurrencesBySchedule(ctx context.Context, arg ListOccurrencesByScheduleParams) ([]ScheduleOccurrence, error)
+	// The sweep's input. updated_at is the parking instant: the run row is
+	// written exactly once when it enters waiting_external and nothing touches
+	// it afterwards, so the grace window measures from the park (not from a
+	// later unrelated write), and runs touched by hand are naturally excluded
+	// until they go quiet again.
+	//
+	// The cutoff is an absolute instant derived from the DB clock by the caller
+	// (CurrentDBTime minus the grace), never from the application clock — the
+	// same rule every other timing decision in this package follows.
+	ListParkedWaitingExternalRunIDs(ctx context.Context, arg ListParkedWaitingExternalRunIDsParams) ([][]byte, error)
 	ListPendingOutbox(ctx context.Context, limit int32) ([]OutboxEvent, error)
 	// Provider admission order. Base priority is explicit and waiting time
 	// adds a bounded bonus so scheduled/background work cannot starve.
 	ListQueuedRunIDs(ctx context.Context, arg ListQueuedRunIDsParams) ([][]byte, error)
 	ListRunArtifacts(ctx context.Context, runID []byte) ([]RunArtifact, error)
 	ListRunArtifactsByExternalID(ctx context.Context, arg ListRunArtifactsByExternalIDParams) (RunArtifact, error)
+	// Keyset pagination over (run_id, sequence) — the existing UNIQUE index is
+	// exactly the right shape, so no OFFSET is ever needed. The LIMIT is
+	// mandatory for long histories (第九轮 P1-3): an unbounded read of a run
+	// with 100k events would materialize the whole log in one query, both for
+	// the HTTP replay endpoint and for the SSE gateway's initial replay.
 	ListRunEventsAfter(ctx context.Context, arg ListRunEventsAfterParams) ([]RunEvent, error)
 	ListRunsByConversation(ctx context.Context, conversationID sql.NullInt64) ([]Run, error)
 	// status: all | running | paused | failed (UI filters). Soft-deleted
@@ -470,6 +526,14 @@ type Querier interface {
 	MarkOccurrenceRunningByRun(ctx context.Context, runID sql.NullString) (sql.Result, error)
 	MarkOccurrenceStatus(ctx context.Context, arg MarkOccurrenceStatusParams) (sql.Result, error)
 	MarkOutboxPublished(ctx context.Context, id uint64) error
+	// The provider answered with an external id: the outcome is now KNOWN, both
+	// here and on the run row (written in the same transaction).
+	MarkProviderSubmissionAccepted(ctx context.Context, arg MarkProviderSubmissionAcceptedParams) (sql.Result, error)
+	// 'unknown' ('the request may have been delivered and the provider cannot
+	// be asked') and 'rejected' ('the provider definitively refused, a retry is
+	// legitimate') are the two outcomes a caller may record. 'sending' is only
+	// ever written by CreateProviderSubmission.
+	MarkProviderSubmissionState(ctx context.Context, arg MarkProviderSubmissionStateParams) (sql.Result, error)
 	// Stamps started_at once, fenced by the current lease epoch, at the point
 	// the run is actually allowed to execute (第四轮 P2). COALESCE keeps the
 	// FIRST start time: a run deferred for a paused provider and later
@@ -501,6 +565,17 @@ type Querier interface {
 	// in the same transaction (CreateOutboxEvent), so Run.available_at ==
 	// Outbox.available_at regardless of app/DB clock skew.
 	RequeueRunFencedImmediate(ctx context.Context, arg RequeueRunFencedImmediateParams) (sql.Result, error)
+	// ───────────────────────────────────────────────── request idempotency ──
+	// POST /api/v2/runs replay protection (第九轮 P0-1). The reservation is
+	// taken INSIDE the run-creation transaction, so a crash between the two
+	// rolls both back: a reserved request identity always has its run.
+	// ON DUPLICATE KEY UPDATE is deliberate: a duplicate reports 0 changed
+	// rows (the assigned column keeps its value) instead of raising MySQL 1062,
+	// so the caller gets a clean "already reserved" signal on the same
+	// round-trip as the success case. A concurrent duplicate blocks until the
+	// winning transaction commits or rolls back — if it rolled back, this
+	// INSERT simply succeeds and takes the identity over.
+	ReserveRunRequest(ctx context.Context, arg ReserveRunRequestParams) (sql.Result, error)
 	RevokeConversationShare(ctx context.Context, arg RevokeConversationShareParams) error
 	RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) error
 	SetApplicationEnabled(ctx context.Context, arg SetApplicationEnabledParams) error

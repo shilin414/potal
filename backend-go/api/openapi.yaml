@@ -838,12 +838,28 @@ paths:
       operationId: createRun
       tags: [runs]
       summary: Create a run (lazily creates the conversation when conversation_id is absent)
+      description: |
+        With a `client_request_id` the request is IDEMPOTENT: an identical
+        resend returns the ORIGINAL run with HTTP 200 and
+        `idempotency_replayed=true` instead of creating a second run, user
+        message and provider chat. Reusing the id with a different payload is
+        rejected with HTTP 409 `idempotency_key_reused`.
+
+        The identity is reserved inside the run-creation transaction and is
+        checked before authorization, rate limiting and attachment
+        validation, so a resend is never misreported as a limit violation for
+        a request that already succeeded.
       requestBody:
         required: true
         content:
           application/json:
             schema: { $ref: "#/components/schemas/CreateRunRequest" }
       responses:
+        "200":
+          description: Idempotent replay — the original run for this client_request_id
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
         "201":
           description: Run created (status=queued)
           content:
@@ -857,6 +873,11 @@ paths:
                 oneOf:
                   - { $ref: "#/components/schemas/BareError" }
                   - { $ref: "#/components/schemas/FieldErrors" }
+        "409":
+          description: idempotency_key_reused — the client_request_id is bound to another payload
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
 
   /api/v2/runs/{runId}:
     parameters:
@@ -883,19 +904,25 @@ paths:
       - name: after
         in: query
         schema: { type: integer, minimum: 0, default: 0 }
-        description: Return events with sequence > after (ascending).
+        description: Return events with sequence > after (ascending). Keyset cursor.
+      - name: limit
+        in: query
+        schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+        description: Page size (default 200, maximum 1000).
     get:
       operationId: listRunEvents
       tags: [runs]
-      summary: Persisted run events (replay after reconnect)
+      summary: One keyset page of persisted run events (replay after reconnect)
+      description: |
+        Keyset pagination over (run_id, sequence) — no OFFSET, so page N costs
+        the same as page 1. Walk by feeding `next_after` back into `after`
+        while `has_more` is true.
       responses:
         "200":
-          description: Events (bare array)
+          description: Event page
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/RunEvent" }
+              schema: { $ref: "#/components/schemas/RunEventPage" }
         "404":
           description: run not found
           content:
@@ -905,13 +932,31 @@ paths:
   /api/v2/runs/{runId}/stream:
     parameters:
       - $ref: "#/components/parameters/RunId"
+      - name: after
+        in: query
+        schema: { type: integer, minimum: 0, default: 0 }
+        description: >-
+          Durable cursor: replay only events with sequence > after. Takes
+          precedence over the Last-Event-ID header.
     get:
       operationId: streamRun
       tags: [runs]
-      summary: SSE stream (DB replay from sequence 0, then Redis live frames)
+      summary: SSE stream (paged DB replay from the durable cursor, then Redis live frames)
       description: |
-        `text/event-stream`. Frames:
-        `event: run.event\ndata: {"run_id","sequence","event_type","payload"[,"created_at"]}\n\n`
+        `text/event-stream`. Durable frames:
+
+        `event: run.event\nid: <sequence>\ndata: {"run_id","sequence","event_type","payload"}\n\n`
+
+        The `id:` line carries the durable run sequence, so a reconnecting
+        client can resume from the last event it processed: either by sending
+        `?after=<sequence>` or by letting EventSource replay `Last-Event-ID`.
+        Precedence is query `after` > `Last-Event-ID` > 0.
+
+        TRANSIENT frames (content.delta, fanned out live without being
+        persisted) carry sequence 0 and deliberately write NO `id:` — sequence
+        0 is a sentinel, and writing it would reset the browser's cursor to
+        the beginning of the run.
+
         Keepalive comment `: keepalive` after 15s of silence.
         Closes after replay when the run is already terminal, or after the
         first terminal live event.
@@ -1875,6 +1920,14 @@ components:
           type: array
           items: { type: string, format: uuid }
           description: studio attachment ids uploaded by this user, unbound to a run
+        client_request_id:
+          type: string
+          maxLength: 64
+          description: >-
+            Client-generated idempotency token for ONE user send action (e.g.
+            a UUID). It must be stable across transport retries of that action
+            and must change when the user edits the message and sends again.
+            Reusing it with a different payload is a 409.
 
     Run:
       type: object
@@ -1967,10 +2020,29 @@ components:
             - run.failed
             - run.interrupted
             - run.poll
+            - run.retrying
+            - run.waiting_external
         payload:
           type: object
           additionalProperties: true
         created_at: { type: string, format: date-time }
+
+    RunEventPage:
+      type: object
+      required: [items, next_after, has_more]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/RunEvent" }
+        next_after:
+          type: integer
+          description: Highest sequence in this page; feed back as `after` to continue.
+        has_more:
+          type: boolean
+          description: >-
+            True when the page was full, so more events may follow. Derived
+            from the page size rather than a COUNT, so reading a page never
+            costs the whole history.
 
     RunCommand:
       type: object
