@@ -1,16 +1,12 @@
 # Creation Agent Studio — 项目长期记忆
 
-## 当前状态（2026-09-15 第七轮复审整改后）
+## 当前状态（2026-09-15 第八轮复审整改后）
 
-第七轮 97/A（P0=0，P1=1，P2=2）→ 报告 §二十四 批次一/二 **全部完成**：P1 SSE terminal replay 立即关闭、P2-1 duration metric post-commit、P2-2 前端同 chunk 终态停止，本机全绿（后端单测+集成 60.1s、前端 tsc/vitest 131/vite build）。报告预期三件套后该块达 98/A+。
-基线 dev `fc255f5`（第六轮功能提交 `ecbc83f`）。变更报告按主题命名放 `docs/`。
+第八轮 97/A（P0=0，**P1=1**，无 P2）→ 唯一 P1 已关闭：merged heartbeat 改为 **BOTH OR NEITHER** + Provider Slot 确认丢失后 Worker 立即 self-fence。本机全绿（单测 + 集成 58.6s），两次反证确认新测试非空转。提交 `a49cee8`（单提交），推送后 CI **run 34967969067 全绿**（`check` 含 `-race` + `integration` 含二次迁移 no-op）。变更报告见 `docs/potal 第八轮复审整改变更报告（…）.md`。
 
-推送后 CI 首轮红（integration / `TestExecutionFencingMatrix`）→ 定位到一条**独立于三件套的缺陷**：同毫秒续约被读成所有权丢失（见下面「事务与时钟」第一条），已修复 + 确定性反证，作为**附加项**记在变更报告 §六。修复推送后 CI 全绿（backend run 34956053704：check 含 `-race` + integration 全 success；frontend 无改动未重跑）。当前 dev HEAD `a7889db`。
+**执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot）已定型。** 第八轮报告 §二十三 明确：到这一节点**真正停止**沿执行主链继续抠边角（Gate/Lease/ProviderSlot/Retry·Defer/Schedule/legacy migration/SSE terminal correctness），下轮转向新架构风险：**client_request_id 幂等、SSE Hub/多连接、Worker dispatcher、Conversation lifecycle、长历史 event 分页、长对话前端性能**。
 
-**执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot）已定型。**
-第七轮报告明确：三件套完成后，**停止**对 Gate1/Gate2/Provider submit boundary/Lease fencing/Retry·Defer/Schedule admission/legacy interrupted migration 继续微调；下轮转向新架构风险（client_request_id 幂等、SSE Hub、长历史 event 分页、Worker dispatcher、Conversation 生命周期、前端长对话性能）。
-
-**第三批（未做）**：`onTransportEnd` 契约清理（实际不可达，报告建议暂时删除死接口）、`runs.next_event_sequence` 分配器。
+**P3 backlog（报告明确「先不动」）**：`onTransportEnd` 契约清理（实际不可达，等 SSE Hub/reconnect policy 一起设计）、`runs.next_event_sequence` 分配器（当前 `COUNT(*)+1` 有 run 行锁保证正确性）。
 
 ---
 
@@ -23,8 +19,10 @@
 - **terminal event = 硬边界**：SSE replay 遇到立即 `break` 并 `return`（**不看 `run.Status` 快照**——快照是开流前读的，正常终态竞争即可 stale）；前端同一 chunk 内 terminal 后停止 dispatch。synthetic terminal 必须按状态映射（succeeded→completed / cancelled→cancelled / failed|interrupted→failed），未知或非 settled **不合成**，绝不默认 `run.completed`。
 
 ### 事务与时钟
-- **续约类 UPDATE 必须单调写**（第七轮 CI 血的教训）：MySQL 的 `UPDATE` 返回 **changed rows，不是 matched rows**。`SET heartbeat_at = CURRENT_TIMESTAMP(3), expires_at = CURRENT_TIMESTAMP(3)+lease` 这种形状，若续约与建行落在**同一毫秒**（CI 回环 MySQL 会，本机 LAN 不会）→ 值完全相同 → `RowsAffected=0`，与"行不存在"不可区分 → 被读成 `ErrProviderSlotLost` / `HeartbeatOwned=false`（worker 会放弃健康 Run）。修法：`heartbeat_at = GREATEST(CURRENT_TIMESTAMP(3), DATE_ADD(heartbeat_at, INTERVAL 1000 MICROSECOND))`（**注意 sqlc 不认 `1 MILLISECOND`，要写 `1000 MICROSECOND`**）。先例：`provider_admission_locks.admissions = admissions + 1`。**不要**用 `ClientFoundRows=true`（会改变 `BindAgentThreadSessionOwned` 与 delivery 的重复检测语义），也**不要**用 `GREATEST(expires_at,…)`（过期时间逐次漂移）。
-- **`SET timestamp = <second>` 可钉死 session 时钟**（`CURRENT_TIMESTAMP(3)` → `.000`），配 `MaxOpenConns(1)` 即可把"恰好同一毫秒"变成确定性条件 —— 时序类栅栏 bug 的确定性复现手段。
+- **续约类 UPDATE 必须单调写**（第七轮 CI 血的教训）：MySQL 的 `UPDATE` 返回 **changed rows，不是 matched rows**。`SET heartbeat_at = CURRENT_TIMESTAMP(3), expires_at = CURRENT_TIMESTAMP(3)+lease` 这种形状，若续约与建行落在**同一毫秒**（CI 回环 MySQL 会，本机 LAN 不会）→ 值完全相同 → `RowsAffected=0`，与"行不存在"不可区分 → 被读成 `ErrProviderSlotLost` / `HeartbeatOwned=false`（worker 会放弃健康 Run）。修法：`heartbeat_at = GREATEST(CURRENT_TIMESTAMP(3), DATE_ADD(heartbeat_at, INTERVAL 1000 MICROSECOND))`（**注意 sqlc 不认 `1 MILLISECOND`，要写 `1000 MICROSECOND`**）。先例：`provider_admission_locks.admissions = admissions + 1`。**不要**用 `ClientFoundRows=true`（会改变 `BindAgentThreadSessionOwned` 与 delivery 的重复检测语义），也**不要**用 `GREATEST(expires_at,…)`（过期时间逐次漂移）。`heartbeat_at` **仅观测、不参与 fencing**（第八轮 P3），判断字段只有 `expires_at`，任何调用方不得开始依赖 `heartbeat_at`。
+- **merged heartbeat 是 BOTH OR NEITHER**（第八轮 P1，`HeartbeatOwnedWithSlot`）：进入 provider execution 后（`slot != nil`）只有四个出口 —— `(true,true,nil)` 一次 commit；`(false,false,nil)` lease fence 被拒；`ErrProviderSlotLost`（往返**成功**但 0 changed rows）；普通 error。**任何 slot 失败都连同 lease 续约一起 ROLLBACK**。单边 commit Run lease 会让 Worker 继续调 provider 而 capacity accounting 已释放该 slot → 下一次 admission 数到 `max-1` 就放行 → 真实并发 `max_inflight+1`，safety 上界破裂。Renew 恒 **XX-only，绝不 recreate slot**（释放掉的 capacity 可能已被新 admission 吃掉；recreate 会把 heartbeat 拖回完整 admission 锁序）。§13 判定：`ErrProviderSlotLost` **立即 cancel**；普通 DB error 仍按「最后一次已确认 TTL」fail-closed；确认丢失后只 local cancel + 幂等 Release，**不 requeue**（provider 请求可能已发出），lease 交给 reaper 收敛。
+- **多返回值 flag 的判定/文案必须带齐维度**：`slotOK=false` 也可能是「lease 被拒所以没走到 slot」的副产品 → 用 `err==nil && !slotOK` 判「容量丢失」会把所有权丢失误报成容量丢失。谓词写 `confirmedProviderSlotLoss(leaseOK, slotOK, err)`，文案抽成可测函数 + 表驱动测试。
+- **`SET timestamp = <second>` 可钉死 session 时钟**（`CURRENT_TIMESTAMP(3)` → `.000`），配 `MaxOpenConns(1)` 即可把"恰好同一毫秒"变成确定性条件 —— 时序类栅栏 bug 的确定性复现手段。同一配方可注入**真实 InnoDB 1205**：`SET SESSION innodb_lock_wait_timeout = 1` + 另一连接 `SELECT … FOR UPDATE` 持锁（注意 `innodb_rollback_on_timeout` 默认 OFF，超时只回滚**语句**，靠被测代码的 `defer tx.Rollback()` 丢掉前一条写）。两种注入共用 `newSessionTunedService(t, sessionStmt, args...)`，不要复制。
 - **metrics / Redis fan-out / delivery hook 一律 post-commit，绝不能在正确性事务内做观测读**：观测读失败不得回滚终态。`studio_run_duration` 两端都取 DB 时钟（`dbClockDuration`，NULL/非单调丢弃），在 commit 后重读行（`GetRunTimestamps`），用 `NewCleanupContext`（detached + 有界）+ 只告警。
 - **Clock Authority 无兜底**：`dbNow/dbNowTx` 出错就中止/跳 tick，绝不回落本机时钟；Scheduler/TriggerNow 一律 `DBNow`。
 - `MarkRunStartedOwned` 返回 **DB 时间**，worker 必须 `claimed.Run.StartedAt = &t`；started_at 在 Gate1 allow 后才写（`CASClaimRun` 不写）；`finalize.go` 先判 `StartedAt != nil` 再 `IsZero()`。
@@ -56,16 +54,18 @@
 ## 数据库与 CI
 - **MySQL 5.7 基线**（TiDB 已退出）：`192.168.211.26:20336`/`xiaoan`/`test_user`；DSN UTC（`loc=UTC`+`time_zone='+00:00'`）不能动；错误码 1213/1205 保留。当前 migration version = 20。
 - CI 两 job：`check`（actionlint/gofmt/vet/build/unit/**race**）+ `integration`（mysql5.7+redis7，含二次迁移 no-op）。**本机无 gcc，`-race` 只能由 CI 兜**。
-- 改 `db/queries/*.sql` 必须跑 `~/go/bin/sqlc.exe generate`（v1.30.0），确认无附带 churn。
+- 改 `db/queries/*.sql` 必须跑 `~/go/bin/sqlc.exe generate`（v1.30.0）。**只改 SQL 注释也会有 diff**（sqlc 把注释搬进 Go doc，`querier.go` 里也有副本），属预期，只需确认没有 query 签名变化。
+- 本机**无 `gh`**：查 CI 用匿名 GitHub API（`api.github.com/repos/shilin414/potal/actions/runs?branch=dev`，公开库无需 token）。**MSYS 的 `/tmp` 与原生 `python.exe`/`node.exe` 不互通** → 用 `curl … | python -c "json.load(sys.stdin)"` 管道，别写 `/tmp/x.json` 再用原生解释器打开。
 
 ## 运行/验证要点
 - 集成测试开关 `STUDIO_TEST_DB=1` / `STUDIO_TEST_REDIS=1`；配置一律 `config.Load()`（`.env.local` 有密码）。delivery 是独立 worker（`--provider=feishu_delivery`）。
 - 冒烟无泄漏判据：running=0/leases=0/slots=0/outbox(pending)=0/delivery(pending)=0/occurrence(pending)=0。
-- **报告类「全库 COUNT 期望 0」校验会被 fixture 残留假红**：新 seed 一律自带 `t.Cleanup`，FK 顺序 events→leases→slots→outbox→run→conversation；圈定清理用 `provider LIKE 'itest%'`。
-- 新增测试必须做**反证**（临时还原修复 → 确认测试 FAIL → 还原 → 全绿），否则测试无价值。
+- **报告类「全库 COUNT 期望 0」校验会被 fixture 残留假红**：新 seed 一律自带 `t.Cleanup`，FK 顺序 events→leases→slots→outbox→run→conversation；圈定清理用 `provider LIKE 'itest%'`。清理**写了不等于生效**——可插一个临时探针（`tests/integration/zz_leakprobe_test.go`，`LEAKPROBE_CLEAN=1` 先清历史残留拿 `0/0/0/0` 基线，跑完全量再 COUNT，**跑完立即删**）量出本轮新 fixture 的真实残留。
+- 新增测试必须做**反证**（临时还原修复 → 确认测试 FAIL → 还原 → 全绿），否则测试无价值。断言时间戳「未变」要用 `CAST(col AS CHAR)` 逐字符串比较（单调列同毫秒也会 +1ms，比剩余 TTL 探针强得多）。
 - 本机 Git Bash 常丢 coreutils：命令前 `export PATH="/usr/bin:/bin:/c/software/Git/cmd:$PATH"`。本机 git 的 `refs/remotes/<name>/<branch>` 写入有缺陷，push 后必须手工写 loose ref + 双写 packed-refs 并用 `git ls-remote` 三方核对。
 
 ## 历轮整改索引（细节见 docs/ 下同名报告）
 - 五轮：finalize 竞态 / streaming 取消 / interrupted 契约 / DB 时钟 / 限流 ctx / started_at / cleanup 边界 → 93/A-
 - 六轮：0018→0020 历史事件迁移修复 / SSE cancelled synthetic / DB-clock duration → 96/A（解除 BLOCKED）
-- 七轮：SSE replay terminal 硬边界（P1）/ duration metric post-commit（P2-1）/ 前端同 chunk 终态停止（P2-2）→ 预期 98/A+
+- 七轮：SSE replay terminal 硬边界（P1）/ duration metric post-commit（P2-1）/ 前端同 chunk 终态停止（P2-2）→ 98/A+
+- 八轮：merged heartbeat BOTH OR NEITHER（P1）/ Provider Slot 确认丢失后 Worker self-fence / `heartbeat_at` 注释澄清（P3 文档）→ 该 P1 关闭
