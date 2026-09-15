@@ -148,6 +148,15 @@ func (c *Client) do(ctx context.Context, method, path, token string, body any) (
 
 // StartChat issues one chat turn. With stream=true the response IS the SSE
 // stream (handled by StreamChat), so this method is for the async path.
+//
+// 第九轮补丁 3.2-B: a successful POST whose body cannot yield an
+// agent_chat_id is NOT success. Previously a malformed body or a missing id
+// silently returned ("", "", nil) — the caller then bound nothing, refreshed
+// the run and polled "" — while the provider may already be running the
+// chat. The submit boundary is "HTTP 200 AND an external identity": anything
+// else is reported as ErrServer so the executor treats the outcome as
+// UNKNOWN (Aily cannot be asked, cannot deduplicate → waiting_external; a
+// future native-idempotent provider gets the safe same-key retry).
 func (c *Client) StartChat(ctx context.Context, agentID, token string, contentItems []map[string]any, attachmentIDs []string, sessionID string) (chatID, newSession string, err error) {
 	body := map[string]any{
 		"user_message": buildUserMessage(contentItems, attachmentIDs),
@@ -163,7 +172,20 @@ func (c *Client) StartChat(ctx context.Context, agentID, token string, contentIt
 		AgentChatID string `json:"agent_chat_id"`
 		SessionID   string `json:"session_id"`
 	}
-	_ = json.Unmarshal(data, &out)
+	if err := json.Unmarshal(data, &out); err != nil {
+		return "", "", &APIError{
+			Kind:       ErrServer,
+			Msg:        "successful chat submit returned malformed data",
+			HTTPStatus: http.StatusOK,
+		}
+	}
+	if strings.TrimSpace(out.AgentChatID) == "" {
+		return "", "", &APIError{
+			Kind:       ErrServer,
+			Msg:        "successful chat submit returned no agent_chat_id",
+			HTTPStatus: http.StatusOK,
+		}
+	}
 	return out.AgentChatID, out.SessionID, nil
 }
 

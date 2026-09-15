@@ -124,7 +124,7 @@ python - <<'PY'
 import io
 p = 'src/stores/useRunChatStore.ts'
 s = io.open(p, encoding='utf-8').read()
-old = "        message.streamBytes = applyIncrementalChunk(message, event.payload || {});"
+old = "        message.streamBytes = applyIncrementalRange(message, event.payload || {});"
 new = """        message.content += event.payload?.text || ''; // FALSIFICATION
         message.streamBytes = utf8ByteLength(message.content);"""
 assert old in s

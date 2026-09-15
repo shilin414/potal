@@ -1,91 +1,31 @@
 # Creation Agent Studio — 项目长期记忆
 
 ## 当前状态
-- 仓库 `shilin414/potal`，分支 `dev`。第九轮专项整改的**批次一–三**已完成（P0-1/P0-2 闭环 + P1-1/P1-3/P1-4 落地），提交 `b81ee8f`；**补丁批次 3.1** 已按复审报告关闭 3 个 blocker + 4 项工程一致性（报告见 `docs/potal 第九轮补丁批次3.1整改变更报告（…）.md`）。CI：第九轮 backend run **34983530376**、frontend run **34983530457** 全绿；3.1 批次 backend run **34997492930**、frontend run **34997493057** 全绿。
-- 第八轮起执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot）**定型冻结**，不再微调 Gate/Lease/ProviderSlot/Retry·Defer/SSE terminal。
-- migration version 基线 = **23**（0021 run_requests / 0022 provider_submissions / 0023 next_event_sequence）。0018/0019/0020 禁止修改。
-- **仍开放（批次四–七）**：SSE Hub 多连接、Worker Dispatcher（poller→dispatcher + claim 后即 ACK）、Conversation lifecycle（generation / 异步 purge）、message keyset 分页 + sidebar 冗余字段、前端长对话（active turn 隔离 / 虚拟列表 / rAF 批处理 / smart auto-scroll）。
+- 仓库 `shilin414/potal`，分支 `dev`。第九轮批次一–三 + 补丁 3.1 + **补丁 3.2 已完成**（Streaming Range / Provider Identity Closure / Idempotency replay-before-error / OpenAPI 清理，报告见 `docs/potal 第九轮补丁3.2整改变更报告（…）.md`），批次一–三可冻结。批次四–七（SSE Hub / Worker Dispatcher / Conversation lifecycle / message keyset 分页 / 前端长对话）开放，**下一步：批次四 SSE Hub**。
+- 执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot/Lease/Heartbeat/Gate）**冻结**，3.2 未触碰。
+- migration 基线 = **23**（0021 run_requests / 0022 provider_submissions / 0023 next_event_sequence）。
+- **3.2 新不变量**：①transient delta 与 durable chunk 共享同一 UTF-8 字节 absolute end offset（coalescer `totalReceived`；前端 `applyIncrementalRange` 双事件共用，无 offset legacy delta 走 append）；②提交边界 = POST 成功**且拿到 external id**（StartChat 200 无 id/坏 body → ErrServer → park，background 与 streaming 一致）；③`persistProviderAcceptance` 失败 = sentinel `ErrProviderAcceptancePersistence`，classifyError 原样上抛（不 poll/finalize/重发），本地重试 50/100/200ms，session bind 恒 best-effort；④`tryServeIdempotentReplay` 统一挂 authorize/admitUserRun/conversation/attachment 四个 post-miss 出口（found→200 / KeyReused→409 / infra err→500 / miss→原错误）。
 
-### 第九轮新增硬性约定
-- **两个 P0 的边界语义**：`POST /v2/runs` 带 `client_request_id` 时**幂等解析必须早于授权/限流/附件校验**（首次请求已消费过这些检查，否则重放会被误报 400/429）；幂等身份用 `run_requests`（lazy conversation 下 `runs` 上放不下），`request_hash = SHA-256(归一化 payload)`。
-- **Provider 提交状态机**：`sending|accepted|rejected|unknown`；**只有 `rejected` 允许重发**（同 payload 复用同一 submission_no/key，key 不含 attempt）。`sending`/`unknown` 一律 `ErrProviderSubmitUnknown` → **park 到 `waiting_external`**，绝不 blind retry。5xx 与 timeout 算"未知"（500 可能是已受理后才抛），4xx/401/403/429 算"明确拒绝"。
-- **`IdempotencyAware` 是可选接口 + fail-closed**：未实现者按最弱类处理；报告 §6 的"可按 request key 查询"类**故意不声明**（本库无该 client，声明只会加不可测分支）。
-- **`waiting_external` 必须有界**：它是非 settled，会占 conversation（否则永久 409）与配额，`ExpireParkedExternalRuns` 用 **DB 时钟 − grace** 收敛为 `failed/provider_submit_unknown`。读时钟失败跳过本轮，不回落本机时钟。
-- **sequence 分配 O(1)**：`runs.next_event_sequence`，锁内 `SELECT FOR UPDATE` → `UPDATE x+1` → `INSERT`；**绝不再用 `COUNT(*)+1`**。事件读取一律带 LIMIT（200/1000），`has_more` 由"页满"推导而非 COUNT。
-- **SSE 帧**：durable 写 `id: <seq>`，**transient(seq 0) 绝不写 id**（否则浏览器 Last-Event-ID 归零→全量重放）；优先级 `query after > Last-Event-ID > 0`；网关逐页 replay；`WriteHeader` 后必须 `Flush`（否则无事件的流不给响应头）。
-- **`content.chunk` 只写增量** `text`+`offset`，不再写累计 `snapshot`（曾使事件数据量随回答长度平方增长）。前端 reducer 保留 snapshot 分支兼容旧事件。
+## 核心硬性约定（违反会复发 P0/事故）
+- **幂等**：`client_request_id` 解析早于授权/限流/附件校验；身份表 `run_requests`，`request_hash=SHA-256(归一化 payload)`。同 key 不同 hash → 409；resolver infra error → 5xx，绝不伪装 429。
+- **Provider 提交状态机**：`sending|accepted|rejected|unknown`；只有 `rejected` 允许重发（同 submission_no/key，key 不含 attempt）。`sending`/`unknown` → `ErrProviderSubmitUnknown` → park `waiting_external`，绝不 blind retry。5xx/timeout=未知，4xx=明确拒绝。**提交边界 = POST 成功，不是拿到 chat id**：已提交但无 external id 一律 unknown+waiting_external，绝不 failRun；park 后必须 return。StartChat 200 但无 chat id / JSON 坏 → `ErrServer` APIError（Aily=IdempotencyNone → unknown → waiting_external）。
+- **accepted identity 持久化是 canonical correctness**：`MarkSubmissionAccepted` 失败必须停止执行链（不 poll/reconcile/finalize/重发），只做本地 DB 短重试（50/100/200ms）；session bind 是 best-effort。sentinel：`ErrProviderAcceptancePersistence`，classifyError 直接上抛。
+- **每次 submission 写都是 canonical write**：`MarkSubmissionStateOwned` 事务内 `verifyActiveOwnershipTx` + SQL CAS；四条 query 互斥（结果只从 sending 来；重发只从 rejected/unknown+native；accepted 只从 sending/unknown 且单调）。「记录结果」与「武装重发」是两条语句。native 能力由 executor 从 `catalog.SubmitIdempotencyOf(adapter)` 现场推导传进 `BeginProviderSubmission*`。
+- **前端按 UTF-8 字节 offset 对账**：transient delta 与 durable chunk 共用同一套 byte coordinate system，**两者都带 absolute end offset**；reducer 三分支：end<=rendered→drop / start<=rendered<end→补 suffix / gap→append+跳计数器。中文 3 字节、emoji 4 字节，**绝不用 `string.length`**。offset missing → legacy append 兼容旧事件。gateway 反向顺序（chunk 先于 buffered delta）天然存在，必须用 offset 去重。
+- **SSE**：durable 写 `id:<seq>`，transient(seq 0) 绝不写 id；优先级 `query after > Last-Event-ID > 0`；replay 遇 terminal 立即 break+return（不看 status 快照）；WriteHeader 后必须 Flush。`content.chunk` 只写增量 text+offset，不写累计 snapshot。
+- **终态语义**：`interrupted` status ≠ `run.interrupted` event（`{reason}`无status=retry标记，`{status}`才是终态）。`IsTerminal()` 只认 `{cancelled,succeeded,failed}`；SQL `status NOT IN (四个)`。migration 新增 `MAX(sequence)` 必须 `COALESCE(MAX(...),0)+1`。
+- **时钟/事务**：Clock Authority 无兜底（dbNow 失败即中止）。续约类 UPDATE 必须单调写（`GREATEST(CURRENT_TIMESTAMP(3), DATE_ADD(...,1000 MICROSECOND))`）；MySQL UPDATE 返回 changed rows 不是 matched。merged heartbeat `HeartbeatOwnedWithSlot` BOTH OR NEITHER，Renew 恒 XX-only。`SET timestamp=<sec>`+MaxOpenConns(1) 可钉时钟；同配方可注入真实 1205。metrics/Redis fan-out post-commit。attempt 唯一消耗点 `BeginProviderAttemptOwned`；消息落库同事务 `TouchConversationUpdated`。
+- **准入/Gate**：唯一门 `catalog.AuthorizeExecution`；普通用户错误 404；先判 `err==nil` 再 `executionDenied(err)`。Gate 双检查点 level-triggered（Gate1 claim 后 + Gate2 `beginSubmit`）；kill=cancel，pause/infra/未知=Defer fail-closed。Provider 门禁按 `provider_key` fail-closed。Streaming 必须同步 Open。
+- **并发**：一 conversation 一个非终态 Run（409）；锁序 `users→conversations`；hard-delete cascade 必须显式带 `run_requests`/`provider_submissions`（无 FK 级联）。`waiting_external` 有界：`ExpireParkedExternalRuns` 用 DB 时钟−grace 收敛。
+- **sequence O(1)**：`runs.next_event_sequence` 锁内 SELECT FOR UPDATE→UPDATE x+1；绝不用 `COUNT(*)+1`；事件读取一律 LIMIT。
+- **前端**：store 异步写 functional setState；`activeRunId` compare-and-clear；拉取失败 null=未知不清空；`run.cancelled` 独立终态（execution_disabled=硬取消）不得映射 done；`run.deferred` 靠 `run.started` 清除；channel 发送可取消。
 
-### 第九轮 3.1 新增硬性约定
-- **前端必须按 UTF-8 字节 offset 对账**：同一段答案会走 transient delta（不落库）与 durable chunk（落库+重放）两条路，**durable cursor 管不了 transient**（其 sequence 恒 0）。reducer 用 `ChatMessage.streamBytes` 与 chunk 的 `offset`（字节 end offset）三分支：已渲染→丢弃 / 部分→只补 suffix / gap→保留并跳计数器。中文 3 字节、emoji 4 字节，**绝不能用 `string.length`**（UTF-16 code unit）。
-- **提交边界 = POST 成功，不是拿到 chat id**：`aily.stream.started` 只在 `agent_chat_id != ""` 时 emit；已提交但无 external id 的任何收尾（transport_error / EOF / 首帧无 id）→ submission=`unknown` + run=`waiting_external`，**绝不 `failRun("aily_no_chat_id")`**。park 之后 run 已结算，必须 return（再走 reconcile 会去 fail 一个已 park 的 run）。
-- **每次 submission 写都是 canonical write**：`MarkSubmissionStateOwned` 必须在事务内 `verifyActiveOwnershipTx` + SQL CAS。四条 query 语义互斥：结果只从 `sending` 来；重发只从 `rejected` 来（或 `unknown` + native 幂等能力）；`accepted` 只从 `sending`/`unknown` 来且单调。「记录结果」与「武装重发」必须是两条语句。
-- **native 幂等能力要传进状态机**：`BeginProviderSubmission*(..., resendOnUnknown)`，由 executor 从 `catalog.SubmitIdempotencyOf(adapter)` 现场推导（与 `classifySubmitFailure` 同源），否则两半策略会互相矛盾、分支变死代码。
-- **hard-delete cascade 必须显式带上 `run_requests` / `provider_submissions`**（两表都无 FK 级联），否则留下永久失效的幂等预留（replay → `GetRun` 找不到 → 500）。
-- **REST 与 SSE 同一个 Event schema**：`run_id`（不是 `run`），否则 REST 分页数据不能喂给前端 `applyEvent()`。
-- **0023 不是 mixed-version-safe**：升级必须 drain 全部旧 worker → 迁移 → 全量启动新 worker（旧代码 `COUNT(*)+1` 不推进计数器 → 新 worker 撞 `UNIQUE(run_id,sequence)`）。已写入迁移注释与 README。
+## 工具与踩坑
+- **前端 CI**：`npx tsc --noEmit` / `npx vitest run` / `npx vite build`（不跑 eslint）。后端 CI：gofmt/vet/build/test/**race** + integration（mysql5.7+redis7）。本机无 gcc，-race 由 CI 兜。
+- **反证测试必须做**（还原修复→FAIL→还原→PASS），会暴露假测试。脚本必须 `trap cleanup EXIT` 还原 `.orig`；跑完 `grep FALSIFICATION` + `find -name '*.orig'` 双查。改代码后同步更新旧脚本锚点。
+- **MySQL 5.7** `192.168.211.26:20336/xiaoan`；DSN UTC 不动；错误码 1213/1205 保留。共享 dev 库测试前先清 orphan 残留。改 `db/queries/*.sql` 跑 `~/go/bin/sqlc.exe generate`。集成开关 `STUDIO_TEST_DB=1`/`STUDIO_TEST_REDIS=1`。全库 COUNT=0 会被 fixture 假红，清理圈定 `provider LIKE 'itest%'`。
+- **本机环境**：Git Bash 常丢 coreutils，先 `export PATH="/usr/bin:/bin:/c/software/Git/cmd:$PATH"`。本机 git `refs/remotes/<name>/<branch>` 写入有缺陷：push 后必须 `mkdir -p .git/refs/remotes/origin` + 写 loose ref + 双写 packed-refs，并用 `git ls-remote` 核对；看到 ahead/gone 先 ls-remote 对比别急着重推。无 `gh`，查 CI 用匿名 GitHub API。
+- bash 嵌套 heredoc 会被内层定界符截断，用不同定界符或 Write 工具写脚本。断言时间戳未变用 `CAST(col AS CHAR)` 逐字符串比较。
 
-## 工具与踩坑补充
-- **前端**：`frontend/` 用 `npx tsc --noEmit` / `npx vitest run` / `npx vite build`（CI 跑这三个，不跑 eslint）；`npx` 在 PATH 可见。仓库既有 6 个 eslint error 属历史遗留，与 CI 无关。
-- **反证脚本化**：`backend-go/scripts/falsify_review9.sh`、`backend-go/scripts/falsify_review9_patch.sh`、`frontend/scripts/falsify_review9.sh` —— 逐个还原修复→确认 FAIL→还原→确认 PASS。**反证会暴露"断言正确但从未被执行"的假测试**（本轮抓到 2 例），必须做。
-- **反证脚本必须加 `trap cleanup EXIT` 把 `.orig` 还原回去**：脚本被超时中断会把「临时还原」留在工作区并可能被当成正常代码提交（3.1 批次实际踩到）。跑完一律 `grep -rn FALSIFICATION` + `find -name '*.orig'` 双查。改了代码后要同步更新旧脚本的匹配锚点。
-- **共享 dev 库上的固定字符串断言要先清残留**：失败一次留下的 orphan row（run 已删、cleanup 的 `run_id IN (SELECT…)` 找不到）会让下次直接假红。
-- **bash 嵌套 heredoc 会被内层定界符提前截断**（`python - <<'PY'` 里再出现 `PY`），用不同定界符或改用 Write 工具写脚本。
-
-## 硬性约定（违反会复发 P0/事故）
-
-### 终态与事件语义
-- `runs.status='interrupted'` ≠ `run_events.event_type='run.interrupted'`，**永不合并**。status 是终态别名（≈failed）；**event 是 overloaded 的**：`{reason}` 无 status = retry 标记，`{status}` 才是真终态。
-- 谓词：`IsSettled()` = canonical ∪ {interrupted}；`IsTerminal()` 只认 `{cancelled,succeeded,failed}`；SQL 统一 `status NOT IN ('cancelled','succeeded','failed','interrupted')`。
-- 新增 migration 的 `MAX(sequence)` 必须 `COALESCE(MAX(...),0)+1`。
-- **terminal event = 硬边界**：SSE replay 遇到立即 `break`+`return`（**不看 `run.Status` 快照**，快照开流前读的，终态竞争即 stale）；前端同一 chunk 内 terminal 后停止 dispatch。synthetic terminal 按状态映射（succeeded→completed / cancelled→cancelled / failed|interrupted→failed），未知或非 settled **不合成**，绝不默认 `run.completed`。
-
-### 事务与时钟
-- **续约类 UPDATE 必须单调写**（第七轮 CI 教训）：MySQL `UPDATE` 返回 **changed rows**，非 matched rows。续约与建行落在同一毫秒 → 0 changed rows → 被误读成 `ErrProviderSlotLost`。修法 `heartbeat_at = GREATEST(CURRENT_TIMESTAMP(3), DATE_ADD(heartbeat_at, INTERVAL 1000 MICROSECOND))`（sqlc 不认 `1 MILLISECOND`）。**不要**用 `ClientFoundRows=true`（破坏重复检测语义）。`heartbeat_at` 仅观测，fencing 只看 `expires_at`。
-- **merged heartbeat 是 BOTH OR NEITHER**（第八轮 P1，`HeartbeatOwnedWithSlot`）：进入 provider execution 后只有 `(true,true,nil)` / `(false,false,nil)` / `ErrProviderSlotLost` / 普通 error 四个出口，**任何 slot 失败都连同 lease 一起 ROLLBACK**。Renew 恒 **XX-only，绝不 recreate slot**。确认丢失后只 local cancel + 幂等 Release，**不 requeue**。
-- **多返回值 flag 判定必须带齐维度**：谓词写 `confirmedProviderSlotLoss(leaseOK, slotOK, err)`，文案抽成可测函数 + 表驱动测试。
-- **`SET timestamp = <second>` 可钉死 session 时钟**，配 `MaxOpenConns(1)` 把「恰好同一毫秒」变确定性条件。同配方可注入**真实 InnoDB 1205**：`SET SESSION innodb_lock_wait_timeout = 1` + 另一连接 `SELECT … FOR UPDATE` 持锁。两种注入共用 `newSessionTunedService(t, sessionStmt, args...)`。
-- **metrics / Redis fan-out / delivery hook 一律 post-commit**，观测读失败不得回滚终态。`studio_run_duration` 两端取 DB 时钟（`dbClockDuration`），commit 后重读（`GetRunTimestamps`），用 `NewCleanupContext` + 只告警。
-- **Clock Authority 无兜底**：`dbNow/dbNowTx` 出错即中止/跳 tick，绝不回落本机时钟。
-- `MarkRunStartedOwned` 返回 **DB 时间**；started_at 在 Gate1 allow 后才写（`CASClaimRun` 不写）；`finalize.go` 先判 `StartedAt != nil`。
-- **detached 写一律 `execution.NewCleanupContext(parent)`**（继承 values、丢 deadline）。
-- attempt 语义：claim 不 +attempt，唯一消耗点 `BeginProviderAttemptOwned`；消息落库必须同事务 `TouchConversationUpdated`。
-
-### 准入、授权与 Gate
-- 执行准入唯一门 `catalog.AuthorizeExecution`；普通用户错误一律 404；停用 app 对任何人不可执行。
-- **授权分类双保险**：调用点先判 `err == nil` 成功路径再 `executionDenied(err)`；`executionDenied(nil)` 恒 false。
-- Gate 双检查点 level-triggered：Gate1（worker claim 后）+ Gate2（aily executor 在 ChatsL.Acquire 后、BeginProviderAttempt 前，`beginSubmit` 唯一入口）。kill=cancel；pause/infra/未知 action=**Defer fail-closed**（`preSubmitStop` 包装）。run.started 在 Gate allow 后。
-- Provider 门禁按 `provider_key` fail-closed（`provider_id` 常为 NULL）；授权与 binding 解析必须在 Admission Lock 之后。
-- `bindingFromExecutionAuthRow` 与 `bindingFromRow` 输出形状必须一致；`Binding.Snapshot()` 无条件写 timeout/config/capabilities。
-- Streaming 必须同步 Open（同 goroutine 发 POST）。
-
-### 并发与锁
-- 一 conversation 同时只允许一个非终态 Run（`CreateRunInTx` 行锁 + Count → 409）。
-- Schedule admission 统一到 schedules 行锁（`GetScheduleRowForUpdate` 锁内重读→判定→创建同事务）；`MaxPendingManual` 超限 → 429。
-- 锁序恒 `users → conversations`；`Server.RunAdmission` 长生命周期，禁止每请求 new。
-- Conversation 硬删守卫：活跃 Run→409；有 scheduled Run/delivery→拒绝。
-- 队列三条 Stream `queue:<provider>:interactive|retry|scheduled` 7:1:2；delivery=At Least Once。
-
-### 前端
-- store 异步写一律 functional setState；`activeRunId` compare-and-clear；拉取失败用 `null` 表示「未知不清空」。
-- `run.cancelled` 是**独立终态**（`execution_disabled` = 硬取消），不得映射成 done；`run.deferred` 非终态，靠 `run.started` 清除。
-- channel 发送必须可取消（`select { out <- ev / ctx.Done() }`）。
-
-## 数据库与 CI
-- **MySQL 5.7**：`192.168.211.26:20336`/`xiaoan`/`test_user`；DSN UTC（`loc=UTC`+`time_zone='+00:00'`）不能动；错误码 1213/1205 保留。
-- CI 两 job：`check`（actionlint/gofmt/vet/build/unit/**race**）+ `integration`（mysql5.7+redis7，含二次迁移 no-op）。**本机无 gcc，`-race` 只能由 CI 兜**。
-- 改 `db/queries/*.sql` 必须跑 `~/go/bin/sqlc.exe generate`（v1.30.0）。只改 SQL 注释也会有 diff（注释进 Go doc），属预期。
-- 本机**无 `gh`**：查 CI 用匿名 GitHub API（`api.github.com/repos/shilin414/potal/actions/runs?branch=dev`）。**MSYS `/tmp` 与原生 python/node 不互通** → 用 `curl … | python -c "json.load(sys.stdin)"` 管道。
-
-## 运行/验证要点
-- 集成测试开关 `STUDIO_TEST_DB=1` / `STUDIO_TEST_REDIS=1`；配置一律 `config.Load()`（`.env.local` 有密码）。delivery 是独立 worker（`--provider=feishu_delivery`）。
-- 冒烟无泄漏判据：running=0/leases=0/slots=0/outbox(pending)=0/delivery(pending)=0/occurrence(pending)=0。
-- **「全库 COUNT 期望 0」会被 fixture 残留假红**：新 seed 自带 `t.Cleanup`，FK 顺序 events→leases→slots→outbox→run→conversation；圈定清理用 `provider LIKE 'itest%'`。需要时插临时探针 `tests/integration/zz_leakprobe_test.go` 量真实残留，**跑完立即删**。
-- 新增测试必须做**反证**（临时还原修复 → 确认 FAIL → 还原 → 全绿）。断言时间戳「未变」用 `CAST(col AS CHAR)` 逐字符串比较。
-- 本机 Git Bash 常丢 coreutils：命令前 `export PATH="/usr/bin:/bin:/c/software/Git/cmd:$PATH"`。本机 git 的 `refs/remotes/<name>/<branch>` 写入有缺陷，push 后必须手工写 loose ref + 双写 packed-refs 并用 `git ls-remote` 三方核对。
-
-## 历轮整改索引（细节见 docs/ 下同名报告）
-- 五轮：finalize 竞态 / streaming 取消 / interrupted 契约 / DB 时钟 / 限流 ctx / started_at / cleanup 边界 → 93/A-
-- 六轮：0018→0020 历史事件迁移修复 / SSE cancelled synthetic / DB-clock duration → 96/A
-- 七轮：SSE replay terminal 硬边界 / duration metric post-commit / 前端同 chunk 终态停止 → 98/A+
-- 八轮：merged heartbeat BOTH OR NEITHER / Provider Slot 确认丢失后 self-fence → P1 关闭
-- 九轮（专项）：批次一–三完成 —— 请求幂等（0021 `run_requests`）/ Provider 提交状态机（0022 `provider_submissions` + `waiting_external`）/ Event Cursor·Keyset 分页·O(1) sequence（0023）/ 去 cumulative snapshot；批次四–七 仍开放。见 `docs/potal 第九轮专项整改变更报告（…）.md`。
+## 历轮索引（细节见 docs/）
+五轮 93/A- → 六轮 96/A → 七轮 98/A+ → 八轮 P1 关闭 → 九轮批次一–三+3.1（幂等 0021 / 提交状态机 0022 / cursor+O(1) sequence 0023 / 去 snapshot）→ **3.2 进行中**。

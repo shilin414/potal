@@ -10,9 +10,12 @@ package http
 // be told 429 for a request that actually succeeded. The client's "retry"
 // then creates a second turn.
 //
-// These tests pin serveReplayAfterRefusal — the layer that decides whether a
-// rejected request gets the original run instead of a 429 — without needing a
-// database, so the ORDERING (and only the ordering) is what is under test.
+// These tests pin tryServeIdempotentReplay — the layer that decides whether a
+// rejected request gets the original run instead of its own error — without
+// needing a database, so the ORDERING (and only the ordering) is what is
+// under test. 第九轮补丁 3.2-C extended it: a same-key/different-payload
+// conflict must surface as 409 (never 429), and a resolver infrastructure
+// error must surface as 500 (never pretend the client is rate limited).
 
 import (
 	"context"
@@ -45,7 +48,7 @@ func TestServeReplayAfterRefusalReturnsTheOriginalRun(t *testing.T) {
 	// answers, the winner's reservation has become visible. That waiting
 	// lives in execution.ResolveRunRequestWithWait and is pinned against a
 	// real uncommitted transaction there.
-	ok := srv.serveReplayAfterRefusal(context.Background(), rec, "req-1",
+	ok := srv.tryServeIdempotentReplay(context.Background(), rec, "req-1",
 		func(context.Context) (*execution.Run, bool, error) {
 			return &execution.Run{ID: mustRunID(t, "8b6f0d1a0f0e4b3f9d2c5a7e1b4d6c80")}, true, nil
 		})
@@ -76,7 +79,7 @@ func TestServeReplayAfterRefusalReturnsTheOriginalRun(t *testing.T) {
 func TestServeReplayAfterRefusalStaysSilentForANewRequest(t *testing.T) {
 	srv := replayServer()
 	rec := httptest.NewRecorder()
-	ok := srv.serveReplayAfterRefusal(context.Background(), rec, "req-new",
+	ok := srv.tryServeIdempotentReplay(context.Background(), rec, "req-new",
 		func(context.Context) (*execution.Run, bool, error) {
 			return nil, false, nil // never resolved within the budget
 		})
@@ -94,11 +97,11 @@ func TestServeReplayAfterRefusalStaysSilentForANewRequest(t *testing.T) {
 
 // Without a client_request_id there is no identity to replay, and the
 // admission path must remain untouched for ordinary requests.
-func TestServeReplayAfterRefusalRequiresAClientRequestID(t *testing.T) {
+func TestTryServeIdempotentReplayRequiresAClientRequestID(t *testing.T) {
 	srv := replayServer()
 	rec := httptest.NewRecorder()
 	called := false
-	ok := srv.serveReplayAfterRefusal(context.Background(), rec, "",
+	ok := srv.tryServeIdempotentReplay(context.Background(), rec, "",
 		func(context.Context) (*execution.Run, bool, error) {
 			called = true
 			return &execution.Run{}, true, nil
@@ -106,5 +109,45 @@ func TestServeReplayAfterRefusalRequiresAClientRequestID(t *testing.T) {
 	if ok || called {
 		t.Fatalf("served=%v resolver-called=%v, want false/false "+
 			"(an ordinary request must not pay a resolve round-trip)", ok, called)
+	}
+}
+
+// 第九轮补丁 3.2-C 12.1: the wait resolver surfaced a SAME-ID/DIFFERENT-PAYLOAD
+// conflict. Swallowing it into the caller's 429 mislabeled a client error as
+// rate limiting AND hid the key reuse; the wire answer is 409.
+func TestTryServeIdempotentReplaySurfacesAKeyConflictAs409(t *testing.T) {
+	srv := replayServer()
+	rec := httptest.NewRecorder()
+	ok := srv.tryServeIdempotentReplay(context.Background(), rec, "req-dup",
+		func(context.Context) (*execution.Run, bool, error) {
+			return nil, false, execution.ErrIdempotencyKeyReused
+		})
+	if !ok {
+		t.Fatal("the conflict was not handled: the caller would have written a 429")
+	}
+	if rec.Code != 409 {
+		t.Fatalf("status = %d, want 409 — a key reuse is a conflict, never rate limiting", rec.Code)
+	}
+	if body := rec.Body.String(); body == "" || !json.Valid([]byte(body)) {
+		t.Fatalf("body = %q, want a JSON error envelope", body)
+	}
+}
+
+// 第九轮补丁 3.2-C 12.2: a resolver INFRASTRUCTURE error (DB outage) must be
+// a 500, not the caller's 429 — an outage disguised as rate limiting sends
+// the client into retry storms while the real problem is on our side.
+func TestTryServeIdempotentReplaySurfacesAResolverErrorAs500(t *testing.T) {
+	srv := replayServer()
+	rec := httptest.NewRecorder()
+	ok := srv.tryServeIdempotentReplay(context.Background(), rec, "req-err",
+		func(context.Context) (*execution.Run, bool, error) {
+			return nil, false, context.DeadlineExceeded
+		})
+	if !ok {
+		t.Fatal("the resolver error was not handled: the caller would have written a 429")
+	}
+	if rec.Code != 500 {
+		t.Fatalf("status = %d, want 500 — an infrastructure failure must not masquerade "+
+			"as client-side rate limiting", rec.Code)
 	}
 }

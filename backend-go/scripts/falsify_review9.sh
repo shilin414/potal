@@ -193,10 +193,15 @@ new = '''	snapshotText := &strings.Builder{} // FALSIFICATION
 	}'''
 assert old in s
 s = s.replace(old, new, 1)
-s = s.replace('''			e.Owned.PublishTransient(ctx, claimed, execution.EventContentDelta, ev.Payload)
-			if coalescer.add(strOf(ev.Payload["text"], "")) {''', '''			e.Owned.PublishTransient(ctx, claimed, execution.EventContentDelta, ev.Payload)
-			snapshotText.WriteString(strOf(ev.Payload["text"], ""))
-			if coalescer.add(strOf(ev.Payload["text"], "")) {''', 1)
+# 3.2-A anchor update: the delta case now computes the transient offset, so
+# the snapshot accumulator hooks in next to it.
+old2 = '''			text := strOf(ev.Payload["text"], "")
+			endOffset, flush := coalescer.add(text)'''
+new2 = '''			text := strOf(ev.Payload["text"], "")
+			snapshotText.WriteString(text) // FALSIFICATION
+			endOffset, flush := coalescer.add(text)'''
+assert old2 in s
+s = s.replace(old2, new2, 1)
 s = s.replace('\t"log/slog"\n\t"time"', '\t"log/slog"\n\t"strings"\n\t"time"', 1)
 io.open(p, 'w', encoding='utf-8', newline='\n').write(s)
 PY

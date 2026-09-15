@@ -60,6 +60,14 @@ type submitRecorder struct {
 	// provider call can fail with a specific APIError kind.
 	streamErr error
 	chatErr   error
+	// emptyChatID makes StartChat SUCCEED without an external id — the
+	// "HTTP 200 but the body carries no agent_chat_id" window from
+	// 第九轮补丁 3.2-B (the real client now refuses it; the fake reproduces
+	// the legacy shape to prove the executor's defense-in-depth).
+	emptyChatID bool
+	// getResults counts GetChatResult calls, i.e. POLLS: a run whose
+	// external identity was never durably accepted must never poll.
+	getResults int
 }
 
 // cannedSSE is a minimal stream: it carries the chat identity and then
@@ -82,6 +90,13 @@ func (r *submitRecorder) counted() (int, int) {
 	return r.startChats, r.openStreams
 }
 
+// polled reports how many GetChatResult calls were made (第九轮补丁 3.2-B).
+func (r *submitRecorder) polled() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.getResults
+}
+
 func (r *submitRecorder) StartChat(ctx context.Context, agentID, token string, contentItems []map[string]any, attachmentIDs []string, sessionID string) (string, string, error) {
 	r.mu.Lock()
 	r.startChats++
@@ -92,6 +107,10 @@ func (r *submitRecorder) StartChat(ctx context.Context, agentID, token string, c
 	}
 	if fail != nil {
 		return "", "", fail
+	}
+	if r.emptyChatID {
+		// The legacy hazard: HTTP ok, but no external identity in the body.
+		return "", "", nil
 	}
 	return "chat-1", "sess-1", nil
 }
@@ -112,6 +131,9 @@ func (r *submitRecorder) OpenStreamChat(ctx context.Context, agentID, token stri
 }
 
 func (r *submitRecorder) GetChatResult(ctx context.Context, agentID, token, chatID string) (json.RawMessage, error) {
+	r.mu.Lock()
+	r.getResults++
+	r.mu.Unlock()
 	return json.RawMessage(`{"status":"succeeded","finish_reason":"stop","msg":"ok"}`), nil
 }
 

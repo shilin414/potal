@@ -170,6 +170,59 @@ describe('applyEvent (unified event protocol rendering)', () => {
     });
   });
 
+  // 第九轮补丁 3.2-A（复审报告 §二/§四）：SSE 网关故意采用
+  // subscribe → replay durable → drain buffered live 的顺序，因此
+  // "chunk 先到、它覆盖过的 buffered delta 后到" 是真实存在的线序，
+  // 而不是理论网络乱序。durable cursor 管不了 transient（sequence 恒 0），
+  // 唯一可靠信号是 delta 与 chunk 共用的绝对 UTF-8 字节 end offset。
+  describe('reverse order: chunk replayed before its buffered deltas (3.2-A)', () => {
+    const text = (state: RunChatState) => state.conversations[42].messages[1].content;
+
+    it('Test 1: chunk ABC then late deltas A/B/C renders ABC once', () => {
+      let state = stateWithStream();
+      state = reduce(state, event('content.chunk', { text: 'ABC', offset: 3 }));
+      state = reduce(state, event('content.delta', { text: 'A', offset: 1 }));
+      state = reduce(state, event('content.delta', { text: 'B', offset: 2 }));
+      state = reduce(state, event('content.delta', { text: 'C', offset: 3 }));
+      expect(text(state)).toBe('ABC');
+    });
+
+    it('Test 2: chunk AB then late A/B/C renders ABC (partial overlap)', () => {
+      let state = stateWithStream();
+      state = reduce(state, event('content.chunk', { text: 'AB', offset: 2 }));
+      state = reduce(state, event('content.delta', { text: 'A', offset: 1 }));
+      state = reduce(state, event('content.delta', { text: 'B', offset: 2 }));
+      state = reduce(state, event('content.delta', { text: 'C', offset: 3 }));
+      expect(text(state)).toBe('ABC');
+    });
+
+    it('Test 3: 中文/emoji reverse overlap renders 中文🚀 without corruption', () => {
+      let state = stateWithStream();
+      state = reduce(state, event('content.chunk', { text: '中文', offset: 6 }));
+      state = reduce(state, event('content.delta', { text: '中', offset: 3 }));
+      state = reduce(state, event('content.delta', { text: '文', offset: 6 }));
+      state = reduce(state, event('content.delta', { text: '🚀', offset: 10 }));
+      expect(text(state)).toBe('中文🚀');
+    });
+
+    it('Test 4: delta A, chunk ABC, late B/C still renders ABC once', () => {
+      let state = stateWithStream();
+      state = reduce(state, event('content.delta', { text: 'A', offset: 1 }));
+      state = reduce(state, event('content.chunk', { text: 'ABC', offset: 3 }));
+      state = reduce(state, event('content.delta', { text: 'B', offset: 2 }));
+      state = reduce(state, event('content.delta', { text: 'C', offset: 3 }));
+      expect(text(state)).toBe('ABC');
+    });
+
+    it('a legacy delta without an offset still appends (no hard backend coupling)', () => {
+      let state = stateWithStream();
+      state = reduce(state, event('content.chunk', { text: 'AB', offset: 2 }));
+      // Pre-3.2 backend: transient deltas carry no offset.
+      state = reduce(state, event('content.delta', { text: 'C' }));
+      expect(text(state)).toBe('ABC');
+    });
+  });
+
   it('run.completed replaces content with the reconciled text and closes the run', () => {
     let state = stateWithStream();
     state = reduce(state, event('content.delta', { text: '流式片段' }));

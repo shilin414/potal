@@ -356,8 +356,10 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
 }));
 
 /**
- * Fold one INCREMENTAL durable chunk into the bubble and return the new
- * rendered-byte count.
+ * Fold one INCREMENTAL text segment into the bubble and return the new
+ * rendered-byte count. 第九轮补丁 3.2-A: BOTH transient content.delta and
+ * durable content.chunk go through this ONE byte-range reconciliation — the
+ * backend now stamps an absolute UTF-8 end offset on both.
  *
  * The same answer reaches the client twice: once as transient content.delta
  * frames (live, never persisted) and once as durable content.chunk events
@@ -367,16 +369,20 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
  * The durable cursor cannot dedupe this either: a transient frame has
  * sequence 0 by definition and never advances it, so a client that saw the
  * deltas and then replays the chunks is outside the cursor's reach entirely.
- * The only reliable signal is the chunk's byte offset:
+ * Worse, the SSE gateway deliberately drains buffered live deltas AFTER
+ * replaying the durable events (subscribe → replay → drain), so the wire
+ * order is genuinely "chunk ABC, then delta A, delta B, delta C" — a plain
+ * append produces ABCABC. The only reliable signal is the shared byte
+ * offset, which makes the arrival order irrelevant:
  *
- *   end <= rendered            the whole chunk was already shown → drop it
+ *   end <= rendered            the whole segment was already shown → drop it
  *   start <= rendered < end    partially shown → append only the missing tail
  *   rendered < start           a real gap → keep the bytes we do have
  *
  * Offsets are UTF-8 BYTES, so every comparison goes through utf8ByteLength /
  * utf8SliceFromBytes rather than string.length.
  */
-function applyIncrementalChunk(
+function applyIncrementalRange(
   message: ChatMessage,
   payload: Record<string, any>,
 ): number {
@@ -402,9 +408,9 @@ function applyIncrementalChunk(
     return rendered + utf8ByteLength(tail);
   }
   // A gap: bytes between `rendered` and `start` never arrived (e.g. the
-  // client attached after the answer had begun). Dropping this chunk would
-  // lose real text, so append it and jump the counter to the chunk's end —
-  // the gap is closed by the terminal event, whose text is authoritative.
+  // client attached after the answer had begun). Dropping this segment would
+  // lose real text, so append it and jump the counter to its end — the gap
+  // is closed by the terminal event, whose text is authoritative.
   message.content += text;
   return end;
 }
@@ -451,10 +457,19 @@ export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<
   const message = { ...conv.messages[idx] };
   switch (event.event_type) {
       case 'content.delta': {
-        // Transient frame: never persisted, so it is the ONLY copy of these
-        // bytes until the coalescer flushes. Count them: the durable chunk
-        // that follows must not add them a second time.
-        const deltaText = event.payload?.text || '';
+        // Transient frame: never persisted. 第九轮补丁 3.2-A: the backend
+        // stamps the SAME absolute UTF-8 end offset on deltas as on chunks,
+        // so the gateway's reverse order (a buffered delta drained AFTER the
+        // coalesced chunk replayed) is deduped by the shared byte ranges
+        // instead of duplicating the answer.
+        const payload = event.payload || {};
+        if (payload.offset !== undefined) {
+          message.streamBytes = applyIncrementalRange(message, payload);
+          break;
+        }
+        // Legacy delta without an offset (pre-3.2 backend): append — the
+        // old behaviour. The two sides must not have to switch in lockstep.
+        const deltaText = payload.text || '';
         const deltaBefore = renderedBytes(message);
         message.content += deltaText;
         message.streamBytes = deltaBefore + utf8ByteLength(deltaText);
@@ -472,7 +487,7 @@ export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<
           message.streamBytes = utf8ByteLength(message.content);
           break;
         }
-        message.streamBytes = applyIncrementalChunk(message, event.payload || {});
+        message.streamBytes = applyIncrementalRange(message, event.payload || {});
         break;
       case 'artifact.discovered': {
         const artifacts = [...(message.artifacts || [])];

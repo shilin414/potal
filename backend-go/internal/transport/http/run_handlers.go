@@ -210,6 +210,14 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 	// disabled one.
 	exe, err := s.Catalog.AuthorizeExecution(ctx, appID, caller.ID, caller.IsStaff)
 	if err != nil {
+		// Mutable-state race (第九轮补丁 3.2-C): the app could be disabled
+		// BETWEEN our initial resolve and this check by the very duplicate
+		// that is committing right now. A committed reservation outranks a
+		// refusal caused by state the original request did not see either.
+		if s.tryServeIdempotentReplay(ctx, w, clientRequestID,
+			s.replayResolver(caller.ID, clientRequestID, requestHash)) {
+			return
+		}
 		writeExecutionDenied(w, err)
 		return
 	}
@@ -233,7 +241,7 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 		// identity a bounded moment to appear before declaring 429 for a
 		// request that actually succeeded — otherwise the client's retry of
 		// a lost response creates a second turn.
-		if s.serveReplayAfterRefusal(ctx, w, clientRequestID,
+		if s.tryServeIdempotentReplay(ctx, w, clientRequestID,
 			s.replayResolver(caller.ID, clientRequestID, requestHash)) {
 			return
 		}
@@ -250,6 +258,13 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 			`SELECT user_id, application_id FROM conversations WHERE id = ?`,
 			targetConvID).Scan(&owner, &appCol)
 		if err != nil || owner != caller.ID || appCol != appID {
+			// Conversation validation race (第九轮补丁 3.2-C): the winner's
+			// transaction may have changed what this check sees; a committed
+			// reservation outranks the refusal.
+			if s.tryServeIdempotentReplay(ctx, w, clientRequestID,
+				s.replayResolver(caller.ID, clientRequestID, requestHash)) {
+				return
+			}
 			writeBare(w, http.StatusBadRequest, "conversation not found")
 			return
 		}
@@ -262,6 +277,14 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 
 	// Attachments: only the caller's own unbound pending attachments.
 	if err := s.validateAttachments(ctx, attachmentIDs, caller.ID, binding.ProviderKey); err != nil {
+		// Attachment race (第九轮补丁 3.2-C): the most reproducible one. The
+		// original request claimed these attachments inside its creation
+		// transaction; the retry's initial resolve ran BEFORE that commit.
+		// If the reservation appears now, this request IS that attempt.
+		if s.tryServeIdempotentReplay(ctx, w, clientRequestID,
+			s.replayResolver(caller.ID, clientRequestID, requestHash)) {
+			return
+		}
 		writeBare(w, http.StatusBadRequest, "one or more attachments are invalid")
 		return
 	}
@@ -387,46 +410,62 @@ func (s *Server) admitUserRun(ctx context.Context, userID int64) error {
 	return fmt.Errorf("too many requests, retry in %ds", secs)
 }
 
-// ReplayResolveWait is how long a request refused by admission waits for its
-// own earlier attempt's reservation to commit (第九轮 P1). See
-// serveReplayAfterRefusal for why that window exists at all.
+// ReplayResolveWait is how long a refused request waits for its own earlier
+// attempt's reservation to commit (第九轮 P1 + 补丁 3.2-C). See
+// tryServeIdempotentReplay for why that window exists at all.
 const ReplayResolveWait = execution.DefaultResolveRunRequestWait
 
-// serveReplayAfterRefusal answers a request that admission just refused with
-// the ORIGINAL run, when client_request_id turns out to belong to an attempt
-// that DID commit. It reports whether it wrote a response.
+// tryServeIdempotentReplay is the ONE helper every post-miss rejection goes
+// through (第九轮补丁 3.2-C). Once a request carries a client_request_id, any
+// validation/admission failure between the initial resolve and the creation
+// transaction can be a race the request's own earlier attempt just won —
+// its reservation was invisible a moment ago and commits now. The refusal
+// must therefore be interrupted by one bounded replay resolution FIRST:
 //
-// The ordering matters: this only runs when the per-user QPS budget is
-// exhausted, i.e. exactly when the earlier attempt's own run is likely to be
-// the reason. A replay must outrank every limit the original request already
-// consumed (第九轮 P0-1).
+//	original request committed   → 200 with the ORIGINAL run (replayed=true)
+//	same id, DIFFERENT payload   → 409 idempotency_key_reused (a conflict was
+//	                               never a 429; swallowing it mislabeled the
+//	                               error AND hid the reuse)
+//	resolver infrastructure err  → 500 (a DB outage must not masquerade as
+//	                               client-side rate limiting)
+//	still genuinely new          → false; the caller writes its own error
 //
-// `resolve` is injected rather than called directly so the semantics can be
-// pinned without a database (see RunHandlersReplay test): the property under
-// test is "answer 200 with the original run if the identity appears inside the
-// budget, otherwise write nothing and let the caller report 429".
-func (s *Server) serveReplayAfterRefusal(
+// `resolve` is injected so the semantics can be pinned without a database
+// (see run_handlers_test.go): the bounded waiting itself lives in
+// execution.ResolveRunRequestWithWait and is tested against a real
+// uncommitted transaction there.
+func (s *Server) tryServeIdempotentReplay(
 	ctx context.Context,
 	w http.ResponseWriter,
 	clientRequestID string,
 	resolve func(context.Context) (*execution.Run, bool, error),
-) bool {
+) (handled bool) {
 	if clientRequestID == "" || resolve == nil {
 		return false
 	}
 	run, found, err := resolve(ctx)
-	if err != nil || !found || run == nil {
-		return false
+	switch {
+	case errors.Is(err, execution.ErrIdempotencyKeyReused):
+		if s.Metric != nil {
+			s.Metric.RunIdempotencyConflictTotal.Inc()
+		}
+		writeDetail(w, http.StatusConflict, "idempotency_key_reused")
+		return true
+	case err != nil:
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return true
+	case found && run != nil:
+		if s.Metric != nil {
+			s.Metric.RunIdempotencyReplayTotal.Inc()
+		}
+		rec := toRunRecord(run)
+		rec.ClientRequestID = clientRequestID
+		rec.IdempotencyReplayed = true
+		// 200, not 201: nothing was created by THIS request.
+		writeJSON(w, http.StatusOK, rec)
+		return true
 	}
-	if s.Metric != nil {
-		s.Metric.RunIdempotencyReplayTotal.Inc()
-	}
-	rec := toRunRecord(run)
-	rec.ClientRequestID = clientRequestID
-	rec.IdempotencyReplayed = true
-	// 200, not 201: nothing was created by THIS request.
-	writeJSON(w, http.StatusOK, rec)
-	return true
+	return false
 }
 
 // replayResolver binds this request's identity to the execution-layer wait.

@@ -388,6 +388,15 @@ func (e *Executor) classifyError(ctx context.Context, claimed *execution.Claimed
 	if errors.Is(err, execution.ErrLostOwnership) {
 		return err // fence verdict: stop writing, never retry from here
 	}
+	// 第九轮补丁 3.2-B: the provider already holds the action; its acceptance
+	// just could not be recorded. failRun would declare a run failed that is
+	// still executing upstream, and RetryOwnedRun would transmit a second
+	// chat — both are forbidden. Return verbatim: the worker exits, the run
+	// stays running, the lease expires and the reaper converges it (the new
+	// owner sees a 'sending' submission → waiting_external).
+	if errors.Is(err, ErrProviderAcceptancePersistence) {
+		return err
+	}
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		if errors.Is(apiErr.Kind, ErrRateLimit) {
@@ -442,28 +451,81 @@ func (e *Executor) thread(ctx context.Context, claimed *execution.ClaimedRun) (t
 	return e.Owned.EnsureAgentThread(ctx, *run.ConversationID, ProviderKey, expectedMode, expectedSubject)
 }
 
-func (e *Executor) bindThreadAndRun(ctx context.Context, claimed *execution.ClaimedRun, threadID ids.ID, sub *execution.ProviderSubmission, agentChatID, sessionID string) error {
-	if agentChatID != "" && claimed.Run.ExternalRunID == "" {
-		// One transaction records BOTH the provider's acceptance and the
-		// run's external id (第九轮 P0-2): splitting them would let a crash
-		// leave an accepted submission whose chat id is unreadable, or a
-		// chat id that cannot be proven accepted — either half alone cannot
-		// be resumed safely.
-		if err := e.Owned.MarkSubmissionAccepted(ctx, claimed, sub, agentChatID); err != nil {
-			return err // includes ErrLostOwnership
-		}
-		claimed.Run.ExternalRunID = agentChatID
+// ErrProviderAcceptancePersistence (第九轮补丁 3.2-B): the provider answered
+// with a chat id, but the ONE transaction that records "accepted + external
+// id" could not be written. This error must NEVER be classified into a
+// failRun / retry / re-submit: the provider already holds the action, and the
+// only safe convergence is to stop, let the lease expire and let the reaper
+// hand the run — with its still-'sending' submission — to a new owner, which
+// will then park it in waiting_external.
+var ErrProviderAcceptancePersistence = errors.New("aily: provider acceptance could not be persisted")
+
+// acceptancePersistWaits is the short LOCAL DB retry budget for recording
+// the provider's acceptance (第九轮补丁 3.2-B). What is retried is the local
+// persistence write — NEVER the provider submit. If the write lands inside
+// this window (a transient lock wait, a brief failover), the ordinary flow
+// continues; if not, the executor returns ErrProviderAcceptancePersistence
+// and the run converges through lease expiry instead.
+var acceptancePersistWaits = []time.Duration{0, 50 * time.Millisecond, 100 * time.Millisecond, 200 * time.Millisecond}
+
+// persistProviderAcceptance records the provider's acceptance (submission
+// state 'accepted' + runs.external_run_id, one transaction) — the canonical
+// correctness half of the old bindThreadAndRun (第九轮补丁 3.2-B).
+//
+// Failure here is NOT log-and-continue: without this row the run has no
+// durable proof of WHICH provider chat belongs to it, so polling would poll
+// "" and a successful finalize would leave a submission stuck in 'sending'
+// with no external id — both break the provider exactly-once ledger. The
+// caller must stop the provider execution chain (no poll, no reconcile, no
+// finalize, no second submit) and let the lease/reaper path converge.
+func (e *Executor) persistProviderAcceptance(ctx context.Context, claimed *execution.ClaimedRun, sub *execution.ProviderSubmission, externalID string) error {
+	if externalID == "" || claimed.Run.ExternalRunID != "" {
+		return nil
 	}
-	if !threadID.IsZero() && sessionID != "" {
-		if err := e.Owned.BindProviderSession(ctx, claimed, threadID, sessionID); err != nil {
-			if errors.Is(err, execution.ErrLostOwnership) {
-				return err
+	var err error
+	for i, wait := range acceptancePersistWaits {
+		if wait > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(wait):
 			}
-			// Session conflict / transient bind failure: the run itself is
-			// unaffected; log and continue (session binding is set-once).
-			e.Log.Warn("bind provider session failed",
-				"run_id", claimed.Run.ID.String(), "err", err)
 		}
+		err = e.Owned.MarkSubmissionAccepted(ctx, claimed, sub, externalID)
+		if err == nil {
+			claimed.Run.ExternalRunID = externalID
+			return nil
+		}
+		if errors.Is(err, execution.ErrLostOwnership) {
+			return err
+		}
+		if i == 0 {
+			e.Log.Warn("persisting provider acceptance failed; retrying the local write",
+				"run_id", claimed.Run.ID.String(), "attempt", i+1, "err", err)
+		}
+	}
+	e.Log.Error("provider acceptance could not be persisted after retries",
+		"run_id", claimed.Run.ID.String(), "external_id", externalID, "err", err)
+	return fmt.Errorf("%w: %w", ErrProviderAcceptancePersistence, err)
+}
+
+// bindProviderSessionBestEffort is the CONVERSATION-OPTIMIZATION half of the
+// old bindThreadAndRun (第九轮补丁 3.2-B): a session conflict or a transient
+// bind failure does not affect the run — the session is set-once and the
+// next turn retries it. Only a lost ownership is propagated, because a
+// fenced-out worker must stop touching state at all.
+func (e *Executor) bindProviderSessionBestEffort(ctx context.Context, claimed *execution.ClaimedRun, threadID ids.ID, sessionID string) error {
+	if threadID.IsZero() || sessionID == "" {
+		return nil
+	}
+	if err := e.Owned.BindProviderSession(ctx, claimed, threadID, sessionID); err != nil {
+		if errors.Is(err, execution.ErrLostOwnership) {
+			return err
+		}
+		// Session conflict / transient bind failure: the run itself is
+		// unaffected; log and continue (session binding is set-once).
+		e.Log.Warn("bind provider session failed",
+			"run_id", claimed.Run.ID.String(), "err", err)
 	}
 	return nil
 }
@@ -481,17 +543,29 @@ type deltaCoalescer struct {
 	flushBytes   int
 	lastFlush    time.Time
 	totalFlushed int
+	// totalReceived is the ABSOLUTE UTF-8 byte position after every delta
+	// ever seen (第九轮补丁 3.2-A). Transient deltas and durable chunks must
+	// share ONE coordinate system: a buffered delta that the SSE gateway
+	// drains AFTER its coalesced chunk replayed can only be deduped by
+	// comparing end offsets. len(text) on a Go string IS its UTF-8 byte
+	// length, so this counter and the chunk offsets can never disagree.
+	totalReceived int
 }
 
 func newDeltaCoalescer() *deltaCoalescer {
 	return &deltaCoalescer{flushBytes: 2000, lastFlush: time.Now()}
 }
 
-// add buffers one delta; shouldFlush reports whether the buffer crossed a
-// threshold (2000 bytes or 500ms since the last flush).
-func (c *deltaCoalescer) add(text string) bool {
+// add buffers one delta and returns (absoluteEndOffset, shouldFlush).
+// shouldFlush reports whether the buffer crossed a threshold (2000 bytes or
+// 500ms since the last flush). The offset is the end of THIS delta in the
+// answer's byte coordinate system — the same number the coalesced chunk
+// that eventually covers it will carry.
+func (c *deltaCoalescer) add(text string) (int, bool) {
 	c.buf = append(c.buf, text...)
-	return len(c.buf) >= c.flushBytes || time.Since(c.lastFlush) >= 500*time.Millisecond
+	c.totalReceived += len(text)
+	return c.totalReceived,
+		len(c.buf) >= c.flushBytes || time.Since(c.lastFlush) >= 500*time.Millisecond
 }
 
 // chunk drains the buffer into a persisted-chunk payload: the incremental
@@ -615,11 +689,20 @@ func (e *Executor) executeStreaming(ctx context.Context, claimed *execution.Clai
 			if newSession == "" {
 				newSession = sessionID
 			}
-			if err := e.bindThreadAndRun(ctx, claimed, threadID, sub, chatID, newSession); err != nil {
-				if errors.Is(err, execution.ErrLostOwnership) {
-					return err
-				}
-				e.Log.Warn("bind thread/run failed", "run_id", run.ID.String(), "err", err)
+			if chatID != "" {
+				externalRunID = chatID
+			}
+			// 第九轮补丁 3.2-B: the acceptance ledger write is CANONICAL —
+			// if it cannot be persisted the stream consumption stops here.
+			// Continuing would let a succeeded reconciliation finalize a
+			// run whose submission ledger still says 'sending' with no
+			// external id. The lease expires, the reaper requeues, and the
+			// next owner parks the 'sending' submission in waiting_external.
+			if err := e.persistProviderAcceptance(ctx, claimed, sub, chatID); err != nil {
+				return err
+			}
+			if err := e.bindProviderSessionBestEffort(ctx, claimed, threadID, newSession); err != nil {
+				return err
 			}
 		case "aily.stream.transport_error":
 			// Break out; reconciliation decides the terminal state — but
@@ -632,8 +715,24 @@ func (e *Executor) executeStreaming(ctx context.Context, claimed *execution.Clai
 			return e.reconcile(ctx, claimed, externalRunID)
 		case execution.EventContentDelta:
 			// Transient: live SSE consumers only — never persisted as-is.
-			e.Owned.PublishTransient(ctx, claimed, execution.EventContentDelta, ev.Payload)
-			if coalescer.add(strOf(ev.Payload["text"], "")) {
+			// 第九轮补丁 3.2-A: the transient delta now carries the SAME
+			// absolute UTF-8 end offset the durable chunk will carry. The
+			// SSE gateway deliberately drains buffered live frames AFTER
+			// replaying durable events, so the wire order is genuinely
+			// "chunk ABC, then delta A, delta B, delta C" — a client that
+			// appended both duplicated the answer. With an offset on both
+			// event kinds, the client's byte-range reconciliation drops
+			// every buffered delta the chunk already covered, whichever
+			// order the two arrive in.
+			text := strOf(ev.Payload["text"], "")
+			endOffset, flush := coalescer.add(text)
+			livePayload := make(map[string]any, len(ev.Payload)+1)
+			for k, v := range ev.Payload {
+				livePayload[k] = v
+			}
+			livePayload["offset"] = endOffset
+			e.Owned.PublishTransient(ctx, claimed, execution.EventContentDelta, livePayload)
+			if flush {
 				if err := flushChunk(); err != nil {
 					if errors.Is(err, execution.ErrLostOwnership) {
 						return err
@@ -713,11 +812,29 @@ func (e *Executor) executeBackground(ctx context.Context, claimed *execution.Cla
 	if err != nil {
 		return &preSubmitStop{err: e.onSubmitFailure(ctx, claimed, sub, err)}
 	}
-	if err := e.bindThreadAndRun(ctx, claimed, threadID, sub, result.ExternalRunID, result.SessionID); err != nil {
-		if errors.Is(err, execution.ErrLostOwnership) {
-			return err
+	// Defense-in-depth (第九轮补丁 3.2-B): SubmitPrepared returning WITHOUT an
+	// external id after a successful POST means the provider crossed the
+	// submit boundary while the response body is unusable (malformed JSON,
+	// missing agent_chat_id). That is the same unknown as a streaming POST
+	// whose first frame carries no chat id — NOT an ordinary provider
+	// failure. ErrServer keeps Aily (IdempotencyNone) on the park path, and
+	// a future native-idempotent provider on the safe-retry path.
+	if result == nil || result.ExternalRunID == "" {
+		err := &APIError{
+			Kind:       ErrServer,
+			Msg:        "provider accepted submit without an external run id",
+			HTTPStatus: 200,
 		}
-		e.Log.Warn("bind thread/run failed", "run_id", run.ID.String(), "err", err)
+		return &preSubmitStop{err: e.onSubmitFailure(ctx, claimed, sub, err)}
+	}
+	// The acceptance ledger write is the canonical correctness step: if it
+	// cannot be persisted, do NOT poll — the run would poll "" and could be
+	// declared failed while the provider is still executing (第九轮补丁 3.2-B).
+	if err := e.persistProviderAcceptance(ctx, claimed, sub, result.ExternalRunID); err != nil {
+		return err
+	}
+	if err := e.bindProviderSessionBestEffort(ctx, claimed, threadID, result.SessionID); err != nil {
+		return err
 	}
 	// Refresh the run data WITHOUT touching the ownership: the fence
 	// lives on claimed.Ownership and cannot be clobbered by a reload

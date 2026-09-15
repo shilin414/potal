@@ -35,9 +35,14 @@ info:
     `GET /api/v2/runs/{id}/stream` responds with `text/event-stream`.
     Frames: `event: run.event` + `data: {run_id, sequence, event_type, payload[, created_at]}`,
     keepalive comment lines `: keepalive` every 15s of silence.
-    Replay covers every persisted event from sequence 0 (clients dedupe by
-    sequence); live frames end after the first terminal event
-    (`run.completed` / `run.failed` / `run.interrupted`), then the connection closes.
+    Durable replay resumes STRICTLY AFTER the client cursor: precedence is
+    query `after` > `Last-Event-ID` header > 0. Transient live frames
+    (`content.delta` et al.) carry sequence 0 and deliberately write NO
+    `id:` — they never advance the cursor and are never replayed.
+    Live frames end after the first terminal event
+    (`run.completed` / `run.failed` / `run.cancelled`), then the connection
+    closes. `run.interrupted` is legacy historical compatibility only
+    (pre-closure replays); the live protocol never emits it.
 servers:
   - url: /
 tags:
@@ -2020,7 +2025,10 @@ components:
             - input.required
             - run.completed
             - run.failed
+            # Legacy historical compatibility only (pre-closure replays);
+            # the live protocol terminates with run.completed/failed/cancelled.
             - run.interrupted
+            - run.cancelled
             - run.poll
             - run.retrying
             - run.waiting_external
