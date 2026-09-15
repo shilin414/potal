@@ -42,6 +42,13 @@ type Executor struct {
 	PollBackoff []time.Duration
 	Log         *slog.Logger
 	Metrics     *telemetry.Metrics
+	// Gate is the PRE-SUBMIT kill switch (第三轮 P1-B, Gate 2). The
+	// worker's claim-time gate (Gate 1) runs before the handler, but the
+	// run may still wait here for auth resolution and a limiter token
+	// while an admin disables the application or the provider — a run
+	// that has not been SUBMITTED yet must still obey the kill switch.
+	// Nil disables the check (tests / non-gated deployments).
+	Gate execution.RunGate
 }
 
 // Execute implements execution.Handler.
@@ -74,6 +81,16 @@ func (e *Executor) Execute(ctx context.Context, claimed *execution.ClaimedRun) e
 			return execution.ErrLostOwnership // cancelled by lease loss
 		}
 		return e.failRun(ctx, claimed, "aily_rate_limit", "waiting for provider rate limit cancelled")
+	}
+
+	// Pre-submit kill switch (第三轮 P1-B, Gate 2): placed AFTER the rate
+	// limiter (which itself may wait) and IMMEDIATELY before
+	// BeginProviderAttempt — the closest possible checkpoint to the
+	// provider submit. kill → cancelled, pause/infra → deferred with the
+	// original priority, unknown verdict → fail closed. No attempt is
+	// consumed on any gated path: the provider never saw this run.
+	if execution.PreSubmitGate(ctx, e.Owned, claimed, e.Gate, e.Log) {
+		return nil
 	}
 
 	// Attempt accounting (P0-2): attempt counts PROVIDER EXECUTIONS. The

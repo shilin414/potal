@@ -342,8 +342,19 @@ func (w *Worker) claimAndExecute(ctx context.Context, runID ids.ID, ack func()) 
 		}
 		return
 	}
+	// Execution-time kill switch BEFORE run.started (复审 P1-2, 第三轮
+	// P2-D): a killed run must never emit a fake started event, and a
+	// provider-paused run must not churn started/deferred pairs every
+	// requeue cycle. The gate reads only the mutable revocable state.
+	if w.gateBlocked(ctx, claimed) {
+		if ack != nil {
+			ack()
+		}
+		return
+	}
 	// Claim event: matches the reference protocol (SSE consumers render
 	// the streaming bubble from run.started). Fenced: only the owner.
+	// Emitted only after the gate ALLOWED the run (第三轮 P2-D).
 	if err := w.Svc.AppendOwnedEvent(ctx, claimed.Ownership, EventRunStarted, map[string]any{
 		"worker_id": w.WorkerID,
 		"attempt":   claimed.Run.Attempt,
@@ -370,49 +381,10 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun, leaseRenewedA
 	w.trackInflight(claimed.Ownership, cancel, leaseRenewedAt)
 	defer w.trackInflight(claimed.Ownership, nil, time.Time{})
 
-	// Execution-time kill switch (复审 P1-2): the admission gate cannot
-	// reach runs that are already queued, so the claim re-checks the
-	// revocable state. Placed BEFORE the provider slot acquire — a gated
-	// run never holds capacity — and before the handler, so nothing has
-	// been submitted to the provider yet (submitted runs are never
-	// force-killed). The frozen runtime snapshot is not consulted.
-	if w.Gate != nil {
-		action, err := w.Gate.CheckRun(ctx, claimed.Run)
-		switch {
-		case err != nil:
-			// Gate unavailable = infrastructure failure: behave like every
-			// other admission outage — pause briefly, never destroy work.
-			w.Log.Warn("run gate unavailable; requeueing run",
-				"run_id", claimed.Run.ID.String(), "err", err)
-			w.requeueForAdmission(claimed, "run_gate_unavailable")
-			return
-		case action == GateKill:
-			// Application/binding disabled: hard kill — cancel the run.
-			w.recordAdmission(telemetry.AdmissionGateKilled)
-			w.Log.Info("run gate killed run (application/binding disabled)",
-				"run_id", claimed.Run.ID.String())
-			if err := w.Svc.FinalizeOwnedRun(ctx, claimed.Run, claimed.Ownership, &FinishInput{
-				Status:       StatusCancelled,
-				ErrorCode:    "execution_disabled",
-				ErrorMessage: "application or runtime binding was disabled before execution",
-			}); err != nil && err != ErrLostOwnership {
-				w.Log.Error("gate kill finalize failed", "run_id", claimed.Run.ID.String(), "err", err)
-			}
-			return
-		case action == GatePause:
-			// Provider paused: keep the run, retry later — reactivating the
-			// provider resumes it without data loss.
-			w.recordAdmission(telemetry.AdmissionGatePaused)
-			w.recordProviderAdmission("provider_disabled")
-			w.Log.Info("run gate paused run (provider inactive); requeueing",
-				"run_id", claimed.Run.ID.String(), "delay", GatePauseRequeueDelay.String())
-			if err := w.Svc.RetryOwnedRunAfter(ctx, claimed.Run, claimed.Ownership,
-				"provider_disabled", GatePauseRequeueDelay); err != nil && err != ErrLostOwnership {
-				w.Log.Error("gate pause requeue failed", "run_id", claimed.Run.ID.String(), "err", err)
-			}
-			return
-		}
-	}
+	// NOTE: the execution-time gate ran here until the third review round;
+	// it moved to claimAndExecute BEFORE run.started (第三轮 P2-D) so a
+	// gated run never emits started, never takes a provider slot and never
+	// reaches this function.
 
 	if w.ProviderSlots != nil {
 		// Ownership-scoped, durable acquire: the row is keyed by the
@@ -504,6 +476,81 @@ func (w *Worker) requeueForAdmission(claimed *ClaimedRun, reason string) {
 	if err := w.Svc.RetryOwnedRunAfter(context.Background(), claimed.Run, claimed.Ownership,
 		reason, AdmissionRequeueDelay); err != nil && err != ErrLostOwnership {
 		w.Log.Error("requeue after provider admission failed",
+			"run_id", claimed.Run.ID.String(), "reason", reason, "err", err)
+	}
+}
+
+// gateBlocked applies the claim-time gate decision (复审 P1-2, 第三轮
+// P2-D/P2-E). Returns true when the run was handled by the gate (killed,
+// deferred, or requeued on an infra failure) and the caller must NOT emit
+// run.started or run the handler.
+//
+// Semantics (product decision 2026-09-15, 第三轮确认):
+//
+//	application/binding disabled → GateKill   (cancel finalize)
+//	provider inactive            → GatePause  (defer, keep waiting,
+//	                                            ORIGINAL priority — 第三轮 P1-C)
+//	gate query fails             → defer briefly (infra, fail safe)
+//	unknown action               → defer, FAIL CLOSED (第三轮 P2-E)
+func (w *Worker) gateBlocked(ctx context.Context, claimed *ClaimedRun) bool {
+	if w.Gate == nil {
+		return false
+	}
+	action, err := w.Gate.CheckRun(ctx, claimed.Run)
+	switch {
+	case err != nil:
+		// Gate unavailable = infrastructure failure: pause briefly with
+		// the original priority (defer, not retry), never destroy work.
+		w.Log.Warn("run gate unavailable; deferring run",
+			"run_id", claimed.Run.ID.String(), "err", err)
+		w.deferAfter(claimed, "run_gate_unavailable", AdmissionRequeueDelay)
+		return true
+	case action == GateKill:
+		// Application/binding disabled: hard kill — cancel the run.
+		w.recordAdmission(telemetry.AdmissionGateKilled)
+		w.Log.Info("run gate killed run (application/binding disabled)",
+			"run_id", claimed.Run.ID.String())
+		if err := w.Svc.FinalizeOwnedRun(ctx, claimed.Run, claimed.Ownership, &FinishInput{
+			Status:       StatusCancelled,
+			ErrorCode:    "execution_disabled",
+			ErrorMessage: "application or runtime binding was disabled before execution",
+		}); err != nil && err != ErrLostOwnership {
+			w.Log.Error("gate kill finalize failed", "run_id", claimed.Run.ID.String(), "err", err)
+		}
+		return true
+	case action == GatePause:
+		// Provider paused: keep the run, defer later — the run keeps its
+		// business priority (no `retry` demotion) and consumes no attempt;
+		// reactivating the provider resumes it without data loss.
+		w.recordAdmission(telemetry.AdmissionGatePaused)
+		w.recordProviderAdmission("provider_disabled")
+		w.Log.Info("run gate deferred run (provider inactive)",
+			"run_id", claimed.Run.ID.String(), "delay", GatePauseRequeueDelay.String())
+		w.deferAfter(claimed, "provider_disabled", GatePauseRequeueDelay)
+		return true
+	case action == GateAllow:
+		return false
+	default:
+		// 第三轮 P2-E: an unknown action is a gate implementation bug.
+		// The kill switch is a safety/operations control point — fail
+		// CLOSED (defer the run), never hand it to the provider on an
+		// unreadable verdict.
+		w.Log.Error("unknown gate action; failing closed",
+			"run_id", claimed.Run.ID.String(), "action", string(action))
+		w.recordAdmission(telemetry.AdmissionGateUnknown)
+		w.deferAfter(claimed, "run_gate_unknown", AdmissionRequeueDelay)
+		return true
+	}
+}
+
+// deferAfter requeues a claimed run with its ORIGINAL priority (第三轮
+// P1-C). The write uses a detached context so a cancelled worker context
+// cannot orphan the run; a failed defer write is recovered by the
+// lease/reaper machinery instead.
+func (w *Worker) deferAfter(claimed *ClaimedRun, reason string, delay time.Duration) {
+	if err := w.Svc.DeferOwnedRunAfter(context.Background(), claimed.Run, claimed.Ownership,
+		reason, delay); err != nil && err != ErrLostOwnership {
+		w.Log.Error("gate defer failed",
 			"run_id", claimed.Run.ID.String(), "reason", reason, "err", err)
 	}
 }

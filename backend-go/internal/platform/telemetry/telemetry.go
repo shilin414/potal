@@ -88,6 +88,10 @@ const (
 	// before any provider interaction.
 	AdmissionGateKilled = "gate_killed"
 	AdmissionGatePaused = "gate_paused"
+	// Execution gate returned an UNREADABLE verdict (第三轮 P2-E): the run
+	// was deferred fail-closed instead of submitted. Any sustained rate
+	// here is a gate implementation bug, not traffic.
+	AdmissionGateUnknown = "gate_unknown"
 )
 
 func NewMetrics(service string) *Metrics {

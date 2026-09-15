@@ -704,6 +704,45 @@ func (q *Queries) CurrentDBTime(ctx context.Context) (time.Time, error) {
 	return now, err
 }
 
+const deferRunFenced = `-- name: DeferRunFenced :execresult
+UPDATE runs
+SET status = 'queued',
+    available_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND)
+WHERE id = ? AND status = 'running' AND lease_epoch = ?
+`
+
+type DeferRunFencedParams struct {
+	DeferDelayMicros interface{}
+	ID               []byte
+	LeaseEpoch       uint64
+}
+
+// Defer (第三轮 P1-C): a gate PAUSE requeues the run WITHOUT demoting its
+// business priority. Unlike RequeueRunFenced this deliberately does NOT
+// touch `priority` — an interactive_user / scheduled_high run paused by an
+// inactive provider keeps its original admission class, so fairness is
+// restored intact when the provider comes back. Pause is "delayed
+// execution", not a provider-failure retry; attempt is not consumed
+// either (the caller never reached BeginProviderAttempt on this path).
+func (q *Queries) DeferRunFenced(ctx context.Context, arg DeferRunFencedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, deferRunFenced, arg.DeferDelayMicros, arg.ID, arg.LeaseEpoch)
+}
+
+const deferScheduledOccurrence = `-- name: DeferScheduledOccurrence :execresult
+UPDATE schedule_occurrences
+SET status = 'queued'
+WHERE run_id = ? AND status = 'running'
+`
+
+// Occurrence state convergence (第三轮 §12): a requeued scheduled run must
+// not leave its occurrence in 'running' — the run is back in the queue,
+// so the occurrence goes back to 'queued' in the SAME transaction. Both
+// are active states, so overlap accounting is unaffected; this only keeps
+// the UI and the Run/Occurrence state invariant honest.
+func (q *Queries) DeferScheduledOccurrence(ctx context.Context, runID sql.NullString) (sql.Result, error) {
+	return q.db.ExecContext(ctx, deferScheduledOccurrence, runID)
+}
+
 const deleteAttachment = `-- name: DeleteAttachment :exec
 DELETE FROM runtime_attachments WHERE id = ?
 `

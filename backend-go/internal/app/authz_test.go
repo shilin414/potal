@@ -23,10 +23,11 @@ import (
 // sentinels (and their wrapped forms) count as "denied"; everything else —
 // MySQL driver errors, connection refused, context deadlines — must NOT
 // be classified as a denial, or the scheduler would permanently fail
-// occurrences on transient outages.
+// occurrences on transient outages. nil is deliberately ABSENT from the
+// policy list: nil means authorization SUCCEEDED (第三轮 P0-A — the old
+// list asserted executionDenied(nil) == true, pinning the bug in).
 func TestExecutionDeniedClassifiesPolicyErrors(t *testing.T) {
 	policy := []error{
-		nil,
 		catalog.ErrExecutionForbidden,
 		catalog.ErrExecutionNotFound,
 		catalog.ErrExecutionDisabled,
@@ -51,6 +52,16 @@ func TestExecutionDeniedClassifiesPolicyErrors(t *testing.T) {
 		if executionDenied(err) {
 			t.Fatalf("executionDenied(%v) = true, want false (infra error must retry the slot)", err)
 		}
+	}
+}
+
+// TestExecutionDeniedNilMeansSuccess (第三轮 P0-A): a nil error is a
+// SUCCESSFUL authorization and must never be classified as a policy
+// denial. The inverted check used to make every authorized schedule fire
+// fail with "application is not schedulable".
+func TestExecutionDeniedNilMeansSuccess(t *testing.T) {
+	if executionDenied(nil) {
+		t.Fatal("nil error must mean successful authorization, not a denial")
 	}
 }
 

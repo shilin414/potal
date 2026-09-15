@@ -151,6 +151,10 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 		Owned:   runs.WorkerOwned(),
 		Adapter: ailyAdapter,
 		Auth:    ailyAuth,
+		// Pre-submit kill switch (第三轮 P1-B, Gate 2): same revocable-state
+		// gate as the worker's claim-time check (Gate 1), re-run inside the
+		// handler right before BeginProviderAttempt.
+		Gate: NewExecutionGate(catalogSvc),
 		ChatsL: execution.NewRateLimiter(rdb, rdb.Key("rate", "aily", "chats"),
 			cfg.Aily.StartRateLimitPerSec, time.Second),
 		PollsL:      execution.NewRateLimiter(rdb, rdb.Key("rate", "aily", "polls"), 10, time.Second),
@@ -215,11 +219,17 @@ type schedulableChecker struct {
 // The ownerUserID parameter is authoritative (schedule.Service passes the
 // real owner on create; update passes the caller).
 //
-// Error contract (复审 P1-1): only policy refusals are reported as
-// schedule.ErrApplicationNotSchedulable (→ 400); infrastructure errors
-// propagate raw so a DB outage cannot masquerade as invalid user input.
+// Error contract (复审 P1-1, 第三轮 P0-A): only policy refusals are
+// reported as schedule.ErrApplicationNotSchedulable (→ 400);
+// infrastructure errors propagate raw so a DB outage cannot masquerade as
+// invalid user input. The SUCCESS path is checked explicitly first —
+// even if executionDenied() were ever regressed, an authorized
+// application can never be classified as a refusal again.
 func (c *schedulableChecker) SchedulableApplication(ctx context.Context, appID, ownerUserID int64) error {
 	_, err := authorizeForOwner(ctx, c.Catalog, c.Users, appID, ownerUserID)
+	if err == nil {
+		return nil // authorized — never re-classify success
+	}
 	if executionDenied(err) {
 		return schedule.ErrApplicationNotSchedulable
 	}
@@ -241,26 +251,39 @@ type bindingResolver struct {
 // rules apply.
 func (r *bindingResolver) EnabledBinding(ctx context.Context, appID int64) (*scheduler.BindingView, error) {
 	exe, err := authorizeForOwner(ctx, r.Catalog, r.Users, appID, 0)
+	if err == nil {
+		return bindingViewOf(exe), nil // authorized — never re-classify success
+	}
 	if executionDenied(err) {
 		return nil, nil // not executable → scheduler treats as not schedulable
 	}
-	if err != nil {
-		return nil, err // infrastructure failure: never disguised as a denial
-	}
-	return bindingViewOf(exe), nil
+	return nil, err // infrastructure failure: never disguised as a denial
 }
 
 // EnabledBindingFor resolves the binding under the schedule owner's
 // identity (used by the scheduler's per-fire authorization).
 func (r *bindingResolver) EnabledBindingFor(ctx context.Context, appID, ownerUserID int64) (*scheduler.BindingView, error) {
 	exe, err := authorizeForOwner(ctx, r.Catalog, r.Users, appID, ownerUserID)
+	if err == nil {
+		return bindingViewOf(exe), nil // authorized — never re-classify success
+	}
 	if executionDenied(err) {
-		return nil, nil
+		return nil, nil // not executable → scheduler treats as not schedulable
 	}
-	if err != nil {
-		return nil, err
-	}
-	return bindingViewOf(exe), nil
+	return nil, err // infrastructure failure: never disguised as a denial
+}
+
+// NewBindingResolver exposes the real catalog-backed resolver for wiring
+// and tests (第三轮 P0-A: happy-path E2E must run the REAL
+// resolver → authorizeForOwner → executionDenied chain, not a stub).
+func NewBindingResolver(svc *catalog.Service, users *identity.Repo) *bindingResolver {
+	return &bindingResolver{Catalog: svc, Users: users}
+}
+
+// NewSchedulableChecker exposes the real schedule application checker for
+// wiring and tests (same rationale as NewBindingResolver).
+func NewSchedulableChecker(svc *catalog.Service, users *identity.Repo) *schedulableChecker {
+	return &schedulableChecker{Catalog: svc, Users: users}
 }
 
 // executionDenied reports whether err is a POLICY rejection — the
@@ -271,9 +294,19 @@ func (r *bindingResolver) EnabledBindingFor(ctx context.Context, appID, ownerUse
 // abort the current tick so the SAME slot is retried on the next scan
 // (复审 P1-1). Swallowing a transient DB error used to permanently fail
 // the occurrence and lose the scheduled slot.
+//
+// 第三轮 P0-A: nil is SUCCESS, never a denial. The previous
+// `err == nil ||` shortcut inverted the classifier — every successful
+// authorization was treated as a policy refusal, which blocked schedule
+// create/update and silently failed every automatic fire and run-now.
+// Callers additionally guard the success path with an explicit
+// `err == nil` check so this helper can never break authorized flow
+// on its own again.
 func executionDenied(err error) bool {
-	return err == nil ||
-		errors.Is(err, catalog.ErrExecutionForbidden) ||
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, catalog.ErrExecutionForbidden) ||
 		errors.Is(err, catalog.ErrExecutionNotFound) ||
 		errors.Is(err, catalog.ErrExecutionDisabled) ||
 		errors.Is(err, catalog.ErrExecutionNotChat) ||

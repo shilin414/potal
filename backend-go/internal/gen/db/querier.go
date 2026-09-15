@@ -173,6 +173,20 @@ type Querier interface {
 	// database so due / misfire / window decisions are identical across
 	// scheduler hosts regardless of their local clock skew.
 	DBNow(ctx context.Context) (time.Time, error)
+	// Defer (第三轮 P1-C): a gate PAUSE requeues the run WITHOUT demoting its
+	// business priority. Unlike RequeueRunFenced this deliberately does NOT
+	// touch `priority` — an interactive_user / scheduled_high run paused by an
+	// inactive provider keeps its original admission class, so fairness is
+	// restored intact when the provider comes back. Pause is "delayed
+	// execution", not a provider-failure retry; attempt is not consumed
+	// either (the caller never reached BeginProviderAttempt on this path).
+	DeferRunFenced(ctx context.Context, arg DeferRunFencedParams) (sql.Result, error)
+	// Occurrence state convergence (第三轮 §12): a requeued scheduled run must
+	// not leave its occurrence in 'running' — the run is back in the queue,
+	// so the occurrence goes back to 'queued' in the SAME transaction. Both
+	// are active states, so overlap accounting is unaffected; this only keeps
+	// the UI and the Run/Occurrence state invariant honest.
+	DeferScheduledOccurrence(ctx context.Context, runID sql.NullString) (sql.Result, error)
 	DeleteApplication(ctx context.Context, id uint64) error
 	DeleteAttachment(ctx context.Context, id []byte) error
 	DeleteConversation(ctx context.Context, id uint64) error

@@ -128,6 +128,29 @@ SET status = 'queued', priority = 'retry',
     available_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(retry_delay_micros) MICROSECOND)
 WHERE id = ? AND status = 'running' AND lease_epoch = ?;
 
+-- name: DeferRunFenced :execresult
+-- Defer (第三轮 P1-C): a gate PAUSE requeues the run WITHOUT demoting its
+-- business priority. Unlike RequeueRunFenced this deliberately does NOT
+-- touch `priority` — an interactive_user / scheduled_high run paused by an
+-- inactive provider keeps its original admission class, so fairness is
+-- restored intact when the provider comes back. Pause is "delayed
+-- execution", not a provider-failure retry; attempt is not consumed
+-- either (the caller never reached BeginProviderAttempt on this path).
+UPDATE runs
+SET status = 'queued',
+    available_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(defer_delay_micros) MICROSECOND)
+WHERE id = ? AND status = 'running' AND lease_epoch = ?;
+
+-- name: DeferScheduledOccurrence :execresult
+-- Occurrence state convergence (第三轮 §12): a requeued scheduled run must
+-- not leave its occurrence in 'running' — the run is back in the queue,
+-- so the occurrence goes back to 'queued' in the SAME transaction. Both
+-- are active states, so overlap accounting is unaffected; this only keeps
+-- the UI and the Run/Occurrence state invariant honest.
+UPDATE schedule_occurrences
+SET status = 'queued'
+WHERE run_id = ? AND status = 'running';
+
 -- name: RequeueRunFencedImmediate :execresult
 -- Reaper recovery requeue: a crashed worker's run becomes claimable AT
 -- ONCE — crash recovery must not wait out a retry backoff. available_at
