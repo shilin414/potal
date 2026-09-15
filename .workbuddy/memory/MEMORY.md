@@ -23,6 +23,14 @@
 - **授权分类双保险（三轮 P0 教训）**：调用点必须先显式判 `err == nil` 成功路径，再 `executionDenied(err)` 分类——不允许只依赖分类器；`executionDenied(nil)` 恒 false（测试 `TestExecutionDeniedNilMeansSuccess` 锁定）；正向 Happy-Path 必须有真实链路测试（不许只测失败路径/mock resolver）
 - **Gate 语义（三轮定型）**：双检查点 level-triggered——Gate 1（worker claim 后）+ Gate 2（`execution.PreSubmitGate`，aily executor 在 ChatsL.Acquire 后、BeginProviderAttempt 前调用）；kill=cancel、pause/infra/未知 action=**Defer fail-closed**（`DeferOwnedRunAfter` 不改 priority、occurrence running→queued 同事务、outbox 用原优先级 class、新事件 `run.deferred`）；未知 GateAction 绝不允许继续 Handler（指标 `gate_unknown`）；run.started 在 Gate allow 之后才发；Execution Generation（严格 edge-triggered）明确不引入
 
+### 第四轮新增约定（2026-09-15，P1 已关闭）
+- **Gate 2 只能在真实 Provider Submit 之前**：`beginSubmit`（Gate→attempt CAS）是唯一入口，本地准备（thread DB、ValidateContent/Attachments）必须在 Gate 之前且不消耗 attempt；`preSubmitStop` 包装避免被 classify 成 Provider 故障
+- **Streaming 必须同步 Open**：`OpenStreamChat` 在同 goroutine 发 POST，goroutine 只做 `pumpSSE` 帧解析（禁止在 goroutine 内发 POST，会重开 Gate→Submit 窗口）
+- `aily.ProviderAPI` 是「Provider 是否被触达」的测试 seam，新测试用它统计真实调用，不要只数 helper 调用次数
+- **started_at = gate allow 的时间**，不是 claim 时间：`CASClaimRun` 不写，由 `MarkRunStartedOwned` 在 Gate1 allow 后、`run.started` 前写，`COALESCE` 保留首次；`finalize.go` 必须 `StartedAt != nil` 再 `IsZero()`（指针解引用会 panic）
+- **前端 `run.cancelled` 是独立终态**（`execution_disabled` = 硬取消，非失败），reducer 与 `finalizeRun` 都不得映射成 done；`run.deferred` 是非终态等待提示，靠 `run.started` 清除
+- 非终态谓词统一 `status NOT IN ('cancelled','succeeded','failed')`；迁移 `0017` 修 provider_id 指向错误的历史 binding（0016 只修 NULL）
+
 ### 数据库与 CI
 - **MySQL 5.7 基线**（TiDB 已退出，别加 TiDB 假设）：`192.168.211.26:20336`/`xiaoan`/`test_user`；DSN UTC（`loc=UTC`+`time_zone='+00:00'`）不能动；错误码 1213/1205 保留
 - CI 两 job：`check`（gofmt/vet/build/unit/race）+ `integration`（mysql5.7+redis7 唯一闸门，含 execution/delivery 包级 DB 测试）；迁移入口 `go run ./cmd/migrate`；失败诊断读 check-run annotations
