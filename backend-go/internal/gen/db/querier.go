@@ -12,6 +12,13 @@ import (
 
 type Querier interface {
 	AppendRunEvent(ctx context.Context, arg AppendRunEventParams) (sql.Result, error)
+	// Explicit-sequence append for writers that must NOT ask the database for
+	// the next value (第六轮 P2-1): the finalize transaction holds the run row
+	// lock and already knows how many events the run has (CountRunEvents read
+	// under that same lock), so COUNT(*)+1 is applied in Go instead of on
+	// every durable write. A mismatch can only mean a lost fence and fails
+	// loudly on uniq_run_event_sequence rather than silently renumbering.
+	AppendRunEventAtSequence(ctx context.Context, arg AppendRunEventAtSequenceParams) (sql.Result, error)
 	// Late-attachment race guard: only while queued.
 	AppendUserAttachmentToRunInput(ctx context.Context, arg AppendUserAttachmentToRunInputParams) (sql.Result, error)
 	ApplicationSlugExists(ctx context.Context, slug string) (int64, error)
@@ -315,7 +322,10 @@ type Querier interface {
 	GetRunCommandByID(ctx context.Context, id []byte) (RunCommand, error)
 	// Lock the run row inside an ownership-verified transaction (finalize /
 	// retry / recovery). Returns the lease_epoch so the caller can verify
-	// the fence under the lock.
+	// the fence under the lock, plus the DB-clock started_at/finished_at so
+	// the finalize path can observe studio_run_duration from ONE clock
+	// authority (第六轮 P2: started_at is written by MySQL, so measuring it
+	// against the worker host clock skews or even negates the duration).
 	GetRunForUpdate(ctx context.Context, id []byte) (GetRunForUpdateRow, error)
 	// Execution-time kill switch (复审 P1-2): the ONLY mutable facts re-checked
 	// after the claim and before any provider interaction. Deliberately does

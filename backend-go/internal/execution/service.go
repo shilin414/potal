@@ -929,6 +929,23 @@ func appendEventTx(ctx context.Context, tx *sql.Tx, runID ids.ID, epoch uint64, 
 	return count + 1, nil
 }
 
+// nextEventSequenceTx returns the sequence a new event must use, from the
+// count read under the caller's run-row lock.
+//
+// COUNT(*)+1 is only valid because EVERY event writer takes the run row
+// FOR UPDATE first (see appendEventTx): the count cannot change between
+// the read and the INSERT, so sequence stays gap-free and unique. Callers
+// that already hold the lock may compute it themselves and pass it to
+// AppendRunEventAtSequence.
+func nextEventSequenceTx(ctx context.Context, tx *sql.Tx, runID ids.ID) (uint64, error) {
+	var count uint64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM run_events WHERE run_id = ?`, runID.Bytes()).Scan(&count); err != nil {
+		return 0, err
+	}
+	return count + 1, nil
+}
+
 // PublishTransient fans a HIGH-FREQUENCY event (content.delta) to live
 // SSE consumers through Redis pub/sub WITHOUT persisting it (评测 P1:
 // run_events write amplification). Transient frames use sequence 0 —
@@ -1018,9 +1035,28 @@ func nullInt64NZ(v int64) sql.NullInt64 {
 
 func nullText(s string) sql.NullString { return sql.NullString{String: s, Valid: true} }
 
-// timeSinceSeconds measures a run's wall-clock duration for metrics.
-func timeSinceSeconds(start time.Time) float64 {
-	return time.Since(start).Seconds()
+// dbClockDuration turns a run's DB-clock started_at/finished_at pair into
+// a metric duration (第六轮 P2).
+//
+// Both bounds MUST come from the database clock: started_at is written by
+// MySQL (MarkRunStartedOwned / CASClaimRun) and finished_at by
+// CASFinishRunFenced, so measuring the pair against time.Now() on the
+// worker host mixes two clock authorities and reports a skewed — even
+// negative — duration whenever the host drifts.
+//
+// Returns ok=false when either timestamp is missing (a run killed before
+// it was allowed to execute has no start) or when the pair is not
+// monotonic (clock skew between the two statements): an unobservable
+// duration must be DROPPED, never recorded as a bogus sample.
+func dbClockDuration(startedAt, finishedAt sql.NullTime) (float64, bool) {
+	if !startedAt.Valid || !finishedAt.Valid {
+		return 0, false
+	}
+	seconds := finishedAt.Time.Sub(startedAt.Time).Seconds()
+	if seconds < 0 {
+		return 0, false
+	}
+	return seconds, true
 }
 
 func defaultMap(m map[string]any) map[string]any {

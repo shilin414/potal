@@ -201,6 +201,16 @@ SET status = 'failed', error_code = ?, error_message = ?,
     finished_at = CURRENT_TIMESTAMP(3)
 WHERE id = ? AND status = 'running' AND lease_epoch = ?;
 
+-- name: AppendRunEventAtSequence :execresult
+-- Explicit-sequence append for writers that must NOT ask the database for
+-- the next value (第六轮 P2-1): the finalize transaction holds the run row
+-- lock and already knows how many events the run has (CountRunEvents read
+-- under that same lock), so COUNT(*)+1 is applied in Go instead of on
+-- every durable write. A mismatch can only mean a lost fence and fails
+-- loudly on uniq_run_event_sequence rather than silently renumbering.
+INSERT INTO run_events (run_id, sequence, event_type, payload)
+VALUES (?, ?, ?, ?);
+
 -- name: AppendRunEvent :execresult
 INSERT INTO run_events (run_id, sequence, event_type, payload)
 VALUES (?, ?, ?, ?);
@@ -261,9 +271,12 @@ FOR UPDATE;
 -- name: GetRunForUpdate :one
 -- Lock the run row inside an ownership-verified transaction (finalize /
 -- retry / recovery). Returns the lease_epoch so the caller can verify
--- the fence under the lock.
+-- the fence under the lock, plus the DB-clock started_at/finished_at so
+-- the finalize path can observe studio_run_duration from ONE clock
+-- authority (第六轮 P2: started_at is written by MySQL, so measuring it
+-- against the worker host clock skews or even negates the duration).
 SELECT id, user_id, external_run_id, status, lease_epoch, attempt, max_attempts,
-       trigger_type, trigger_id, conversation_id
+       trigger_type, trigger_id, conversation_id, started_at, finished_at
 FROM runs WHERE id = ? FOR UPDATE;
 
 -- name: DeleteLeaseByToken :execresult

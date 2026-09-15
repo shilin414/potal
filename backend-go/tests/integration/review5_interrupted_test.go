@@ -232,14 +232,21 @@ func TestFinalizeRejectsLegacyInterruptedStatus(t *testing.T) {
 // file to a seeded legacy row and asserts the documented outcome:
 // runs → failed (with an error_code marker when empty), legacy
 // run.interrupted events → run.failed, and the run is finished_at-stamped.
+//
+// The fixture payload is the DIRECT TERMINAL shape the legacy
+// Finish(StatusInterrupted) path wrote ({"status": ..., "error_code": ...}),
+// NOT the retry marker — 第六轮 established that the two are different
+// historical facts and that only the direct-terminal one may become
+// run.failed (see review6_interrupted_event_migration_test.go, where the
+// reason-only retry marker is repaired back to run.retrying by 0020).
 func TestMigration0018NormalizesLegacyInterrupted(t *testing.T) {
 	env := newScheduleEnv(t)
 	ctx := context.Background()
 	runID, _, _ := seedInterruptedRun(t, env.db)
 
 	if _, err := env.db.ExecContext(ctx,
-		`INSERT INTO run_events (run_id, sequence, event_type, payload) VALUES (?, 1, 'run.interrupted', '{}')`,
-		runID); err != nil {
+		`INSERT INTO run_events (run_id, sequence, event_type, payload) VALUES (?, 1, 'run.interrupted', ?)`,
+		runID, legacyDirectTerminalPayload); err != nil {
 		t.Fatalf("seed legacy event: %v", err)
 	}
 

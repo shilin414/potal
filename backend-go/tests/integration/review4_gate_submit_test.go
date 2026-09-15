@@ -480,6 +480,17 @@ func TestLegacyInterruptedFreesTheConversation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create first run: %v", err)
 	}
+	// 第六轮: the fixture is DELETED at the end of the test. The invariant
+	// sweeps in the review report ("legacy interrupted status = 0",
+	// "terminal run owns a terminal event = 0 violations") scan the whole
+	// database, so a leftover row here would fail them forever and falsely
+	// suggest the migrations did not repair production data.
+	t.Cleanup(func() {
+		_, _ = env.db.ExecContext(context.Background(),
+			`DELETE FROM runs WHERE conversation_id = ?`, convID)
+		_, _ = env.db.ExecContext(context.Background(),
+			`DELETE FROM conversations WHERE id = ?`, convID)
+	})
 	if _, err := env.db.ExecContext(ctx,
 		`UPDATE runs SET status = ? WHERE id = ?`, execution.StatusInterrupted, first.ID.Bytes()); err != nil {
 		t.Fatalf("force interrupted status: %v", err)
@@ -514,6 +525,13 @@ func TestNonTerminalRunCountsAgainstUserOutstandingCap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create first run: %v", err)
 	}
+	// 第六轮: fixture cleanup (see the note in the test above).
+	t.Cleanup(func() {
+		_, _ = env.db.ExecContext(context.Background(),
+			`DELETE FROM runs WHERE conversation_id = ?`, convID)
+		_, _ = env.db.ExecContext(context.Background(),
+			`DELETE FROM conversations WHERE id = ?`, convID)
+	})
 	if _, err := env.db.ExecContext(ctx,
 		`UPDATE runs SET status = ? WHERE id = ?`, execution.StatusWaitingInput, first.ID.Bytes()); err != nil {
 		t.Fatalf("force waiting_input: %v", err)

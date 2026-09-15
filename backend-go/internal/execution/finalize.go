@@ -83,8 +83,17 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 	if err != nil {
 		return err
 	}
-	sequence, err := appendEventTx(ctx, tx, own.RunID, own.LeaseEpoch, terminalEvent, terminalPayload)
+	sequence, err := nextEventSequenceTx(ctx, tx, own.RunID)
 	if err != nil {
+		return err
+	}
+	terminalPayloadJSON, _ := json.Marshal(terminalPayload)
+	if _, err := q.AppendRunEventAtSequence(ctx, db.AppendRunEventAtSequenceParams{
+		RunID:     own.RunID.Bytes(),
+		Sequence:  sequence,
+		EventType: terminalEvent,
+		Payload:   dbtypes.JSONText(terminalPayloadJSON),
+	}); err != nil {
 		return err
 	}
 
@@ -101,6 +110,20 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 	}); err != nil {
 		return err
 	}
+
+	// studio_run_duration is measured from the DB-clock timestamps the run
+	// row itself carries (第六轮 P2): started_at was stamped by MySQL in
+	// MarkRunStartedOwned and finished_at by the CAS above. Re-reading the
+	// ROW (not the caller's snapshot) is what makes the pair consistent;
+	// measuring against time.Now() compared a MySQL timestamp with the
+	// worker host clock, so host skew inflated, shrank or even negated the
+	// observed duration. NULL when the run never started (killed before it
+	// was allowed to execute) → no duration to observe.
+	finishedRow, err := q.GetRunForUpdate(ctx, own.RunID.Bytes())
+	if err != nil {
+		return err
+	}
+	durationSeconds, hasDuration := dbClockDuration(finishedRow.StartedAt, finishedRow.FinishedAt)
 
 	// 4. Assistant message durability: inserted in the SAME transaction
 	// (评测 §二十 — previously Run succeeded + crash could lose the answer).
@@ -169,11 +192,12 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 		s.Metrics.RunTotal.WithLabelValues(run.Provider, in.Status).Inc()
 		// started_at is NULL for a run killed before it was allowed to
 		// execute (第四轮 P2) — such a run has no duration to observe.
-		// The pointer must be nil-checked before the deref.
-		if run.StartedAt != nil && !run.StartedAt.IsZero() {
+		// A clock-skewed pair is dropped rather than observed as a
+		// negative duration.
+		if hasDuration {
 			s.Metrics.RunDuration.
 				WithLabelValues(run.Provider, in.Status).
-				Observe(timeSinceSeconds(*run.StartedAt))
+				Observe(durationSeconds)
 		}
 	}
 	return nil

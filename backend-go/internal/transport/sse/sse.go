@@ -142,9 +142,13 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 			if run.ErrorMessage != "" {
 				synthetic["error_message"] = run.ErrorMessage
 			}
-			eventType := execution.EventRunCompleted
-			if run.Status == execution.StatusFailed || run.Status == execution.StatusInterrupted {
-				eventType = execution.EventRunFailed
+			eventType, ok := syntheticTerminalEventName(run.Status)
+			if !ok {
+				// A settled status without a terminal event name is a
+				// status nobody defined: never fabricate a frame (a
+				// default of run.completed would report an unknown
+				// outcome as a success).
+				return
 			}
 			writeFrame(0, eventType, synthetic, true)
 		}
@@ -193,4 +197,34 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 			}
 		}
 	}
+}
+
+// syntheticTerminalEventName maps a SETTLED run status to the terminal
+// frame the gateway synthesizes when the run has no persisted terminal
+// event (修复计划 §19 fallback; legacy rows predating the atomic
+// finalize transaction).
+//
+// cancelled must map to run.cancelled — mapping it to run.completed, as
+// the previous inline `if failed||interrupted` did, resurrects exactly
+// the "cancelled ≠ success" bug the execution closure removed: the
+// frontend renders a user-cancelled run as a successful one.
+//
+// `interrupted` is the pre-closure terminal ALIAS of `failed` (第五轮
+// P2-1) and therefore still maps to run.failed for rows migration 0018
+// has not normalized yet.
+//
+// The bool is false for any non-settled or unknown status: the caller
+// must NOT fabricate a terminal frame then, because a zero-value event
+// name would either be ignored by the client (stream never closes) or,
+// with a naive default, reported as a success nobody observed.
+func syntheticTerminalEventName(status string) (string, bool) {
+	switch status {
+	case execution.StatusSucceeded:
+		return execution.EventRunCompleted, true
+	case execution.StatusCancelled:
+		return execution.EventRunCancelled, true
+	case execution.StatusFailed, execution.StatusInterrupted:
+		return execution.EventRunFailed, true
+	}
+	return "", false
 }

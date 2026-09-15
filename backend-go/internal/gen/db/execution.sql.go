@@ -34,6 +34,33 @@ func (q *Queries) AppendRunEvent(ctx context.Context, arg AppendRunEventParams) 
 	)
 }
 
+const appendRunEventAtSequence = `-- name: AppendRunEventAtSequence :execresult
+INSERT INTO run_events (run_id, sequence, event_type, payload)
+VALUES (?, ?, ?, ?)
+`
+
+type AppendRunEventAtSequenceParams struct {
+	RunID     []byte
+	Sequence  uint64
+	EventType string
+	Payload   dbtypes.JSONText
+}
+
+// Explicit-sequence append for writers that must NOT ask the database for
+// the next value (第六轮 P2-1): the finalize transaction holds the run row
+// lock and already knows how many events the run has (CountRunEvents read
+// under that same lock), so COUNT(*)+1 is applied in Go instead of on
+// every durable write. A mismatch can only mean a lost fence and fails
+// loudly on uniq_run_event_sequence rather than silently renumbering.
+func (q *Queries) AppendRunEventAtSequence(ctx context.Context, arg AppendRunEventAtSequenceParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, appendRunEventAtSequence,
+		arg.RunID,
+		arg.Sequence,
+		arg.EventType,
+		arg.Payload,
+	)
+}
+
 const appendUserAttachmentToRunInput = `-- name: AppendUserAttachmentToRunInput :execresult
 UPDATE runs SET input = JSON_ARRAY_APPEND(input, '$.agent_attachment_ids', ?)
 WHERE id = ? AND status = 'queued'
@@ -1259,7 +1286,7 @@ func (q *Queries) GetRunCommandByID(ctx context.Context, id []byte) (RunCommand,
 
 const getRunForUpdate = `-- name: GetRunForUpdate :one
 SELECT id, user_id, external_run_id, status, lease_epoch, attempt, max_attempts,
-       trigger_type, trigger_id, conversation_id
+       trigger_type, trigger_id, conversation_id, started_at, finished_at
 FROM runs WHERE id = ? FOR UPDATE
 `
 
@@ -1274,11 +1301,16 @@ type GetRunForUpdateRow struct {
 	TriggerType    string
 	TriggerID      sql.NullInt64
 	ConversationID sql.NullInt64
+	StartedAt      sql.NullTime
+	FinishedAt     sql.NullTime
 }
 
 // Lock the run row inside an ownership-verified transaction (finalize /
 // retry / recovery). Returns the lease_epoch so the caller can verify
-// the fence under the lock.
+// the fence under the lock, plus the DB-clock started_at/finished_at so
+// the finalize path can observe studio_run_duration from ONE clock
+// authority (第六轮 P2: started_at is written by MySQL, so measuring it
+// against the worker host clock skews or even negates the duration).
 func (q *Queries) GetRunForUpdate(ctx context.Context, id []byte) (GetRunForUpdateRow, error) {
 	row := q.db.QueryRowContext(ctx, getRunForUpdate, id)
 	var i GetRunForUpdateRow
@@ -1293,6 +1325,8 @@ func (q *Queries) GetRunForUpdate(ctx context.Context, id []byte) (GetRunForUpda
 		&i.TriggerType,
 		&i.TriggerID,
 		&i.ConversationID,
+		&i.StartedAt,
+		&i.FinishedAt,
 	)
 	return i, err
 }

@@ -205,6 +205,103 @@ drained:
 	}
 }
 
+// TestSSECancelledRunWithoutTerminalEventReplaysCancelled (第六轮 P1):
+// a legacy settled run with NO persisted terminal event must be closed
+// with a frame carrying its REAL outcome. The pre-fix fallback mapped
+// everything that was not failed/interrupted to run.completed, so a
+// user-cancelled run reconnected as a success.
+func TestSSECancelledRunWithoutTerminalEventReplaysCancelled(t *testing.T) {
+	svc, _ := testEnv(t)
+	runID := seedRun(t, svc, "feishu_aily")
+	ctx := context.Background()
+	// The report's §25 invariant sweeps scan the WHOLE database: a leaked
+	// terminal run with no terminal event keeps them red forever.
+	deleteRunFixture(t, svc, runID)
+
+	if _, err := svc.Querier().CASFinishRun(ctx, dbFinishRunParams(runID.Bytes(), "cancelled", `{}`)); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately no run.cancelled event: this is the legacy shape the
+	// fallback exists for.
+	appendTestEvent(t, svc, runID, 1, execution.EventContentDelta, "partial")
+
+	frames := readSSE(t, svc, runID)
+	if len(frames) != 2 {
+		t.Fatalf("got %d frames, want 2 (replayed delta + synthetic terminal)", len(frames))
+	}
+	synthetic := frames[len(frames)-1]
+	if synthetic.EventType != execution.EventRunCancelled {
+		t.Fatalf("synthetic frame event_type = %q, want %q: a cancelled run must "+
+			"never be reported as a success", synthetic.EventType, execution.EventRunCancelled)
+	}
+	if synthetic.EventType == execution.EventRunCompleted {
+		t.Fatal("cancelled run synthesized as run.completed")
+	}
+	if synthetic.Payload["status"] != execution.StatusCancelled {
+		t.Fatalf("synthetic payload status = %v, want %q",
+			synthetic.Payload["status"], execution.StatusCancelled)
+	}
+	if synthetic.CreatedAt == "" {
+		t.Error("synthetic frame must carry created_at (it is not a replayed row)")
+	}
+}
+
+// The other settled statuses keep their own frame (no single default).
+func TestSSESyntheticTerminalFramesMatchRunStatus(t *testing.T) {
+	cases := []struct {
+		status    string
+		wantEvent string
+	}{
+		{"succeeded", execution.EventRunCompleted},
+		{"failed", execution.EventRunFailed},
+		{"interrupted", execution.EventRunFailed},
+		{"cancelled", execution.EventRunCancelled},
+	}
+	for _, tc := range cases {
+		t.Run(tc.status, func(t *testing.T) {
+			svc, _ := testEnv(t)
+			runID := seedRun(t, svc, "feishu_aily")
+			deleteRunFixture(t, svc, runID)
+			if _, err := svc.Querier().CASFinishRun(context.Background(),
+				dbFinishRunParams(runID.Bytes(), tc.status, `{}`)); err != nil {
+				t.Fatal(err)
+			}
+			frames := readSSE(t, svc, runID)
+			if len(frames) != 1 {
+				t.Fatalf("got %d frames, want 1 (synthetic terminal only)", len(frames))
+			}
+			if frames[0].EventType != tc.wantEvent {
+				t.Fatalf("status %q → %q, want %q", tc.status, frames[0].EventType, tc.wantEvent)
+			}
+		})
+	}
+}
+
+// deleteRunFixture registers removal of a seeded run (and everything that
+// points at it) at the end of the test.
+//
+// The report's §25 verification sweeps are DATABASE-WIDE, so a fixture
+// run that is left in a terminal state without a canonical terminal event
+// makes a correct migration look broken — and would just as surely hide a
+// real regression when one appears.
+func deleteRunFixture(t *testing.T, svc *execution.Service, runID ids.ID) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx := context.Background()
+		// FK order: children first, then the run itself.
+		for _, stmt := range []string{
+			`DELETE FROM run_events WHERE run_id = ?`,
+			`DELETE FROM run_leases WHERE run_id = ?`,
+			`DELETE FROM runs WHERE id = ?`,
+		} {
+			_, _ = svc.DB.ExecContext(ctx, stmt, runID.Bytes())
+		}
+		_, _ = svc.DB.ExecContext(ctx,
+			`DELETE FROM outbox_events WHERE aggregate = 'run' AND aggregate_id = ?`,
+			runID.Bytes())
+	})
+}
+
 func startSSEServer(t *testing.T, svc *execution.Service, rdb *redisx.Client, runID ids.ID) *httptest.Server {
 	t.Helper()
 	gw := &sse.Gateway{Runs: svc, Redis: rdb, Keepalive: 500 * time.Millisecond}
