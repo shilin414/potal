@@ -20,6 +20,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
@@ -27,7 +28,10 @@ import (
 
 	"github.com/creation-agent-studio/backend-go/internal/execution"
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
+	"github.com/creation-agent-studio/backend-go/internal/platform/config"
+	"github.com/creation-agent-studio/backend-go/internal/platform/database"
 	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
+	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
 )
 
 // ── P2-1: a failing metric read can never roll back terminalization ──
@@ -186,6 +190,109 @@ func TestDurationMetricUsesPersistedDBTimestamps(t *testing.T) {
 		map[string]string{"provider": provider, "status": execution.StatusSucceeded}); n != 1 {
 		t.Fatalf("duration samples = %d, want 1 (the DB-clock pair is observable)", n)
 	}
+}
+
+// ── CI 复盘: a renewal of a LIVE row must report 1 changed row ──
+//
+// CI failed the seventh-round push on
+//
+//	fencing_matrix_test.go:224: current owner slot renew:
+//	execution: provider inflight slot lost
+//
+// with a slot that existed and was owned. Root cause is MySQL's affected-rows
+// semantics, not the fixture: `UPDATE` reports CHANGED rows, not matched ones,
+// so a renewal that lands in the same millisecond as the write that created
+// the row computes byte-identical heartbeat_at/expires_at and reports 0 —
+// which Renew reads as "slot gone", and HeartbeatOwned as "ownership lost".
+// A localhost MySQL (CI) is fast enough to land in the same millisecond; a LAN
+// round trip (local dev) always crosses a millisecond boundary, which is why
+// 10 local runs of the same test never reproduced it.
+//
+// `SET timestamp` pins the SESSION clock, so this test reproduces the race
+// deterministically instead of hoping for a fast millisecond.
+func TestLiveRenewalReportsOneChangedRow(t *testing.T) {
+	testEnv(t) // env guard (STUDIO_TEST_DB) + shared fixture helpers
+	svc := newFrozenClockService(t)
+	ctx := context.Background()
+
+	runID := seedRun(t, svc, "itest_frozen_clock")
+	deleteRunFixture(t, svc, runID)
+	claimed, won, err := svc.ClaimRun(ctx, runID, "frozen-worker", time.Minute)
+	if err != nil || !won {
+		t.Fatalf("claim: won=%v err=%v", won, err)
+	}
+
+	// 1. Lease renewal. The lease was created at the pinned instant, so
+	//    HeartbeatOwned recomputes exactly the same timestamps.
+	ok, err := svc.HeartbeatOwned(ctx, claimed.Ownership, time.Minute)
+	if err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	if !ok {
+		t.Fatal("HeartbeatOwned reported LOST OWNERSHIP for a live lease whose renewal " +
+			"landed in the same millisecond as its creation: a same-millisecond renewal " +
+			"must still count as one changed row")
+	}
+
+	// 2. Provider slot renewal — the statement CI actually failed on.
+	provider := "itest_frozen_clock_slot"
+	slots := execution.NewProviderSlots(svc.DB, provider, 4, time.Minute)
+	t.Cleanup(func() {
+		_, _ = svc.DB.ExecContext(context.Background(),
+			`DELETE FROM provider_execution_slots WHERE provider = ?`, provider)
+		_, _ = svc.DB.ExecContext(context.Background(),
+			`DELETE FROM provider_admission_locks WHERE provider = ?`, provider)
+	})
+	slot, admitted, _, err := slots.Acquire(ctx, claimed.Ownership)
+	if err != nil || !admitted {
+		t.Fatalf("slot acquire: admitted=%v err=%v", admitted, err)
+	}
+	if err := slots.Renew(ctx, slot); err != nil {
+		t.Fatalf("Renew reported %v for a live, owned slot: a same-millisecond renewal "+
+			"must not be mistaken for a lost slot", err)
+	}
+	// The idempotent re-acquire path touches the slot too, and its own
+	// affected-rows check has the same exposure.
+	if _, admitted, _, err := slots.Acquire(ctx, claimed.Ownership); err != nil || !admitted {
+		t.Fatalf("idempotent re-acquire: admitted=%v err=%v", admitted, err)
+	}
+}
+
+// newFrozenClockService opens a SECOND handle on the same database whose
+// session clock is pinned to the current second, so two consecutive renewal
+// statements compute identical CURRENT_TIMESTAMP(3) values.
+//
+// MySQL's `SET timestamp` is session-scoped, hence MaxOpenConns(1): every query
+// must go back to the one connection that carries the setting.
+func newFrozenClockService(t *testing.T) *execution.Service {
+	t.Helper()
+	if os.Getenv("STUDIO_TEST_DB") != "1" {
+		t.Skip("set STUDIO_TEST_DB=1 to run database integration tests")
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	ctx := context.Background()
+	d, err := database.Open(ctx, cfg.Database)
+	if err != nil {
+		t.Fatalf("database: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	d.SetMaxOpenConns(1)
+	d.SetMaxIdleConns(1)
+
+	conn, err := d.Conn(ctx)
+	if err != nil {
+		t.Fatalf("conn: %v", err)
+	}
+	defer func() { _ = conn.Close() }() // back to the pool WITH the session variable set
+	if _, err := conn.ExecContext(ctx, "SET timestamp = ?", time.Now().Unix()); err != nil {
+		// Loud, never skipped: a silent skip here would hide exactly the
+		// regression this test exists to catch.
+		t.Fatalf("this test needs session-clock control (SET timestamp = ?): %v", err)
+	}
+	return execution.NewService(d, nil, silentLogger(), telemetry.NewMetrics("test"))
 }
 
 // ── helpers ──

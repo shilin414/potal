@@ -300,8 +300,19 @@ DELETE FROM run_leases WHERE run_id = ? AND lease_token = ?;
 -- Lease extension from the DB clock (Phase 3). A negative microsecond delay
 -- expires the lease immediately — test fixtures use that instead of passing
 -- an absolute app-clock instant.
+--
+-- heartbeat_at is written MONOTONICALLY on purpose (第七轮 CI 复盘): MySQL
+-- reports CHANGED rows, not matched ones, so a renewal that lands in the same
+-- millisecond as the previous write computes the very same values and reports
+-- 0 — indistinguishable from "this lease does not exist". Callers read 0 as
+-- lost ownership, so a perfectly healthy renewal would raise a false
+-- ownership-loss signal (observed in CI on provider slot renew). Writing
+-- GREATEST(now, stored + 1ms) always differs from the stored value while
+-- staying within 1ms of the DB clock, so changed rows == matched rows again.
+-- Same idea as provider_admission_locks.admissions, which increments instead
+-- of assigning, for exactly this reason.
 UPDATE run_leases
-SET heartbeat_at = CURRENT_TIMESTAMP(3),
+SET heartbeat_at = GREATEST(CURRENT_TIMESTAMP(3), DATE_ADD(heartbeat_at, INTERVAL 1000 MICROSECOND)),
     expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(lease_micros) MICROSECOND)
 WHERE run_id = ? AND worker_id = ?;
 
@@ -310,8 +321,12 @@ WHERE run_id = ? AND worker_id = ?;
 -- cannot renew a lease it no longer owns. Extension is DB-clock based, so a
 -- skewed worker clock can neither extend nor shorten the lease. An expired
 -- lease is terminal ownership loss and cannot be revived before the reaper.
+--
+-- heartbeat_at is written monotonically for the reason spelled out on
+-- HeartbeatLease: a same-millisecond renewal must still report 1 changed row,
+-- or the caller reads "0" as lost ownership and abandons a healthy run.
 UPDATE run_leases
-SET heartbeat_at = CURRENT_TIMESTAMP(3),
+SET heartbeat_at = GREATEST(CURRENT_TIMESTAMP(3), DATE_ADD(heartbeat_at, INTERVAL 1000 MICROSECOND)),
     expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(lease_micros) MICROSECOND)
 WHERE run_id = ? AND lease_token = ?
   AND expires_at > CURRENT_TIMESTAMP(3);
@@ -381,8 +396,15 @@ FOR UPDATE;
 -- name: TouchProviderSlot :execresult
 -- Renew (XX-only): the slot must already exist. 0 rows = expired/released →
 -- ErrProviderSlotLost; a lost slot is NEVER recreated by a renewal.
+--
+-- heartbeat_at is written monotonically for the reason spelled out on
+-- HeartbeatLease. This is the statement that surfaced the hazard: a renewal
+-- right after Acquire landed in the same millisecond, reported 0 changed rows
+-- for a slot that existed and was owned, and made Renew return
+-- ErrProviderSlotLost on CI (local runs never hit it — the LAN round trip
+-- always crossed a millisecond boundary, while a localhost MySQL does not).
 UPDATE provider_execution_slots
-SET heartbeat_at = CURRENT_TIMESTAMP(3),
+SET heartbeat_at = GREATEST(CURRENT_TIMESTAMP(3), DATE_ADD(heartbeat_at, INTERVAL 1000 MICROSECOND)),
     expires_at = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL sqlc.arg(lease_micros) MICROSECOND)
 WHERE provider = ? AND run_id = ? AND lease_epoch = ? AND lease_token = ?
   AND expires_at > CURRENT_TIMESTAMP(3);

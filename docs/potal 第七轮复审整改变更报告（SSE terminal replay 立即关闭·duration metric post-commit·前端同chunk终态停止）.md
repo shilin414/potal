@@ -185,29 +185,114 @@ if (complete && buffer.trim() && !closed && !sawTerminal) {
 
 ---
 
-## 五、本机验证结果
+## 六、附加修复：CI 首轮红 —— 同毫秒续约被误判为「槽位/所有权丢失」
+
+### 6.1 现象
+
+三件套推送后 CI 回归（run 34954246578）：`check` job 全绿（含 `-race`），`integration` job 在 "integration tests" 步骤失败，注解给出的失败点是**既有测试**：
+
+```text
+integration tests failed :: --- FAIL: TestExecutionFencingMatrix (0.41s) FAIL
+github.com/.../tests/integration 31.005s FAIL
+  :: fencing_matrix_test.go:224: current owner slot renew:
+     execution: provider inflight slot lost
+```
+
+`slot_renew/current_owner` 断言"当前持有者续约必须成功"，却在槽位**存在且归属正确**时收到 `ErrProviderSlotLost`。本机同一套集成测试连跑 10 次全过；两者差别在图：CI 的 MySQL 是同 runner 上的容器（本地回环），本机走 LAN。
+
+### 6.2 根因（已用探针证明，不是推测）
+
+MySQL 的 `UPDATE` 返回的是 **changed rows，不是 matched rows**。续约语句的形状是：
+
+```sql
+UPDATE provider_execution_slots
+SET heartbeat_at = CURRENT_TIMESTAMP(3),
+    expires_at   = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND)
+WHERE ... AND expires_at > CURRENT_TIMESTAMP(3);
+```
+
+`Acquire` 建槽与紧随其后的 `Renew` 若落在**同一毫秒**，两条语句算出的 `heartbeat_at` / `expires_at` **完全相同** → 行被匹配但没有任何列发生变化 → `RowsAffected = 0`，与"这行不存在"不可区分。调用方把 0 读成所有权丢失：
+
+- `ProviderSlots.Renew` → `ErrProviderSlotLost`（CI 报错点）
+- `slots.acquireOnce` 幂等分支 → 同一处判定（原注释写"row is locked, so this is unreachable outside data corruption"，实测**可达**）
+- `HeartbeatOwned` / 合并心跳 → `ok=false` + `RunOwnershipLostTotal`，worker 会**放弃一个健康的 Run**
+
+CI（回环 MySQL）单条语句百微秒级，两条续约之间的服务端间隔可以 <1ms；本机 LAN 单次往返 1–3ms，必然跨毫秒 → 这就是"本地 10 次全过、CI 挂"的全部原因。
+
+用两段临时探针（跑完即删）验证：
+
+```text
+rows matching the renew predicate : 1        ← 行确实存在且满足谓词
+RowsAffected when new values EQUAL stored : 0   ← 被判成"槽位丢失"
+RowsAffected when new values DIFFER        : 1
+RowsAffected with LAST_INSERT_ID(id) idiom : 0   ← 常见偏方在此形状下无效
+```
+
+顺带确认：项目**自己早就绕过这个坑**——`LockProviderAdmission` 特意写成 `SET admissions = admissions + 1`，注释明说"affected rows 必须是 1；0 表示行不存在"。本次修复沿用同一思路。
+
+### 6.3 修复
+
+三条续约语句的 `heartbeat_at` 改为**单调写**：
+
+```sql
+SET heartbeat_at = GREATEST(CURRENT_TIMESTAMP(3),
+                            DATE_ADD(heartbeat_at, INTERVAL 1000 MICROSECOND)),
+    expires_at   = DATE_ADD(CURRENT_TIMESTAMP(3), INTERVAL ? MICROSECOND)
+```
+
+- `GREATEST(now, stored + 1ms)` 与 `stored` **恒不相等**（若 `stored+1ms > now` 则取前者，否则取 `now`，而 `now ≥ stored+1ms > stored`），因此"changed rows == matched rows"重新成立：`RowsAffected = 1` ⟺ 行存在且归属正确。
+- `expires_at` **语义完全不变**（仍是 `now + lease`）。刻意不用 `GREATEST(expires_at, ...)` 那类写法：那会让过期时间每次续约都向上累加（漂移），崩溃恢复窗口可能无界增长。
+- `heartbeat_at` 最多比 DB 时钟超前 1ms，且它不参与任何栅栏判定（栅栏只看 `expires_at`），无副作用。
+- 影响面：`HeartbeatLease`、`HeartbeatLeaseFenced`、`TouchProviderSlot` 三条语句的 SET 子句；**Go 代码零改动**（三个调用点的判定因此自动变正确）。
+- 刻意**没有**采用 `ClientFoundRows=true`：它会同时改变 `BindAgentThreadSessionOwned`（依赖 changed-rows 区分"幂等重绑"与"换会话"）与 `delivery` 的重复检测语义，属于全局语义变更，风险远大于收益。
+
+### 6.4 新增测试（确定性复现，含反证）
+
+`TestLiveRenewalReportsOneChangedRow`（`tests/integration/review7_fixes_test.go`）
+
+`SET timestamp = <second>` 可把 **session 时钟**钉死，于是两条连续续约语句算出的 `CURRENT_TIMESTAMP(3)` 完全相同——把"能否恰好落在同一毫秒"从运气变成确定：
+
+```text
+claim run（租约在钉死时刻创建）
+→ HeartbeatOwned 必须返回 true（旧代码在此失败：false）
+→ slot Acquire 后 Renew 必须成功（旧代码在此失败：ErrProviderSlotLost）
+→ 幂等 re-Acquire 不得报槽位丢失
+```
+
+**反证**：把三条 SQL 还原成 `SET heartbeat_at = CURRENT_TIMESTAMP(3)` → 重新 `sqlc generate` → 该测试**确定性 FAIL**（`HeartbeatOwned reported LOST OWNERSHIP for a live lease …`）→ 还原后 PASS。注意这是本机可复现的失败，不是"只在 CI 才出现的偶发"。
+
+### 6.5 与本轮报告批次的关系（越界说明）
+
+第七轮报告要求三件套完成后**停止**对 `Lease fencing` 等执行主链继续微调。本次修复确实落在该范围内，但它不是"微调"：它是一条 CI 阻断项，且是三件套推送后由 CI 暴露出来的**新缺陷类别**（affected-rows 语义 vs 栅栏判定），本机根本无法用常规手段发现。因此按"先修阻断、再报告"处理，并在报告中明确标注为附加项，供复审判断是否接受。
+
+---
+
+## 七、本机验证结果
 
 ```text
 gofmt -l internal tests cmd        → 空
 go vet ./...                       → ok
 go build ./...                     → ok
 go test ./...                      → 全部 ok
-sqlc generate                      → 仅 GetRunTimestamps 相关新增，无其他 diff
+sqlc generate                      → 仅 GetRunTimestamps 与三条续约语句相关 diff，无附带 churn
 
 STUDIO_TEST_DB=1 STUDIO_TEST_REDIS=1
-  go test ./tests/integration/     → ok (55.9s，全量套件)
+  go test ./tests/integration/     → ok (60.1s，全量套件)
 
 frontend: tsc --noEmit             → ok
           vitest run               → 16 files / 131 tests passed
           vite build               → ok
 ```
 
+反证记录：4 个后端新测试 + 2 个前端新测试逐个还原修复后均确定性 FAIL（细节见 §四、§6.4），
+还原后全绿；临时探针 `cmd/tmpciadmin`、`cmd/tmpslotprobe`、`cmd/tmpslotprobe2` 跑完即删，未入库。
+
 未变更迁移，故 MySQL 侧 `migration version = 20`、二次执行 clean no-op 不受影响（CI 覆盖）。
 本机无 gcc，`go test -race` 仍只在 CI Ubuntu 上跑。
 
 ---
 
-## 六、遗留（第七轮报告 §二十一 / §二十三 / §二十四 第三批）
+## 八、遗留（第七轮报告 §二十一 / §二十三 / §二十四 第三批）
 
 按报告「第三批：以后」执行，本轮**未做**：
 
