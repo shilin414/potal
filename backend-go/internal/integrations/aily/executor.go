@@ -496,7 +496,7 @@ func (e *Executor) reconcile(ctx context.Context, claimed *execution.ClaimedRun,
 		return e.failRun(ctx, claimed, "aily_no_chat_id", "stream ended without agent_chat_id")
 	}
 	if refreshed, err := e.Owned.GetRun(ctx, run.ID); err == nil {
-		if execution.IsTerminal(refreshed.Status) {
+		if execution.IsSettled(refreshed.Status) {
 			return nil // someone else finished it (reaper/cancel)
 		}
 		// Ownership is immutable on the ClaimedRun — the refresh only

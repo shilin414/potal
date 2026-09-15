@@ -89,7 +89,7 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 	//   3. Drain live frames, skipping sequences already replayed
 	//      (overlap between snapshot and subscription is deduplicated).
 	var lastReplayed uint64
-	if g.Redis != nil && !execution.IsTerminal(run.Status) {
+	if g.Redis != nil && !execution.IsSettled(run.Status) {
 		var pubsub *goredis.PubSub
 		pubsub = g.Redis.Subscribe(ctx, g.Redis.RunEventsChannel(run.ID.String()))
 		if _, err := pubsub.Receive(ctx); err != nil { // wait for confirmation
@@ -124,7 +124,7 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 			replayedTerminal = true
 		}
 	}
-	if execution.IsTerminal(run.Status) {
+	if execution.IsSettled(run.Status) {
 		// Belt-and-suspenders (修复计划 §19 fallback): the finalize
 		// transaction guarantees terminal CAS + terminal event together;
 		// if a LEGACY row predating that transaction is terminal without

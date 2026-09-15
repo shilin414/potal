@@ -51,6 +51,8 @@ type Querier interface {
 	// (the delivery layer stays independent — see delivery_executions).
 	CASFinishOccurrenceByRun(ctx context.Context, arg CASFinishOccurrenceByRunParams) (sql.Result, error)
 	// Terminal-only transition; 0 rows affected = already terminal (idempotent).
+	// `interrupted` counts as settled too (第五轮 P2-1): a legacy pre-closure
+	// row must never be re-finished, same as the three canonical statuses.
 	CASFinishRun(ctx context.Context, arg CASFinishRunParams) (sql.Result, error)
 	// Fenced terminal transition: only the current lease epoch may finish a
 	// running run. 0 rows = already terminal (idempotent) OR lost ownership.
@@ -74,13 +76,17 @@ type Querier interface {
 	CountActiveOccurrencesExcluding(ctx context.Context, arg CountActiveOccurrencesExcludingParams) (int64, error)
 	// Active = not past its DB-clock expiry.
 	CountActiveProviderSlots(ctx context.Context, provider string) (int64, error)
-	// ACTIVE = NON-TERMINAL (第四轮 P2). The status list used to be hard-coded
-	// to ('queued','running'); the domain has nine states and only
-	// cancelled/succeeded/failed are terminal (execution.TerminalStatuses), so
-	// a run in waiting_input / waiting_external / cancelling / interrupted
-	// would have looked "inactive" and let a SECOND run into a conversation
-	// that must stay serialized. Backed by idx_runs_conversation_status
-	// (migration 0014).
+	// ACTIVE = NOT SETTLED (第四轮 P2 / 第五轮 P2-1). The status list used to be
+	// hard-coded to ('queued','running'); the domain has nine states and the
+	// only settled ones are cancelled/succeeded/failed plus the legacy
+	// `interrupted` alias (execution.IsSettled).
+	//
+	// `interrupted` MUST be in this list: it is a pre-closure terminal alias
+	// that new code never writes, and migration 0018 rewrites historical rows
+	// to `failed`. Until that migration has run — and for any row a restore
+	// brings back — an interrupted run would otherwise be counted as ACTIVE
+	// forever and pin the conversation at 409 on every subsequent send.
+	// Backed by idx_runs_conversation_status (migration 0014).
 	CountActiveRunsByConversation(ctx context.Context, conversationID sql.NullInt64) (int64, error)
 	CountConversationByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
 	// Same guard, direct: any delivery execution hanging off this
@@ -94,10 +100,11 @@ type Querier interface {
 	// Invariant M: an ACTIVE provider slot must belong to a running run at the
 	// matching lease epoch.
 	CountOrphanProviderSlots(ctx context.Context) (int64, error)
-	// Per-user admission (评测 P1-7): every NON-TERMINAL run counts against
-	// the cap (第四轮 P2) — same predicate as CountActiveRunsByConversation, so
-	// a waiting_input / waiting_external / cancelling / interrupted run can no
-	// longer slip past the outstanding limit.
+	// Per-user admission (评测 P1-7): every NON-SETTLED run counts against
+	// the cap (第四轮 P2 / 第五轮 P2-1) — same predicate as
+	// CountActiveRunsByConversation, so a waiting_input / waiting_external /
+	// cancelling run still cannot slip past the outstanding limit, while a
+	// legacy `interrupted` run no longer consumes a slot forever.
 	CountOutstandingRunsByUser(ctx context.Context, userID sql.NullInt64) (int64, error)
 	// Run-now pending cap (复审 P1-3): pending occurrences are future work no
 	// outstanding-run limit sees, so the manual queue must be bounded.
@@ -318,6 +325,13 @@ type Querier interface {
 	// missing or inactive provider → pause (requeue, keep waiting).
 	GetRunGateState(ctx context.Context, id []byte) (GetRunGateStateRow, error)
 	GetRunLeaseEpoch(ctx context.Context, id []byte) (uint64, error)
+	// Reads back the canonical started_at the UPDATE above just wrote
+	// (第五轮 P2-4). The caller needs the DATABASE's timestamp, not a
+	// locally generated one: started_at is already DB-clock authoritative and
+	// COALESCE may have kept an earlier value, so the only correct source is
+	// the row. It lets the worker refresh its in-memory Run snapshot so
+	// FinalizeOwnedRun can observe studio_run_duration.
+	GetRunStartedAt(ctx context.Context, arg GetRunStartedAtParams) (sql.NullTime, error)
 	GetRunStatus(ctx context.Context, id []byte) (string, error)
 	GetScheduleByID(ctx context.Context, id uint64) (Schedule, error)
 	GetScheduleDeliveryByID(ctx context.Context, id uint64) (ScheduleDelivery, error)

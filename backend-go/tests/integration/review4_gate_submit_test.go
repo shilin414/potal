@@ -392,10 +392,15 @@ func TestNonTerminalStatusBlocksSecondTurn(t *testing.T) {
 	svc := execution.NewService(env.db, nil, silentLogger(), telemetry.NewMetrics("test"))
 	ctx := context.Background()
 
+	// 第五轮 P2-1: `interrupted` is NO LONGER in this list. It was
+	// re-specified as a pre-closure TERMINAL ALIAS (equivalent to
+	// failed), so a legacy interrupted row must free the conversation
+	// instead of pinning it at 409 forever. See
+	// TestLegacyInterruptedFreesTheConversation below.
 	nonTerminal := []string{
 		execution.StatusQueued, execution.StatusRunning,
 		execution.StatusWaitingInput, execution.StatusWaitingExternal,
-		execution.StatusCancelling, execution.StatusInterrupted,
+		execution.StatusCancelling,
 	}
 	for _, st := range nonTerminal {
 		t.Run(st, func(t *testing.T) {
@@ -453,6 +458,39 @@ func TestTerminalStatusFreesTheConversation(t *testing.T) {
 		ExecutionMode: "interactive", Content: "second turn",
 	}); err != nil {
 		t.Fatalf("second turn after a succeeded run: %v", err)
+	}
+}
+
+// TestLegacyInterruptedFreesTheConversation (第五轮 P2-1): the contract
+// flip. Fourth round counted `interrupted` as live work (it was in the
+// non-terminal list of the test above); a single pre-closure row then
+// pinned its conversation at 409 for the rest of time. Interrupted is now
+// a terminal alias — the next turn must be admitted.
+func TestLegacyInterruptedFreesTheConversation(t *testing.T) {
+	env := newScheduleEnv(t)
+	svc := execution.NewService(env.db, nil, silentLogger(), telemetry.NewMetrics("test"))
+	ctx := context.Background()
+	convID := seedConversation(t, svc)
+
+	first, err := svc.CreateRun(ctx, &execution.CreateRunInput{
+		UserID: 42, ApplicationID: 1, ConversationID: convID,
+		Provider: "itest_pred", RuntimeType: "agent",
+		ExecutionMode: "interactive", Content: "legacy interrupted turn",
+	})
+	if err != nil {
+		t.Fatalf("create first run: %v", err)
+	}
+	if _, err := env.db.ExecContext(ctx,
+		`UPDATE runs SET status = ? WHERE id = ?`, execution.StatusInterrupted, first.ID.Bytes()); err != nil {
+		t.Fatalf("force interrupted status: %v", err)
+	}
+	if _, err := svc.CreateRun(ctx, &execution.CreateRunInput{
+		UserID: 42, ApplicationID: 1, ConversationID: convID,
+		Provider: "itest_pred", RuntimeType: "agent",
+		ExecutionMode: "interactive", Content: "second turn",
+	}); err != nil {
+		t.Fatalf("second turn after a legacy interrupted run: %v — a settled run "+
+			"must never block the next turn", err)
 	}
 }
 

@@ -399,3 +399,153 @@ func TestRunNowPendingQueueHasBound(t *testing.T) {
 		t.Fatalf("cleanup schedule: %v", err)
 	}
 }
+
+// ── §十二: concurrency boundaries for the two admission caps ──
+
+// TestUserMaxOutstandingConcurrentBoundary (复审 §十二): the per-user
+// outstanding cap is only a REAL bound if concurrent submits cannot
+// overshoot it. The count and the insert share one transaction under the
+// users row lock, so K is a hard ceiling — but that is exactly the kind of
+// invariant a sequential test cannot prove (sequentially, "read then
+// insert" and "lock, read, insert" behave identically).
+//
+// Every racer creates its OWN conversation (CreateConversation) so the
+// only contested resource is the cap itself: a conversation-busy error
+// would mask an overshoot and make the test pass for the wrong reason.
+func TestUserMaxOutstandingConcurrentBoundary(t *testing.T) {
+	env := newScheduleEnv(t)
+	svc := execution.NewService(env.db, nil, silentLogger(), telemetry.NewMetrics("test"))
+	ctx := context.Background()
+	userID := seedUser(t, env.db)
+	t.Cleanup(func() {
+		_, _ = env.db.ExecContext(context.Background(),
+			`UPDATE runs SET status = 'cancelled' WHERE user_id = ?`, userID)
+	})
+
+	const limit = 3
+	const burst = 12
+
+	var (
+		wg         sync.WaitGroup
+		admitted   atomic.Int64
+		rejected   atomic.Int64
+		mu         sync.Mutex
+		unexpected []error
+	)
+	start := make(chan struct{})
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start // release every racer at once
+			_, err := svc.CreateRunAdmitted(ctx, &execution.CreateRunInput{
+				UserID:             userID,
+				ApplicationID:      1,
+				CreateConversation: true,
+				Provider:           "itest_boundary",
+				RuntimeType:        "agent",
+				ExecutionMode:      "interactive",
+				Content:            fmt.Sprintf("boundary turn %d", i),
+			}, limit)
+			switch {
+			case err == nil:
+				admitted.Add(1)
+			case errors.Is(err, execution.ErrUserOutstandingExceeded):
+				rejected.Add(1)
+			default:
+				mu.Lock()
+				unexpected = append(unexpected, err)
+				mu.Unlock()
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if len(unexpected) > 0 {
+		t.Fatalf("unexpected errors from the racers: %v", unexpected)
+	}
+	if admitted.Load() != limit {
+		t.Fatalf("admitted=%d, want exactly %d — the cap was overshot under concurrency", admitted.Load(), limit)
+	}
+	if rejected.Load() != burst-limit {
+		t.Fatalf("rejected=%d, want %d (every loser must report the cap, not a silent failure)", rejected.Load(), burst-limit)
+	}
+	// The database is the authority: the cap bounds LIVE work, so the
+	// non-terminal row count must match what the callers were told.
+	live := env.count(t,
+		`SELECT COUNT(*) FROM runs WHERE user_id = ? AND status NOT IN ('cancelled','succeeded','failed','interrupted')`, userID)
+	if live != limit {
+		t.Fatalf("live runs=%d, want %d", live, limit)
+	}
+}
+
+// TestScheduleMaxConcurrentBoundary (复审 §十二): same invariant for the
+// per-user schedule quota. Create counts under the users row lock inside
+// the create transaction, so N concurrent creates must settle at exactly
+// the cap rather than all observing the same pre-insert count.
+func TestScheduleMaxConcurrentBoundary(t *testing.T) {
+	env := newScheduleEnv(t)
+	ctx := context.Background()
+	userID := seedUser(t, env.db)
+	t.Cleanup(func() {
+		_, _ = env.db.ExecContext(context.Background(),
+			`UPDATE schedules SET enabled = 0, deleted_at = CURRENT_TIMESTAMP(3) WHERE owner_user_id = ?`, userID)
+	})
+
+	const limit = 3
+	const burst = 12
+	env.svc.MaxSchedules = limit
+
+	var (
+		wg         sync.WaitGroup
+		created    atomic.Int64
+		quota      atomic.Int64
+		mu         sync.Mutex
+		unexpected []error
+	)
+	start := make(chan struct{})
+	for i := 0; i < burst; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, err := env.svc.Create(ctx, userID, &schedule.CreateInput{
+				Name:          fmt.Sprintf("boundary schedule %d", i),
+				ApplicationID: 1,
+				Prompt:        "boundary prompt",
+				ScheduleType:  schedule.TypeDaily,
+				TriggerConfig: schedule.TriggerConfig{Time: "09:00"},
+				Timezone:      "Asia/Shanghai",
+			})
+			var ve *schedule.ValidationError
+			switch {
+			case err == nil:
+				created.Add(1)
+			case errors.As(err, &ve):
+				quota.Add(1)
+			default:
+				mu.Lock()
+				unexpected = append(unexpected, err)
+				mu.Unlock()
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	if len(unexpected) > 0 {
+		t.Fatalf("unexpected errors from the racers: %v", unexpected)
+	}
+	if created.Load() != limit {
+		t.Fatalf("created=%d, want exactly %d — the schedule quota was overshot under concurrency", created.Load(), limit)
+	}
+	if quota.Load() != burst-limit {
+		t.Fatalf("quota rejections=%d, want %d", quota.Load(), burst-limit)
+	}
+	live := env.count(t,
+		`SELECT COUNT(*) FROM schedules WHERE owner_user_id = ? AND deleted_at IS NULL`, userID)
+	if live != limit {
+		t.Fatalf("live schedules=%d, want %d", live, limit)
+	}
+}

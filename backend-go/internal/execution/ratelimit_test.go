@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"errors"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -132,6 +133,54 @@ func TestLimiterRedisOutageLocalFallback(t *testing.T) {
 	}
 	if !limiter.Degraded() {
 		t.Fatal("Degraded() = false during a Redis outage")
+	}
+}
+
+// TestAllowKeyCancelledContextReturnsCtxError (第五轮 P2-3): a caller that
+// is already gone must NOT be admitted and must NOT consume a token —
+// and the failure must be reported as an ERROR, never as
+// (ok=false, nil), which the HTTP layer used to treat as "rate limited"
+// (a 429 to a client that had already hung up) or, worse, as success.
+//
+// Both paths are covered: with Redis (the script call fails on the dead
+// context) and without Redis (the in-process fallback path — previously
+// the ctx check was only in the Redis-error branch, so this path silently
+// admitted cancelled requests).
+func TestAllowKeyCancelledContextReturnsCtxError(t *testing.T) {
+	dead := goredis.NewClient(&goredis.Options{
+		Addr:        "127.0.0.1:1",
+		DialTimeout: 100 * time.Millisecond,
+		MaxRetries:  1,
+	})
+	defer func() { _ = dead.Close() }()
+	withRedis := redisx.NewWithPrefix("itest_ctx")
+	withRedis.Client = dead
+
+	limiters := map[string]*RateLimiter{
+		"no-redis":   NewRateLimiter(nil, "itest:ctx:none", 10, time.Second),
+		"with-redis": NewRateLimiter(withRedis, "itest:ctx:redis", 10, time.Second),
+	}
+	for name, limiter := range limiters {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			ok, _, err := limiter.AllowKey(ctx, "itest:ctx:key")
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("AllowKey err = %v, want context.Canceled "+
+					"(a cancelled request must never look like a rate-limit decision)", err)
+			}
+			if ok {
+				t.Fatal("AllowKey admitted a cancelled context")
+			}
+
+			// The cancelled call must not have consumed budget.
+			ok, _, err = limiter.AllowKey(context.Background(), "itest:ctx:key")
+			if err != nil || !ok {
+				t.Fatalf("live AllowKey after a cancelled one: ok=%v err=%v — the "+
+					"cancelled call consumed a token", ok, err)
+			}
+		})
 	}
 }
 

@@ -25,11 +25,46 @@ const (
 	StatusInterrupted     = "interrupted"
 )
 
-// TerminalStatuses: the only states a run can finish in.
+// TerminalStatuses: the only states a run can finish in. New code must
+// never write anything outside this set.
 var TerminalStatuses = map[string]bool{
 	StatusCancelled: true,
 	StatusSucceeded: true,
 	StatusFailed:    true,
+}
+
+// LegacyTerminalStatuses are historical terminal aliases (第五轮 P2-1).
+//
+//	StatusInterrupted is a PRE-CLOSURE status: the old retry path wrote it
+//	and emitted run.interrupted. New code never writes it (retry emits
+//	run.retrying and keeps streaming; terminal failure emits run.failed),
+//	and migration 0018 rewrites every historical row to `failed`.
+//
+//	It is still treated as terminal for READS because a legacy row must not
+//	be able to occupy a conversation or a user's outstanding quota forever:
+//	before the review the "active run" predicate was
+//	`status NOT IN ('cancelled','succeeded','failed')`, so one interrupted
+//	run parked a conversation at 409 permanently (and counted against
+//	RUN_USER_MAX_OUTSTANDING).
+var LegacyTerminalStatuses = map[string]bool{
+	StatusInterrupted: true,
+}
+
+// IsTerminal reports whether a status ends a run.
+func IsTerminal(status string) bool { return TerminalStatuses[status] }
+
+// IsSettled reports whether a run is finished for ADMISSION / lifecycle
+// purposes: the three canonical terminal statuses plus the legacy
+// `interrupted` alias above.
+//
+// It is the Go mirror of the SQL "active run" predicate
+// `status NOT IN ('cancelled','succeeded','failed','interrupted')` used by
+// CountActiveRunsByConversation / CountOutstandingRunsByUser. Use it
+// wherever a SETTLED run must be excluded (SSE termination, admission,
+// reconcile skip); keep IsTerminal where only canonical statuses are
+// valid input (finalization).
+func IsSettled(status string) bool {
+	return IsTerminal(status) || LegacyTerminalStatuses[status]
 }
 
 // Unified event protocol.
@@ -57,9 +92,6 @@ const (
 	// failure uses run.failed — 修复计划 §14-16).
 	EventRunInterrupted = "run.interrupted"
 )
-
-// IsTerminal reports whether a status ends a run.
-func IsTerminal(status string) bool { return TerminalStatuses[status] }
 
 // Run is a unified execution across every provider.
 type Run struct {

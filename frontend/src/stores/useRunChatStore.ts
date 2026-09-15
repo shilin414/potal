@@ -391,6 +391,12 @@ export function closeRunStream(runId: string) {
 
 // Exported for tests: the GET-Run reconciliation must not turn a
 // cancelled run into a successful one (第四轮 P1-2).
+//
+// 第五轮 P1-1：GET Run + fetchRunArtifacts 都是异步请求，请求期间用户可能
+// 已经发起了下一条 Run（Run B）。因此绝不能用请求前捕获的 conversation
+// 快照整体覆盖回来 —— 那会把 B 的消息抹掉、或把 B 的 activeRunId 清成
+// null。这里改为 functional setState：异步结束后基于**最新** store state
+// 只 merge 我自己的那条消息。
 export async function finalizeRun(runId: string, eventText?: string) {
   closeRunStream(runId);
   let run: RunRecord;
@@ -399,59 +405,66 @@ export async function finalizeRun(runId: string, eventText?: string) {
   } catch {
     return;
   }
-  const state = useRunChatStore.getState();
-  const cid = run.conversation;
-  const conv = state.conversations[cid];
-  if (!conv) return;
-
-  const messages = conv.messages.map((m) => {
-    if (m.id !== `run-${runId}`) return m;
-    // 'cancelled' 必须保持 cancelled：管理员撤销不是成功，也不是 Provider
-    // 故障（第四轮 P1-2）。此前只有 failed 分支，cancelled 会被映射成
-    // done —— 用户会看到一个空白的“成功回答”。
-    const cancelled = run.status === 'cancelled';
-    const failed = run.status === 'failed' || run.status === 'interrupted';
-    return {
-      ...m,
-      content: (eventText ?? run.output?.text) || m.content,
-      status: cancelled
-        ? 'cancelled' as const
-        : failed
-          ? 'failed' as const
-          : 'done' as const,
-      error: cancelled
-        ? cancelledNotice(run.error_code)
-        : failed
-          ? (run.error_message || run.error_code || '执行失败')
-          : undefined,
-    };
-  });
 
   // Attach artifact cards from the run's persisted artifacts (source of
   // truth; covers artifacts discovered before the stream was opened).
-  let artifacts: ChatArtifact[] = [];
+  //
+  // null 语义：本次查询失败 = "不知道"，不能覆盖事件流已经拿到的 artifact。
+  // 只有真正拿到列表（哪怕是空数组）才写回。
+  let fetchedArtifacts: ChatArtifact[] | null = null;
   try {
     const records: RunArtifactRecord[] = await fetchRunArtifacts(runId);
-    artifacts = records.map((r) => ({
+    fetchedArtifacts = records.map((r) => ({
       artifactId: r.id,
       name: r.name || '生成产物',
       normalizedType: r.normalized_type,
     }));
   } catch {
-    // Artifact listing is best-effort; cards from events still render.
+    fetchedArtifacts = null;
   }
 
-  useRunChatStore.setState({
-    conversations: {
-      ...state.conversations,
-      [cid]: {
-        ...conv,
-        messages: messages.map((m) => (
-          m.id === `run-${runId}` ? { ...m, artifacts } : m
-        )),
-        activeRunId: null,
+  useRunChatStore.setState((current) => {
+    const cid = run.conversation;
+    const conv = current.conversations[cid];
+    if (!conv) return {};
+
+    const messages = conv.messages.map((m) => {
+      if (m.id !== `run-${runId}`) return m;
+      // 'cancelled' 必须保持 cancelled：管理员撤销不是成功，也不是 Provider
+      // 故障（第四轮 P1-2）。此前只有 failed 分支，cancelled 会被映射成
+      // done —— 用户会看到一个空白的“成功回答”。
+      const cancelled = run.status === 'cancelled';
+      const failed = run.status === 'failed' || run.status === 'interrupted';
+      return {
+        ...m,
+        content: (eventText ?? run.output?.text) || m.content,
+        status: cancelled
+          ? 'cancelled' as const
+          : failed
+            ? 'failed' as const
+            : 'done' as const,
+        error: cancelled
+          ? (run.error_message || cancelledNotice(run.error_code))
+          : failed
+            ? (run.error_message || run.error_code || '执行失败')
+            : undefined,
+        artifacts: fetchedArtifacts !== null ? fetchedArtifacts : m.artifacts,
+      };
+    });
+
+    return {
+      conversations: {
+        ...current.conversations,
+        [cid]: {
+          ...conv,
+          messages,
+          // 只能清理“我自己”。如果 B 已经成为 active run，A 绝不能把 B
+          // 清掉（compare-and-clear）。
+          activeRunId: conv.activeRunId === runId ? null : conv.activeRunId,
+        },
       },
-    },
+    };
   });
+
   refreshSidebarDebounced();
 }

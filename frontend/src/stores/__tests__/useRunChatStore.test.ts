@@ -278,6 +278,136 @@ describe('applyEvent (unified event protocol rendering)', () => {
       await finalizeRun(runId);
       expect(useRunChatStore.getState().conversations[42].messages[1].status).toBe('done');
     });
+
+    // 第五轮 P1-1: finalizeRun 内部有两次 await（getRun + fetchRunArtifacts）。
+    // 请求飞行期间用户可能已经发起了 Run B；收尾必须用**最新** store state
+    // 做局部 merge，不能拿请求前的旧 conversation 快照整体覆盖。
+    it('finalizeRun preserves a newer active run', async () => {
+      let openBarrier!: () => void;
+      const barrier = new Promise<void>((resolve) => { openBarrier = resolve; });
+      let artifactRequested!: () => void;
+      const requested = new Promise<void>((resolve) => { artifactRequested = resolve; });
+
+      vi.mocked(getRun).mockResolvedValue({
+        id: runId,
+        conversation: 42,
+        status: 'succeeded',
+        output: { text: 'A 最终答案' },
+      } as any);
+      vi.mocked(fetchRunArtifacts).mockImplementation(async () => {
+        artifactRequested();
+        await barrier;
+        return [];
+      });
+
+      const pending = finalizeRun(runId);
+      // Wait until finalizeRun is parked on the artifact request.
+      await requested;
+
+      // 用户立刻发了下一条：Run B 成为 active run。
+      useRunChatStore.setState((s) => ({
+        conversations: {
+          ...s.conversations,
+          42: {
+            ...s.conversations[42],
+            messages: [
+              ...s.conversations[42].messages,
+              {
+                id: 'user-run-B', role: 'user' as const, content: '第二条',
+                created_at: '', runId: 'run-B',
+              },
+              {
+                id: 'run-run-B', role: 'assistant' as const, content: '',
+                created_at: '', runId: 'run-B', status: 'streaming' as const,
+                artifacts: [],
+              },
+            ],
+            activeRunId: 'run-B',
+          },
+        },
+      }));
+
+      openBarrier();
+      await pending;
+
+      const conv = useRunChatStore.getState().conversations[42];
+      const a = conv.messages.find((m) => m.id === `run-${runId}`);
+      expect(a?.status).toBe('done');
+      expect(a?.content).toBe('A 最终答案');
+      // Run B 的消息不能被 A 的收尾覆盖掉
+      expect(conv.messages.some((m) => m.id === 'user-run-B')).toBe(true);
+      expect(conv.messages.some((m) => m.id === 'run-run-B')).toBe(true);
+      // 也不能把 B 的 activeRunId 清成 null
+      expect(conv.activeRunId).toBe('run-B');
+    });
+
+    // 第五轮 P1-1: artifact 列表查询失败 = "不知道"，不能把事件流已经拿到
+    // 的 artifact 覆盖成 []。
+    it('finalizeRun preserves event artifacts when artifact refresh fails', async () => {
+      useRunChatStore.setState((s) => ({
+        conversations: {
+          ...s.conversations,
+          42: {
+            ...s.conversations[42],
+            messages: s.conversations[42].messages.map((m) => (
+              m.id === `run-${runId}`
+                ? {
+                    ...m,
+                    artifacts: [
+                      { artifactId: 'art-A', name: 'a.pdf', normalizedType: 'file' },
+                      { artifactId: 'art-B', name: 'b.pdf', normalizedType: 'file' },
+                    ],
+                  }
+                : m
+            )),
+          },
+        },
+      }));
+
+      vi.mocked(getRun).mockResolvedValue({
+        id: runId, conversation: 42, status: 'succeeded',
+      } as any);
+      vi.mocked(fetchRunArtifacts).mockRejectedValue(new Error('network down'));
+
+      await finalizeRun(runId);
+
+      const conv = useRunChatStore.getState().conversations[42];
+      const artifacts = conv.messages.find((m) => m.id === `run-${runId}`)?.artifacts;
+      expect(artifacts).toHaveLength(2);
+      expect(artifacts?.map((a) => a.artifactId)).toEqual(['art-A', 'art-B']);
+    });
+
+    // [] 是服务端的权威回答（确实没有 artifact），此时必须清空。
+    it('finalizeRun clears artifacts when the server reports none', async () => {
+      useRunChatStore.setState((s) => ({
+        conversations: {
+          ...s.conversations,
+          42: {
+            ...s.conversations[42],
+            messages: s.conversations[42].messages.map((m) => (
+              m.id === `run-${runId}`
+                ? {
+                    ...m,
+                    artifacts: [
+                      { artifactId: 'art-A', name: 'a.pdf', normalizedType: 'file' },
+                    ],
+                  }
+                : m
+            )),
+          },
+        },
+      }));
+
+      vi.mocked(getRun).mockResolvedValue({
+        id: runId, conversation: 42, status: 'succeeded',
+      } as any);
+      vi.mocked(fetchRunArtifacts).mockResolvedValue([]);
+
+      await finalizeRun(runId);
+
+      const conv = useRunChatStore.getState().conversations[42];
+      expect(conv.messages.find((m) => m.id === `run-${runId}`)?.artifacts).toEqual([]);
+    });
   });
 
   it('re-seeds the streaming bubble when a history reload wiped it', () => {

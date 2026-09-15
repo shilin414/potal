@@ -189,9 +189,15 @@ func (s *Service) FailOwnedRun(ctx context.Context, run *Run, own ExecutionOwner
 	})
 }
 
-// terminalEventName maps a terminal status to its terminal event. The
-// legacy interrupted status maps to run.failed — retry never produces a
-// terminal event (修复计划 §16: terminal events must be unique).
+// terminalEventName maps a terminal status to its terminal event. Retry
+// never produces a terminal event (修复计划 §16: terminal events must be
+// unique).
+//
+// The legacy `interrupted` status is deliberately ABSENT (第五轮 P2-1): it
+// is a pre-closure alias that new code never writes and that migration
+// 0018 rewrites to `failed`, and FinalizeOwnedRun already rejects it via
+// IsTerminal. Keeping the case would resurrect the two-contract conflict
+// ("interrupted is live" vs "interrupted is a terminal failure").
 //
 // An unknown status is a programming error and returns
 // ErrInvalidTerminalStatus. Defaulting it to "success" would let a bug
@@ -202,7 +208,7 @@ func terminalEventName(status string) (string, error) {
 		return EventRunCompleted, nil
 	case StatusCancelled:
 		return EventRunCancelled, nil
-	case StatusFailed, StatusInterrupted:
+	case StatusFailed:
 		return EventRunFailed, nil
 	default:
 		return "", ErrInvalidTerminalStatus

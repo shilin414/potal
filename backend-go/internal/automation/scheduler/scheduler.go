@@ -79,8 +79,6 @@ type Scheduler struct {
 	// enqueue unbounded work. 0 disables the cap. Enforced under the
 	// schedules row lock, so concurrent run-nows cannot overshoot it.
 	MaxPendingManual int
-
-	nowFunc func() time.Time
 }
 
 func New(d *sql.DB, runs *execution.Service, binding RuntimeResolver, log *slog.Logger, m *telemetry.Metrics) *Scheduler {
@@ -88,7 +86,7 @@ func New(d *sql.DB, runs *execution.Service, binding RuntimeResolver, log *slog.
 		log = slog.Default()
 	}
 	return &Scheduler{DB: d, Runs: runs, Binding: binding, Log: log, Metrics: m,
-		Interval: time.Second, Batch: 100, nowFunc: time.Now}
+		Interval: time.Second, Batch: 100}
 }
 
 // Run loops until ctx is cancelled.
@@ -134,21 +132,35 @@ func captureDeliveryExpectations(ctx context.Context, q db.Querier, occurrenceID
 // first admit any pending occurrences (overlap=queue backlog), then fire
 // due schedule slots.
 func (s *Scheduler) ProcessDue(ctx context.Context) {
-	now := s.dbNow(ctx)
+	// 第五轮 P2-2: an unreadable clock skips the whole tick. Firing it
+	// against the local clock would let one skewed host decide due /
+	// misfire / execution-window outcomes for everyone.
+	now, err := s.dbNow(ctx)
+	if err != nil {
+		s.Log.Error("scheduler db clock unavailable — tick skipped", "err", err)
+		return
+	}
 	s.admitPending(ctx, s.Batch, now)
 	s.processDue(ctx, s.Batch, now)
 }
 
 // dbNow resolves the tick clock from MySQL (Clock Authority, 评测 §十七):
 // due, misfire and execution-window decisions must not depend on any one
-// scheduler host's local clock. Falls back to the local clock only when
-// the DB read fails (degraded, logged by the caller's error path).
-func (s *Scheduler) dbNow(ctx context.Context) time.Time {
+// scheduler host's local clock.
+//
+// 第五轮 P2-2: there is no local-clock fallback. A tick that cannot read
+// the canonical clock is skipped and retried on the next interval; the
+// alternative (compute against a host clock and write it down) is exactly
+// the divergence Clock Authority exists to prevent.
+func (s *Scheduler) dbNow(ctx context.Context) (time.Time, error) {
 	t, err := s.q(ctx).DBNow(ctx)
-	if err != nil || t.IsZero() {
-		return s.nowFunc().UTC()
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%w: %v", schedule.ErrDBClockUnavailable, err)
 	}
-	return t.UTC()
+	if t.IsZero() {
+		return time.Time{}, fmt.Errorf("%w: zero timestamp", schedule.ErrDBClockUnavailable)
+	}
+	return t.UTC(), nil
 }
 
 func (s *Scheduler) processDue(ctx context.Context, batch int, now time.Time) {
@@ -620,7 +632,11 @@ func (s *Scheduler) createOccurrenceAndRunTx(ctx context.Context, tx *sql.Tx, q 
 // ONE transaction holding the schedules row lock and the CURRENT row
 // state, the same path the scan loop uses.
 func (s *Scheduler) TriggerNow(ctx context.Context, scheduleID, userID int64, isStaff bool) (*schedule.Occurrence, error) {
-	now := s.dbNow(ctx).Truncate(time.Millisecond)
+	now, err := s.dbNow(ctx)
+	if err != nil {
+		return nil, err
+	}
+	now = now.Truncate(time.Millisecond)
 
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {

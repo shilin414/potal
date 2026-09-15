@@ -113,7 +113,7 @@ const cASFinishRun = `-- name: CASFinishRun :execresult
 UPDATE runs
 SET status = ?, output = ?, provider_status = ?, provider_finish_reason = ?,
     error_code = ?, error_message = ?, finished_at = CURRENT_TIMESTAMP(3)
-WHERE id = ? AND status NOT IN ('cancelled', 'succeeded', 'failed')
+WHERE id = ? AND status NOT IN ('cancelled', 'succeeded', 'failed', 'interrupted')
 `
 
 type CASFinishRunParams struct {
@@ -127,6 +127,8 @@ type CASFinishRunParams struct {
 }
 
 // Terminal-only transition; 0 rows affected = already terminal (idempotent).
+// `interrupted` counts as settled too (第五轮 P2-1): a legacy pre-closure
+// row must never be re-finished, same as the three canonical statuses.
 func (q *Queries) CASFinishRun(ctx context.Context, arg CASFinishRunParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, cASFinishRun,
 		arg.Status,
@@ -276,13 +278,14 @@ func (q *Queries) CountOrphanProviderSlots(ctx context.Context) (int64, error) {
 
 const countOutstandingRunsByUser = `-- name: CountOutstandingRunsByUser :one
 SELECT COUNT(*) AS n FROM runs
-WHERE user_id = ? AND status NOT IN ('cancelled', 'succeeded', 'failed')
+WHERE user_id = ? AND status NOT IN ('cancelled', 'succeeded', 'failed', 'interrupted')
 `
 
-// Per-user admission (评测 P1-7): every NON-TERMINAL run counts against
-// the cap (第四轮 P2) — same predicate as CountActiveRunsByConversation, so
-// a waiting_input / waiting_external / cancelling / interrupted run can no
-// longer slip past the outstanding limit.
+// Per-user admission (评测 P1-7): every NON-SETTLED run counts against
+// the cap (第四轮 P2 / 第五轮 P2-1) — same predicate as
+// CountActiveRunsByConversation, so a waiting_input / waiting_external /
+// cancelling run still cannot slip past the outstanding limit, while a
+// legacy `interrupted` run no longer consumes a slot forever.
 func (q *Queries) CountOutstandingRunsByUser(ctx context.Context, userID sql.NullInt64) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countOutstandingRunsByUser, userID)
 	var n int64
@@ -1333,6 +1336,29 @@ func (q *Queries) GetRunLeaseEpoch(ctx context.Context, id []byte) (uint64, erro
 	var lease_epoch uint64
 	err := row.Scan(&lease_epoch)
 	return lease_epoch, err
+}
+
+const getRunStartedAt = `-- name: GetRunStartedAt :one
+SELECT started_at FROM runs
+WHERE id = ? AND status = 'running' AND lease_epoch = ?
+`
+
+type GetRunStartedAtParams struct {
+	ID         []byte
+	LeaseEpoch uint64
+}
+
+// Reads back the canonical started_at the UPDATE above just wrote
+// (第五轮 P2-4). The caller needs the DATABASE's timestamp, not a
+// locally generated one: started_at is already DB-clock authoritative and
+// COALESCE may have kept an earlier value, so the only correct source is
+// the row. It lets the worker refresh its in-memory Run snapshot so
+// FinalizeOwnedRun can observe studio_run_duration.
+func (q *Queries) GetRunStartedAt(ctx context.Context, arg GetRunStartedAtParams) (sql.NullTime, error) {
+	row := q.db.QueryRowContext(ctx, getRunStartedAt, arg.ID, arg.LeaseEpoch)
+	var started_at sql.NullTime
+	err := row.Scan(&started_at)
+	return started_at, err
 }
 
 const getRunStatus = `-- name: GetRunStatus :one

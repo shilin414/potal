@@ -79,7 +79,12 @@ func PreSubmitGate(ctx context.Context, owned *WorkerOwnedService, claimed *Clai
 // detached context so a cancelled handler context cannot orphan the run —
 // a failed defer is recovered by the lease/reaper machinery instead.
 func deferClaimed(ctx context.Context, owned *WorkerOwnedService, claimed *ClaimedRun, reason string, delay time.Duration, log *slog.Logger) {
-	if err := owned.DeferAfter(context.Background(), claimed, reason, delay); err != nil && err != ErrLostOwnership {
+	// 第五轮 P2-5: detached from the handler context (a cancelled handler
+	// must still be able to requeue) but bounded — a hung DB gives the
+	// goroutine back after CleanupTimeout instead of blocking forever.
+	cleanupCtx, cancel := NewCleanupContext(ctx)
+	defer cancel()
+	if err := owned.DeferAfter(cleanupCtx, claimed, reason, delay); err != nil && err != ErrLostOwnership {
 		log.Error("pre-submit gate defer failed",
 			"run_id", claimed.Run.ID.String(), "reason", reason, "err", err)
 	}

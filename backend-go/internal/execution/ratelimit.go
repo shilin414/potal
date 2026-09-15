@@ -102,6 +102,15 @@ func (l *RateLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, e
 // limiter can then meter many scopes (per user, per tenant) without
 // losing the local fallback state between calls.
 func (l *RateLimiter) AllowKey(ctx context.Context, key string) (ok bool, wait time.Duration, err error) {
+	// 第五轮 P2-3: ctx is checked before ANY path — including the
+	// no-Redis / Redis-outage local fallback. The request is already
+	// gone, so consuming a token (or even just reporting "allowed") would
+	// let a client that hung up spend budget for work that will never
+	// run. Previously only the Redis error branch checked ctx, so a
+	// deployment without Redis silently admitted cancelled requests.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, 0, ctxErr
+	}
 	if l.limit <= 0 {
 		return true, 0, nil
 	}

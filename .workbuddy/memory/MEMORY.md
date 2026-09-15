@@ -23,6 +23,16 @@
 - **授权分类双保险（三轮 P0 教训）**：调用点必须先显式判 `err == nil` 成功路径，再 `executionDenied(err)` 分类——不允许只依赖分类器；`executionDenied(nil)` 恒 false（测试 `TestExecutionDeniedNilMeansSuccess` 锁定）；正向 Happy-Path 必须有真实链路测试（不许只测失败路径/mock resolver）
 - **Gate 语义（三轮定型）**：双检查点 level-triggered——Gate 1（worker claim 后）+ Gate 2（`execution.PreSubmitGate`，aily executor 在 ChatsL.Acquire 后、BeginProviderAttempt 前调用）；kill=cancel、pause/infra/未知 action=**Defer fail-closed**（`DeferOwnedRunAfter` 不改 priority、occurrence running→queued 同事务、outbox 用原优先级 class、新事件 `run.deferred`）；未知 GateAction 绝不允许继续 Handler（指标 `gate_unknown`）；run.started 在 Gate allow 之后才发；Execution Generation（严格 edge-triggered）明确不引入
 
+### 第五轮新增约定（2026-09-15，93/A- → 目标 96/A）
+- **`interrupted` = 收口前终态别名**（等价 failed，新代码永不写入）：`IsSettled()` = canonical 终态 ∪ {interrupted}；`IsTerminal()` 只认 `{cancelled,succeeded,failed}`；SQL 谓词一律 `NOT IN ('cancelled','succeeded','failed','interrupted')`；`FinalizeOwnedRun` 通过 `IsTerminal` 拒绝写入 legacy 别名。迁移 0018 归一历史行（含为无事件行合成 `run.failed`，保 invariant D）
+- **前端 store 异步写一律 functional setState**：任何 `await` 之后不得使用 await 之前取的 state/conv 快照；`activeRunId` 用 compare-and-clear；远端拉取失败的字段用 `null` 表示「未知不清空」，只有成功的空数组才清空
+- **channel 发送必须可取消**：producer 一律 `select { case out <- ev: case <-ctx.Done(): }`；测此类修复时假流必须**无尽头**且先等缓冲满，否则 drain 会制造假阴性
+- **Clock Authority 无兜底**：`dbNow/dbNowTx` 返回 error 就中止/跳 tick，绝不回落本机时钟
+- **限流 ctx 先判**：`AllowKey` 所有分支之前先 `ctx.Err()`；HTTP 层 `err != nil` 直接返回错误（不是 429），客户端已断开时什么都不写
+- **`MarkRunStartedOwned` 返回 DB 时间**，worker 必须 `claimed.Run.StartedAt = &t`（否则 `studio_run_duration` 对全量 run 静默为 0）
+- **detached cleanup 用 `execution.NewCleanupContext(parent)`**（5s 有界、继承 values、丢弃父 deadline）——不要用裸 `context.Background()`，也不要用 `WithoutCancel`（会继承已过期的执行 deadline）
+- 迁移 **0019** = provider_id 完整 reconciliation（LEFT JOIN，key 解析不到置 NULL）；**0017 已执行过，禁止修改**
+
 ### 第四轮新增约定（2026-09-15，P1 已关闭）
 - **Gate 2 只能在真实 Provider Submit 之前**：`beginSubmit`（Gate→attempt CAS）是唯一入口，本地准备（thread DB、ValidateContent/Attachments）必须在 Gate 之前且不消耗 attempt；`preSubmitStop` 包装避免被 classify 成 Provider 故障
 - **Streaming 必须同步 Open**：`OpenStreamChat` 在同 goroutine 发 POST，goroutine 只做 `pumpSSE` 帧解析（禁止在 goroutine 内发 POST，会重开 Gate→Submit 窗口）

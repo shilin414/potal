@@ -143,6 +143,13 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 	// so the Redis-outage fallback actually keeps state) plus an
 	// outstanding-run cap enforced atomically with the insert.
 	if err := s.admitUserRun(ctx, caller.ID); err != nil {
+		// A cancelled client context is not a rate-limit rejection: the
+		// request is over, so abort without writing a body (第五轮 P2-3).
+		// Writing 429 here would both mislabel the outcome and hide the
+		// cancellation from the client's own logs.
+		if ctx.Err() != nil {
+			return
+		}
 		writeDetail(w, http.StatusTooManyRequests, err.Error())
 		return
 	}
@@ -258,9 +265,16 @@ func (s *Server) admitUserRun(ctx context.Context, userID int64) error {
 		key = s.Redis.Key("rate", "runs", "user", userKey)
 	}
 	ok, wait, err := limiter.AllowKey(ctx, key)
-	if err != nil || ok {
-		// AllowKey degrades to the in-process limiter on Redis errors and
-		// returns no error in that case; only ctx cancellation surfaces.
+	if err != nil {
+		// 第五轮 P2-3: propagate instead of treating it as admission
+		// success. AllowKey only returns an error for a CANCELLED CONTEXT
+		// (Redis errors degrade to the in-process GCRA and return no
+		// error) — swallowing it let a client that had already hung up
+		// "pass" admission and run on until some later DB call reported
+		// the cancellation anyway. The caller aborts the request.
+		return err
+	}
+	if ok {
 		return nil
 	}
 	secs := int(wait.Seconds())

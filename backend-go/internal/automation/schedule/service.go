@@ -71,27 +71,37 @@ type Service struct {
 	// MaxSchedules caps how many live schedules one owner may have
 	// (评测 P1-7); 0 disables the cap.
 	MaxSchedules int
-	nowFunc      func() time.Time
 }
 
 func NewService(d *sql.DB, check ApplicationChecker, log *slog.Logger) *Service {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Service{DB: d, Check: check, Log: log, nowFunc: time.Now}
+	return &Service{DB: d, Check: check, Log: log}
 }
 
 func (s *Service) q(ctx context.Context) db.Querier { return db.New(s.DB) }
+
+// ErrDBClockUnavailable means the schedule clock could not be read from
+// MySQL (第五轮 P2-2). Mutations MUST fail rather than fall back to the
+// process clock: a silent fallback lets a transient DB hiccup write a
+// next_run_at computed from one API node's local time into canonical state
+// that every other node then treats as authoritative. Clock Authority is
+// only real if there is exactly one source — no degradation path.
+var ErrDBClockUnavailable = errors.New("schedule db clock unavailable")
 
 // dbNow resolves "now" from MySQL (Clock Authority, 评测 §十七; 第四轮
 // P2): next_run_at and the "run_at must be in the future" check must not
 // depend on the API host's local clock — two nodes with a little clock
 // skew would otherwise compute different first slots for the same
-// schedule. Falls back to the process clock only when the DB read fails
-// (degraded, same policy as the scheduler).
-func (s *Service) dbNow(ctx context.Context) time.Time {
+// schedule.
+//
+// 第五轮 P2-2: there is no process-clock fallback any more. A failed read
+// returns ErrDBClockUnavailable and the caller aborts the mutation; the
+// request can simply be retried.
+func (s *Service) dbNow(ctx context.Context) (time.Time, error) {
 	if s.DB == nil {
-		return s.nowFunc().UTC()
+		return time.Time{}, fmt.Errorf("%w: no database configured", ErrDBClockUnavailable)
 	}
 	return s.dbNowTx(ctx, db.New(s.DB))
 }
@@ -99,12 +109,15 @@ func (s *Service) dbNow(ctx context.Context) time.Time {
 // dbNowTx is dbNow inside a caller-owned transaction (CREATE/UPDATE/ENABLE
 // compute the next slot under a lock, so the clock read belongs to the
 // same snapshot).
-func (s *Service) dbNowTx(ctx context.Context, q db.Querier) time.Time {
+func (s *Service) dbNowTx(ctx context.Context, q db.Querier) (time.Time, error) {
 	t, err := q.DBNow(ctx)
-	if err != nil || t.IsZero() {
-		return s.nowFunc().UTC()
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%w: %v", ErrDBClockUnavailable, err)
 	}
-	return t.UTC()
+	if t.IsZero() {
+		return time.Time{}, fmt.Errorf("%w: zero timestamp", ErrDBClockUnavailable)
+	}
+	return t.UTC(), nil
 }
 
 // ─────────────────────────────────────────────────────────── validation ──
@@ -140,7 +153,11 @@ func policyValid(kind, v string) bool { return policyValues[kind][v] }
 // validate enforces domain rules; caller identity checks happen upstream.
 // ownerUserID feeds the AuthorizeExecution gate (评测 P0-1).
 func (s *Service) validate(ctx context.Context, in *CreateInput, ownerUserID int64) error {
-	return s.validateAt(ctx, in, ownerUserID, s.dbNow(ctx))
+	now, err := s.dbNow(ctx)
+	if err != nil {
+		return err
+	}
+	return s.validateAt(ctx, in, ownerUserID, now)
 }
 
 // validateAt validates against an explicit instant (the DB clock), so the
@@ -223,7 +240,10 @@ func validateInput(ctx context.Context, in *CreateInput, ownerUserID int64, now 
 // same instant, and it is the database's instant — never the API host's.
 func (s *Service) Create(ctx context.Context, ownerUserID int64, in *CreateInput) (*Schedule, error) {
 	in.defaults()
-	now := s.dbNow(ctx)
+	now, err := s.dbNow(ctx)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.validateAt(ctx, in, ownerUserID, now); err != nil {
 		return nil, err
 	}
@@ -565,8 +585,12 @@ func (s *Service) Update(ctx context.Context, id, userID int64, isStaff bool, in
 	// the caller (评测 P2): a staff member editing someone else's schedule
 	// must not point it at an application the owner cannot execute — that
 	// would save successfully and then fail on every fire.
-	// DB clock, read under the locked row (第四轮 P2).
-	now := s.dbNowTx(ctx, q)
+	// DB clock, read under the locked row (第四轮 P2). A failure aborts
+	// the transaction instead of falling back to this host's clock.
+	now, err := s.dbNowTx(ctx, q)
+	if err != nil {
+		return nil, err
+	}
 	if err := s.validateAt(ctx, next, cur.OwnerUserID, now); err != nil {
 		return nil, err
 	}
@@ -648,8 +672,15 @@ func (s *Service) SetEnabled(ctx context.Context, id, userID int64, isStaff, ena
 
 	if enabled {
 		cur := FromDBRow(row)
-		// DB clock, read under the schedules row lock (第四轮 P2).
-		nr, err := NextRunAfter(cur.ScheduleType, cur.TriggerConfig, cur.RunAt, cur.Timezone, s.dbNowTx(ctx, q))
+		// DB clock, read under the schedules row lock (第四轮 P2). A
+		// failure aborts the transaction: enabling a schedule with a
+		// host-clock next_run_at would make two nodes disagree about
+		// the first slot.
+		now, err := s.dbNowTx(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		nr, err := NextRunAfter(cur.ScheduleType, cur.TriggerConfig, cur.RunAt, cur.Timezone, now)
 		if err != nil {
 			return nil, err
 		}

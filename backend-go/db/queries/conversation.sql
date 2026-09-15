@@ -113,15 +113,19 @@ DELETE FROM conversations WHERE id = ?;
 SELECT id FROM conversations WHERE id = ? FOR UPDATE;
 
 -- name: CountActiveRunsByConversation :one
--- ACTIVE = NON-TERMINAL (第四轮 P2). The status list used to be hard-coded
--- to ('queued','running'); the domain has nine states and only
--- cancelled/succeeded/failed are terminal (execution.TerminalStatuses), so
--- a run in waiting_input / waiting_external / cancelling / interrupted
--- would have looked "inactive" and let a SECOND run into a conversation
--- that must stay serialized. Backed by idx_runs_conversation_status
--- (migration 0014).
+-- ACTIVE = NOT SETTLED (第四轮 P2 / 第五轮 P2-1). The status list used to be
+-- hard-coded to ('queued','running'); the domain has nine states and the
+-- only settled ones are cancelled/succeeded/failed plus the legacy
+-- `interrupted` alias (execution.IsSettled).
+--
+-- `interrupted` MUST be in this list: it is a pre-closure terminal alias
+-- that new code never writes, and migration 0018 rewrites historical rows
+-- to `failed`. Until that migration has run — and for any row a restore
+-- brings back — an interrupted run would otherwise be counted as ACTIVE
+-- forever and pin the conversation at 409 on every subsequent send.
+-- Backed by idx_runs_conversation_status (migration 0014).
 SELECT COUNT(*) AS n FROM runs
-WHERE conversation_id = ? AND status NOT IN ('cancelled', 'succeeded', 'failed');
+WHERE conversation_id = ? AND status NOT IN ('cancelled', 'succeeded', 'failed', 'interrupted');
 
 -- name: CountScheduledRunsByConversation :one
 -- Lifetime guard (评测 P1): a run created by the scheduler owns an

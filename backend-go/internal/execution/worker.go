@@ -356,7 +356,8 @@ func (w *Worker) claimAndExecute(ctx context.Context, runID ids.ID, ack func()) 
 	// gate ALLOWED the run, before the run.started event. A run killed by
 	// the gate therefore has no start time at all, and COALESCE keeps the
 	// first start across provider-pause deferrals.
-	if err := w.Svc.MarkRunStartedOwned(ctx, claimed.Ownership); err != nil {
+	startedAt, err := w.Svc.MarkRunStartedOwned(ctx, claimed.Ownership)
+	if err != nil {
 		if err == ErrLostOwnership {
 			if ack != nil {
 				ack()
@@ -364,6 +365,12 @@ func (w *Worker) claimAndExecute(ctx context.Context, runID ids.ID, ack func()) 
 			return
 		}
 		w.Log.Warn("mark run started failed", "run_id", runID.String(), "err", err)
+	} else {
+		// 第五轮 P2-4: the in-memory snapshot was loaded at claim time,
+		// when started_at was still NULL. Without this copy
+		// FinalizeOwnedRun never sees a start time and
+		// studio_run_duration records nothing.
+		claimed.Run.StartedAt = &startedAt
 	}
 	// Claim event: matches the reference protocol (SSE consumers render
 	// the streaming bubble from run.started). Fenced: only the owner.
@@ -417,7 +424,7 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun, leaseRenewedA
 			w.Log.Warn("provider slot store unavailable; requeueing run",
 				"run_id", claimed.Run.ID.String(), "err", err)
 			w.recordProviderAdmission("provider_inflight_unavailable")
-			w.requeueForAdmission(claimed, "provider_inflight_unavailable")
+			w.requeueForAdmission(ctx, claimed, "provider_inflight_unavailable")
 			return
 		}
 		if !ok {
@@ -425,13 +432,17 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun, leaseRenewedA
 				"run_id", claimed.Run.ID.String(), "depth", depth)
 			w.recordProviderAdmission("provider_inflight_limit")
 			w.recordAdmission(telemetry.AdmissionCapacityRejected)
-			w.requeueForAdmission(claimed, "provider_inflight_limit")
+			w.requeueForAdmission(ctx, claimed, "provider_inflight_limit")
 			return
 		}
 		w.recordAdmission(telemetry.AdmissionAdmitted)
 		w.attachProviderSlot(claimed.Ownership, slot)
 		defer func() {
-			if err := w.ProviderSlots.Release(context.Background(), slot); err != nil {
+			// 第五轮 P2-5: bounded + detached — the release must survive a
+			// cancelled/expired execution context, but must never block forever.
+			cleanupCtx, cleanupCancel := NewCleanupContext(ctx)
+			defer cleanupCancel()
+			if err := w.ProviderSlots.Release(cleanupCtx, slot); err != nil {
 				w.Log.Warn("provider slot release failed", "run_id", claimed.Run.ID.String(), "err", err)
 			}
 		}()
@@ -443,7 +454,10 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun, leaseRenewedA
 			// Fenced retry: the panicking worker may still own the run —
 			// requeue it for another attempt. ErrLostOwnership (already
 			// taken over) is the expected no-op.
-			if err := w.Svc.RetryOwnedRun(context.Background(), claimed.Run, claimed.Ownership, "worker panic"); err != nil && err != ErrLostOwnership {
+			// 第五轮 P2-5: bounded + detached cleanup write.
+			cleanupCtx, cleanupCancel := NewCleanupContext(ctx)
+			defer cleanupCancel()
+			if err := w.Svc.RetryOwnedRun(cleanupCtx, claimed.Run, claimed.Ownership, "worker panic"); err != nil && err != ErrLostOwnership {
 				w.Log.Error("retry after panic failed", "run_id", claimed.Run.ID.String(), "err", err)
 			}
 		}
@@ -479,14 +493,17 @@ func (w *Worker) recordAdmission(result string) {
 	}
 }
 
-func (w *Worker) requeueForAdmission(claimed *ClaimedRun, reason string) {
+func (w *Worker) requeueForAdmission(ctx context.Context, claimed *ClaimedRun, reason string) {
 	// Admission contention is a capacity problem, not a provider failure:
 	// the run is made claimable again after a short pause (long enough to
 	// avoid hot-looping against the saturated provider, short enough that
 	// a freed slot is used immediately). Provider-failure retries keep
 	// their own backoff (Service.RequeueDelay). The delay is applied by the
 	// DB clock in the same transaction as the dispatch outbox row.
-	if err := w.Svc.RetryOwnedRunAfter(context.Background(), claimed.Run, claimed.Ownership,
+	// 第五轮 P2-5: bounded + detached cleanup write.
+	cleanupCtx, cleanupCancel := NewCleanupContext(ctx)
+	defer cleanupCancel()
+	if err := w.Svc.RetryOwnedRunAfter(cleanupCtx, claimed.Run, claimed.Ownership,
 		reason, AdmissionRequeueDelay); err != nil && err != ErrLostOwnership {
 		w.Log.Error("requeue after provider admission failed",
 			"run_id", claimed.Run.ID.String(), "reason", reason, "err", err)
@@ -516,7 +533,7 @@ func (w *Worker) gateBlocked(ctx context.Context, claimed *ClaimedRun) bool {
 		// the original priority (defer, not retry), never destroy work.
 		w.Log.Warn("run gate unavailable; deferring run",
 			"run_id", claimed.Run.ID.String(), "err", err)
-		w.deferAfter(claimed, "run_gate_unavailable", AdmissionRequeueDelay)
+		w.deferAfter(ctx, claimed, "run_gate_unavailable", AdmissionRequeueDelay)
 		return true
 	case action == GateKill:
 		// Application/binding disabled: hard kill — cancel the run.
@@ -539,7 +556,7 @@ func (w *Worker) gateBlocked(ctx context.Context, claimed *ClaimedRun) bool {
 		w.recordProviderAdmission("provider_disabled")
 		w.Log.Info("run gate deferred run (provider inactive)",
 			"run_id", claimed.Run.ID.String(), "delay", GatePauseRequeueDelay.String())
-		w.deferAfter(claimed, "provider_disabled", GatePauseRequeueDelay)
+		w.deferAfter(ctx, claimed, "provider_disabled", GatePauseRequeueDelay)
 		return true
 	case action == GateAllow:
 		return false
@@ -551,7 +568,7 @@ func (w *Worker) gateBlocked(ctx context.Context, claimed *ClaimedRun) bool {
 		w.Log.Error("unknown gate action; failing closed",
 			"run_id", claimed.Run.ID.String(), "action", string(action))
 		w.recordAdmission(telemetry.AdmissionGateUnknown)
-		w.deferAfter(claimed, "run_gate_unknown", AdmissionRequeueDelay)
+		w.deferAfter(ctx, claimed, "run_gate_unknown", AdmissionRequeueDelay)
 		return true
 	}
 }
@@ -560,8 +577,11 @@ func (w *Worker) gateBlocked(ctx context.Context, claimed *ClaimedRun) bool {
 // P1-C). The write uses a detached context so a cancelled worker context
 // cannot orphan the run; a failed defer write is recovered by the
 // lease/reaper machinery instead.
-func (w *Worker) deferAfter(claimed *ClaimedRun, reason string, delay time.Duration) {
-	if err := w.Svc.DeferOwnedRunAfter(context.Background(), claimed.Run, claimed.Ownership,
+func (w *Worker) deferAfter(ctx context.Context, claimed *ClaimedRun, reason string, delay time.Duration) {
+	// 第五轮 P2-5: bounded + detached cleanup write.
+	cleanupCtx, cleanupCancel := NewCleanupContext(ctx)
+	defer cleanupCancel()
+	if err := w.Svc.DeferOwnedRunAfter(cleanupCtx, claimed.Run, claimed.Ownership,
 		reason, delay); err != nil && err != ErrLostOwnership {
 		w.Log.Error("gate defer failed",
 			"run_id", claimed.Run.ID.String(), "reason", reason, "err", err)
@@ -784,7 +804,11 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 					// Release this attempt's own provider slot (never the
 					// new owner's — the row is ownership-scoped).
 					if snap.slot != nil && w.ProviderSlots != nil {
-						if rerr := w.ProviderSlots.Release(context.Background(), snap.slot); rerr != nil && rerr != ErrProviderSlotLost {
+						// 第五轮 P2-5: bounded + detached cleanup write.
+						cleanupCtx, cleanupCancel := NewCleanupContext(ctx)
+						rerr := w.ProviderSlots.Release(cleanupCtx, snap.slot)
+						cleanupCancel()
+						if rerr != nil && rerr != ErrProviderSlotLost {
 							w.Log.Warn("provider slot release after lease loss failed",
 								"run_id", id.String(), "err", rerr)
 						}

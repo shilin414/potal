@@ -625,28 +625,49 @@ func (s *Service) BeginProviderAttemptOwned(ctx context.Context, own ExecutionOw
 // for a paused provider and later re-claimed keeps its FIRST start time, so
 // RunDuration measures execution wall-clock rather than the last requeue.
 //
+// It returns the CANONICAL DATABASE timestamp (第五轮 P2-4). The worker
+// must copy it onto its in-memory Run: the snapshot was loaded at claim
+// time, when started_at was still NULL, and FinalizeOwnedRun only observes
+// studio_run_duration when run.StartedAt is set — without this the metric
+// silently stopped recording for every run.
+//
 // Failure here is an observability loss, not a correctness loss — the caller
 // logs and continues.
-func (s *Service) MarkRunStartedOwned(ctx context.Context, own ExecutionOwnership) error {
+func (s *Service) MarkRunStartedOwned(ctx context.Context, own ExecutionOwnership) (time.Time, error) {
 	if !own.Valid() {
-		return ErrLostOwnership
+		return time.Time{}, ErrLostOwnership
 	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := verifyActiveOwnershipTx(ctx, tx, own); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if _, err := db.New(tx).MarkRunStartedFenced(ctx, db.MarkRunStartedFencedParams{
 		ID:         own.RunID.Bytes(),
 		LeaseEpoch: own.LeaseEpoch,
 	}); err != nil {
-		return err
+		return time.Time{}, err
 	}
-	return tx.Commit()
+	// Read back inside the SAME transaction: the value is the row's, and
+	// COALESCE may have preserved a start from an earlier attempt.
+	started, err := db.New(tx).GetRunStartedAt(ctx, db.GetRunStartedAtParams{
+		ID:         own.RunID.Bytes(),
+		LeaseEpoch: own.LeaseEpoch,
+	})
+	if err != nil {
+		return time.Time{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return time.Time{}, err
+	}
+	if !started.Valid {
+		return time.Time{}, ErrLostOwnership
+	}
+	return started.Time.UTC(), nil
 }
 
 // HeartbeatOwned extends the lease; the WHERE carries the lease token so

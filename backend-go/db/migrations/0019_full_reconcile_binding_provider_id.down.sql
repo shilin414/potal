@@ -1,0 +1,11 @@
+-- Irreversible on purpose (第五轮 P2-5).
+--
+-- The reconciliation derives provider_id FROM provider_key. Rolling it
+-- back would mean restoring whatever inconsistent value was there before,
+-- and that value is not recorded anywhere — a NULL-ing "reverse" would
+-- actively destroy correct data written by the running system since.
+--
+-- provider_id is a derived cache of provider_key; the authoritative
+-- repair path after a rollback of the schema version is to re-run the
+-- forward migration.
+SELECT 1;

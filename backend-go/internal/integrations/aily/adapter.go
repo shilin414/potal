@@ -282,25 +282,51 @@ func (a *AgentAdapter) StreamPrepared(ctx context.Context, in *catalog.SubmitInp
 				started = true
 				chatID, _ := parsed["agent_chat_id"].(string)
 				sessionID, _ := parsed["session_id"].(string)
-				out <- catalog.StreamEvent{EventType: "aily.stream.started", Payload: map[string]any{
-					"agent_chat_id": chatID,
-					"session_id":    sessionID,
-				}}
+				if err := emitStreamEvent(cctx, out, catalog.StreamEvent{
+					EventType: "aily.stream.started",
+					Payload: map[string]any{
+						"agent_chat_id": chatID,
+						"session_id":    sessionID,
+					},
+				}); err != nil {
+					return err
+				}
 			}
 			for _, ev := range mapper.ToUnified(eventName, parsed) {
-				out <- catalog.StreamEvent{EventType: ev.Type, Payload: ev.Payload}
+				if err := emitStreamEvent(cctx, out, catalog.StreamEvent{
+					EventType: ev.Type,
+					Payload:   ev.Payload,
+				}); err != nil {
+					return err
+				}
 			}
 			return nil
 		})
-		if err != nil && !errors.Is(err, context.Canceled) {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			// Transport-level failure: emit a failed event? No — the
 			// executor reconciles via GetChatResult instead (§26).
-			out <- catalog.StreamEvent{EventType: "aily.stream.transport_error", Payload: map[string]any{
-				"error": err.Error(),
-			}}
+			_ = emitStreamEvent(cctx, out, catalog.StreamEvent{
+				EventType: "aily.stream.transport_error",
+				Payload:   map[string]any{"error": err.Error()},
+			})
 		}
 	}()
 	return out, stop, nil
+}
+
+// emitStreamEvent is the ONLY way the stream producer may hand an event to
+// the consumer (第五轮 P1-2). A bare `out <- ev` on a full buffer cannot be
+// interrupted by closing the SSE body or cancelling the context, so an
+// early executor exit (lost lease ownership, DB error, worker shutdown)
+// would strand the producer goroutine forever — and `defer close(out)` /
+// `defer stop()` would never run.
+func emitStreamEvent(ctx context.Context, out chan<- catalog.StreamEvent, ev catalog.StreamEvent) error {
+	select {
+	case out <- ev:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // UploadAttachment streams bytes to Aily under the caller's UAT.
