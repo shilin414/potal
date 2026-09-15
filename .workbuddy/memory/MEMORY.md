@@ -1,6 +1,37 @@
 # Creation Agent Studio — 项目长期记忆
 
-## Admission 闭环：Conversation / Schedule / 用户层（2026-09-15 完成，最新）
+## Admission 收口二轮：复审 P0/P1 修复（2026-09-15 同日，最新）
+
+变更报告：`docs/potal 复审问题修复变更报告（Admission 收口二轮）.md`（复审基线 `418f2f18`）。
+
+- **Binding 重建必须字段完整（P0 教训）**：`catalog.bindingFromExecutionAuthRow` 与
+  `bindingFromRow` 输出形状必须一致 —— `Binding.Snapshot()` 无条件写
+  `timeout_seconds`/`config`/`capabilities`，漏填会把 Run 的运行时预算清零
+  （异步执行立即超时、交互超时被砍到 lease）。有回归测试
+  `TestAuthorizeExecutionPreservesRuntimeSnapshot` 锁定。
+- **Provider 门禁按 `provider_key` fail-closed**：授权 SQL `LEFT JOIN providers ON provider_key`，
+  Go 侧要求行存在且 `status='active'`（NULL 或非 active 一律拒绝）。
+  原因是 `runtime_bindings.provider_id` 常为 NULL（API 创建路径曾不写 FK，实测 18 个 binding 16 个 NULL）。
+  创建/更新 binding 现已写 `b.ProviderID`；迁移 `0016` 回填历史数据。
+  **不要再写依赖 `provider_id` 的授权判定。**
+- **授权与 binding 解析必须在最终 Admission Lock 之后**：`admitOne` 已改为锁内重读行后再
+  `resolveBinding`（否则 PATCH application A→B 会产出 application_id=B 但 binding/snapshot=A 的 Run）。
+- **Conversation 硬删有生命周期守卫**（`execution.DeleteConversationCascade`，单事务）：
+  活跃 Run → 409；存在 `trigger_type='scheduled'` 的 Run 或 `delivery_executions` → **拒绝硬删**
+  （scheduled Run 是执行审计实体，occurrence.run_id 与 delivery 的 `run.Output` 依赖它）。
+  `ClearConversation` 同样下沉到 execution（清 messages + agent_thread）。
+  **未做** Conversation 软删除（hide）—— 需改造 Sidebar/消息读取/分享/SSE，留作下轮。
+- **用户准入**：`Server.RunAdmission` 是**长生命周期** `RateLimiter`，用 `AllowKey(ctx, key)` 按用户
+  动态计费，本地降级状态是**每键有界 map**（`localStateMax=4096`）；`AllowKey` 有 **nil Redis 保护**
+  （此前 nil rdb 会 panic）。**禁止每请求 new RateLimiter**（会让 Redis 故障退化为 fail-open）。
+  outstanding 上限在 `execution.CreateRunAdmitted`：**users 行锁 → 计数 → 同事务建 Run**，
+  锁序恒为 `users → conversations`（定时 Run 不走该上限）。
+- **Schedule **软删除不再物理删 `schedule_deliveries`**：避免 `deliveries→schedules` 与调度器
+  `schedules→deliveries` 的锁序反转（死锁），并保住旧 occurrence（`delivery_snapshot_at IS NULL`）fallback。
+- **Schedule Update 的执行权按 `cur.OwnerUserID` 校验**（不是管理员身份）；配额在用户行锁内原子判定。
+- **TriggerNow 全程使用 DB now**（不要在其中再调 `nowFunc()`）。
+
+## Admission 闭环：Conversation / Schedule / 用户层（2026-09-15 完成）
 
 变更报告：`docs/potal Conversation 与 Schedule 准入闭环修复变更报告.md`。
 **执行内核与 Provider 准入层不要动**；本轮补的是「用户 → Conversation → Run」与

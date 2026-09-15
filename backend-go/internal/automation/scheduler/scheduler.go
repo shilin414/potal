@@ -661,7 +661,7 @@ func (s *Scheduler) TriggerNow(ctx context.Context, scheduleID, userID int64, is
 		return nil, ErrNotSchedulable
 	}
 
-	occID, err := s.createOccurrenceAndRunTx(ctx, tx, q, sch, time.Time{}, binding, s.nowFunc().UTC(), "run_now")
+	occID, err := s.createOccurrenceAndRunTx(ctx, tx, q, sch, time.Time{}, binding, now, "run_now")
 	if err != nil {
 		return nil, err
 	}
@@ -728,7 +728,7 @@ func (s *Scheduler) admitOne(ctx context.Context, occRow db.ScheduleOccurrence, 
 		_, err := s.q(ctx).MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: schedule.OccSkipped, ID: occRow.ID})
 		return err
 	}
-	// Admission check: nothing else queued/running for this schedule
+	// Fast path (read-only): nothing queued/running for this schedule
 	// (the pending row itself must not block its own admission).
 	active, err := s.q(ctx).CountActiveOccurrencesExcluding(ctx, db.CountActiveOccurrencesExcludingParams{
 		ScheduleID: occRow.ScheduleID, ID: occRow.ID,
@@ -739,17 +739,7 @@ func (s *Scheduler) admitOne(ctx context.Context, occRow db.ScheduleOccurrence, 
 	if active > 0 {
 		return nil // still waiting (queue semantics)
 	}
-	binding, err := s.resolveBinding(ctx, sch.ApplicationID, sch.OwnerUserID)
-	if err != nil {
-		return err
-	}
-	if binding == nil {
-		_, err := s.q(ctx).MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: schedule.OccFailed, ID: occRow.ID})
-		if err != nil {
-			return err
-		}
-		return ErrNotSchedulable
-	}
+
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -790,6 +780,24 @@ func (s *Scheduler) admitOne(ctx context.Context, occRow db.ScheduleOccurrence, 
 	}
 	if active2 > 0 {
 		return nil
+	}
+	// Authorization + binding resolution happen INSIDE the lock, off the
+	// freshly re-read row (评测 P1): everything that shapes the run's
+	// runtime snapshot must be decided after the admission lock is held.
+	// Resolving earlier let a concurrent PATCH (application A→B) produce a
+	// run whose application_id, binding and provider disagreed.
+	binding, err := s.resolveBinding(ctx, cur.ApplicationID, cur.OwnerUserID)
+	if err != nil {
+		return err
+	}
+	if binding == nil {
+		if _, err := q.MarkOccurrenceStatus(ctx, db.MarkOccurrenceStatusParams{Status: schedule.OccFailed, ID: occRow.ID}); err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		return ErrNotSchedulable
 	}
 	// Legacy pending occurrences created before the snapshot migration are
 	// captured at their first admission. New occurrences are already marked,

@@ -563,7 +563,7 @@ SELECT a.id AS app_id, a.slug AS app_slug, a.name AS app_name, a.kind AS app_kin
        p.status AS provider_status
 FROM applications a
 JOIN runtime_bindings b ON b.application_id = a.id AND b.enabled = 1
-LEFT JOIN providers p ON p.id = b.provider_id
+LEFT JOIN providers p ON p.provider_key = b.provider_key
 WHERE a.id = ? AND a.enabled = 1 AND a.kind = 'chat'
   AND (? OR a.is_public = 1)
 ORDER BY b.id DESC
@@ -610,6 +610,12 @@ type GetExecutionAuthBundleRow struct {
 // The join itself cannot express the staff bypass, so the Go layer calls
 // it with show_all for staff and is_public=1 for regular users (mirrors
 // ListApplicationsByVisibility).
+//
+// The provider is joined by provider_key, NOT provider_id (评测 P1):
+// provider_id is nullable and was left NULL by bindings created through
+// the API, which silently disabled the provider kill switch. provider_key
+// is the business key that always exists. A missing/inactive provider row
+// fails the check closed in Go.
 func (q *Queries) GetExecutionAuthBundle(ctx context.Context, arg GetExecutionAuthBundleParams) (GetExecutionAuthBundleRow, error) {
 	row := q.db.QueryRowContext(ctx, getExecutionAuthBundle, arg.ID, arg.ShowAll)
 	var i GetExecutionAuthBundleRow

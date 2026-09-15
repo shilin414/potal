@@ -139,9 +139,9 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 	}
 	binding := exe.Binding
 
-	// User admission (评测 P1-7): per-user QPS + outstanding backlog cap.
-	// Provider capacity is finite; without this an authenticated client can
-	// grow the MySQL backlog without bound.
+	// User admission (评测 P1-7): per-user QPS (long-lived GCRA limiter,
+	// so the Redis-outage fallback actually keeps state) plus an
+	// outstanding-run cap enforced atomically with the insert.
 	if err := s.admitUserRun(ctx, caller.ID); err != nil {
 		writeDetail(w, http.StatusTooManyRequests, err.Error())
 		return
@@ -177,7 +177,7 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	run, err := s.Runs.CreateRun(ctx, &execution.CreateRunInput{
+	run, err := s.Runs.CreateRunAdmitted(ctx, &execution.CreateRunInput{
 		UserID:             caller.ID,
 		ApplicationID:      appID,
 		ConversationID:     convID,
@@ -190,7 +190,7 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 		ConversationTitle:  title,
 		CreateConversation: convID == 0,
 		RuntimeSnapshot:    binding.Snapshot(),
-	})
+	}, s.Config.Runner.UserMaxOutstanding)
 	if err != nil {
 		switch {
 		case errors.Is(err, execution.ErrConversationBusy):
@@ -200,6 +200,9 @@ func (s *Server) CreateRun(w http.ResponseWriter, r *http.Request) {
 			writeDetail(w, http.StatusConflict, "one or more attachments were already used")
 		case errors.Is(err, execution.ErrConversationNotFound):
 			writeBare(w, http.StatusBadRequest, "conversation not found")
+		case errors.Is(err, execution.ErrUserOutstandingExceeded):
+			writeDetail(w, http.StatusTooManyRequests,
+				fmt.Sprintf("too many outstanding runs (limit %d)", s.Config.Runner.UserMaxOutstanding))
 		default:
 			writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		}
@@ -227,30 +230,31 @@ func writeExecutionDenied(w http.ResponseWriter, err error) {
 	}
 }
 
-// admitUserRun applies the per-user admission policy (评测 P1-7): a GCRA
-// QPS limit plus an outstanding (queued+running) run cap. Both are
-// skipped when unconfigured (tests / single-tenant dev).
+// admitUserRun applies the per-user QPS policy (评测 P1-7).
+//
+// The limiter is a LONG-LIVED object supplied by the server: it keeps the
+// in-process fallback state per key, so a Redis outage still bounds the
+// rate. Building a limiter per request (as an earlier revision did) reset
+// that state on every call and turned the outage fallback into fail-open.
+// The outstanding-run cap is enforced inside CreateRunAdmitted, atomically
+// with the insert.
 func (s *Server) admitUserRun(ctx context.Context, userID int64) error {
-	qps := s.Config.Runner.UserRunQPS
-	if qps > 0 && s.Redis != nil {
-		limiter := execution.NewRateLimiter(s.Redis,
-			s.Redis.Key("rate", "runs", "user", strconv.FormatInt(userID, 10)), qps, time.Second)
-		if ok, wait, err := limiter.Allow(ctx); err == nil && !ok {
-			secs := int(wait.Seconds())
-			if secs < 1 {
-				secs = 1
-			}
-			return fmt.Errorf("too many requests, retry in %ds", secs)
-		}
+	limiter := s.RunAdmission
+	if limiter == nil || s.Redis == nil || s.Config == nil {
+		return nil
 	}
-	max := s.Config.Runner.UserMaxOutstanding
-	if max > 0 {
-		n, err := s.Runs.Querier().CountOutstandingRunsByUser(ctx, sql.NullInt64{Int64: userID, Valid: true})
-		if err == nil && n >= int64(max) {
-			return fmt.Errorf("too many outstanding runs (limit %d)", max)
-		}
+	key := s.Redis.Key("rate", "runs", "user", strconv.FormatInt(userID, 10))
+	ok, wait, err := limiter.AllowKey(ctx, key)
+	if err != nil || ok {
+		// AllowKey degrades to the in-process limiter on Redis errors and
+		// returns no error in that case; only ctx cancellation surfaces.
+		return nil
 	}
-	return nil
+	secs := int(wait.Seconds())
+	if secs < 1 {
+		secs = 1
+	}
+	return fmt.Errorf("too many requests, retry in %ds", secs)
 }
 
 func dedupe(in []string) []string {

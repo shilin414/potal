@@ -61,12 +61,43 @@ func (q *Queries) CountActiveRunsByConversation(ctx context.Context, conversatio
 	return n, err
 }
 
+const countDeliveriesByConversation = `-- name: CountDeliveriesByConversation :one
+SELECT COUNT(*) AS n FROM delivery_executions d
+JOIN runs r ON r.id = d.run_id
+WHERE r.conversation_id = ?
+`
+
+// Same guard, direct: any delivery execution hanging off this
+// conversation's runs must keep them alive.
+func (q *Queries) CountDeliveriesByConversation(ctx context.Context, conversationID sql.NullInt64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countDeliveriesByConversation, conversationID)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
 const countMessagesByConversation = `-- name: CountMessagesByConversation :one
 SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?
 `
 
 func (q *Queries) CountMessagesByConversation(ctx context.Context, conversationID uint64) (int64, error) {
 	row := q.db.QueryRowContext(ctx, countMessagesByConversation, conversationID)
+	var n int64
+	err := row.Scan(&n)
+	return n, err
+}
+
+const countScheduledRunsByConversation = `-- name: CountScheduledRunsByConversation :one
+SELECT COUNT(*) AS n FROM runs
+WHERE conversation_id = ? AND trigger_type = 'scheduled'
+`
+
+// Lifetime guard (评测 P1): a run created by the scheduler owns an
+// occurrence and may still owe a pending delivery. Physically deleting it
+// would leave schedule_occurrences.run_id dangling and make the delivery
+// worker's GetRunByID fail → a timed-out notification.
+func (q *Queries) CountScheduledRunsByConversation(ctx context.Context, conversationID sql.NullInt64) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countScheduledRunsByConversation, conversationID)
 	var n int64
 	err := row.Scan(&n)
 	return n, err

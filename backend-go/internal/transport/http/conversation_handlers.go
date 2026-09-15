@@ -3,10 +3,12 @@ package http
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/creation-agent-studio/backend-go/internal/execution"
 	genapi "github.com/creation-agent-studio/backend-go/internal/gen/api"
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/identity"
@@ -149,165 +151,57 @@ func nullableID(v sql.NullInt64) any {
 }
 
 // DeleteConversation implements DELETE /api/conversations/{id}/delete_conversation/.
-// Full cascade: runs (+events/artifacts/commands/leases), messages,
-// thread, attachments, then the conversation row.
+// Full cascade in ONE transaction: runs (+events/artifacts/commands/leases),
+// messages, thread, shares, attachments, then the conversation row.
 //
-// Lifetime safety (评测 P1-4): the whole cascade runs in ONE transaction
-// and REFUSES to delete while the conversation still has a queued/running
-// run — otherwise a worker's FinalizeOwnedRun could insert the assistant
-// message into (or race child deletes against) a half-deleted
-// conversation, leaving orphan rows.
+// The lifetime rules live in execution.DeleteConversationCascade (评测
+// P1-4 + P1 lifetime): refused while a run is active, and refused when the
+// conversation holds scheduler-created runs or delivery executions whose
+// rows other systems still reference.
 func (s *Server) DeleteConversation(w http.ResponseWriter, r *http.Request, conversationId int) {
 	caller := userFrom(r.Context())
 	if caller == nil {
 		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
 		return
 	}
-	ctx := r.Context()
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-	q := db.New(tx)
-
-	// Lock the conversation row first: it serializes with CreateRunInTx
-	// (which takes the same lock before counting active runs), so no run
-	// can be created between our active-run check and the delete.
-	if _, err := q.GetConversationRowForUpdate(ctx, uint64(conversationId)); err != nil {
+	err := s.Runs.DeleteConversationCascade(r.Context(), int64(conversationId), caller.ID)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]string{"detail": "会话已删除"})
+	case errors.Is(err, execution.ErrConversationNotFound):
 		writeDetail(w, http.StatusNotFound, "conversation not found")
-		return
-	}
-	owner, err := q.GetConversationByID(ctx, uint64(conversationId))
-	if err != nil || owner.UserID != uint64(caller.ID) {
-		writeDetail(w, http.StatusNotFound, "conversation not found")
-		return
-	}
-	active, err := q.CountActiveRunsByConversation(ctx, sql.NullInt64{Int64: int64(conversationId), Valid: true})
-	if err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if active > 0 {
+	case errors.Is(err, execution.ErrConversationHasActiveRun):
 		writeDetail(w, http.StatusConflict, "conversation has an active run")
-		return
-	}
-
-	runIDs, err := q.DeleteConversationRuns(ctx, sql.NullInt64{Int64: int64(conversationId), Valid: true})
-	if err != nil {
+	case errors.Is(err, execution.ErrConversationHasScheduledRuns):
+		writeDetail(w, http.StatusConflict,
+			"conversation contains scheduled runs or pending deliveries and cannot be deleted")
+	default:
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
 	}
-	for _, runID := range runIDs {
-		if err := q.DeleteRunEvents(ctx, runID); err != nil {
-			writeSimpleError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if err := q.DeleteRunArtifacts(ctx, runID); err != nil {
-			writeSimpleError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if err := q.DeleteRunCommands(ctx, runID); err != nil {
-			writeSimpleError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		if err := q.DeleteRunLeaseByRun(ctx, runID); err != nil {
-			writeSimpleError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-	}
-	convArg := sql.NullInt64{Int64: int64(conversationId), Valid: true}
-	if err := q.DeleteRunsByConversation(ctx, convArg); err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := q.DeleteConversationMessages(ctx, uint64(conversationId)); err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := q.DeleteThreadByConversation(ctx, uint64(conversationId)); err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := q.DeleteSharesByConversation(ctx, uint64(conversationId)); err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := q.UnbindConversationAttachments(ctx, convArg); err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := q.DeleteConversation(ctx, uint64(conversationId)); err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"detail": "会话已删除"})
 }
 
 // ClearConversation implements DELETE /api/conversations/{id}/clear/.
 //
-// Semantics (评测 P1-3): 清空 = 重新开始. Messages AND the agent thread are
-// removed together, so the next turn starts a NEW provider session — a
-// cleared conversation must not keep answering with the old context. It
-// refuses while a run is active (the answer of an in-flight run would
-// otherwise reappear in a conversation the user just emptied).
+// Semantics (评测 P1-3): 清空 = 重新开始 — messages and the agent thread are
+// removed together inside one transaction, so the next turn starts a NEW
+// provider session. Refused while a run is active.
 func (s *Server) ClearConversation(w http.ResponseWriter, r *http.Request, conversationId int) {
 	caller := userFrom(r.Context())
 	if caller == nil {
 		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
 		return
 	}
-	ctx := r.Context()
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	defer func() { _ = tx.Rollback() }()
-	q := db.New(tx)
-
-	if _, err := q.GetConversationRowForUpdate(ctx, uint64(conversationId)); err != nil {
+	err := s.Runs.ClearConversation(r.Context(), int64(conversationId), caller.ID)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, map[string]string{"detail": "会话已清空"})
+	case errors.Is(err, execution.ErrConversationNotFound):
 		writeDetail(w, http.StatusNotFound, "conversation not found")
-		return
-	}
-	conv, err := q.GetConversationByID(ctx, uint64(conversationId))
-	if err != nil || conv.UserID != uint64(caller.ID) {
-		writeDetail(w, http.StatusNotFound, "conversation not found")
-		return
-	}
-	active, err := q.CountActiveRunsByConversation(ctx, sql.NullInt64{Int64: int64(conversationId), Valid: true})
-	if err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if active > 0 {
+	case errors.Is(err, execution.ErrConversationHasActiveRun):
 		writeDetail(w, http.StatusConflict, "conversation has an active run")
-		return
-	}
-	if err := q.DeleteConversationMessages(ctx, uint64(conversationId)); err != nil {
+	default:
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
 	}
-	// Reset the provider session too: deleting the thread makes the next
-	// turn lazily create a fresh one (and a fresh Aily session).
-	if err := q.DeleteThreadByConversation(ctx, uint64(conversationId)); err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := q.TouchConversationUpdated(ctx, uint64(conversationId)); err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		writeSimpleError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]string{"detail": "会话已清空"})
 }
 
 // ─────────────────────────────────────────────────────────── register ──

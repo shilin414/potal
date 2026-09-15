@@ -1,5 +1,12 @@
 -- ─────────────────────────────────────────────────────────── identity ──
 
+-- name: LockUserRow :one
+-- Per-user admission lock (评测 P1-7): the user's own row is the natural
+-- serialization point for "count my outstanding runs / schedules, then
+-- create one" — it makes those caps real instead of best-effort. Callers
+-- hold it inside the same transaction that inserts the run/schedule.
+SELECT id FROM users WHERE id = ? FOR UPDATE;
+
 -- name: CreateUser :execresult
 INSERT INTO users (username, password_hash, display_name, display_id, email, role, auth_source, is_staff)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?);

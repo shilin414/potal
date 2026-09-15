@@ -1,5 +1,10 @@
 # potal 对话、定时任务与并发安全性能专项评测 —— 修复变更报告
 
+> ⚠️ **后续修正（2026-09-15 复审二轮）**：本报告中的两处结论已被后续复审推翻并修复，请以
+> `docs/potal 复审问题修复变更报告（Admission 收口二轮）.md` 为准：
+> 1. 本报告称「Provider active 已校验」，实际当时依赖 nullable `provider_id`，**kill switch 并未生效**（已改为按 `provider_key` fail-closed）；
+> 2. 本报告新增的 `AuthorizeExecution` **漏填 `timeout_seconds`/`config`/`capabilities`**，导致 Runtime Snapshot 被清零（P0，已修复并加回归测试）。
+
 - 仓库：`shilin414/potal`，分支 `dev`
 - 评测基线：`e4fe49fd118b001ce6baa976c878344c4b744210`（本报告的修复起点即该提交）
 - 修复范围：评测报告 **P0×2 + P1×7**，并顺带关闭两项 P2（Sidebar `updated_at`、Scheduler 时钟）

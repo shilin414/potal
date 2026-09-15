@@ -118,6 +118,21 @@ SELECT id FROM conversations WHERE id = ? FOR UPDATE;
 SELECT COUNT(*) AS n FROM runs
 WHERE conversation_id = ? AND status IN ('queued', 'running');
 
+-- name: CountScheduledRunsByConversation :one
+-- Lifetime guard (评测 P1): a run created by the scheduler owns an
+-- occurrence and may still owe a pending delivery. Physically deleting it
+-- would leave schedule_occurrences.run_id dangling and make the delivery
+-- worker's GetRunByID fail → a timed-out notification.
+SELECT COUNT(*) AS n FROM runs
+WHERE conversation_id = ? AND trigger_type = 'scheduled';
+
+-- name: CountDeliveriesByConversation :one
+-- Same guard, direct: any delivery execution hanging off this
+-- conversation's runs must keep them alive.
+SELECT COUNT(*) AS n FROM delivery_executions d
+JOIN runs r ON r.id = d.run_id
+WHERE r.conversation_id = ?;
+
 -- name: TouchConversationUpdated :exec
 -- Sidebar ordering (评测 §十三): conversations.updated_at must move when a
 -- message lands, otherwise an old conversation never returns to the top of

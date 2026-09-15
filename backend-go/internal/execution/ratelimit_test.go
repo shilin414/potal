@@ -134,3 +134,39 @@ func TestLimiterRedisOutageLocalFallback(t *testing.T) {
 		t.Fatal("Degraded() = false during a Redis outage")
 	}
 }
+
+// TestUserAdmissionRedisDownStillBounded (评测 P1): the per-user limiter is
+// long-lived and meters per key, so a Redis outage must NOT fail open.
+//
+// A nil Redis client makes every AllowKey take the degraded in-process
+// path. A per-request limiter (the previous design) would have reset the
+// fallback state on every call and admitted everything.
+func TestUserAdmissionRedisDownStillBounded(t *testing.T) {
+	limiter := NewRateLimiter(nil, "rate:runs:user", 3, time.Second)
+	ctx := context.Background()
+
+	allowed := 0
+	for i := 0; i < 20; i++ {
+		ok, _, err := limiter.AllowKey(ctx, "rate:runs:user:1")
+		if err != nil {
+			t.Fatalf("AllowKey: %v", err)
+		}
+		if ok {
+			allowed++
+		}
+	}
+	if allowed == 0 {
+		t.Fatal("degraded limiter admitted nothing; the local fallback is broken")
+	}
+	if allowed > 3 {
+		t.Fatalf("degraded limiter admitted %d of 20 with limit 3 (fail-open)", allowed)
+	}
+	if !limiter.Degraded() {
+		t.Fatal("limiter must report degraded while Redis is unreachable")
+	}
+
+	// Keys are metered independently: a different user has its own budget.
+	if ok, _, err := limiter.AllowKey(ctx, "rate:runs:user:2"); err != nil || !ok {
+		t.Fatalf("second key must have its own budget (ok=%v err=%v)", ok, err)
+	}
+}

@@ -68,7 +68,6 @@ func (q *Queries) CreateFeishuIdentity(ctx context.Context, arg CreateFeishuIden
 }
 
 const createUser = `-- name: CreateUser :execresult
-
 INSERT INTO users (username, password_hash, display_name, display_id, email, role, auth_source, is_staff)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 `
@@ -84,7 +83,6 @@ type CreateUserParams struct {
 	IsStaff      bool
 }
 
-// ─────────────────────────────────────────────────────────── identity ──
 func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, createUser,
 		arg.Username,
@@ -228,6 +226,22 @@ func (q *Queries) GetUserByUsername(ctx context.Context, username string) (User,
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const lockUserRow = `-- name: LockUserRow :one
+
+SELECT id FROM users WHERE id = ? FOR UPDATE
+`
+
+// ─────────────────────────────────────────────────────────── identity ──
+// Per-user admission lock (评测 P1-7): the user's own row is the natural
+// serialization point for "count my outstanding runs / schedules, then
+// create one" — it makes those caps real instead of best-effort. Callers
+// hold it inside the same transaction that inserts the run/schedule.
+func (q *Queries) LockUserRow(ctx context.Context, id uint64) (uint64, error) {
+	row := q.db.QueryRowContext(ctx, lockUserRow, id)
+	err := row.Scan(&id)
+	return id, err
 }
 
 const rotateRefreshToken = `-- name: RotateRefreshToken :exec

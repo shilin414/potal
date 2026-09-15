@@ -52,6 +52,10 @@ var ErrConversationNotFound = errors.New("execution: conversation not found")
 // whole run creation rolls back.
 var ErrAttachmentClaimed = errors.New("execution: attachment already claimed")
 
+// ErrUserOutstandingExceeded marks a CreateRun refused by the per-user
+// outstanding-run cap (评测 P1-7). The check is atomic with the insert.
+var ErrUserOutstandingExceeded = errors.New("execution: too many outstanding runs")
+
 // Service implements the Run lifecycle on top of MySQL.
 type Service struct {
 	DB      *sql.DB
@@ -135,6 +139,41 @@ func (s *Service) CreateRun(ctx context.Context, in *CreateRunInput) (*Run, erro
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	runID, err := s.CreateRunInTx(ctx, tx, in)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.GetRun(ctx, runID)
+}
+
+// CreateRunAdmitted creates a run under the per-user outstanding cap
+// (评测 P1-7). The user row is locked, the queued+running count is read
+// under that lock and the run is inserted in the SAME transaction, so N
+// concurrent submits can no longer all observe the same count and
+// overshoot the cap. maxOutstanding <= 0 disables the cap.
+func (s *Service) CreateRunAdmitted(ctx context.Context, in *CreateRunInput, maxOutstanding int) (*Run, error) {
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	q := db.New(tx)
+
+	if maxOutstanding > 0 && in.UserID != 0 {
+		if _, err := q.LockUserRow(ctx, uint64(in.UserID)); err != nil {
+			return nil, fmt.Errorf("user admission lock: %w", err)
+		}
+		n, err := q.CountOutstandingRunsByUser(ctx, sql.NullInt64{Int64: in.UserID, Valid: true})
+		if err != nil {
+			return nil, fmt.Errorf("user admission count: %w", err)
+		}
+		if n >= int64(maxOutstanding) {
+			return nil, ErrUserOutstandingExceeded
+		}
+	}
 	runID, err := s.CreateRunInTx(ctx, tx, in)
 	if err != nil {
 		return nil, err

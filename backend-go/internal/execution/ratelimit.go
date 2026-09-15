@@ -61,18 +61,30 @@ return {1, '0'}
 // aggregate rate then bounds at limit × worker-count instead of the
 // shared limit, which is still far safer than unbounded), and reports
 // degraded=true for monitoring.
+//
+// The limiter is designed to be LONG-LIVED. AllowKey lets one instance
+// serve many dynamic scopes (e.g. one key per user) while the local
+// fallback keeps per-key state — creating a limiter per request would
+// reset that state and silently turn the outage fallback into fail-open
+// (评测 P1).
 type RateLimiter struct {
 	rdb    *redisx.Client
 	key    string
 	limit  int           // events per period
 	period time.Duration // e.g. 1s
 
-	// local fallback state (GCRA tat in microseconds, same math as the
-	// Lua script) + degraded flag for monitoring.
+	// local fallback state (GCRA tat per Redis key, in microseconds, same
+	// math as the Lua script) + degraded flag for monitoring. Bounded: the
+	// map never grows past localStateMax entries (keys are dropped
+	// wholesale at the cap — the fallback is a blast-radius guard, not a
+	// precise per-tenant meter).
 	localMu  sync.Mutex
-	localTat atomic.Int64
+	localTat map[string]int64
 	degraded atomic.Bool
 }
+
+// localStateMax bounds the in-process fallback map.
+const localStateMax = 4096
 
 // NewRateLimiter builds a GCRA limiter: `limit` events per `period`,
 // shared across every worker instance via Redis.
@@ -80,9 +92,16 @@ func NewRateLimiter(rdb *redisx.Client, key string, limit int, period time.Durat
 	return &RateLimiter{rdb: rdb, key: key, limit: limit, period: period}
 }
 
-// Allow attempts to consume one token. When denied it returns how long
-// the caller should wait.
+// Allow attempts to consume one token from the limiter's own key. When
+// denied it returns how long the caller should wait.
 func (l *RateLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, err error) {
+	return l.AllowKey(ctx, l.key)
+}
+
+// AllowKey is Allow against a caller-supplied Redis key — one long-lived
+// limiter can then meter many scopes (per user, per tenant) without
+// losing the local fallback state between calls.
+func (l *RateLimiter) AllowKey(ctx context.Context, key string) (ok bool, wait time.Duration, err error) {
 	if l.limit <= 0 {
 		return true, 0, nil
 	}
@@ -96,8 +115,18 @@ func (l *RateLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, e
 	burstOffset := emissionMicro * int64(l.limit-1)
 	ttlMillis := int64(l.period/time.Millisecond)*int64(l.limit) + 1000
 
+	if key == "" {
+		key = l.key
+	}
+	// No Redis configured at all (dev/test wiring) is the same failure
+	// class as an outage: degrade to the in-process limiter rather than
+	// dereferencing a nil client.
+	if l.rdb == nil || l.rdb.Client == nil {
+		l.degraded.Store(true)
+		return l.allowLocal(key, time.Now().UnixMicro(), emissionMicro, burstOffset)
+	}
 	// Redis owns "now" for the shared window (Phase 3).
-	res, err := gcraLua.Run(ctx, l.rdb.Client, []string{l.key},
+	res, err := gcraLua.Run(ctx, l.rdb.Client, []string{key},
 		emissionMicro, burstOffset, ttlMillis).Slice()
 	if err != nil {
 		// Degraded mode: fall back to the in-process limiter with the
@@ -106,7 +135,7 @@ func (l *RateLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, e
 		// one worker while Redis is unreachable, and is reported through
 		// Degraded().
 		l.degraded.Store(true)
-		return l.allowLocal(time.Now().UnixMicro(), emissionMicro, burstOffset)
+		return l.allowLocal(key, time.Now().UnixMicro(), emissionMicro, burstOffset)
 	}
 	l.degraded.Store(false)
 	allowed, _ := res[0].(int64)
@@ -123,11 +152,18 @@ func (l *RateLimiter) Allow(ctx context.Context) (ok bool, wait time.Duration, e
 // (Redis unreachable). Expose as provider_limiter_degraded in metrics.
 func (l *RateLimiter) Degraded() bool { return l.degraded.Load() }
 
-// allowLocal runs the same GCRA decision in-process (per-worker bound).
-func (l *RateLimiter) allowLocal(nowMicro, emissionMicro, burstOffset int64) (bool, time.Duration, error) {
+// allowLocal runs the same GCRA decision in-process, per key (per-worker
+// bound while Redis is unreachable).
+func (l *RateLimiter) allowLocal(key string, nowMicro, emissionMicro, burstOffset int64) (bool, time.Duration, error) {
 	l.localMu.Lock()
 	defer l.localMu.Unlock()
-	tat := l.localTat.Load()
+	if l.localTat == nil {
+		l.localTat = make(map[string]int64)
+	}
+	if len(l.localTat) >= localStateMax {
+		l.localTat = make(map[string]int64, localStateMax)
+	}
+	tat := l.localTat[key]
 	if nowMicro < tat-burstOffset {
 		return false, time.Duration(tat-burstOffset-nowMicro) * time.Microsecond, nil
 	}
@@ -135,7 +171,7 @@ func (l *RateLimiter) allowLocal(nowMicro, emissionMicro, burstOffset int64) (bo
 	if nowMicro > newTat {
 		newTat = nowMicro
 	}
-	l.localTat.Store(newTat + emissionMicro)
+	l.localTat[key] = newTat + emissionMicro
 	return true, 0, nil
 }
 

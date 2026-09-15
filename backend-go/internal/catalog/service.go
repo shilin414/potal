@@ -161,6 +161,13 @@ func (s *Service) Create(ctx context.Context, in *CreateInput) (*Application, *B
 
 	if in.Runtime != nil {
 		b := bindingFromInput(id, in.Runtime)
+		// Record the provider FK (评测 P1): without it the join-based
+		// provider check has nothing to match and the kill switch fails
+		// open for API-created bindings.
+		if provider != nil {
+			pid := provider.ID
+			b.ProviderID = &pid
+		}
 		caps := adapterCapabilities(adapter)
 		bid, err := UpsertBindingTx(ctx, tx, b, caps)
 		if err != nil {
@@ -204,12 +211,13 @@ func (s *Service) Update(ctx context.Context, appID, callerID int64, isStaff boo
 	}
 
 	var adapter RuntimeAdapter
+	var provider *Provider
 	if runtime != nil {
-		a, _, err := s.validateRuntimeInput(ctx, runtime)
+		a, p, err := s.validateRuntimeInput(ctx, runtime)
 		if err != nil {
 			return nil, nil, err
 		}
-		adapter = a
+		adapter, provider = a, p
 	}
 
 	tx, err := s.DB.BeginTx(ctx, nil)
@@ -276,6 +284,11 @@ func (s *Service) Update(ctx context.Context, appID, callerID int64, isStaff boo
 	var updatedBinding *Binding
 	if runtime != nil {
 		b := bindingFromInput(appID, runtime)
+		// Keep the provider FK in sync on every binding update (评测 P1).
+		if provider != nil {
+			pid := provider.ID
+			b.ProviderID = &pid
+		}
 		caps := adapterCapabilities(adapter)
 		if _, err := UpsertBindingTx(ctx, tx, b, caps); err != nil {
 			return nil, nil, err

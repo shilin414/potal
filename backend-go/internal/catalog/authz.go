@@ -3,6 +3,7 @@ package catalog
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
@@ -29,6 +30,9 @@ var (
 	// ErrExecutionProviderInactive is returned to staff callers when the
 	// provider row exists but is not active.
 	ErrExecutionProviderInactive = errors.New("provider is not active")
+	// ErrExecutionProviderMissing is returned to staff callers when the
+	// binding's provider_key has no providers row at all.
+	ErrExecutionProviderMissing = errors.New("provider is not registered")
 )
 
 // Executable is the result of a successful AuthorizeExecution: the
@@ -54,11 +58,16 @@ type Executable struct {
 //	application.kind = 'chat'
 //	regular caller → is_public = 1 visibility == execution right
 //	runtime binding enabled = 1
-//	provider status = 'active'     (when the provider row exists)
+//	provider ACTIVE                matched by provider_key (fail closed)
 //
 // Staff bypass visibility only (they may execute private apps); a
 // disabled application is not executable by anyone — that is the whole
 // point of the admin kill switch.
+//
+// The provider check is deliberately keyed on `provider_key`, not on the
+// nullable `provider_id` (评测 P1): bindings created through the API did
+// not populate provider_id, so a NULL join let a disabled provider keep
+// executing. provider_key is the business key that is always present.
 func (s *Service) AuthorizeExecution(ctx context.Context, applicationID, userID int64, isStaff bool) (*Executable, error) {
 	row, err := s.repo().q(ctx).GetExecutionAuthBundle(ctx, db.GetExecutionAuthBundleParams{
 		ID:      uint64(applicationID),
@@ -70,21 +79,43 @@ func (s *Service) AuthorizeExecution(ctx context.Context, applicationID, userID 
 	if err != nil {
 		return nil, err
 	}
-	if row.ProviderStatus.Valid && row.ProviderStatus.String != "active" {
+	// Fail closed: no providers row, or a row that is not active, blocks
+	// execution for everyone (the kill switch must be absolute).
+	if !row.ProviderStatus.Valid {
+		if isStaff {
+			return nil, ErrExecutionProviderMissing
+		}
+		return nil, ErrExecutionForbidden
+	}
+	if row.ProviderStatus.String != "active" {
 		if isStaff {
 			return nil, ErrExecutionProviderInactive
 		}
 		return nil, ErrExecutionForbidden
 	}
-	app := &Application{
-		ID:       int64(row.AppID),
-		Slug:     row.AppSlug,
-		Name:     row.AppName,
-		Kind:     row.AppKind,
-		IsPublic: row.AppIsPublic,
-		Enabled:  row.AppEnabled,
-	}
-	binding := &Binding{
+	return &Executable{
+		Application: &Application{
+			ID:       int64(row.AppID),
+			Slug:     row.AppSlug,
+			Name:     row.AppName,
+			Kind:     row.AppKind,
+			IsPublic: row.AppIsPublic,
+			Enabled:  row.AppEnabled,
+		},
+		Binding: bindingFromExecutionAuthRow(row),
+	}, nil
+}
+
+// bindingFromExecutionAuthRow converts the authorization row into the
+// SAME Binding shape bindingFromRow produces.
+//
+// This is load-bearing (评测 P0): Binding.Snapshot() is frozen onto every
+// Run, and it writes timeout_seconds / config / capabilities
+// unconditionally. Dropping any of them silently zeroes the run's runtime
+// budget — a background run with timeout_seconds=0 fails immediately and
+// an interactive run loses its extended deadline.
+func bindingFromExecutionAuthRow(row db.GetExecutionAuthBundleRow) *Binding {
+	b := &Binding{
 		ID:                 int64(row.BindingID),
 		ApplicationID:      int64(row.AppID),
 		ProviderKey:        row.BindingProviderKey,
@@ -94,13 +125,16 @@ func (s *Service) AuthorizeExecution(ctx context.Context, applicationID, userID 
 		ExecutionMode:      row.BindingExecutionMode,
 		SessionPolicy:      row.BindingSessionPolicy,
 		ArtifactPolicy:     row.BindingArtifactPolicy,
+		TimeoutSeconds:     int64(row.BindingTimeoutSeconds),
 		Enabled:            row.BindingEnabled,
 	}
 	if row.BindingProviderID.Valid {
 		v := int64(row.BindingProviderID.Int64)
-		binding.ProviderID = &v
+		b.ProviderID = &v
 	}
-	return &Executable{Application: app, Binding: binding}, nil
+	_ = json.Unmarshal(row.BindingCapabilities, &b.Capabilities)
+	_ = json.Unmarshal(row.BindingConfig, &b.Config)
+	return b
 }
 
 // explainRejection turns a join miss into a precise error for staff and a

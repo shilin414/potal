@@ -179,16 +179,6 @@ func (s *Service) Create(ctx context.Context, ownerUserID int64, in *CreateInput
 	if err := s.validate(ctx, in, ownerUserID); err != nil {
 		return nil, err
 	}
-	// Per-user schedule quota (评测 P1-7).
-	if s.MaxSchedules > 0 {
-		n, err := s.q(ctx).CountSchedulesByOwner(ctx, uint64(ownerUserID))
-		if err != nil {
-			return nil, err
-		}
-		if n >= int64(s.MaxSchedules) {
-			return nil, &ValidationError{Msg: "定时任务数量已达上限"}
-		}
-	}
 	now := s.nowFunc().UTC()
 	next, err := NextRunAfter(in.ScheduleType, in.TriggerConfig, in.RunAt, in.Timezone, now)
 	if err != nil {
@@ -205,6 +195,22 @@ func (s *Service) Create(ctx context.Context, ownerUserID int64, in *CreateInput
 	}
 	defer func() { _ = tx.Rollback() }()
 	q := db.New(tx)
+
+	// Per-user schedule quota (评测 P1-7): the count runs under the user's
+	// row lock inside the create transaction, so N concurrent creates can
+	// no longer all observe the same "49" and overshoot the cap.
+	if s.MaxSchedules > 0 {
+		if _, err := q.LockUserRow(ctx, uint64(ownerUserID)); err != nil {
+			return nil, err
+		}
+		n, err := q.CountSchedulesByOwner(ctx, uint64(ownerUserID))
+		if err != nil {
+			return nil, err
+		}
+		if n >= int64(s.MaxSchedules) {
+			return nil, &ValidationError{Msg: "定时任务数量已达上限"}
+		}
+	}
 
 	var nextArg sql.NullTime
 	if !next.IsZero() {
@@ -480,7 +486,11 @@ func (s *Service) Update(ctx context.Context, id, userID int64, isStaff bool, in
 		next.ExecutionWindowSeconds = *in.ExecutionWindowSeconds
 	}
 	next.defaults()
-	if err := s.validate(ctx, next, userID); err != nil {
+	// Execution authorization is decided for the SCHEDULE OWNER, not for
+	// the caller (评测 P2): a staff member editing someone else's schedule
+	// must not point it at an application the owner cannot execute — that
+	// would save successfully and then fail on every fire.
+	if err := s.validate(ctx, next, cur.OwnerUserID); err != nil {
 		return nil, err
 	}
 	// Recompute from now; missed slots while editing are not replayed.
@@ -583,23 +593,21 @@ func (s *Service) SetEnabled(ctx context.Context, id, userID int64, isStaff, ena
 // so the row must survive. The scheduler scan (ListDueSchedules filters
 // deleted_at IS NULL) and every owner surface stop seeing it; occurrences,
 // runs and delivery executions are kept as history.
+//
+// The delivery CONFIG is kept too (评测 P1 — lock order): physically
+// deleting schedule_deliveries here would take locks in the order
+// deliveries→schedules, while the scheduler's admission takes
+// schedules→deliveries, which is a deadlock cycle. Keeping the config also
+// preserves the legacy fallback for occurrences whose delivery_snapshot_at
+// is still NULL.
 func (s *Service) Delete(ctx context.Context, id, userID int64, isStaff bool) error {
 	if _, err := s.Get(ctx, id, userID, isStaff); err != nil {
 		return err
 	}
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
+	if _, err := s.q(ctx).DeleteSchedule(ctx, uint64(id)); err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }()
-	q := db.New(tx)
-	if err := q.DeleteScheduleDeliveries(ctx, uint64(id)); err != nil {
-		return err
-	}
-	if _, err := q.DeleteSchedule(ctx, uint64(id)); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return nil
 }
 
 // ListDeliveries returns the delivery targets of an owned schedule.

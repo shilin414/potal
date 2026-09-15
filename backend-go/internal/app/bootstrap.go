@@ -32,6 +32,7 @@ func NewServer(cfg *config.Config, a *App) *transporthttp.Server {
 		Runs:               a.Runs,
 		Storage:            a.Storage,
 		RateLimitArtifacts: a.ArtifactsRL,
+		RunAdmission:       a.RunAdmissionRL,
 
 		Schedules: a.Schedules,
 		Scheduler: a.Scheduler,

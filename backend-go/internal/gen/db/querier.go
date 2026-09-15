@@ -72,6 +72,9 @@ type Querier interface {
 	// idx_runs_conversation_status (migration 0014).
 	CountActiveRunsByConversation(ctx context.Context, conversationID sql.NullInt64) (int64, error)
 	CountConversationByApplication(ctx context.Context, applicationID sql.NullInt64) (int64, error)
+	// Same guard, direct: any delivery execution hanging off this
+	// conversation's runs must keep them alive.
+	CountDeliveriesByConversation(ctx context.Context, conversationID sql.NullInt64) (int64, error)
 	CountMessagesByConversation(ctx context.Context, conversationID uint64) (int64, error)
 	// Invariant L: every target captured for a succeeded occurrence has a
 	// durable delivery execution row. The expectation is immutable history;
@@ -99,6 +102,11 @@ type Querier interface {
 	CountScheduleOverlapViolations(ctx context.Context) ([]CountScheduleOverlapViolationsRow, error)
 	// Invariant H: a terminal scheduled run and its occurrence must converge.
 	CountScheduledRunOccurrenceMismatch(ctx context.Context) (int64, error)
+	// Lifetime guard (评测 P1): a run created by the scheduler owns an
+	// occurrence and may still owe a pending delivery. Physically deleting it
+	// would leave schedule_occurrences.run_id dangling and make the delivery
+	// worker's GetRunByID fail → a timed-out notification.
+	CountScheduledRunsByConversation(ctx context.Context, conversationID sql.NullInt64) (int64, error)
 	// Per-user schedule cap (评测 P1-7): only live (non-deleted) schedules
 	// count against the quota.
 	CountSchedulesByOwner(ctx context.Context, ownerUserID uint64) (int64, error)
@@ -150,7 +158,6 @@ type Querier interface {
 	// UNIQUE (schedule_id, scheduled_at) is the idempotency barrier: a losing
 	// concurrent insert must be detected in Go via duplicate-key error.
 	CreateScheduleOccurrence(ctx context.Context, arg CreateScheduleOccurrenceParams) (sql.Result, error)
-	// ─────────────────────────────────────────────────────────── identity ──
 	CreateUser(ctx context.Context, arg CreateUserParams) (sql.Result, error)
 	// Authoritative clock read. State written in the same transaction derives
 	// its timestamps from this value or from CURRENT_TIMESTAMP(3) directly —
@@ -243,6 +250,12 @@ type Querier interface {
 	// The join itself cannot express the staff bypass, so the Go layer calls
 	// it with show_all for staff and is_public=1 for regular users (mirrors
 	// ListApplicationsByVisibility).
+	//
+	// The provider is joined by provider_key, NOT provider_id (评测 P1):
+	// provider_id is nullable and was left NULL by bindings created through
+	// the API, which silently disabled the provider kill switch. provider_key
+	// is the business key that always exists. A missing/inactive provider row
+	// fails the check closed in Go.
 	GetExecutionAuthBundle(ctx context.Context, arg GetExecutionAuthBundleParams) (GetExecutionAuthBundleRow, error)
 	// Reaper row lock: the lease is re-validated under lock inside the
 	// recovery transaction — a heartbeat that lands first wins the row.
@@ -350,6 +363,12 @@ type Querier interface {
 	// with a fresh snapshot. Affected rows must be 1; 0 means the row is missing
 	// and the caller fails closed (the next Acquire re-materializes it).
 	LockProviderAdmission(ctx context.Context, provider string) (sql.Result, error)
+	// ─────────────────────────────────────────────────────────── identity ──
+	// Per-user admission lock (评测 P1-7): the user's own row is the natural
+	// serialization point for "count my outstanding runs / schedules, then
+	// create one" — it makes those caps real instead of best-effort. Callers
+	// hold it inside the same transaction that inserts the run/schedule.
+	LockUserRow(ctx context.Context, id uint64) (uint64, error)
 	MarkOccurrenceDeliverySnapshotCaptured(ctx context.Context, id uint64) (sql.Result, error)
 	MarkOccurrenceQueued(ctx context.Context, arg MarkOccurrenceQueuedParams) (sql.Result, error)
 	// Run claim fan-out: the occurrence linked to this run enters 'running'.

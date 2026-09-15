@@ -59,6 +59,11 @@ type Server struct {
 
 	RateLimitArtifacts *execution.RateLimiter
 
+	// RunAdmission meters run creation per user (评测 P1-7). It is a
+	// long-lived limiter so the in-process fallback keeps per-user state
+	// when Redis is unreachable.
+	RunAdmission *execution.RateLimiter
+
 	// Schedule automation.
 	Schedules *schedule.Service
 	Scheduler *scheduler.Scheduler

@@ -49,6 +49,9 @@ type App struct {
 	Runs         *execution.Service
 	ArtifactsRL  *execution.RateLimiter
 	AilyExecutor *aily.Executor
+	// RunAdmissionRL is the long-lived per-user run-creation limiter
+	// (评测 P1-7): one object, dynamic keys, per-key fallback state.
+	RunAdmissionRL *execution.RateLimiter
 
 	// Schedule automation (fourth role: studio-scheduler).
 	Schedules        *schedule.Service
@@ -189,6 +192,8 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 		Oauth: oauth, Feishu: feishu,
 		Catalog: catalogSvc, CatalogRepo: catalogRepo, Registry: registry,
 		Runs: runs, ArtifactsRL: ailyExecutor.ArtifactsL, AilyExecutor: ailyExecutor,
+		RunAdmissionRL: execution.NewRateLimiter(rdb, rdb.Key("rate", "runs", "user"),
+			cfg.Runner.UserRunQPS, time.Second),
 		Schedules: schedSvc, Scheduler: schedJob,
 		DeliveryDispatch: disp, DeliverySender: feishuSender, DeliveryLimiter: deliveryLimiter,
 		ProviderSlots: execution.NewProviderSlots(dbh, "feishu_aily", maxInflight, cfg.Runner.LeaseSeconds),
