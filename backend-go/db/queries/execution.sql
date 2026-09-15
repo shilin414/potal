@@ -69,6 +69,18 @@ WHERE id = ? AND status = 'running' AND lease_epoch = ?;
 SELECT started_at FROM runs
 WHERE id = ? AND status = 'running' AND lease_epoch = ?;
 
+-- name: GetRunTimestamps :one
+-- Duration-metric observation ONLY (第七轮 P2-1). Called AFTER the finalize
+-- transaction commits, never inside it: a metrics read is a post-commit side
+-- effect, so a failure here must not be able to roll back the terminal
+-- transition (that would put a finished run back to running and drop its
+-- terminal event). Terminal rows are immutable, so reading them later is
+-- safe. Both bounds stay on the DB clock — the pair is only meaningful
+-- because MySQL wrote both.
+SELECT started_at, finished_at
+FROM runs
+WHERE id = ?;
+
 -- name: BeginProviderAttemptFenced :execresult
 -- Consumes ONE provider execution attempt, fenced by the current lease
 -- epoch. Called by the owner right before the provider submit; claim /

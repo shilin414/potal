@@ -1406,6 +1406,31 @@ func (q *Queries) GetRunStatus(ctx context.Context, id []byte) (string, error) {
 	return status, err
 }
 
+const getRunTimestamps = `-- name: GetRunTimestamps :one
+SELECT started_at, finished_at
+FROM runs
+WHERE id = ?
+`
+
+type GetRunTimestampsRow struct {
+	StartedAt  sql.NullTime
+	FinishedAt sql.NullTime
+}
+
+// Duration-metric observation ONLY (第七轮 P2-1). Called AFTER the finalize
+// transaction commits, never inside it: a metrics read is a post-commit side
+// effect, so a failure here must not be able to roll back the terminal
+// transition (that would put a finished run back to running and drop its
+// terminal event). Terminal rows are immutable, so reading them later is
+// safe. Both bounds stay on the DB clock — the pair is only meaningful
+// because MySQL wrote both.
+func (q *Queries) GetRunTimestamps(ctx context.Context, id []byte) (GetRunTimestampsRow, error) {
+	row := q.db.QueryRowContext(ctx, getRunTimestamps, id)
+	var i GetRunTimestampsRow
+	err := row.Scan(&i.StartedAt, &i.FinishedAt)
+	return i, err
+}
+
 const heartbeatLease = `-- name: HeartbeatLease :execresult
 UPDATE run_leases
 SET heartbeat_at = CURRENT_TIMESTAMP(3),

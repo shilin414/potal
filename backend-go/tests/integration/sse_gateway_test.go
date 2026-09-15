@@ -277,6 +277,161 @@ func TestSSESyntheticTerminalFramesMatchRunStatus(t *testing.T) {
 	}
 }
 
+// TestSSEStaleRunningSnapshotClosesAfterTerminalReplay (第七轮 P1).
+//
+// The snapshot the HTTP handler hands to the gateway is read BEFORE the
+// run finishes, so it can still say `running` while the replay already
+// carries the terminal event. The gateway must close on what the REPLAY
+// observed, never on that stale snapshot: otherwise the terminal Redis
+// message — which the live loop deduplicates against lastReplayed — never
+// reaches a return, and the server holds the connection open with
+// keepalives forever. No bad data is required; this is the normal
+// terminal outcome race.
+func TestSSEStaleRunningSnapshotClosesAfterTerminalReplay(t *testing.T) {
+	svc, rdb := testEnv(t)
+	if rdb == nil {
+		t.Skip("needs STUDIO_TEST_REDIS=1")
+	}
+	ctx := context.Background()
+	convID := seedConversation(t, svc)
+	runID := seedRunWithConversation(t, svc, "itest_sse_stale", convID)
+	// Cleanup order: LIFO, so the run (FK child) goes before the conversation.
+	deleteConversationFixture(t, svc, convID)
+	deleteRunFixture(t, svc, runID)
+
+	claimed, _, err := svc.ClaimRun(ctx, runID, "sse-worker", time.Minute)
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// T1/T2: the stale snapshot — status=running, taken before the run ends.
+	stale, err := svc.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stale.Status != execution.StatusRunning {
+		t.Fatalf("snapshot status = %q, want %q (the race needs a stale running snapshot)",
+			stale.Status, execution.StatusRunning)
+	}
+
+	// T4: the run finishes while the stream is about to replay — terminal
+	// CAS + terminal event in ONE transaction.
+	if err := svc.FinalizeOwnedRun(ctx, claimed.Run, claimed.Ownership, &execution.FinishInput{
+		Status:         execution.StatusSucceeded,
+		Output:         map[string]any{"text": "done"},
+		ProviderStatus: "Completed",
+	}); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+
+	ts := startSSEServerWithRun(t, svc, rdb, stale)
+	defer ts.Close()
+
+	reqCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(reqCtx, http.MethodGet, ts.URL, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("stream request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	frames := make(chan sseFrame, 32)
+	eof := make(chan struct{})
+	go func() {
+		defer close(eof)
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+		for sc.Scan() {
+			line := strings.TrimSpace(sc.Text())
+			if !strings.HasPrefix(line, "data:") {
+				continue // keepalive comments
+			}
+			var f sseFrame
+			if json.Unmarshal([]byte(strings.TrimPrefix(line, "data:")), &f) == nil {
+				frames <- f
+			}
+		}
+	}()
+
+	var terminal *sseFrame
+	deadline := time.Now().Add(5 * time.Second)
+	for terminal == nil && time.Now().Before(deadline) {
+		select {
+		case f, ok := <-frames:
+			if !ok {
+				t.Fatal("stream closed before replaying the terminal event")
+			}
+			if f.EventType == execution.EventRunCompleted {
+				cp := f
+				terminal = &cp
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	if terminal == nil {
+		t.Fatal("terminal replay frame never arrived")
+	}
+
+	// The server must close the stream itself, right after the terminal
+	// frame. Pre-fix the handler fell through to the live Redis loop, where
+	// the 500ms keepalive kept the body open with no further data frames.
+	select {
+	case <-eof:
+	case <-time.After(2 * time.Second):
+		t.Fatal("server kept the stream open after replaying a terminal event " +
+			"for a run whose status snapshot was stale (第七轮 P1)")
+	}
+}
+
+// TestSSEReplayStopsAtFirstTerminalEvent (第七轮 P1): a terminal event is a
+// HARD boundary. Dirty history can hold rows after it (the pre-0020
+// failed-then-completed shape), and replaying those would let a later frame
+// rewrite the outcome a client has already rendered — the same class of
+// damage 0020 repairs for stored history.
+func TestSSEReplayStopsAtFirstTerminalEvent(t *testing.T) {
+	svc, _ := testEnv(t)
+	runID := seedRun(t, svc, "itest_sse_boundary")
+	deleteRunFixture(t, svc, runID)
+
+	appendTestEvent(t, svc, runID, 1, execution.EventContentDelta, "delta-1")
+	appendTestEvent(t, svc, runID, 2, execution.EventRunFailed, "boom")
+	appendTestEvent(t, svc, runID, 3, execution.EventContentDelta, "after-terminal")
+
+	frames := readSSE(t, svc, runID)
+	if len(frames) != 2 {
+		t.Fatalf("got %d frames, want 2 (replay must stop at the terminal event): %v",
+			len(frames), frameTypes(frames))
+	}
+	if frames[1].EventType != execution.EventRunFailed {
+		t.Fatalf("last replayed frame = %q, want %q (a later frame must never follow a terminal one)",
+			frames[1].EventType, execution.EventRunFailed)
+	}
+	if frames[0].EventType != execution.EventContentDelta {
+		t.Fatalf("first replayed frame = %q, want %q", frames[0].EventType, execution.EventContentDelta)
+	}
+}
+
+func frameTypes(frames []sseFrame) []string {
+	out := make([]string, 0, len(frames))
+	for _, f := range frames {
+		out = append(out, f.EventType)
+	}
+	return out
+}
+
+// deleteConversationFixture removes a seeded conversation and its messages
+// at the end of the test. The report's §25 sweeps are DATABASE-WIDE, so a
+// leaked conversation is a leak the next verification run has to explain.
+func deleteConversationFixture(t *testing.T, svc *execution.Service, convID int64) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_, _ = svc.DB.ExecContext(ctx, `DELETE FROM messages WHERE conversation_id = ?`, convID)
+		_, _ = svc.DB.ExecContext(ctx, `DELETE FROM conversations WHERE id = ?`, convID)
+	})
+}
+
 // deleteRunFixture registers removal of a seeded run (and everything that
 // points at it) at the end of the test.
 //
@@ -292,6 +447,7 @@ func deleteRunFixture(t *testing.T, svc *execution.Service, runID ids.ID) {
 		for _, stmt := range []string{
 			`DELETE FROM run_events WHERE run_id = ?`,
 			`DELETE FROM run_leases WHERE run_id = ?`,
+			`DELETE FROM provider_execution_slots WHERE run_id = ?`,
 			`DELETE FROM runs WHERE id = ?`,
 		} {
 			_, _ = svc.DB.ExecContext(ctx, stmt, runID.Bytes())
@@ -304,11 +460,19 @@ func deleteRunFixture(t *testing.T, svc *execution.Service, runID ids.ID) {
 
 func startSSEServer(t *testing.T, svc *execution.Service, rdb *redisx.Client, runID ids.ID) *httptest.Server {
 	t.Helper()
-	gw := &sse.Gateway{Runs: svc, Redis: rdb, Keepalive: 500 * time.Millisecond}
 	run, err := svc.GetRun(context.Background(), runID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return startSSEServerWithRun(t, svc, rdb, run)
+}
+
+// startSSEServerWithRun hands the gateway a CALLER-SUPPLIED run snapshot —
+// exactly what the HTTP handler does (GetRun, then Stream). A stale
+// snapshot is the whole point of 第七轮 P1.
+func startSSEServerWithRun(t *testing.T, svc *execution.Service, rdb *redisx.Client, run *execution.Run) *httptest.Server {
+	t.Helper()
+	gw := &sse.Gateway{Runs: svc, Redis: rdb, Keepalive: 500 * time.Millisecond}
 	// Redis is injected per test; wrap Stream via closure so the test can
 	// pass its own client.
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

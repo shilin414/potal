@@ -1,10 +1,18 @@
 // Package sse implements the run event stream gateway:
 //
-//  1. Replay every persisted RunEvent from MySQL (sequence 0 → head).
-//  2. Subscribe the Redis pub/sub channel for live events.
+//  1. Subscribe the Redis pub/sub channel for live events.
+//  2. Replay every persisted RunEvent from MySQL (sequence 0 → first
+//     terminal event).
 //  3. Keepalive comment after 15s of silence.
-//  4. Close after replay when the run is already terminal, or after the
-//     first terminal live event.
+//  4. Close as soon as a terminal event is observed — in the replay, in
+//     the live loop, or synthesized from an already-settled run status.
+//
+// A terminal event is a HARD boundary (第七轮 P1): replay stops at the
+// first one and the handler returns regardless of what the caller's
+// `run.Status` snapshot said. The snapshot was read before the stream
+// opened, so it can still say `running` while the replay already carries
+// the terminal event — trusting the snapshot kept the connection open
+// (keepalive forever) after the client had been told the run ended.
 //
 // Frame format (validated frontend contract):
 //
@@ -121,8 +129,24 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 		}
 		lastReplayed = ev.Sequence
 		if execution.IsTerminalEventName(ev.EventType) {
+			// A terminal event ends the run's lifecycle, so it is the
+			// LAST frame this stream may carry — even if the table
+			// holds rows after it (dirty history: a pre-0020
+			// failed-then-completed shape). Stopping here also makes
+			// the terminal fact the replay itself observed, instead
+			// of the stale run.Status snapshot below.
 			replayedTerminal = true
+			break
 		}
+	}
+	if replayedTerminal {
+		// The stream has already delivered the end of the run. Returning
+		// here is what makes the contract "server closes after the
+		// terminal event" hold: the live loop would otherwise wait on
+		// Redis forever, and the terminal message it is waiting for has
+		// already been deduplicated by the `sequence <= lastReplayed`
+		// guard (第七轮 P1 — normal outcome race, no bad data required).
+		return
 	}
 	if execution.IsSettled(run.Status) {
 		// Belt-and-suspenders (修复计划 §19 fallback): the finalize

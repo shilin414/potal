@@ -74,6 +74,16 @@ type Service struct {
 	// finalize to make scheduled delivery requests durable before commit.
 	// Delivery execution is decoupled in a separate delivery package.
 	CreateDeliveryExecutionsTx func(ctx context.Context, tx *sql.Tx, run *Run) error
+
+	// RunDurationTimestamps reads the persisted DB-clock
+	// started_at/finished_at that the duration metric observes AFTER the
+	// finalize commit (第七轮 P2-1). Nil uses the SQL querier.
+	//
+	// It exists as a seam (same idea as aily.ProviderAPI): the property
+	// that has to hold is "a failing metric read can never roll back a
+	// terminal transition", and the only way to prove that against a real
+	// database is to fail the read on purpose.
+	RunDurationTimestamps func(ctx context.Context, runID ids.ID) (startedAt, finishedAt sql.NullTime, err error)
 }
 
 // DefaultRequeueDelay is used when Service.RequeueDelay is unset.

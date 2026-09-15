@@ -2,10 +2,14 @@ package execution
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"log/slog"
+	"time"
 
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
+	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
 )
 
 // FinalizeOwnedRun applies the terminal transition as ONE database
@@ -111,19 +115,10 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 		return err
 	}
 
-	// studio_run_duration is measured from the DB-clock timestamps the run
-	// row itself carries (第六轮 P2): started_at was stamped by MySQL in
-	// MarkRunStartedOwned and finished_at by the CAS above. Re-reading the
-	// ROW (not the caller's snapshot) is what makes the pair consistent;
-	// measuring against time.Now() compared a MySQL timestamp with the
-	// worker host clock, so host skew inflated, shrank or even negated the
-	// observed duration. NULL when the run never started (killed before it
-	// was allowed to execute) → no duration to observe.
-	finishedRow, err := q.GetRunForUpdate(ctx, own.RunID.Bytes())
-	if err != nil {
-		return err
-	}
-	durationSeconds, hasDuration := dbClockDuration(finishedRow.StartedAt, finishedRow.FinishedAt)
+	// NOTE (第七轮 P2-1): nothing reads the row for metrics here. The
+	// duration observation lives below, AFTER the commit — a read inside
+	// this transaction (however innocent) is a precondition for
+	// terminalization and can roll the terminal transition back.
 
 	// 4. Assistant message durability: inserted in the SAME transaction
 	// (评测 §二十 — previously Run succeeded + crash could lose the answer).
@@ -190,17 +185,78 @@ func (s *Service) FinalizeOwnedRun(ctx context.Context, run *Run, own ExecutionO
 	s.publishLive(ctx, own.RunID, sequence, terminalEvent, terminalPayload)
 	if s.Metrics != nil {
 		s.Metrics.RunTotal.WithLabelValues(run.Provider, in.Status).Inc()
-		// started_at is NULL for a run killed before it was allowed to
-		// execute (第四轮 P2) — such a run has no duration to observe.
-		// A clock-skewed pair is dropped rather than observed as a
-		// negative duration.
-		if hasDuration {
-			s.Metrics.RunDuration.
-				WithLabelValues(run.Provider, in.Status).
-				Observe(durationSeconds)
-		}
+		// studio_run_duration is re-read from the ROW (not the caller's
+		// snapshot) so both bounds stay on the DB clock: started_at was
+		// stamped by MySQL in MarkRunStartedOwned, finished_at by the
+		// CAS above. Measuring the pair against time.Now() mixed two
+		// clock authorities and host skew inflated, shrank or even
+		// negated the observed duration.
+		s.observeRunDuration(ctx, own.RunID, run.Provider, in.Status)
 	}
 	return nil
+}
+
+// RunDurationObservationTimeout bounds the detached duration read. It is
+// short because the observation is worth nothing next to the caller's
+// latency, and finite because a wedged database must not pin a worker.
+const RunDurationObservationTimeout = 2 * time.Second
+
+// observeRunDuration records studio_run_duration for a run that just
+// reached a terminal state (第七轮 P2-1).
+//
+// It runs strictly AFTER the finalize commit, on its own detached
+// connection, and every failure mode is a WARNING: a metrics read that
+// cannot complete must cost one missing sample and nothing else — never a
+// rolled-back terminal transition with the run back in `running`.
+//
+// The context is DETACHED from the caller (NewCleanupContext: keeps values
+// for log/trace correlation, drops cancellation and deadline) for the same
+// reason cleanup writes are: a cancelled execution context or a
+// disconnected caller must not silently suppress the observation. Both
+// timestamps come from the DB clock, and a missing or non-monotonic pair is
+// dropped rather than observed as a bogus sample.
+func (s *Service) observeRunDuration(ctx context.Context, runID ids.ID, provider, status string) {
+	if s.Metrics == nil {
+		return
+	}
+	log := s.Log
+	if log == nil {
+		log = slog.Default()
+	}
+
+	obsCtx, cancel := NewCleanupContext(ctx)
+	defer cancel()
+	obsCtx, cancelTimeout := context.WithTimeout(obsCtx, RunDurationObservationTimeout)
+	defer cancelTimeout()
+
+	startedAt, finishedAt, err := s.runTimestamps(obsCtx, runID)
+	if err != nil {
+		log.Warn("run duration observation skipped",
+			"run_id", runID.String(), "provider", provider, "status", status, "err", err)
+		return
+	}
+	seconds, ok := dbClockDuration(startedAt, finishedAt)
+	if !ok {
+		// No sample is the correct outcome for a run that never started
+		// (killed before it was allowed to execute) or a clock-skewed
+		// pair; a zero or negative duration would poison the histogram.
+		return
+	}
+	s.Metrics.RunDuration.WithLabelValues(provider, status).Observe(seconds)
+}
+
+// runTimestamps reads the persisted DB-clock bounds of a run. The nil seam
+// uses the SQL querier; tests inject a failing reader to prove a metric
+// read error can never roll back the finalize transaction (第七轮 P2-1).
+func (s *Service) runTimestamps(ctx context.Context, runID ids.ID) (sql.NullTime, sql.NullTime, error) {
+	if s.RunDurationTimestamps != nil {
+		return s.RunDurationTimestamps(ctx, runID)
+	}
+	row, err := s.q(ctx).GetRunTimestamps(ctx, runID.Bytes())
+	if err != nil {
+		return sql.NullTime{}, sql.NullTime{}, err
+	}
+	return row.StartedAt, row.FinishedAt, nil
 }
 
 // FailOwnedRun drives the run into the terminal failed state through the

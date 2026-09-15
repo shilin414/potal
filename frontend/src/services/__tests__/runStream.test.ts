@@ -136,3 +136,44 @@ describe('openRunStream historical replay', () => {
     expect(requests.length).toBeGreaterThanOrEqual(2);
   });
 });
+
+/**
+ * 第七轮 P2-2: terminal is a HARD boundary inside a single network chunk.
+ *
+ * HTTP, ReadableStream, nginx and TCP may coalesce several SSE frames into
+ * ONE read. The previous `frames.forEach` therefore kept dispatching
+ * whatever followed the terminal frame — a stale/dirty `run.failed`
+ * followed by `run.completed` would re-render a finished run as a success.
+ */
+describe('openRunStream same-chunk terminal boundary', () => {
+  it('stops dispatching events after a terminal frame in the same network chunk', async () => {
+    vi.useFakeTimers();
+    const events: string[] = [];
+    // ONE chunk, two frames — the framing boundary the consumer must honour.
+    mockFetchWithChunks([
+      { data: frame('run.failed', 2, {}) + frame('run.completed', 3, {}) },
+    ]);
+
+    openRunStream('r1', { onEvent: (e) => events.push(e.event_type) });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(events).toEqual(['run.failed']);
+  });
+
+  it('emits both frames when a non-terminal frame precedes a terminal one in the same chunk', async () => {
+    vi.useFakeTimers();
+    const events: string[] = [];
+    // run.retrying is NON-terminal: the same stream must keep reading
+    // across a requeue, so the guard must not stop at it.
+    mockFetchWithChunks([
+      { data: frame('run.retrying', 2, { reason: 'worker lease expired' }) + frame('run.completed', 3, {}) },
+    ]);
+
+    openRunStream('r1', { onEvent: (e) => events.push(e.event_type) });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(events).toEqual(['run.retrying', 'run.completed']);
+  });
+});

@@ -60,8 +60,19 @@ export function openRunStream(
           buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
           const frames = buffer.split(/\r?\n\r?\n/);
           buffer = frames.pop() || '';
-          frames.forEach((frame) => consumeFrame(frame, dispatch));
-          if (complete && buffer.trim()) consumeFrame(buffer, dispatch);
+          // A terminal event is a HARD boundary (第七轮 P2-2). HTTP,
+          // ReadableStream, nginx and TCP may all coalesce several SSE
+          // frames into ONE chunk, so the loop has to stop between frames —
+          // forEach would keep feeding events that follow the terminal one
+          // into the reducer (e.g. a stale/dirty run.failed followed by
+          // run.completed) and rewrite an outcome the UI already rendered.
+          for (const frame of frames) {
+            if (closed || sawTerminal) break;
+            consumeFrame(frame, dispatch);
+          }
+          if (complete && buffer.trim() && !closed && !sawTerminal) {
+            consumeFrame(buffer, dispatch);
+          }
         }
       } catch (error: any) {
         if (closed || error?.name === 'AbortError') return;

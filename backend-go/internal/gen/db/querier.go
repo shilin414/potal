@@ -343,6 +343,14 @@ type Querier interface {
 	// FinalizeOwnedRun can observe studio_run_duration.
 	GetRunStartedAt(ctx context.Context, arg GetRunStartedAtParams) (sql.NullTime, error)
 	GetRunStatus(ctx context.Context, id []byte) (string, error)
+	// Duration-metric observation ONLY (第七轮 P2-1). Called AFTER the finalize
+	// transaction commits, never inside it: a metrics read is a post-commit side
+	// effect, so a failure here must not be able to roll back the terminal
+	// transition (that would put a finished run back to running and drop its
+	// terminal event). Terminal rows are immutable, so reading them later is
+	// safe. Both bounds stay on the DB clock — the pair is only meaningful
+	// because MySQL wrote both.
+	GetRunTimestamps(ctx context.Context, id []byte) (GetRunTimestampsRow, error)
 	GetScheduleByID(ctx context.Context, id uint64) (Schedule, error)
 	GetScheduleDeliveryByID(ctx context.Context, id uint64) (ScheduleDelivery, error)
 	GetScheduleOccurrenceByID(ctx context.Context, id uint64) (ScheduleOccurrence, error)
