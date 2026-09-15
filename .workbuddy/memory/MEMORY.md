@@ -1,8 +1,8 @@
 # Creation Agent Studio — 项目长期记忆
 
-## Admission 状态（截至 2026-09-15 二轮复审后）
+## Admission 状态（截至 2026-09-15 三轮复审整改后）
 
-复审结论：91/A-，可作上线候选。基线 dev `b2112ad`。历次变更报告都在 `docs/` 下（按主题命名）。
+三轮复审 84/B+（二轮引入 P0）→ 五项已全部修复，预期回到 94~95/A（待复审确认）。基线 dev `12d98f8`。历次变更报告都在 `docs/` 下（按主题命名）。
 
 **执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot）已定型，不要改。**
 
@@ -20,6 +20,8 @@
 - attempt 语义：claim 不+attempt，唯一消耗点 `BeginProviderAttemptOwned`；ProviderSlot attempt-scoped member={run_id}:{lease_epoch}:{lease_token}；heartbeat 先 Run Lease 后 Slot
 - 队列三条 Stream `queue:<provider>:interactive|retry|scheduled` 权重 7:1:2（classScheduler）；retry 单事务 Run.available_at≡Outbox.available_at
 - delivery=At Least Once，`IdempotencyKey=DeliveryExecution.ID`；provider 并发权威=catalog `max_inflight`
+- **授权分类双保险（三轮 P0 教训）**：调用点必须先显式判 `err == nil` 成功路径，再 `executionDenied(err)` 分类——不允许只依赖分类器；`executionDenied(nil)` 恒 false（测试 `TestExecutionDeniedNilMeansSuccess` 锁定）；正向 Happy-Path 必须有真实链路测试（不许只测失败路径/mock resolver）
+- **Gate 语义（三轮定型）**：双检查点 level-triggered——Gate 1（worker claim 后）+ Gate 2（`execution.PreSubmitGate`，aily executor 在 ChatsL.Acquire 后、BeginProviderAttempt 前调用）；kill=cancel、pause/infra/未知 action=**Defer fail-closed**（`DeferOwnedRunAfter` 不改 priority、occurrence running→queued 同事务、outbox 用原优先级 class、新事件 `run.deferred`）；未知 GateAction 绝不允许继续 Handler（指标 `gate_unknown`）；run.started 在 Gate allow 之后才发；Execution Generation（严格 edge-triggered）明确不引入
 
 ### 数据库与 CI
 - **MySQL 5.7 基线**（TiDB 已退出，别加 TiDB 假设）：`192.168.211.26:20336`/`xiaoan`/`test_user`；DSN UTC（`loc=UTC`+`time_zone='+00:00'`）不能动；错误码 1213/1205 保留
@@ -32,7 +34,7 @@
 - 集成测试会写目标库；改 `db/queries/*.sql` 必须跑 sqlc generate（`~/go/bin/sqlc`）；`go run` 可能被杀软拦截，用 build+执行
 - 冒烟无泄漏判据：running=0/leases=0/slots=0/outbox(pending)=0/delivery(pending)=0/occurrence(pending)=0
 
-## 二轮复审整改（2026-09-15 完成，最新）
+## 二轮复审整改（2026-09-15）
 
 变更报告：`docs/potal 二轮复审整改变更报告（Scheduler错误分类·WorkerGate·run-now上限·Schedule行锁）.md`。复审基线 dev `b2112ad`，91/A- → 目标 A。
 
@@ -43,6 +45,10 @@
 - 新测试：`internal/app/authz_test.go`（3）+ `tests/integration/review2_fixes_test.go`（5，infra 重试/kill/pause/PATCH 竞态/pending cap）；测试结束要软删自己的 fixture schedule（flaky resolver 会让到期槽每 tick 报错）。
 - **教训**：集成测试 fixture 的 applications.slug 是 UNIQUE，重跑套件会撞——seed 数据带 UnixNano 后缀（gateFixture 模式）。
 - 本机无 gcc，`-race` 跑不了（CI Ubuntu 上跑）；本地用单测+集成覆盖。
+
+## 三轮复审整改（2026-09-15 完成，最新）
+
+报告：`docs/potal 第三轮复审整改变更报告（executionDenied-P0·PreSubmitGate·Defer保留优先级·run.started时点·fail-closed）.md`。修复二轮引入的 `executionDenied(nil)` P0（nil=成功被判拒绝→Schedule 面全瘫）+ Gate 2/Defer/run.started/fail-closed。核心新文件：`internal/execution/defer.go`、`internal/execution/gate.go`；新查询 `DeferRunFenced`/`DeferScheduledOccurrence`；测试 `tests/integration/review3_fixes_test.go`（11 个，含 Barrier 竞态与真实链路正向测试）；构造器 `app.NewBindingResolver`/`app.NewSchedulableChecker` 供测试与接线用。
 
 ### 下轮待办（复审遗留）
 SSE Hub 多路复用、Worker 阻塞 dispatcher、RunEvent 去 COUNT、client_request_id 幂等键、Sidebar keyset 分页、Conversation soft-delete、非终态 Run predicate 统一（waiting_input 等，启用 waiting/resume 前必须 P1）、Schedule Service 全 DB Clock、RateLimiter ctx/nil-Redis 边角。
