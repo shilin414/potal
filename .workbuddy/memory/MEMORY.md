@@ -21,6 +21,7 @@
 - **并发**：一 conversation 一个非终态 Run（409）；锁序 `users→conversations`；hard-delete cascade 必须显式带 `run_requests`/`provider_submissions`（无 FK 级联）。`waiting_external` 有界：`ExpireParkedExternalRuns` 用 DB 时钟−grace 收敛。
 - **sequence O(1)**：`runs.next_event_sequence` 锁内 SELECT FOR UPDATE→UPDATE x+1；绝不用 `COUNT(*)+1`；事件读取一律 LIMIT。
 - **前端**：store 异步写 functional setState；`activeRunId` compare-and-clear；拉取失败 null=未知不清空；`run.cancelled` 独立终态（execution_disabled=硬取消）不得映射 done；`run.deferred` 靠 `run.started` 清除；channel 发送可取消。
+- **antd 表单取值（P0，2026-09-16 事故）**：拼 payload 一律 `form.getFieldsValue(true)`；**绝不用 `validateFields()` / `getFieldsValue()` 的返回值**——它们只含**已注册 Form.Item 的路径**（rc-field-form 按注册路径重建对象），`setFieldsValue` 写入但无 Form.Item 对应的字段（深层 `deliveries[0].target_type`、`misfire_policy` 等）会被**静默丢弃**。组件级回归测试：`frontend/src/components/Schedules/__tests__/scheduleEditorPayload.test.tsx`（jsdom，文件头 `// @vitest-environment jsdom`；vitest include 已含 `.tsx`）。
 
 ## 工具与踩坑
 - **前端 CI**：`npx tsc --noEmit` / `npx vitest run` / `npx vite build`（不跑 eslint）。后端 CI：gofmt/vet/build/test/**race** + integration（mysql5.7+redis7）。本机无 gcc，-race 由 CI 兜。
