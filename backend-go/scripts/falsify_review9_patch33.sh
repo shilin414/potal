@@ -14,12 +14,23 @@
 #   3. drop 'accepted' from the capacity submission states
 #        → TestProviderCapacityHoldsAfterAcceptedWorkerCrash FAILs
 #          (a crashed worker's still-running provider chat stops counting)
-#   4. let the gateway send transient content.delta to legacy clients again
-#        → TestSSELegacyClientReceivesNoTransientDelta FAILs
-#          (an append-only client renders the delta/chunk overlap twice)
+#   4. let the hub subscriber deliver transient content.delta to legacy
+#      protocol clients again
+#        → TestHubSubscriberProtocolIsolation FAILs
+#          (a legacy subscriber receives content.delta on top of the durable
+#           chunk and renders the overlap twice)
 #
 # Same discipline as the earlier drivers; a test that cannot fail proves
 # nothing.
+#
+# Mutation 4 maintenance (Batch 5.1, P2-4): the capability gate used to live
+# in internal/transport/sse/sse.go's gateway frame loop and was proven by the
+# integration test TestSSELegacyClientReceivesNoTransientDelta. The SSE Hub
+# (Batch 4) moved the gate into Subscriber.accepts
+# (internal/transport/sse/hub_subscription.go) and the contract is now pinned
+# by TestHubSubscriberProtocolIsolation (legacy vs protocol-2 fan-out). The
+# mutation retargets THAT code and THAT test — production code stays
+# untouched.
 set -u
 export PATH="/usr/bin:/bin:/c/software/Git/cmd:$PATH"
 cd "$(dirname "$0")/.." || exit 1
@@ -45,6 +56,17 @@ run_test() { # pattern
 verdict() { # pattern → FAIL | PASS
   local out
   out="$(run_test "$1")"
+  if echo "$out" | grep -q "FAIL"; then echo FAIL; else echo PASS; fi
+}
+
+run_pkg_test() { # package pattern
+  go test "$1" -run "$2" -count=1 -timeout 300s 2>&1 \
+    | grep -E "^(--- FAIL|--- PASS|FAIL|ok)" | head -5
+}
+
+pkg_verdict() { # package pattern → FAIL | PASS
+  local out
+  out="$(run_pkg_test "$1" "$2")"
   if echo "$out" | grep -q "FAIL"; then echo FAIL; else echo PASS; fi
 }
 
@@ -145,28 +167,33 @@ revert internal/gen/db/execution.sql.go
 report "accepted provider chat keeps occupying capacity (restored)" PASS "$(verdict 'TestProviderCapacityHoldsAfterAcceptedWorkerCrash')"
 
 echo "=== 4. §二十四: legacy clients get transient content.delta again ==="
-snapshot internal/transport/sse/sse.go
+# Retargeted (Batch 5.1, P2-4): the gate now lives in Subscriber.accepts
+# (internal/transport/sse/hub_subscription.go) — mutated by switching the
+# protocol comparison to a constant false, so legacy subscribers receive the
+# transient delta they must never see. The contract test is the sse package's
+# TestHubSubscriberProtocolIsolation.
+snapshot internal/transport/sse/hub_subscription.go
 python - <<'PYEOF'
 import io
-p = 'internal/transport/sse/sse.go'
+p = 'internal/transport/sse/hub_subscription.go'
 s = io.open(p, encoding='utf-8').read()
 old = (
-    '\t\t\tif frame.Sequence == 0 &&\n'
-    '\t\t\t\tframe.EventType == execution.EventContentDelta &&\n'
-    '\t\t\t\tprotocol < StreamProtocolRangeDelta {\n'
+    '\tif ev.Sequence == 0 && ev.EventType == execution.EventContentDelta &&\n'
+    '\t\ts.protocol < StreamProtocolRangeDelta {\n'
 )
-assert old in s, "mutation 4 anchor missing"
+assert s.count(old) == 1, "mutation 4 anchor missing or ambiguous"
 new = (
-    '\t\t\tif frame.Sequence == 0 &&\n'
-    '\t\t\t\tframe.EventType == execution.EventContentDelta &&\n'
-    '\t\t\t\tfalse { // FALSIFICATION: capability gate removed\n'
+    '\tif ev.Sequence == 0 && ev.EventType == execution.EventContentDelta &&\n'
+    '\t\tfalse { // FALSIFICATION: capability gate removed\n'
 )
 s = s.replace(old, new, 1)
 io.open(p, 'w', encoding='utf-8', newline='\n').write(s)
 PYEOF
-report "legacy client receives no transient delta (mutated)" FAIL "$(verdict 'TestSSELegacyClientReceivesNoTransientDelta')"
-revert internal/transport/sse/sse.go
-report "legacy client receives no transient delta (restored)" PASS "$(verdict 'TestSSELegacyClientReceivesNoTransientDelta')"
+report "legacy subscriber receives no transient delta (mutated)" FAIL \
+  "$(pkg_verdict ./internal/transport/sse/ TestHubSubscriberProtocolIsolation)"
+revert internal/transport/sse/hub_subscription.go
+report "legacy subscriber receives no transient delta (restored)" PASS \
+  "$(pkg_verdict ./internal/transport/sse/ TestHubSubscriberProtocolIsolation)"
 
 echo
 echo "=== leftovers (both must be empty) ==="
