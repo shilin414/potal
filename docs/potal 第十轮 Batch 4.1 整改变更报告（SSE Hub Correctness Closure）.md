@@ -81,9 +81,22 @@ sequence >  lastDelivered+1  → FORWARD GAP：拒绝该帧，从 MySQL 补 [las
   走下一轮，绝不重复发送），并同步 `RememberDurable` 预热 cache（不 fan-out，与 replay 一致）。
 * **terminal 仍是硬边界**：补齐过程中遇到 terminal → 写 101 再写 102 → 关闭，绝不 `102 CLOSE`
   （AC-4.1-4）。
-* **fail closed（AC-4.1-5）**：读失败 / 日志给不出 `through` → 什么都不写，直接结束连接。客户端
-  用「最后连续游标」重连，走正常 replay 补齐。**重复帧只是观感问题，丢一帧是内容丢失**，所以
-  任何情况下都不把缺口透传给客户端。
+* **fail closed（AC-4.1-5）**：读失败 / 日志给不出 `through` → 结束连接，客户端用「最后连续游标」
+  重连，走正常 replay 补齐。**重复帧只是观感问题，丢一帧是内容丢失**，所以任何情况下都不把缺口
+  透传给客户端。
+
+> **AC-4.1-5 的文字修正（Batch 4.1.1 §19）**：原文"什么都不写"只对**第一笔 DB read 就失败**成立。
+> 准确的契约是：
+>
+> ```text
+> Gap repair 失败时：
+> 绝不发送第一条未经连续性证明的 durable frame，也绝不发送其后的任何 frame。
+> 已经成功验证并发送的连续前缀允许保留，
+> 客户端随后从其实际收到的最高连续 cursor 重连。
+> ```
+>
+> 已写出的 SSE frame 无法撤回，要求回滚是做不到的；真正的保证是"从第一帧未被证明连续的
+> durable frame 起，一帧都不再发"。
 
 第 31 条要求也对上了：补齐走的就是 MySQL replay 路径，帧数继续计入
 `studio_sse_replay_events_total`；新增
@@ -352,3 +365,17 @@ message keyset 分页 / 前端长对话）。
 本轮明确未扩大范围：sequence allocator 本身没有问题（问题是 commit 后 publish 的 wall-clock
 顺序与 DB sequence 顺序不是同一件事），故 `provider_submissions`、Provider 容量、Worker lease、
 ownership epoch、请求幂等、terminal DB 事务、UTF-8 range 对账全部未动。
+
+### 4.1.1 修正记录
+
+> 上述 FROZEN 判定在 Batch 4.1 复审中被**暂时撤销**：复审发现 §6 的锁序整改把初始 idle timer
+> 留在 `newRunHub` constructor 内且不持 `hub.mu`，而 `armIdleTimerLocked` 会调用
+> `time.AfterFunc`，其 callback（`evictIfIdle`）在另一 goroutine 上清 `idleTimer` / 置
+> `closed` ⇒ **真实 data race**；`SSE_HUB_IDLE_TTL` 只校验 `> 0`，`1ns` 是合法配置，callback
+> 可以赢过赋值，于是 GetOrCreate 会发布一个已取消的 Hub。
+>
+> 该 P1 连同一条 P2（`repairDurableGap` 应显式校验权威日志自身连续）由
+> `Batch 4.1.1 — Hub Initial Timer Race Closure` 关闭，见
+> `docs/potal 第十轮 Batch 4.1.1 整改变更报告（Hub Initial Timer Race Closure）.md`；
+> 本文档 §2.2 的 AC-4.1-5 措辞亦按该批 §19 修正为"连续前缀允许保留"。
+> 4.1.1 全部门禁通过后，上表 FROZEN 判定恢复有效。
