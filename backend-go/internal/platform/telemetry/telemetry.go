@@ -90,6 +90,16 @@ type Metrics struct {
 	// completes.
 	SSEStreamProtocolTotal *prometheus.CounterVec // {protocol}
 
+	// WorkerDispatchTotal counts how the worker dispatcher routed claimed
+	// runs (Batch 5): routed = a runtime handler was found and called;
+	// provider_mismatch / snapshot_mismatch / route_missing = the run was
+	// terminal-failed by the dispatcher itself. The result label is a CLOSED
+	// enum and the label set stops there ON PURPOSE — a run id, user id or
+	// conversation id here would turn a routing health series into a
+	// cardinality incident. Run OUTCOMES stay with studio_runs_total:
+	// `routed` says the executor was reached, not that the run succeeded.
+	WorkerDispatchTotal *prometheus.CounterVec // {provider, runtime_type, result}
+
 	// Production alerting surface (剩余问题报告 P3): one decision counter for
 	// provider admission, a reaper counter, a confirmed ownership-loss
 	// counter, fair-dispatch accounting and delivery retries. These are the
@@ -363,6 +373,12 @@ func NewMetrics(service string) *Metrics {
 			Name: "studio_sse_stream_protocol_total",
 			Help: "Accepted SSE streams by negotiated stream_protocol (1 = durable frames only, 2 = transient deltas included).",
 		}, []string{"protocol"}),
+		WorkerDispatchTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "studio_worker_dispatch_total",
+			Help: "Worker dispatcher routing decisions by provider, runtime_type and result: routed (a runtime handler " +
+				"was found and called), provider_mismatch / snapshot_mismatch / route_missing (the dispatcher " +
+				"terminal-failed the run itself). Alert on any non-routed result.",
+		}, []string{"provider", "runtime_type", "result"}),
 		RunReaperTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "studio_run_reaper_total",
 			Help: "Expired run leases recovered (requeued or failed) by the reaper.",
@@ -476,6 +492,7 @@ func NewMetrics(service string) *Metrics {
 		m.SSEHubSubscriberDroppedTotal, m.SSEHubUpstreamFailureTotal,
 		m.SSEHubCacheEvents, m.SSEHubCacheBytes,
 		m.SSELiveGapRepairTotal,
+		m.WorkerDispatchTotal,
 	)
 	return m
 }

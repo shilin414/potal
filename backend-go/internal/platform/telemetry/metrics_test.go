@@ -180,6 +180,64 @@ func TestSSEStreamProtocolMetricLabelShape(t *testing.T) {
 	}
 }
 
+// TestWorkerDispatchMetricLabelShape pins the Batch 5 dispatch metric's
+// shape: exactly [provider, runtime_type, result], and `result` is the
+// CLOSED four-value routing enum — never a run id, a user id, a worker id
+// or an ad-hoc status string. This series answers "how are claims being
+// routed"; letting an unbounded label in would turn a routing health
+// series into a cardinality incident.
+func TestWorkerDispatchMetricLabelShape(t *testing.T) {
+	m := NewMetrics("test")
+	for _, result := range []string{
+		"routed", "provider_mismatch", "snapshot_mismatch", "route_missing",
+	} {
+		m.WorkerDispatchTotal.
+			WithLabelValues("feishu_aily", "agent", result).Add(0)
+	}
+
+	got := gatherNames(t, m)["studio_worker_dispatch_total"]
+	if got == nil {
+		t.Fatal("studio_worker_dispatch_total is not exported")
+	}
+	if len(got.GetMetric()) != 4 {
+		t.Fatalf("studio_worker_dispatch_total series = %d, want 4 (one per closed result value)",
+			len(got.GetMetric()))
+	}
+	results := map[string]bool{}
+	for _, metric := range got.GetMetric() {
+		lps := metric.GetLabel()
+		if len(lps) != 3 {
+			t.Fatalf("studio_worker_dispatch_total labels = %v, want exactly [provider, runtime_type, result]", lps)
+		}
+		// Prometheus sorts label names alphabetically — assert the NAME SET,
+		// not the positions.
+		names := map[string]bool{}
+		for _, lp := range lps {
+			names[lp.GetName()] = true
+		}
+		for _, want := range []string{"provider", "runtime_type", "result"} {
+			if !names[want] {
+				t.Fatalf("studio_worker_dispatch_total labels = %v, want [provider, runtime_type, result]", lps)
+			}
+		}
+		if len(names) != 3 {
+			t.Fatalf("studio_worker_dispatch_total labels = %v, want exactly the three names", lps)
+		}
+		for _, lp := range lps {
+			if lp.GetName() == "result" {
+				results[lp.GetValue()] = true
+			}
+		}
+	}
+	for _, want := range []string{
+		"routed", "provider_mismatch", "snapshot_mismatch", "route_missing",
+	} {
+		if !results[want] {
+			t.Errorf("studio_worker_dispatch_total has no result=%q series", want)
+		}
+	}
+}
+
 // TestSSEHubMetricsAreExported pins the Batch 4 (SSE Hub) observability surface.
 //
 // These are the series the canary reads, and the only ones that can prove the
