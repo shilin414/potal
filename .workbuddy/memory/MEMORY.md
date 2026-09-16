@@ -5,8 +5,20 @@
 
 ## 当前状态
 - 仓库 `shilin414/potal`，分支 `dev`。执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot/Lease/Heartbeat/Gate）与第九轮 **冻结**，不得顺手改。
-- 第十轮 Batch 4 / 4.1 / 4.1.1 / **4.1.2** 全部收口，**SSE Hub 永久 FROZEN**（4.1.2 为 test-only），报告 `docs/potal 第十轮 Batch 4*`。**下一步：Batch 5 — Worker Dispatcher**，不再扩大 Batch 4 生产范围。
-- migration 基线 = **24**（0021 run_requests / 0022 provider_submissions / 0023 next_event_sequence / 0024 容量索引）。Batch 4 系列**无 migration**。
+- 第十轮 Batch 4 / 4.1 / 4.1.1 / **4.1.2** 全部收口，**SSE Hub 永久 FROZEN**（4.1.2 为 test-only）。**Batch 5 — Worker Dispatcher + Batch 5.1 Freeze Gate Closure 已完成并 FINAL FROZEN**（报告 `docs/potal 第十轮 Batch 5 Worker Dispatcher 整改变更报告.md` §7）。**下一步：Batch 6 — 优先 Aily Workflow Runtime**（验证同 provider 不同 runtime_type 不同 Executor）。
+- migration 基线 = **24**（0021 run_requests / 0022 provider_submissions / 0023 next_event_sequence / 0024 容量索引）。Batch 4/5 系列**无 migration**。
+
+## Batch 5/5.1 — Worker Dispatcher（FINAL FROZEN —— 动手前先读 `docs/potal 第十轮 Batch 5*.md`）
+- **新包 `internal/workerdispatch`**（不动 execution、不动 catalog）：`RegisterProvider` 严格校验（空 key / 空 routes / 空 runtime_type / `none` 拒绝 / handler nil / `Slots.Provider != Spec.Key` / 重复注册 / **FailureSink nil** / **typed-nil HealthProbe**）+ routes defensive copy；unknown provider `ResolveProvider` 报错，cmd/worker **exit 2 且先于任何 consumer group/XREADGROUP/claim**。
+- **5.1 typed-nil 硬化（P2-2）**：Go 的 nil `*T` 装进接口后 `== nil` 为 false——注册校验必须用 `isNilLike`（reflect），否则 `var executor *SomeExecutor` 会拖到第一笔业务请求 panic、`HealthFunc(nil)` 会杀死 worker metrics goroutine（普通 goroutine panic 杀整个进程）。错误：`ErrNilFailureSink` / `ErrNilHealthProbe`。
+- **route identity = canonical `Run.Provider + Run.RuntimeType`**（CreateRun 冻结列）；snapshot 的 `provider_key`/`runtime_type` 只做「present AND different → fail closed」（`runtime_route_snapshot_mismatch`），缺失不失败；**绝不**用 snapshot 做主路由、**绝不** fallback 到 agent（missing route = `runtime_handler_unavailable` ownership-fenced terminal fail，防 lease/reaper 死循环）。**两条 snapshot guard 各有独立反证**（5.1 P2-3/P2-4：provider guard 由 `TestSnapshotProviderMismatchFailsClosed` + Mutation H 钉住）。
+- **ProviderSlots 是 provider-wide**：同 provider 全部 runtime routes 共用一个 semaphore（app.go `ailySlots` 与 `ProviderSlots` 兼容别名是**同一对象**，wiring 集成测试有断言）。
+- Dispatcher 只选 Handler + 对自身三类路由问题 terminal fail；handler 错误**原样透传**（不 Retry/Finalize/改写）；**无 `defer recover()`**（Worker 已有 panic recovery，双层会改 retry 语义）；`FailureSink` 最小权限（生产 `runs.WorkerOwned()`），`ErrLostOwnership` 原样传播。
+- `cmd/worker`：execution 分支零具体 Executor 引用；provider monitor 泛化 `plan.Provider/Slots/Health`，**仅 plan != nil 才启动**（delivery worker 不再采样 Aily）；启动日志 `worker provider registered provider=... runtime_types=[...] concurrency=...`。
+- 指标 `studio_worker_dispatch_total{provider,runtime_type,result}`，result 封闭枚举 `routed/provider_mismatch/snapshot_mismatch/route_missing`，无 run/user 等高基数 label。
+- **CI integration gate 必须包含 `./internal/app/...`**（5.1 P2-1 教训：wiring 测试要 STUDIO_TEST_DB/REDIS，unit job 恒 SKIP，integration job 不列包就永远不会在 CI 真跑）。
+- **已知生命周期顺序特征（记录不重构）**：Dispatcher 路由检查在 `run.started`/ProviderSlots admission 之后（Worker 既有顺序）；容量满时 unsupported runtime 先走 `provider_inflight_limit → requeue`，但错误 Executor/Provider API 永不会被调用。要提前终止需单独设计 Preflight。
+- 反证 `falsify_review10_batch5.sh`（A-H，**17/17**）；race gate 已追加 `./internal/workerdispatch/...`。**旧 `falsify_review9_patch33.sh` Mutation 4 已迁移到 `Subscriber.accepts`（hub_subscription.go）+ `TestHubSubscriberProtocolIsolation`，8/8**——SSE 生产代码零改动；锚点会随重构失效，改 sse 后必须复核脚本锚点。
 
 ## 本机三条操作红线
 - **同一文件绝不可并行发两个 Edit**：后写覆盖前写 = 静默丢失（实测被吃掉且**仍编译通过**）。串行改 + grep 复核。
@@ -41,4 +53,4 @@
 - **antd 表单取值（P0 事故）**：拼 payload 一律 `form.getFieldsValue(true)`；**绝不用 `validateFields()`/`getFieldsValue()` 的返回值**（只含已注册 Form.Item 的路径，其他字段被**静默丢弃**）。回归测试 `frontend/src/components/Schedules/__tests__/scheduleEditorPayload.test.tsx`。
 
 ## 历轮索引（细节见 `docs/`）
-十轮 **4**(单 upstream/有界 cache/协议隔离/register-before-replay/慢客户端隔离/terminal 硬边界) → **4.1**(live gap 修复/cache 字节硬上界/指标代际围栏/锁序) → **4.1.1**(constructor inert/初始 idle timer 竞态/canonical 连续性 fail-closed) → **4.1.2**(test-only：交错 B 确定性测试 + Mutation N)。九轮及以前：五轮 93/A- → 六轮 98/A+ → 八轮 P1 关闭 → 九轮（幂等 0021 / 提交状态机 0022 / O(1) sequence 0023 / Streaming Range / 有效容量 + 协议协商，**冻结**）。
+十轮 **4**(单 upstream/有界 cache/协议隔离/register-before-replay/慢客户端隔离/terminal 硬边界) → **4.1**(live gap 修复/cache 字节硬上界/指标代际围栏/锁序) → **4.1.1**(constructor inert/初始 idle timer 竞态/canonical 连续性 fail-closed) → **4.1.2**(test-only：交错 B 确定性测试 + Mutation N) → **5**(Worker Dispatcher：provider+runtime_type 路由/unknown provider 启动失败/missing route fail-closed/snapshot guard/slots provider-wide，**冻结**)。九轮及以前：五轮 93/A- → 六轮 98/A+ → 八轮 P1 关闭 → 九轮（幂等 0021 / 提交状态机 0022 / O(1) sequence 0023 / Streaming Range / 有效容量 + 协议协商，**冻结**）。
