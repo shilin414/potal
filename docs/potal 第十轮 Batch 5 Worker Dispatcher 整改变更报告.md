@@ -107,7 +107,11 @@ npx vite build     EXIT=0
 
 `TestBuildRegistersFeishuAilyAgentDispatchPlan` 依赖 `STUDIO_TEST_DB/REDIS`，unit job 里必然 SKIP，而 integration job 的包清单没有 `./internal/app/...` —— 该测试在 GitHub CI 上从未真正执行。
 
-整改：`.github/workflows/backend.yml` 的 database-backed package tests 步骤加入 `./internal/app/...`。验证：Actions 日志必须出现 `--- PASS: TestBuildRegistersFeishuAilyAgentDispatchPlan`（本地集成环境 verbose 复验同为 PASS 非 SKIP）。
+整改：`.github/workflows/backend.yml` 的 database-backed package tests 步骤加入 `./internal/app/...`。
+
+**CI 红与修复（de3da86）**：首次纳入后 integration job 4 秒失败——CI 环境只提供 DB/Redis 变量（无 `.env.local`），`App.Build` 在 `crypto.NewAESGCM("")` 处报 `crypto: empty encryption secret`。修复：测试内 `t.Setenv` 提供一次性 `TOKEN_ENCRYPTION_KEY` 并显式 `APP_ENV=development`（本测试证明的是 wiring，不是密钥材料；development 钉死同时防未来 CI 端 production 设置把 `validateProduction` 拖进来）。
+
+最终证据（run @ `de3da86`）：`check` job success（unit + **race gate 含 workerdispatch**）；`integration` job 的 "database-backed package tests (real MySQL/Redis)" step success —— 上一轮同 step 正是因该测试真跑 Build 而失败，本轮同 step 通过即证明 `TestBuildRegistersFeishuAilyAgentDispatchPlan` 在 CI 真实执行且 PASS（本地集成环境 verbose 复验同为 `--- PASS`，非 SKIP）。
 
 ### P2-2：RegisterProvider 的 typed-nil 漏洞
 
@@ -146,9 +150,9 @@ capability gate 自 Batch 4 起位于 `internal/transport/sse/hub_subscription.g
 | AC-5.1-9 Mutation A-G 继续有效 | PASS | 反证 A-G 段全绿 |
 | AC-5.1-10/5.1-11 Mutation H + 反证 17/17 | PASS | falsify_review10_batch5.sh ok=17 bad=0 |
 | AC-5.1-12/5.1-13 旧 Mutation 4 迁移 + 8/8 | PASS | falsify_review9_patch33.sh ok=8 bad=0（零 SSE 生产改动） |
-| AC-5.1-14/5.1-15 CI integration 运行 internal/app 且 PASS | PASS | backend.yml integration step + Actions 日志 `--- PASS: TestBuildRegistersFeishuAilyAgentDispatchPlan` |
+| AC-5.1-14/5.1-15 CI integration 运行 internal/app 且 PASS | PASS | backend.yml integration step；run @ `de3da86`：同 step 前后两轮对照（上轮 4s 失败证明真跑，本轮 success）+ 本地 verbose `--- PASS` |
 | AC-5.1-16 go test ./... PASS | PASS | 全量绿 |
-| AC-5.1-17 -race 全绿 | PASS | race gate（含 workerdispatch）CI 通过 |
+| AC-5.1-17 -race 全绿 | PASS | run @ `de3da86` check job：race gate（含 workerdispatch）success |
 | AC-5.1-18 MySQL5.7 + Redis7 integration 全绿 | PASS | migrate ×2 + 包测试 + tests/integration |
 | AC-5.1-19 无 migration | PASS | baseline 24 |
 | AC-5.1-20 execution / SSE 冻结层无修改 | PASS | `git diff` 为空（仅脚本重定向） |

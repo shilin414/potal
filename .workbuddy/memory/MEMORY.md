@@ -16,7 +16,7 @@
 - Dispatcher 只选 Handler + 对自身三类路由问题 terminal fail；handler 错误**原样透传**（不 Retry/Finalize/改写）；**无 `defer recover()`**（Worker 已有 panic recovery，双层会改 retry 语义）；`FailureSink` 最小权限（生产 `runs.WorkerOwned()`），`ErrLostOwnership` 原样传播。
 - `cmd/worker`：execution 分支零具体 Executor 引用；provider monitor 泛化 `plan.Provider/Slots/Health`，**仅 plan != nil 才启动**（delivery worker 不再采样 Aily）；启动日志 `worker provider registered provider=... runtime_types=[...] concurrency=...`。
 - 指标 `studio_worker_dispatch_total{provider,runtime_type,result}`，result 封闭枚举 `routed/provider_mismatch/snapshot_mismatch/route_missing`，无 run/user 等高基数 label。
-- **CI integration gate 必须包含 `./internal/app/...`**（5.1 P2-1 教训：wiring 测试要 STUDIO_TEST_DB/REDIS，unit job 恒 SKIP，integration job 不列包就永远不会在 CI 真跑）。
+- **CI integration gate 必须包含 `./internal/app/...`**（5.1 P2-1 教训：wiring 测试要 STUDIO_TEST_DB/REDIS，unit job 恒 SKIP，integration job 不列包就永远不会在 CI 真跑）。**在 CI 调 `app.Build` 的测试必须自带最小 env**：CI integration job 只有 DB/Redis 变量、无 `.env.local`，`Build` 会在 `crypto.NewAESGCM("")` 爆炸（5.1 CI 红教训，测试里 `t.Setenv` 一次性 `TOKEN_ENCRYPTION_KEY` + `APP_ENV=development`）。
 - **已知生命周期顺序特征（记录不重构）**：Dispatcher 路由检查在 `run.started`/ProviderSlots admission 之后（Worker 既有顺序）；容量满时 unsupported runtime 先走 `provider_inflight_limit → requeue`，但错误 Executor/Provider API 永不会被调用。要提前终止需单独设计 Preflight。
 - 反证 `falsify_review10_batch5.sh`（A-H，**17/17**）；race gate 已追加 `./internal/workerdispatch/...`。**旧 `falsify_review9_patch33.sh` Mutation 4 已迁移到 `Subscriber.accepts`（hub_subscription.go）+ `TestHubSubscriberProtocolIsolation`，8/8**——SSE 生产代码零改动；锚点会随重构失效，改 sse 后必须复核脚本锚点。
 
