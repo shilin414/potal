@@ -298,13 +298,27 @@ go vet ./...                                通过
 go build ./...                              通过
 go test ./... -count=1                      通过
 STUDIO_TEST_DB=1 STUDIO_TEST_REDIS=1
-  go test ./tests/integration/ -count=1     全部通过（含新增 3 个）
+  go test ./tests/integration/ -count=1     全部通过（111s，含新增 3 个）
 npx tsc --noEmit                            通过
 npx vitest run                              18 文件 / 158 用例 全绿
 npx vite build                              通过
 ```
 
-本机无 gcc，`go test -race` 仍由 GitHub Actions 兜。
+本机无 gcc，`go test -race` 由 GitHub Actions 兜——**已通过**：
+
+```text
+commit        adc5621
+run           35047359734   backend    success
+job check        actionlint / gofmt / vet / build / go test（unit）
+                 go test -race (execution plane)                        全绿
+job integration  wait for mysql 5.7 / apply migrations（含第二次必须 no-op）
+                 database-backed package tests (real MySQL/Redis)
+                 integration tests                                      全绿
+```
+
+Frontend workflow 是路径过滤的（只吃 `frontend/**`），本补丁前端零改动，因此没有
+为 adc5621 触发 frontend run；前端以本地全套回归为准（上一次 frontend run
+35044964086 亦为 success）。
 
 ---
 
@@ -382,3 +396,22 @@ Conversation Lifecycle / message keyset 分页、Batch 7 长对话前端。
 1. **TiDB EXPLAIN 待部署环境执行**（§2.5，本机无可授权实例）。
 2. `provider_submissions` 的长期留存策略（归档 / 分区）仍未定；本补丁让准入不再
    依赖它的规模，但表本身仍随历史单调增长。
+
+---
+
+## 8. 交付
+
+```text
+commit   adc5621   fix(review9.3.1): drive capacity admission from active runs,
+                   bound the stream protocol
+branch   dev （c55f24c..adc5621）
+远程     origin/dev = adc5621（ls-remote 核对；本机 ref 缺陷已按既定手法修复）
+CI       backend run 35047359734  success（job check + job integration 全绿，含 -race）
+         前端零改动，frontend workflow 路径过滤未触发
+```
+
+同一提交内还包含工作区里**并行会话**尚未提交的两处改动（经用户确认一并提交）：
+`internal/delivery/worker.go`（`CASFinishDelivery` 的重复 status 占位符导致成功投递
+`sent_at` 恒为 NULL）及其对应的 `README.md` / `ENTERPRISE.md` 说明。这两处与 3.3.1
+无逻辑关联，仅因 `backend-go/README.md` 是两边共同修改的文件而无法拆分为独立提交。
+
