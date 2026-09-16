@@ -449,8 +449,141 @@ WHERE provider = ? AND run_id = ? AND lease_epoch = ? AND lease_token = ?
 
 -- name: CountActiveProviderSlots :one
 -- Active = not past its DB-clock expiry.
+--
+-- This is the CONTROLLED depth: slots a live worker currently owns. It is
+-- kept with its original meaning (diagnostics, orphan detection, the
+-- controlled leg of capacity metrics) and must NOT be used on its own as the
+-- admission bound — a provider execution can outlive its slot (worker crash
+-- after accept, waiting_external after an unknown submit). Admission uses
+-- CountProviderEffectiveInflight* below.
 SELECT COUNT(*) AS n FROM provider_execution_slots
 WHERE provider = ? AND expires_at > CURRENT_TIMESTAMP(3);
+
+-- name: CountProviderEffectiveInflight :one
+-- Provider EFFECTIVE inflight (第九轮补丁 3.3-A): the conservative count of
+-- real provider executions the admission plane must assume exist.
+--
+-- DISTINCT over two sources:
+--
+--   controlled — live (non-expired, DB-clock) provider slots;
+--   unresolved — non-settled runs whose provider submission is
+--                sending / unknown / accepted, i.e. a provider call that was
+--                transmitted and whose external action may still exist.
+--
+-- UNION (never UNION ALL) is load-bearing: during NORMAL execution the same
+-- run owns a slot AND has a sending/accepted submission, so the two legs are
+-- one execution. Adding the counts would double-count it.
+--
+-- rejected is deliberately excluded: the provider definitively refused, so
+-- no external action exists and counting it would leak capacity on every
+-- 400/401/403/429. Settled runs are excluded too: provider_submissions is
+-- history and keeps state='accepted' after the run succeeds, so without the
+-- runs.status filter every completed run would pin a slot forever.
+--
+-- The unresolved leg is not unbounded: ExpireParkedExternalRuns settles a
+-- waiting_external run after the configured unresolved-execution grace (~10
+-- min by default), which releases its reservation. See the ProviderSlots
+-- doc comment for the exact wording of the guarantee.
+SELECT COUNT(*) AS n
+FROM (
+    SELECT s.run_id
+    FROM provider_execution_slots s
+    WHERE s.provider = ?
+      AND s.expires_at > CURRENT_TIMESTAMP(3)
+
+    UNION
+
+    SELECT ps.run_id
+    FROM provider_submissions ps
+    JOIN runs r ON r.id = ps.run_id
+    WHERE ps.provider = ?
+      AND ps.state IN ('sending', 'unknown', 'accepted')
+      AND r.status NOT IN (
+          'cancelled',
+          'succeeded',
+          'failed',
+          'interrupted'
+      )
+) capacity_runs;
+
+-- name: CountProviderEffectiveInflightExcludingRun :one
+-- Same as CountProviderEffectiveInflight, minus one run — the run whose own
+-- admission is being decided.
+--
+-- Admission MUST exclude itself. A run whose submission is unresolved and
+-- whose slot expired (worker crash, or a reaper requeue) is still counted in
+-- the effective depth, so a global count would make it reject ITSELF:
+--
+--     max_inflight = 1
+--     Run A: submission=sending, slot expired, reaper requeued it
+--     new worker claims A → Acquire(A) → effective=1 → 1 >= max → rejected
+--
+-- A can then never re-enter the executor, and the queue entry that would
+-- have parked it in waiting_external is never consumed — a self-deadlock
+-- that no lease or timeout can break. Excluding self means a run is counted
+-- exactly once: either by its own remote reservation (before this acquired
+-- decision) or by the slot it is about to be granted, never twice and never
+-- zero.
+SELECT COUNT(*) AS n
+FROM (
+    SELECT s.run_id
+    FROM provider_execution_slots s
+    WHERE s.provider = ?
+      AND s.expires_at > CURRENT_TIMESTAMP(3)
+      AND s.run_id <> ?
+
+    UNION
+
+    SELECT ps.run_id
+    FROM provider_submissions ps
+    JOIN runs r ON r.id = ps.run_id
+    WHERE ps.provider = ?
+      AND ps.run_id <> ?
+      AND ps.state IN ('sending', 'unknown', 'accepted')
+      AND r.status NOT IN (
+          'cancelled',
+          'succeeded',
+          'failed',
+          'interrupted'
+      )
+) capacity_runs;
+
+-- name: CountProviderUncontrolledInflight :one
+-- UNCONTROLLED depth (diagnostics only, never an admission bound): provider
+-- executions that may still be running while no live worker owns a slot for
+-- them.
+--
+--     submission IN (sending, unknown, accepted)
+--     AND run non-settled
+--     AND no live provider_execution_slots row for that run
+--
+-- Healthy operation keeps this at ~0 (effective ≈ controlled). A SUSTAINED
+-- non-zero value means one of:
+--
+--     worker crash between accept and release
+--     waiting_external accumulation (unknown submit outcome)
+--     acceptance-persistence failure (ErrProviderAcceptancePersistence)
+--     provider reconciliation backlog
+--
+-- It is the leading indicator for the alert in the 3.3 metrics section: the
+-- effective count stays correct, but the share of capacity that no worker
+-- controls is growing.
+SELECT COUNT(DISTINCT ps.run_id)
+FROM provider_submissions ps
+JOIN runs r ON r.id = ps.run_id
+LEFT JOIN provider_execution_slots s
+  ON s.provider = ps.provider
+ AND s.run_id = ps.run_id
+ AND s.expires_at > CURRENT_TIMESTAMP(3)
+WHERE ps.provider = ?
+  AND ps.state IN ('sending', 'unknown', 'accepted')
+  AND r.status NOT IN (
+      'cancelled',
+      'succeeded',
+      'failed',
+      'interrupted'
+  )
+  AND s.run_id IS NULL;
 
 -- name: CreateProviderSlot :exec
 INSERT INTO provider_execution_slots

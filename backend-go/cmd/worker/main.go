@@ -125,8 +125,27 @@ func main() {
 					degraded = 1.0
 				}
 				a.Metrics.ProviderLimiterDegraded.Set(degraded)
+				// Provider capacity, all three faces (第九轮补丁 3.3-A §二十):
+				// effective is the bound admission enforces; controlled is what
+				// a live worker owns; uncontrolled is real provider work nobody
+				// owns. effective ≈ controlled and uncontrolled ≈ 0 is healthy —
+				// a sustained uncontrolled rise is the alert.
 				if depth, err := a.ProviderSlots.Depth(runCtx); err == nil {
 					a.Metrics.ProviderInflight.WithLabelValues("feishu_aily").Set(float64(depth))
+					a.Metrics.ProviderCapacityDepth.
+						WithLabelValues("feishu_aily", telemetry.CapacityEffective).Set(float64(depth))
+				}
+				if depth, err := a.ProviderSlots.ControlledDepth(runCtx); err == nil {
+					a.Metrics.ProviderCapacityDepth.
+						WithLabelValues("feishu_aily", telemetry.CapacityControlled).Set(float64(depth))
+				}
+				if depth, err := a.ProviderSlots.UncontrolledDepth(runCtx); err == nil {
+					a.Metrics.ProviderCapacityDepth.
+						WithLabelValues("feishu_aily", telemetry.CapacityUncontrolled).Set(float64(depth))
+					if depth > 0 {
+						logger.Warn("provider capacity is uncontrolled: real provider work has no live slot",
+							"provider", "feishu_aily", "uncontrolled_depth", depth)
+					}
 				}
 			}
 		}

@@ -32,6 +32,26 @@
 // silently restart every replay from the beginning, re-rendering the whole
 // answer.
 //
+// PROTOCOL CAPABILITY (第九轮补丁 3.3-B). Transient `content.delta` frames are
+// only safe to render for a client that can reconcile them against the durable
+// `content.chunk` frames that carry the same text:
+//
+//	GET /v2/runs/{id}/stream?stream_protocol=2
+//
+// A protocol-2 client reassembles by UTF-8 BYTE RANGE (`content.delta.offset`
+// and `content.chunk.offset` share one coordinate system), so an overlapping
+// transient/durable pair renders once. A legacy client has no offset and can
+// only append — and because the gateway can observe a durable chunk BEFORE the
+// buffered transient delta for the same bytes (reverse order is normal), an
+// append-only client renders "ABCABC".
+//
+// Negotiation, not duplicated reconciliation: a client that does not declare
+// protocol 2 simply does not receive transient deltas. It still receives every
+// durable `content.chunk` (written within ~500ms / ~2KB of the bytes being
+// produced), so the worst case is a slightly coarser streaming cadence — never
+// a lost or duplicated answer. The same shape is what the SSE Hub will
+// inherit: capability belongs to the SUBSCRIBER, not to the run.
+//
 // Frame format (validated frontend contract):
 //
 //	event: run.event\n
@@ -59,12 +79,51 @@ const (
 	defaultKeepalive = 15 * time.Second
 )
 
+// Stream protocol capabilities.
+const (
+	// StreamProtocolLegacy is what a client that sends no `stream_protocol`
+	// (or an unparsable / lower value) gets: durable frames only.
+	StreamProtocolLegacy = 1
+	// StreamProtocolRangeDelta declares that the client understands
+	// `content.delta.offset` and reconciles transient deltas against durable
+	// chunks by UTF-8 byte range. Only such a client receives transient
+	// `content.delta` frames.
+	StreamProtocolRangeDelta = 2
+)
+
+// StreamProtocolHeader advertises the protocol the response was rendered for.
+// It is for browser Network panels, logs and canary triage only — no client
+// logic may depend on it (the request parameter is the contract).
+const StreamProtocolHeader = "X-Studio-Stream-Protocol"
+
 // Gateway serves GET /api/v2/runs/{id}/stream for a single run.
 type Gateway struct {
 	Runs      *execution.Service
 	Redis     *redisx.Client
 	Keepalive time.Duration // defaults to 15s
 	Metrics   *telemetry.Metrics
+}
+
+// StreamProtocol resolves the client's declared SSE rendering capability.
+//
+// An absent, unparsable or out-of-range value degrades to the LEGACY
+// behaviour rather than failing the stream: the safe direction of a
+// capability negotiation is the smaller feature set, and a legacy client that
+// receives a 400 here would be broken by a server upgrade it cannot see. The
+// parameter is deliberately NOT carried in Last-Event-ID — the durable cursor
+// and the rendering capability are different dimensions, and a capability
+// that only arrives on reconnect would leave a mid-life upgrade with the
+// wrong wire format on one connection.
+func StreamProtocol(r *http.Request) int {
+	raw := r.URL.Query().Get("stream_protocol")
+	if raw == "" {
+		return StreamProtocolLegacy
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || v < StreamProtocolLegacy {
+		return StreamProtocolLegacy
+	}
+	return v
 }
 
 // ResumeCursor resolves the client's durable cursor. query `after` wins over
@@ -93,11 +152,25 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	// The client's declared rendering capability. Everything below — including
+	// the transient-delta filter in the live loop — is decided from this ONE
+	// value, so a connection cannot render half of its frames under one
+	// protocol and half under another.
+	protocol := StreamProtocol(r)
+	if g.Metrics != nil {
+		// The v1/v2 connection ratio is what the 3.3 rollout watches while old
+		// and new frontends coexist: while protocol 1 is still non-zero the
+		// backend must keep serving durable-only clients.
+		g.Metrics.SSEStreamProtocolTotal.WithLabelValues(strconv.Itoa(protocol)).Inc()
+	}
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache, no-transform")
 	h.Set("X-Accel-Buffering", "no")
 	h.Set("Connection", "keep-alive")
+	// Observability only (browser Network panel, logs, canary triage) — the
+	// client must not branch on it; the request parameter is the contract.
+	h.Set(StreamProtocolHeader, strconv.Itoa(protocol))
 	w.WriteHeader(http.StatusOK)
 	// Flush the response headers immediately. Go buffers them until the first
 	// write or flush, so without this a stream that has nothing to send yet
@@ -287,6 +360,21 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 			}
 			// Skip events already covered by the replay snapshot.
 			if frame.Sequence != 0 && frame.Sequence <= lastReplayed {
+				continue
+			}
+			// Capability gate (第九轮补丁 3.3-B): a legacy client cannot
+			// reconcile a transient delta against the durable chunk that
+			// carries the same bytes, so it must not receive one at all.
+			//
+			// ONLY content.delta is filtered. Sequence 0 is a transport
+			// marker, not a feature: a future transient control frame that
+			// needs no byte-range reconciliation must still reach legacy
+			// clients, so filtering "every sequence-0 frame" would silently
+			// drop it. The durable chunk path is untouched either way, which
+			// is what keeps the final answer complete for legacy clients.
+			if frame.Sequence == 0 &&
+				frame.EventType == execution.EventContentDelta &&
+				protocol < StreamProtocolRangeDelta {
 				continue
 			}
 			if !writeFrame(frame.Sequence, frame.EventType, frame.Payload, true) {

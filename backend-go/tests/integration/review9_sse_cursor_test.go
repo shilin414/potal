@@ -288,7 +288,11 @@ func TestSSETransientFrameCarriesNoResumeId(t *testing.T) {
 		})).Err()
 	}
 
-	frames, closed := rawStream(t, svc, rdb, runID, "", nil, publish)
+	// 第九轮补丁 3.3-B: transient content.delta is a protocol-2 frame set, so
+	// this test must DECLARE the capability — it asserts on the `id:` line of a
+	// transient frame, and a legacy client no longer receives one at all
+	// (TestSSELegacyClientReceivesNoTransientDelta pins that side).
+	frames, closed := rawStream(t, svc, rdb, runID, "stream_protocol=2", nil, publish)
 	if !closed {
 		t.Fatal("the stream must close after the live terminal frame")
 	}

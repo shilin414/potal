@@ -72,15 +72,44 @@ func (s *ProviderSlot) providerOr(def string) string {
 //
 //	Acquire  — serialized per provider by a CONFLICTING WRITE on the shared
 //	           admission-lock row, deletes expired slots, is idempotent for
-//	           the same ownership, and rejects once the active count reaches
-//	           max
+//	           the same ownership, and rejects once the EFFECTIVE count
+//	           reaches max
 //	Renew    — XX-only: refreshes an existing slot, never recreates one
 //	Release  — deletes exactly the caller's own ownership slot
 //	expiry   — DB clock + slot lease; a crashed worker's slot self-heals
 //
-// Invariant (with the merged heartbeat): Run Ownership alive ⇔ Provider Slot
-// alive, and the count of active slots is a STRICT upper bound on real
-// provider executions — Redis state loss cannot raise it.
+// Effective provider capacity (第九轮补丁 3.3-A) is the DISTINCT union of:
+//
+//  1. live ownership-scoped provider slots; and
+//  2. non-settled runs whose provider submission is sending / unknown /
+//     accepted.
+//
+// Within the configured unresolved-execution grace, this is the conservative
+// upper bound used by admission.
+//
+// The second leg is what makes the bound hold. A provider execution is not
+// bounded by its local slot: `provider_submissions` is the durable ledger of
+// provider-side side effects (migration 0022), so a request that reached the
+// provider and then lost its slot — worker crash after accept, an unknown
+// submit outcome parked in waiting_external, an acceptance-persistence
+// failure — still occupies real provider concurrency. Counting only the
+// live slots under-counted exactly those cases, and the (max+1)-th run was
+// then admitted against a provider already running `max` of them.
+//
+// It is a DISTINCT union over run_id, never a sum: a normally executing run
+// holds a slot AND has a sending/accepted submission, and those are ONE
+// execution. `rejected` (definitively refused — no external action exists)
+// and settled runs (the ledger keeps state='accepted' forever as history)
+// are excluded, otherwise capacity would leak on every 4xx and pin every
+// completed run.
+//
+// The bound is conservative but not eternal: an unresolved run is settled
+// (failed/provider_submit_unknown) once the unresolved-execution grace
+// expires, so the reservation is held for the uncertainty window and then
+// released. The invariant is therefore "a strict upper bound on every
+// locally non-settled provider execution that may still exist", not "the
+// provider is permanently bounded no matter what it does behind our back".
+// Ownership alive ⇔ Slot alive still holds for the CONTROLLED portion.
 type ProviderSlots struct {
 	DB          *sql.DB
 	Provider    string
@@ -114,7 +143,8 @@ func (l *ProviderSlots) leaseMicros() int64 {
 // Re-acquiring with the SAME ownership is idempotent (refreshes the expiry);
 // a run re-claimed by a new attempt gets a distinct row and must fit within
 // the limit independently. Returns the slot, whether it was admitted and the
-// post-decision active depth (for rejection metrics).
+// post-decision EFFECTIVE depth (for rejection metrics) — the count of other
+// runs' capacity plus this one, never a raw slot count.
 func (l *ProviderSlots) Acquire(ctx context.Context, own ExecutionOwnership) (*ProviderSlot, bool, int, error) {
 	if l == nil || l.DB == nil || l.MaxInflight <= 0 {
 		return nil, true, 0, nil
@@ -213,28 +243,55 @@ func (l *ProviderSlots) acquireOnce(ctx context.Context, own ExecutionOwnership,
 			// corruption; fail closed rather than over-admit.
 			return nil, false, 0, ErrProviderSlotLost
 		}
-		count, cerr := q.CountActiveProviderSlots(ctx, l.Provider)
+		// Depth is the OTHER runs' effective capacity plus this one: the
+		// count excludes this run_id on purpose (the slot just refreshed is
+		// this run's own capacity, and its unresolved submission is the same
+		// execution). There is deliberately NO max check here — refreshing a
+		// slot that already exists consumes no capacity, so a same-ownership
+		// re-acquire must never fail; rejecting it would strand a run whose
+		// capacity it is already holding.
+		other, cerr := q.CountProviderEffectiveInflightExcludingRun(ctx,
+			db.CountProviderEffectiveInflightExcludingRunParams{
+				Provider:   l.Provider,
+				RunID:      own.RunID.Bytes(),
+				Provider_2: l.Provider,
+				RunID_2:    own.RunID.Bytes(),
+			})
 		if cerr != nil {
 			return nil, false, 0, cerr
 		}
 		if err := tx.Commit(); err != nil {
 			return nil, false, 0, err
 		}
-		return slot, true, int(count), nil
+		return slot, true, int(other) + 1, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return nil, false, 0, err
 	}
 
-	// 5. Capacity check — the strict upper bound.
-	count, err := q.CountActiveProviderSlots(ctx, l.Provider)
+	// 5. Capacity check — the conservative bound over real provider work, as
+	// seen by the OTHER runs.
+	//
+	// Excluding this run is what keeps recovery possible: a run whose
+	// submission is still sending/unknown/accepted but whose slot has expired
+	// (worker crash, reaper requeue) is ITSELF part of the effective depth. A
+	// global count would reject it (1 >= max with max=1) and it could never
+	// re-enter the executor to consume the queue entry that parks it in
+	// waiting_external — a self-deadlock no timeout can break (§十).
+	other, err := q.CountProviderEffectiveInflightExcludingRun(ctx,
+		db.CountProviderEffectiveInflightExcludingRunParams{
+			Provider:   l.Provider,
+			RunID:      own.RunID.Bytes(),
+			Provider_2: l.Provider,
+			RunID_2:    own.RunID.Bytes(),
+		})
 	if err != nil {
 		return nil, false, 0, err
 	}
-	if int(count) >= l.MaxInflight {
+	if int(other) >= l.MaxInflight {
 		// Rejection writes nothing: the deferred rollback discards the
 		// serialization write, so concurrent rejections cannot conflict with
 		// each other at commit and cannot exhaust the retry budget.
-		return nil, false, int(count), nil
+		return nil, false, int(other), nil
 	}
 
 	// 6. Admit.
@@ -251,7 +308,7 @@ func (l *ProviderSlots) acquireOnce(ctx context.Context, own ExecutionOwnership,
 	if err := tx.Commit(); err != nil {
 		return nil, false, 0, err
 	}
-	return slot, true, int(count) + 1, nil
+	return slot, true, int(other) + 1, nil
 }
 
 // isRetryableAdmissionConflict reports whether err is an InnoDB
@@ -321,12 +378,57 @@ func (l *ProviderSlots) Release(ctx context.Context, slot *ProviderSlot) error {
 	return err
 }
 
-// Depth reports the current active (non-expired, DB-clock) slot count.
+// Depth reports the provider's EFFECTIVE inflight: the distinct count of real
+// provider executions admission believes exist — live slots union non-settled
+// sending/unknown/accepted submissions (see the ProviderSlots doc comment).
+//
+// It answers "how much of max_inflight does the admission plane consider
+// used", which is what a dashboard comparing inflight against real provider
+// concurrency needs. ControlledDepth is the narrower "how many of those does
+// a live worker own" question.
 func (l *ProviderSlots) Depth(ctx context.Context) (int, error) {
 	if l == nil || l.DB == nil || l.MaxInflight <= 0 {
 		return 0, nil
 	}
+	n, err := db.New(l.DB).CountProviderEffectiveInflight(ctx,
+		db.CountProviderEffectiveInflightParams{
+			Provider:   l.Provider,
+			Provider_2: l.Provider,
+		})
+	return int(n), err
+}
+
+// ControlledDepth reports the CONTROLLED portion of provider capacity: the
+// live (non-expired, DB-clock) ownership-scoped slots a worker currently
+// holds. It is the original CountActiveProviderSlots semantics, kept for
+// diagnostics — orphan-slot detection and the controlled leg of the capacity
+// metrics.
+//
+// It is NOT a safe admission bound: a provider execution outlives its slot
+// whenever a worker crashes after accept or a run parks in waiting_external.
+func (l *ProviderSlots) ControlledDepth(ctx context.Context) (int, error) {
+	if l == nil || l.DB == nil || l.MaxInflight <= 0 {
+		return 0, nil
+	}
 	n, err := db.New(l.DB).CountActiveProviderSlots(ctx, l.Provider)
+	return int(n), err
+}
+
+// UncontrolledDepth reports the UNCONTROLLED portion of provider capacity:
+// non-settled runs with a sending/unknown/accepted submission but no live
+// slot. Diagnostics only, never an admission bound.
+//
+// Healthy operation keeps this at ~0 (effective ≈ controlled). A sustained
+// non-zero value means real provider work is accumulating outside any
+// worker's control: a crash between accept and release, waiting_external
+// build-up, an acceptance-persistence failure, or reconciliation backlog.
+// This is the series to alert on — the effective count stays correct either
+// way, but the uncontrolled share is what grows before an incident does.
+func (l *ProviderSlots) UncontrolledDepth(ctx context.Context) (int, error) {
+	if l == nil || l.DB == nil || l.MaxInflight <= 0 {
+		return 0, nil
+	}
+	n, err := db.New(l.DB).CountProviderUncontrolledInflight(ctx, l.Provider)
 	return int(n), err
 }
 

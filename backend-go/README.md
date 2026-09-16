@@ -92,6 +92,30 @@ Schema 权威来源是 `db/migrations`——**不要**把任何 dump 的 `SHOW C
 滚动发布、多 Pod 灰度在本次升级不适用。若以后必须无停机，应改为两阶段：
 先让所有 Pod 跑「会推进计数器」的代码，再切到「读取计数器」的代码。
 
+### 补丁 3.3 的发布合同：Backend first，Frontend second
+
+`0024_provider_effective_capacity` 只增加一条索引（`provider_submissions`
+的 `(provider, state, run_id)`），不改任何列/行/状态语义，可以与 0022 时代
+的代码共存；但它之后的 **3.3 协议协商只存在于新 Backend**，所以顺序不能反。
+
+```text
+1. 执行迁移 0024（纯加索引，可在线）
+2. 全量部署 Backend 3.3（api / stream / worker / scheduler 全部切完）
+     —— 旧 frontend 不带 stream_protocol=2，Backend 自动只推 durable
+        content.chunk，不推 transient content.delta，因此天然安全
+3. 部署 Frontend 3.3（新前端带 stream_protocol=2）
+     —— 恢复低延迟 transient delta + durable chunk 双路
+4. 观测：provider controlled / uncontrolled / effective depth 与
+   SSE protocol v1/v2 连接占比，确认稳定后冻结
+```
+
+**禁止 frontend-first。** 旧 Backend 不认识 `stream_protocol`，会继续发送
+不带 byte offset 的 transient delta；新前端虽然能 fallback append，但网关的
+「durable chunk 先到、buffered delta 后到」线序仍可能造成重复渲染。
+
+后端把能力写在 SSE 响应头 `X-Studio-Stream-Protocol` 上，仅用于浏览器
+Network 面板 / 日志 / 灰度排查，客户端逻辑不得依赖它（请求参数才是合同）。
+
 然后：
 
 ```bash

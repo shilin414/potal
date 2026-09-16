@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 
-import { openRunStream } from '../runStream';
+import { openRunStream, STREAM_PROTOCOL_RANGE_DELTA } from '../runStream';
 
 type Chunk = { data: string; done?: boolean };
 
@@ -338,5 +338,80 @@ describe('openRunStream durable cursor', () => {
 
     expect(events.filter((e) => e === 'run.completed')).toHaveLength(1);
     expect(urls).toHaveLength(2);
+  });
+});
+
+/**
+ * 第九轮补丁 3.3-B: SSE stream protocol capability negotiation.
+ *
+ * Transient `content.delta` frames are only safe for a client that reconciles
+ * them against durable chunks by byte offset — the gateway may deliver the
+ * durable chunk FIRST, and an append-only client renders ABCABC. The client
+ * therefore declares the capability on the request, and the server decides
+ * which frame set to send.
+ *
+ * The declaration must be on EVERY connection, not just the first: it is a
+ * rendering capability, so folding it into the durable cursor (or letting it
+ * ride on Last-Event-ID) would leave a mid-life reconnect rendering under a
+ * protocol the server no longer knows about.
+ */
+describe('openRunStream protocol capability', () => {
+  function mockFetchSequence(responses: string[][], urls: string[]) {
+    const encoder = new TextEncoder();
+    let call = 0;
+    const fetchMock = vi.fn(async (input: unknown) => {
+      urls.push(String(input));
+      const chunks = responses[Math.min(call, responses.length - 1)] || [];
+      call += 1;
+      const remaining = chunks.slice();
+      const stream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          const next = remaining.shift();
+          if (!next) {
+            controller.close();
+            return;
+          }
+          controller.enqueue(encoder.encode(next));
+        },
+      });
+      return { ok: true, status: 200, body: stream } as unknown as Response;
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+
+  it('declares stream_protocol=2 on the very first connection', async () => {
+    vi.useFakeTimers();
+    const urls: string[] = [];
+    mockFetchSequence([[frame('run.completed', 1, {})]], urls);
+
+    const h = openRunStream('r1', { onEvent: () => {} });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    h.close();
+
+    expect(urls).toHaveLength(1);
+    // Without this the server must assume an append-only client and withhold
+    // the transient delta — the low-latency path would be silently dead.
+    expect(urls[0]).toContain(`stream_protocol=${STREAM_PROTOCOL_RANGE_DELTA}`);
+  });
+
+  it('declares the capability again on a reconnect, alongside the cursor', async () => {
+    vi.useFakeTimers();
+    const urls: string[] = [];
+    mockFetchSequence(
+      [[frame('content.chunk', 5, { text: 'a', offset: 1 })], [frame('run.completed', 6, {})]],
+      urls,
+    );
+
+    const h = openRunStream('r1', { onEvent: () => {} });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(3000);
+    h.close();
+
+    expect(urls.length).toBeGreaterThanOrEqual(2);
+    expect(urls[1]).toContain('after=5');
+    expect(urls[1]).toContain(`stream_protocol=${STREAM_PROTOCOL_RANGE_DELTA}`);
   });
 });

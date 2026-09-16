@@ -81,3 +81,64 @@ func TestProductionAlertingMetricsAreExported(t *testing.T) {
 		}
 	}
 }
+
+// TestProviderCapacityMetricsAreExported pins the 3.3-A observability surface
+// (第九轮补丁 §二十): the three capacity faces are what the rollout watches,
+// and the alert is defined on `kind="uncontrolled"` — so a rename or a dropped
+// label must fail here rather than silently un-arm the alert.
+func TestProviderCapacityMetricsAreExported(t *testing.T) {
+	m := NewMetrics("test")
+
+	for _, kind := range []string{CapacityEffective, CapacityControlled, CapacityUncontrolled} {
+		m.ProviderCapacityDepth.WithLabelValues("feishu_aily", kind).Set(0)
+	}
+	m.ProviderCapacityRejectTotal.
+		WithLabelValues("feishu_aily", CapacityRejectEffectiveInflightLimit).Add(0)
+	m.SSEStreamProtocolTotal.WithLabelValues("1").Add(0)
+	m.SSEStreamProtocolTotal.WithLabelValues("2").Add(0)
+
+	got := gatherNames(t, m)
+	for _, name := range []string{
+		"studio_provider_capacity_depth",
+		"studio_provider_capacity_reject_total",
+		"studio_sse_stream_protocol_total",
+	} {
+		if _, ok := got[name]; !ok {
+			t.Errorf("metric %s is not exported (3.3 capacity surface)", name)
+		}
+	}
+
+	// Every capacity face must be individually addressable, otherwise the
+	// "uncontrolled keeps rising" alert cannot be written.
+	kinds := map[string]bool{}
+	for _, metric := range got["studio_provider_capacity_depth"].GetMetric() {
+		for _, lp := range metric.GetLabel() {
+			if lp.GetName() == "kind" {
+				kinds[lp.GetValue()] = true
+			}
+		}
+	}
+	for _, want := range []string{CapacityEffective, CapacityControlled, CapacityUncontrolled} {
+		if !kinds[want] {
+			t.Errorf("studio_provider_capacity_depth has no kind=%q series", want)
+		}
+	}
+
+	// The three capacity kinds must be DIFFERENT label values — collapsing
+	// them would make the gauge read as a single number again, which is the
+	// defect 3.3-A removed from the underlying count.
+	depth := got["studio_provider_capacity_depth"]
+	for _, metric := range depth.GetMetric() {
+		var kind string
+		for _, lp := range metric.GetLabel() {
+			if lp.GetName() == "kind" {
+				kind = lp.GetValue()
+			}
+		}
+		if kind == CapacityEffective {
+			if metric.GetGauge().GetValue() != 0 {
+				t.Fatalf("effective gauge = %v, want the pinned 0", metric.GetGauge().GetValue())
+			}
+		}
+	}
+}

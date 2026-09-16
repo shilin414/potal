@@ -428,9 +428,10 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun, leaseRenewedA
 			return
 		}
 		if !ok {
-			w.Log.Warn("provider max_inflight reached; requeueing run",
+			w.Log.Warn("provider effective capacity reached; requeueing run",
 				"run_id", claimed.Run.ID.String(), "depth", depth)
 			w.recordProviderAdmission("provider_inflight_limit")
+			w.recordCapacityReject(telemetry.CapacityRejectEffectiveInflightLimit)
 			w.recordAdmission(telemetry.AdmissionCapacityRejected)
 			w.requeueForAdmission(ctx, claimed, "provider_inflight_limit")
 			return
@@ -482,6 +483,17 @@ func (w *Worker) execute(ctx context.Context, claimed *ClaimedRun, leaseRenewedA
 func (w *Worker) recordProviderAdmission(reason string) {
 	if w.Svc != nil && w.Svc.Metrics != nil {
 		w.Svc.Metrics.ProviderInflightRejected.WithLabelValues(w.Provider, reason).Inc()
+	}
+}
+
+// recordCapacityReject counts one rejection of the EFFECTIVE capacity decision
+// (第九轮补丁 3.3-A): the run was not admitted because another run may still
+// hold a real provider execution. Kept separate from ProviderInflightRejected
+// so the effective-bound rejections stay measurable on their own after the
+// limit's meaning changed.
+func (w *Worker) recordCapacityReject(reason string) {
+	if w.Svc != nil && w.Svc.Metrics != nil {
+		w.Svc.Metrics.ProviderCapacityRejectTotal.WithLabelValues(w.Provider, reason).Inc()
 	}
 }
 

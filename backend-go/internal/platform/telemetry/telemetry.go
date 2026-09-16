@@ -61,6 +61,35 @@ type Metrics struct {
 	ProviderInflight         *prometheus.GaugeVec
 	ProviderInflightRejected *prometheus.CounterVec
 
+	// Provider EFFECTIVE capacity (第九轮补丁 3.3-A §二十). One gauge, three
+	// kinds, because the interesting question is not "how much capacity is
+	// used" but "how much of it nobody controls":
+	//
+	//	effective    admission's real bound — distinct live slots UNION
+	//	             non-settled sending/unknown/accepted submissions
+	//	controlled   live ownership-scoped slots a worker holds right now
+	//	uncontrolled non-settled sending/unknown/accepted submissions with NO
+	//	             live slot
+	//
+	// Healthy operation is effective ≈ controlled and uncontrolled ≈ 0. A
+	// SUSTAINED rise in uncontrolled is the leading indicator: the effective
+	// bound stays correct, but real provider work is escaping worker control
+	// (crash between accept and release, waiting_external build-up, an
+	// acceptance-persistence failure, reconciliation backlog). Warn on
+	// uncontrolled > 0, alert when it keeps climbing.
+	ProviderCapacityDepth *prometheus.GaugeVec // {provider, kind}
+
+	// ProviderCapacityRejectTotal is the reason-tagged rejection counter for
+	// THE capacity decision (as opposed to ProviderInflightRejected, which
+	// predates the effective bound and is kept for continuity).
+	ProviderCapacityRejectTotal *prometheus.CounterVec // {provider, reason}
+
+	// SSEStreamProtocolTotal counts accepted streams per negotiated protocol,
+	// which is the ratio the 3.3 rollout watches while old and new frontends
+	// coexist: it goes to 0 for protocol 1 only after the frontend rollout
+	// completes.
+	SSEStreamProtocolTotal *prometheus.CounterVec // {protocol}
+
 	// Production alerting surface (剩余问题报告 P3): one decision counter for
 	// provider admission, a reaper counter, a confirmed ownership-loss
 	// counter, fair-dispatch accounting and delivery retries. These are the
@@ -71,6 +100,12 @@ type Metrics struct {
 	//	ownership loss spikes       (RunOwnershipLostTotal)
 	//	reaper spikes               (RunReaperTotal)
 	//	capacity_rejected sustained (ProviderAdmission{result="capacity_rejected"})
+	//
+	// Since 第九轮补丁 3.3-A the inflight reading to compare against real
+	// provider executions is ProviderCapacityDepth{kind="controlled"}
+	// (ProviderInflight is kept as its historical alias), while the bound
+	// admission actually enforces is ProviderCapacityDepth{kind="effective"}.
+	// The gap between them is the uncontrolled kind.
 	ProviderAdmission     *prometheus.CounterVec // {provider, result}
 	RunReaperTotal        prometheus.Counter
 	RunOwnershipLostTotal prometheus.Counter
@@ -119,6 +154,25 @@ const (
 	// was deferred fail-closed instead of submitted. Any sustained rate
 	// here is a gate implementation bug, not traffic.
 	AdmissionGateUnknown = "gate_unknown"
+)
+
+// Provider capacity depth kinds (ProviderCapacityDepth label values).
+const (
+	// CapacityEffective is what admission enforces: the distinct union of
+	// live slots and non-settled sending/unknown/accepted submissions.
+	CapacityEffective = "effective"
+	// CapacityControlled is the live ownership-scoped slot count.
+	CapacityControlled = "controlled"
+	// CapacityUncontrolled is provider work with no live slot owning it.
+	CapacityUncontrolled = "uncontrolled"
+)
+
+// Provider capacity rejection reasons (ProviderCapacityRejectTotal label
+// values).
+const (
+	// CapacityRejectEffectiveInflightLimit: another run may still hold a real
+	// provider execution, so this run was requeued instead of admitted.
+	CapacityRejectEffectiveInflightLimit = "effective_inflight_limit"
 )
 
 func NewMetrics(service string) *Metrics {
@@ -236,6 +290,20 @@ func NewMetrics(service string) *Metrics {
 			Name: "studio_provider_admission_total",
 			Help: "Provider admission decisions: admitted, capacity_rejected, lost_ownership, provider_slot_lost.",
 		}, []string{"provider", "result"}),
+		ProviderCapacityDepth: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "studio_provider_capacity_depth",
+			Help: "Provider concurrency capacity by kind: effective (the admission bound: distinct live slots UNION " +
+				"non-settled sending/unknown/accepted submissions), controlled (live slots) and uncontrolled " +
+				"(provider work with no live slot — alert when this keeps rising).",
+		}, []string{"provider", "kind"}),
+		ProviderCapacityRejectTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "studio_provider_capacity_reject_total",
+			Help: "Runs not admitted because another run may still hold a real provider execution.",
+		}, []string{"provider", "reason"}),
+		SSEStreamProtocolTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "studio_sse_stream_protocol_total",
+			Help: "Accepted SSE streams by negotiated stream_protocol (1 = durable frames only, 2 = transient deltas included).",
+		}, []string{"protocol"}),
 		RunReaperTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "studio_run_reaper_total",
 			Help: "Expired run leases recovered (requeued or failed) by the reaper.",
@@ -284,6 +352,8 @@ func NewMetrics(service string) *Metrics {
 		m.InvariantViolation, m.ProviderLimiterDegraded,
 		m.ProviderInflight, m.ProviderInflightRejected,
 		m.ProviderAdmission, m.RunReaperTotal, m.RunOwnershipLostTotal,
+		m.ProviderCapacityDepth, m.ProviderCapacityRejectTotal,
+		m.SSEStreamProtocolTotal,
 		m.PriorityDispatchTotal, m.DeliveryRetryTotal,
 		m.RunIdempotencyReplayTotal, m.RunIdempotencyConflictTotal,
 		m.ProviderSubmissionUnknownTotal, m.ProviderSubmissionDedupTotal,

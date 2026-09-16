@@ -943,6 +943,21 @@ paths:
         description: >-
           Durable cursor: replay only events with sequence > after. Takes
           precedence over the Last-Event-ID header.
+      - name: stream_protocol
+        in: query
+        required: false
+        schema:
+          type: integer
+          enum: [1, 2]
+          default: 1
+        description: |
+          SSE rendering capability.
+
+          Protocol 2 declares support for UTF-8 byte-offset reconciliation
+          between transient `content.delta` and durable `content.chunk`.
+
+          Legacy clients receive durable chunks but no transient
+          `content.delta` frames.
     get:
       operationId: streamRun
       tags: [runs]
@@ -962,12 +977,32 @@ paths:
         0 is a sentinel, and writing it would reset the browser's cursor to
         the beginning of the run.
 
+        PROTOCOL NEGOTIATION: `content.delta` is sent only to
+        `stream_protocol >= 2` clients. Both `content.delta` and
+        `content.chunk` carry an absolute UTF-8 BYTE end offset in their
+        payload, and a transient delta may be observed AFTER the durable chunk
+        holding the same bytes — so a client that cannot reconcile by byte
+        range (i.e. does not declare protocol 2) would render the overlap
+        twice. It receives the durable chunks instead, which are written within
+        ~500ms / ~2KB of the bytes being produced: coarser cadence, never a
+        lost or duplicated answer. `stream_protocol` is independent of `after`
+        / Last-Event-ID (a rendering capability is not a cursor position) and
+        must be declared on every connection.
+
+        The response carries `X-Studio-Stream-Protocol: <negotiated>` for
+        browser Network panels, logs and canary triage; clients must not branch
+        on it.
+
         Keepalive comment `: keepalive` after 15s of silence.
         Closes after replay when the run is already terminal, or after the
         first terminal live event.
       responses:
         "200":
           description: SSE stream
+          headers:
+            X-Studio-Stream-Protocol:
+              description: The protocol the response was rendered for (1 = durable only, 2 = transient deltas included).
+              schema: { type: integer }
           content:
             text/event-stream:
               schema:

@@ -26,6 +26,21 @@
  * replayed chunk that is fed to the reducer twice appends its text twice —
  * visibly duplicated output instead of a self-healing snapshot replace.
  *
+ * PROTOCOL NEGOTIATION (第九轮补丁 3.3-B). Transient `content.delta` frames are
+ * only rendered correctly by a client that reconciles them against the durable
+ * `content.chunk` frames carrying the same bytes — the gateway may legitimately
+ * deliver the durable chunk FIRST. The reducer does exactly that (shared UTF-8
+ * byte offsets), so this client declares it:
+ *
+ *   ?stream_protocol=2
+ *
+ * and the server answers with transient deltas. A client that does not declare
+ * it receives durable chunks only, which is why a backend-first rollout is
+ * safe: during it, every old frontend keeps streaming at a slightly coarser
+ * cadence and never double-renders. The parameter is deliberately separate
+ * from `after` — a rendering capability is not a cursor position, so it must
+ * be declared on EVERY connection rather than inherited from Last-Event-ID.
+ *
  * Terminal events (run.completed/failed/cancelled) end the subscription —
  * run.retrying and run.waiting_external are deliberately NON-terminal: a
  * requeued or parked attempt keeps the same stream alive (Execution
@@ -43,6 +58,15 @@ export interface RunStreamHandlers {
 const TERMINAL_EVENTS = new Set([
   'run.completed', 'run.failed', 'run.cancelled',
 ]);
+
+/**
+ * STREAM_PROTOCOL_RANGE_DELTA declares byte-offset reconciliation between
+ * transient deltas and durable chunks. It MUST match the server's
+ * `StreamProtocolRangeDelta` (backend-go/internal/transport/sse): a client that
+ * claims 2 but cannot reconcile would render duplicated text, and a client that
+ * fails to claim it merely streams coarser.
+ */
+export const STREAM_PROTOCOL_RANGE_DELTA = 2;
 
 /**
  * durableSequenceOf resolves the run sequence a frame advances the cursor to.
@@ -90,11 +114,21 @@ export function openRunStream(
       try {
         // Resume from the cursor: without it the gateway replays the run
         // from sequence 0 on every reconnect (the pre-第九轮 behaviour).
-        const cursor = lastDurableSequence > 0 ? `?after=${lastDurableSequence}` : '';
-        const response = await fetch(`${baseUrl}/v2/runs/${runId}/stream${cursor}`, {
-          credentials: 'same-origin', // studio_session cookie
-          signal: controller.signal,
-        });
+        //
+        // `stream_protocol` is sent on EVERY connection, including the first
+        // one: it describes what this client can RENDER, so it cannot be
+        // folded into the durable cursor (a reconnect is not an upgrade) or
+        // carried on Last-Event-ID.
+        const params = new URLSearchParams();
+        if (lastDurableSequence > 0) params.set('after', String(lastDurableSequence));
+        params.set('stream_protocol', String(STREAM_PROTOCOL_RANGE_DELTA));
+        const response = await fetch(
+          `${baseUrl}/v2/runs/${runId}/stream?${params.toString()}`,
+          {
+            credentials: 'same-origin', // studio_session cookie
+            signal: controller.signal,
+          },
+        );
         if (!response.ok) {
           throw new Error(`stream HTTP ${response.status}`);
         }

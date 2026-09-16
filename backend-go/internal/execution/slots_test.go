@@ -54,6 +54,46 @@ func TestProviderSlotsUnlimitedIsTransparent(t *testing.T) {
 	}
 }
 
+// TestProviderSlotsDisabledDepthFacesAreTransparent (第九轮补丁 3.3-A): all
+// three capacity faces must degrade to 0 with the limiter disabled rather
+// than touching the database. A nil-DB metric scrape (the worker polls these
+// every 5s) must not panic or fabricate a depth — and "depth 0" is the honest
+// reading, because a disabled limiter enforces nothing.
+func TestProviderSlotsDisabledDepthFacesAreTransparent(t *testing.T) {
+	l := NewProviderSlots(nil, "feishu_aily", 0, time.Minute)
+	ctx := context.Background()
+
+	if n, err := l.Depth(ctx); err != nil || n != 0 {
+		t.Fatalf("effective depth=%d err=%v, want 0/nil", n, err)
+	}
+	if n, err := l.ControlledDepth(ctx); err != nil || n != 0 {
+		t.Fatalf("controlled depth=%d err=%v, want 0/nil", n, err)
+	}
+	if n, err := l.UncontrolledDepth(ctx); err != nil || n != 0 {
+		t.Fatalf("uncontrolled depth=%d err=%v, want 0/nil", n, err)
+	}
+	if n, err := l.CleanupExpired(ctx); err != nil || n != 0 {
+		t.Fatalf("cleanup=%d err=%v, want 0/nil", n, err)
+	}
+}
+
+// TestProviderSlotsNilReceiverDepthFacesAreSafe: the metric collector holds a
+// *ProviderSlots that may be nil when no limiter is configured. Every face
+// must answer 0 instead of dereferencing it.
+func TestProviderSlotsNilReceiverDepthFacesAreSafe(t *testing.T) {
+	var l *ProviderSlots
+	ctx := context.Background()
+	if n, err := l.Depth(ctx); err != nil || n != 0 {
+		t.Fatalf("nil effective depth=%d err=%v, want 0/nil", n, err)
+	}
+	if n, err := l.ControlledDepth(ctx); err != nil || n != 0 {
+		t.Fatalf("nil controlled depth=%d err=%v, want 0/nil", n, err)
+	}
+	if n, err := l.UncontrolledDepth(ctx); err != nil || n != 0 {
+		t.Fatalf("nil uncontrolled depth=%d err=%v, want 0/nil", n, err)
+	}
+}
+
 func ownershipFixture(epoch uint64) ExecutionOwnership {
 	return ExecutionOwnership{
 		RunID:      ids.New(),
