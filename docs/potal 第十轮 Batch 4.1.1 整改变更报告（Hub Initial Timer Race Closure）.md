@@ -305,12 +305,31 @@ AC-4.1.1-2  所有 idleTimer 读写都发生在 hub.mu 下（5 个调用点逐�
 AC-4.1.1-3  manager.mu 与 hub.mu 继续保持不嵌套                                  PASS
 AC-4.1.1-4  无 subscriber 的新 Hub 仍会在 IdleTTL 后回收                          PASS
 AC-4.1.1-5  并发 subscriber 能可靠 stop initial idle timer                        PASS
-AC-4.1.1-6  合法的极短 IdleTTL（1ns）在 -race 下无 data race                      CI
+AC-4.1.1-6  合法的极短 IdleTTL（1ns）在 -race 下无 data race                      CI PASS
 AC-4.1.1-7  canonical gap repair 只有 ev.Sequence == last+1 才允许发送            PASS
 AC-4.1.1-8  canonical log 出现 hole 时，不发送 hole 后的 durable frame            PASS
 AC-4.1.1-9  Batch 4 / 4.1 原全部测试继续 PASS                                     PASS
-AC-4.1.1-10 backend unit / integration / race + frontend CI 全部 PASS             CI
+AC-4.1.1-10 backend unit / integration / race + frontend CI 全部 PASS             PASS
 ```
+
+### CI 证据（`95e0a60`，backend run 35074005255）
+
+```text
+check        actionlint / gofmt check / go vet / go build                success
+             go test (unit; integration gated by env)                    success
+             go test -race (execution plane + SSE hub)                   success   ← AC-4.1.1-6
+integration  apply migrations / 二次运行必须是干净 no-op                   success
+             database-backed package tests (real MySQL/Redis)            success
+             integration tests                                           success
+
+frontend     run 35069505412（f360fac）tsc / vitest / vite build          success
+             本批无 frontend 路径改动，workflow 未为 95e0a60 触发；
+             同一工作区本地实测 tsc / 158 tests / vite build 全绿
+```
+
+race 覆盖 `./internal/transport/sse/...`，也就是本批改动的包；本机无法跑 `-race`，该门由 CI 兜住。
+`TestTinyInitialIdleTTLIsRaceSafe`（`IdleTTL = 1ns`、60 轮跨代际）就在这组里跑，这是阻止
+`callback ↔ idleTimer assignment` 回归的真正门。
 
 ---
 
