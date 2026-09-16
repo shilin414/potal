@@ -168,10 +168,17 @@ jobs:
       # every lease / retry / schedule comparison. It used to be skipped
       # everywhere in CI (the unit job runs without STUDIO_TEST_DB), so a
       # server-side timezone regression could reach production unnoticed.
+      #
+      # internal/app/... is included for the same reason (Batch 5.1, P2-1):
+      # TestBuildRegistersFeishuAilyAgentDispatchPlan needs the real
+      # MySQL+Redis to build the app graph, and until 5.1 the integration job
+      # never listed the package — the wiring test was SKIPped in the unit
+      # job and never discovered here, so the most important Batch 5 wiring
+      # assertion never actually ran on CI.
       - name: database-backed package tests (real MySQL/Redis)
         run: |
           set -uo pipefail
-          if ! out=$(go test ./internal/execution/... ./internal/delivery/... ./internal/platform/... -count=1 -v 2>&1); then
+          if ! out=$(go test ./internal/execution/... ./internal/delivery/... ./internal/platform/... ./internal/app/... -count=1 -v 2>&1); then
             printf '%s\n' "$out"
             msg=$(printf '%s' "$out" | grep -E '^(--- FAIL|FAIL|panic:|\s+.*_test\.go:)' | tr '\n' ' ' | tr -s ' ' | tail -c 900)
             echo "::error title=database-backed package tests failed::$msg"
