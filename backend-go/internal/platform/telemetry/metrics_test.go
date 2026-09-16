@@ -142,3 +142,40 @@ func TestProviderCapacityMetricsAreExported(t *testing.T) {
 		}
 	}
 }
+
+// TestSSEStreamProtocolMetricLabelShape pins the telemetry half of the 3.3.1-B
+// invariant: `studio_sse_stream_protocol_total` is labeled by the NEGOTIATED
+// protocol only, and by nothing else.
+//
+// The cardinality property itself (that the negotiation can never produce more
+// than the two values this server implements) is asserted in the sse package,
+// where the negotiation and the label write are visible together
+// (TestSSEStreamProtocolMetricCardinalityIsBounded). What can only be checked
+// here is the SHAPE: a second label — a run id, a user, a raw requested version
+// kept "for debugging" — would multiply the series per client, and the fix in
+// the parser would not save it.
+func TestSSEStreamProtocolMetricLabelShape(t *testing.T) {
+	m := NewMetrics("test")
+	m.SSEStreamProtocolTotal.WithLabelValues("1").Add(0)
+	m.SSEStreamProtocolTotal.WithLabelValues("2").Add(0)
+
+	got := gatherNames(t, m)["studio_sse_stream_protocol_total"]
+	if got == nil {
+		t.Fatal("studio_sse_stream_protocol_total is not exported")
+	}
+	if len(got.GetMetric()) != 2 {
+		t.Fatalf("studio_sse_stream_protocol_total series = %d, want 2 (protocol 1 and 2)",
+			len(got.GetMetric()))
+	}
+	for _, metric := range got.GetMetric() {
+		lps := metric.GetLabel()
+		if len(lps) != 1 || lps[0].GetName() != "protocol" {
+			t.Fatalf("studio_sse_stream_protocol_total labels = %v, want exactly [protocol] — "+
+				"every extra label multiplies the cardinality of a client-controlled value", lps)
+		}
+		v := lps[0].GetValue()
+		if v != "1" && v != "2" {
+			t.Fatalf("studio_sse_stream_protocol_total has protocol=%q, want only \"1\" or \"2\"", v)
+		}
+	}
+}

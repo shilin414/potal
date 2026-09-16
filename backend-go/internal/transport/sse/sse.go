@@ -52,6 +52,11 @@
 // a lost or duplicated answer. The same shape is what the SSE Hub will
 // inherit: capability belongs to the SUBSCRIBER, not to the run.
 //
+// The declaration is a REQUEST, not a decision (第九轮补丁 3.3.1-B): the server
+// answers with the highest protocol it implements, so `stream_protocol=3` (or
+// any larger positive integer a future client might send) is served as
+// protocol 2 rather than echoed back. See StreamProtocol.
+//
 // Frame format (validated frontend contract):
 //
 //	event: run.event\n
@@ -80,14 +85,21 @@ const (
 )
 
 // Stream protocol capabilities.
+//
+// These two values are also the ONLY values the negotiated protocol may take:
+// StreamProtocolRangeDelta is this server's highest implemented version, and
+// StreamProtocol clamps every request down to it. See the note there for why
+// the raw request value is never echoed back.
 const (
 	// StreamProtocolLegacy is what a client that sends no `stream_protocol`
-	// (or an unparsable / lower value) gets: durable frames only.
+	// (or an unparsable / non-positive / overflowing value) gets: durable
+	// frames only.
 	StreamProtocolLegacy = 1
 	// StreamProtocolRangeDelta declares that the client understands
 	// `content.delta.offset` and reconciles transient deltas against durable
 	// chunks by UTF-8 byte range. Only such a client receives transient
-	// `content.delta` frames.
+	// `content.delta` frames. It is also the highest protocol this server
+	// implements, so it is the ceiling of every negotiation.
 	StreamProtocolRangeDelta = 2
 )
 
@@ -104,26 +116,39 @@ type Gateway struct {
 	Metrics   *telemetry.Metrics
 }
 
-// StreamProtocol resolves the client's declared SSE rendering capability.
+// StreamProtocol resolves the client's declared SSE rendering capability and
+// NEGOTIATES it against what this server can actually render.
 //
-// An absent, unparsable or out-of-range value degrades to the LEGACY
-// behaviour rather than failing the stream: the safe direction of a
+// An absent, unparsable, non-positive or overflowing value degrades to the
+// LEGACY behaviour rather than failing the stream: the safe direction of a
 // capability negotiation is the smaller feature set, and a legacy client that
 // receives a 400 here would be broken by a server upgrade it cannot see. The
 // parameter is deliberately NOT carried in Last-Event-ID — the durable cursor
 // and the rendering capability are different dimensions, and a capability
 // that only arrives on reconnect would leave a mid-life upgrade with the
 // wrong wire format on one connection.
+//
+// The return value is the NEGOTIATED protocol, never the raw request value
+// (第九轮补丁 3.3.1-B). Protocol numbers are a server capability: the highest
+// one this server implements is StreamProtocolRangeDelta, so a future client
+// asking for 3 — or 100, or 2147483647, or anything a script can generate —
+// gets 2 back, the largest version both sides understand. Echoing the request
+// would claim a rendering contract that does not exist, and because the
+// result is also a Prometheus label value it would let any authenticated
+// client mint unbounded time series (`protocol="1001"`, `"1002"`, …) from a
+// query parameter. The negotiated value is therefore always 1 or 2.
 func StreamProtocol(r *http.Request) int {
-	raw := r.URL.Query().Get("stream_protocol")
+	raw := strings.TrimSpace(r.URL.Query().Get("stream_protocol"))
 	if raw == "" {
 		return StreamProtocolLegacy
 	}
-	v, err := strconv.Atoi(strings.TrimSpace(raw))
-	if err != nil || v < StreamProtocolLegacy {
+	// strconv.Atoi returns ErrRange for values that do not fit in an int; those
+	// take the same fail-safe path as junk.
+	requested, err := strconv.Atoi(raw)
+	if err != nil || requested < StreamProtocolRangeDelta {
 		return StreamProtocolLegacy
 	}
-	return v
+	return StreamProtocolRangeDelta
 }
 
 // ResumeCursor resolves the client's durable cursor. query `after` wins over
@@ -152,10 +177,14 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
-	// The client's declared rendering capability. Everything below — including
-	// the transient-delta filter in the live loop — is decided from this ONE
-	// value, so a connection cannot render half of its frames under one
-	// protocol and half under another.
+	// The NEGOTIATED rendering capability — the largest protocol both this
+	// server and the client understand, i.e. always 1 or 2 (3.3.1-B). It is
+	// never the raw `stream_protocol` request value: the metric label below
+	// and the response header are both derived from it, so an echoed request
+	// would make a query parameter an unbounded Prometheus label. Everything
+	// below — including the transient-delta filter in the live loop — is
+	// decided from this ONE value, so a connection cannot render half of its
+	// frames under one protocol and half under another.
 	protocol := StreamProtocol(r)
 	if g.Metrics != nil {
 		// The v1/v2 connection ratio is what the 3.3 rollout watches while old

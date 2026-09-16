@@ -951,13 +951,28 @@ paths:
           enum: [1, 2]
           default: 1
         description: |
-          SSE rendering capability.
+          SSE rendering capability the client requests.
 
           Protocol 2 declares support for UTF-8 byte-offset reconciliation
           between transient `content.delta` and durable `content.chunk`.
-
           Legacy clients receive durable chunks but no transient
           `content.delta` frames.
+
+          This is a request, not a decision: the value is NEGOTIATED. A client
+          normally sends 1 or 2, and if a future client requests a higher
+          positive protocol the server serves the highest protocol it
+          currently supports (2) rather than echoing the request back — a
+          server cannot claim a rendering contract it does not implement.
+
+          Malformed, zero, negative or overflowing values degrade to legacy
+          protocol 1. Nothing here fails the stream: a client that cannot see
+          the server was upgraded must keep working, and the safe direction of
+          a capability negotiation is the smaller feature set.
+
+          The negotiated value is what appears in the
+          `X-Studio-Stream-Protocol` response header and as the `protocol`
+          label of `studio_sse_stream_protocol_total`, so it is always exactly
+          1 or 2.
     get:
       operationId: streamRun
       tags: [runs]
@@ -1001,8 +1016,11 @@ paths:
           description: SSE stream
           headers:
             X-Studio-Stream-Protocol:
-              description: The protocol the response was rendered for (1 = durable only, 2 = transient deltas included).
-              schema: { type: integer }
+              description: >-
+                The protocol the response was rendered for (1 = durable only,
+                2 = transient deltas included). This is the negotiated value,
+                so it is always 1 or 2 — never the raw requested integer.
+              schema: { type: integer, enum: [1, 2] }
           content:
             text/event-stream:
               schema:

@@ -44,6 +44,10 @@ React SPA (static)              Go Backend
                                    │
                                    ▼
                              Feishu Aily
+
+                          Delivery Plane
+                  studio-worker --provider=feishu_delivery
+             (scheduled-run results → Feishu IM as the owner)
 ```
 
 ## Governance scope (G13)

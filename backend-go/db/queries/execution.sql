@@ -484,6 +484,35 @@ WHERE provider = ? AND expires_at > CURRENT_TIMESTAMP(3);
 -- waiting_external run after the configured unresolved-execution grace (~10
 -- min by default), which releases its reservation. See the ProviderSlots
 -- doc comment for the exact wording of the guarantee.
+--
+-- DRIVING SIDE (第九轮补丁 3.3.1-A). The remote leg is written runs-first and
+-- pinned with STRAIGHT_JOIN on purpose:
+--
+--     runs (active)                          ← driving side, bounded
+--       → provider_submissions (run_id PK)   ← one lookup per active run
+--
+-- provider_submissions is HISTORY: a submission row is never deleted when its
+-- run settles, so `provider = ? AND state = 'accepted'` selects every provider
+-- execution since the table was created, and a history-driven plan pays for
+-- all of it on every claim (admission runs on EVERY Acquire, not in a report).
+-- Migration 0024 removed the full scan; it did not make the candidate RANGE
+-- bounded — that is what this rewrite does. The predicate is unchanged, so the
+-- capacity semantics are unchanged, only the traversal direction is.
+--
+-- `r.status IN (...)` is the explicit complement of IsSettled()
+-- (cancelled/succeeded/failed/interrupted) and is spelled as an IN list, not
+-- as NOT IN, because `status` leads idx_runs_claim(status, provider,
+-- queued_at): a NOT IN cannot use that index range and would push the plan
+-- back onto a scan. The five statuses are pinned against the status enum by
+-- TestProviderCapacityStatusListIsExactComplementOfSettled.
+--
+-- STRAIGHT_JOIN (not merely stating the FROM order) is load-bearing: the
+-- optimizer is free to reorder an inner join, and if it decides the
+-- ('sending','unknown','accepted') range is more selective it will drive from
+-- the ledger again. Both MySQL 5.7 and TiDB honour STRAIGHT_JOIN for exactly
+-- this purpose. FORCE INDEX is deliberately NOT used: whether
+-- idx_runs_claim is chosen should be proven by EXPLAIN first
+-- (TestProviderCapacityQueryIsDrivenByActiveRuns).
 SELECT COUNT(*) AS n
 FROM (
     SELECT s.run_id
@@ -493,17 +522,20 @@ FROM (
 
     UNION
 
-    SELECT ps.run_id
-    FROM provider_submissions ps
-    JOIN runs r ON r.id = ps.run_id
-    WHERE ps.provider = ?
-      AND ps.state IN ('sending', 'unknown', 'accepted')
-      AND r.status NOT IN (
-          'cancelled',
-          'succeeded',
-          'failed',
-          'interrupted'
+    SELECT r.id AS run_id
+    FROM runs r
+    STRAIGHT_JOIN provider_submissions ps
+      ON ps.run_id = r.id
+     AND ps.provider = r.provider
+    WHERE r.provider = ?
+      AND r.status IN (
+          'queued',
+          'running',
+          'waiting_input',
+          'waiting_external',
+          'cancelling'
       )
+      AND ps.state IN ('sending', 'unknown', 'accepted')
 ) capacity_runs;
 
 -- name: CountProviderEffectiveInflightExcludingRun :one
@@ -524,6 +556,15 @@ FROM (
 -- exactly once: either by its own remote reservation (before this acquired
 -- decision) or by the slot it is about to be granted, never twice and never
 -- zero.
+--
+-- Same runs-first / STRAIGHT_JOIN driving side as CountProviderEffectiveInflight
+-- (第九轮补丁 3.3.1-A); only the self-exclusion is added, on BOTH legs.
+--
+-- The remote-leg exclusion is spelled `ps.run_id <> ?` rather than `r.id <> ?`
+-- so the generated parameter keeps its existing name (RunID_2) and the
+-- admission call site does not have to change: the join is
+-- `ps.run_id = r.id`, and SQL equality propagation makes the two spellings the
+-- same predicate with the same index access.
 SELECT COUNT(*) AS n
 FROM (
     SELECT s.run_id
@@ -534,18 +575,21 @@ FROM (
 
     UNION
 
-    SELECT ps.run_id
-    FROM provider_submissions ps
-    JOIN runs r ON r.id = ps.run_id
-    WHERE ps.provider = ?
+    SELECT r.id AS run_id
+    FROM runs r
+    STRAIGHT_JOIN provider_submissions ps
+      ON ps.run_id = r.id
+     AND ps.provider = r.provider
+    WHERE r.provider = ?
       AND ps.run_id <> ?
-      AND ps.state IN ('sending', 'unknown', 'accepted')
-      AND r.status NOT IN (
-          'cancelled',
-          'succeeded',
-          'failed',
-          'interrupted'
+      AND r.status IN (
+          'queued',
+          'running',
+          'waiting_input',
+          'waiting_external',
+          'cancelling'
       )
+      AND ps.state IN ('sending', 'unknown', 'accepted')
 ) capacity_runs;
 
 -- name: CountProviderUncontrolledInflight :one
@@ -568,21 +612,28 @@ FROM (
 -- It is the leading indicator for the alert in the 3.3 metrics section: the
 -- effective count stays correct, but the share of capacity that no worker
 -- controls is growing.
-SELECT COUNT(DISTINCT ps.run_id)
-FROM provider_submissions ps
-JOIN runs r ON r.id = ps.run_id
+--
+-- Same runs-first / STRAIGHT_JOIN driving side as CountProviderEffectiveInflight
+-- (第九轮补丁 3.3.1-A): this is a periodic metrics read, so a history-driven
+-- plan here would regress scrape latency as the ledger grows.
+SELECT COUNT(DISTINCT r.id)
+FROM runs r
+STRAIGHT_JOIN provider_submissions ps
+  ON ps.run_id = r.id
+ AND ps.provider = r.provider
 LEFT JOIN provider_execution_slots s
-  ON s.provider = ps.provider
- AND s.run_id = ps.run_id
+  ON s.provider = r.provider
+ AND s.run_id = r.id
  AND s.expires_at > CURRENT_TIMESTAMP(3)
-WHERE ps.provider = ?
-  AND ps.state IN ('sending', 'unknown', 'accepted')
-  AND r.status NOT IN (
-      'cancelled',
-      'succeeded',
-      'failed',
-      'interrupted'
+WHERE r.provider = ?
+  AND r.status IN (
+      'queued',
+      'running',
+      'waiting_input',
+      'waiting_external',
+      'cancelling'
   )
+  AND ps.state IN ('sending', 'unknown', 'accepted')
   AND s.run_id IS NULL;
 
 -- name: CreateProviderSlot :exec

@@ -30,6 +30,8 @@
 - **本机环境**：Git Bash 常丢 coreutils，先 `export PATH="/usr/bin:/bin:/c/software/Git/cmd:$PATH"`。本机 git `refs/remotes/<name>/<branch>` 写入有缺陷：push 后必须 `mkdir -p .git/refs/remotes/origin` + 写 loose ref + 双写 packed-refs，并用 `git ls-remote` 核对；看到 ahead/gone 先 ls-remote 对比别急着重推。无 `gh`，查 CI 用匿名 GitHub API。
 - bash 嵌套 heredoc 会被内层定界符截断，用不同定界符或 Write 工具写脚本。断言时间戳未变用 `CAST(col AS CHAR)` 逐字符串比较。
 - **Redis pub/sub 不为未来订阅者缓冲**：SSE 集成测试里用 marker 帧证明"网关已订阅"时，单次发送会落在「响应头 flush 之后、网关 SUBSCRIBE 之前」的窗口里永久丢失 → 必须**循环重发直到收到**。另：既有 SSE 测试要区分"测 transient 帧本身"（须声明 `stream_protocol=2`）与"测 legacy 兼容"（不声明）。
+- **本地起环境是 5 个进程**：api / stream / worker(`--provider=feishu_aily`) / **worker(`--provider=feishu_delivery`)** / vite。**漏掉 delivery 那个时，定时任务对话照常跑、有回复，但飞书收不到**（`delivery_executions` 停在 `pending`/`attempt=0`）——投递是独立队列，不是执行面的一部分；消费者起来后 `dueScanLoop` 会自动补发。另：`(cmd &)` 自 detach 在普通 Bash 调用里活不下来，常驻必须 `run_in_background`。
+- **`CASFinishDelivery` 的双占位符**：`sent_at = IF(? = 'succeeded', …)` 的第二个 `?` 被 sqlc 生成成 `Column5`，调用方必须把 status 传两次，否则成功投递的 `sent_at` 永远为 NULL。
 - migration 的 up/down 验证可写临时 `cmd/tmp-migdown` 程序用 `golang-migrate` 的 `m.Up()` / `m.Steps(-1)`，source 路径相对 cwd（在 backend-go 下是 `file://db/migrations`，测试里才是 `../../db/migrations`）。跑完删掉临时目录。
 
 ## 历轮索引（细节见 docs/）

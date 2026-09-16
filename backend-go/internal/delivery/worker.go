@@ -159,7 +159,12 @@ func (w *Worker) process(ctx context.Context, msg goredis.XMessage) {
 		w.handleFailure(ctx, row, err)
 	} else if _, err := q.CASFinishDelivery(ctx, db.CASFinishDeliveryParams{
 		Status: schedule.DeliverySucceeded,
-		ID:     id.Bytes(),
+		// Column5 is the duplicated `status` placeholder in the query: it
+		// guards `sent_at = IF(? = 'succeeded', ...)`. Leaving it nil makes
+		// the guard NULL → falsy → a successful delivery keeps sent_at NULL,
+		// so the UI shows "已投递" without a send time (第九轮 user report).
+		Column5: schedule.DeliverySucceeded,
+		ID:      id.Bytes(),
 	}); err != nil {
 		w.Log.Error("delivery finish failed", "delivery_id", raw, "err", err)
 	} else {
@@ -227,7 +232,10 @@ func (w *Worker) handleFailure(ctx context.Context, row db.DeliveryExecution, se
 			Status:       schedule.DeliveryFailed,
 			ErrorCode:    code,
 			ErrorMessage: sqlNullString(msg),
-			ID:           row.ID,
+			// Column5 = the duplicated `status` placeholder guarding sent_at;
+			// a failure must leave sent_at untouched.
+			Column5: schedule.DeliveryFailed,
+			ID:      row.ID,
 		}); err != nil {
 			w.Log.Error("delivery dead-end failed", "err", err)
 			return

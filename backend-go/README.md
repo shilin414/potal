@@ -16,9 +16,10 @@ Nginx
  ├─ /runs/*/stream  → studio-stream(cmd/stream, :8081)   SSE 长连接面
  └─ React SPA
 
-studio-worker (cmd/worker) —— 执行面（可按 provider 水平扩容）
-   Outbox Relay: MySQL → Redis Streams
-   Worker:       XREADGROUP → MySQL CAS Claim → RunLease → Provider Handler
+studio-worker (cmd/worker) —— 执行面 + 投递面（**同 binary，两个独立队列消费者**）
+   Outbox Relay: MySQL → Redis Streams（同时把 delivery outbox 路由到 queue:feishu_delivery）
+   --provider=feishu_aily       Worker: XREADGROUP → MySQL CAS Claim → RunLease → Provider Handler
+   --provider=feishu_delivery   Delivery: 定时任务结果 → 飞书 IM（owner UAT）
 ```
 
 - **MySQL 5.7（Source of Truth）**：users / feishu_identities / providers /
@@ -34,7 +35,7 @@ studio-worker (cmd/worker) —— 执行面（可按 provider 水平扩容）
 ```text
 cmd/api          studio-api 入口（-migrate 顺带跑迁移）
 cmd/stream       studio-stream 入口（SSE 独立扩容）
-cmd/worker       studio-worker 入口（--provider=feishu_aily）
+cmd/worker       studio-worker 入口（--provider=feishu_aily | feishu_delivery，两个队列各自一个进程）
 api/openapi.yaml 唯一 HTTP Contract（OpenAPI 3.0.3，冻结已验证 v2 行为）
 db/migrations    golang-migrate 迁移（MySQL 5.7 兼容 DDL）
 db/queries       sqlc 查询（显式列，无 SELECT *）
@@ -116,6 +117,59 @@ Schema 权威来源是 `db/migrations`——**不要**把任何 dump 的 `SHOW C
 后端把能力写在 SSE 响应头 `X-Studio-Stream-Protocol` 上，仅用于浏览器
 Network 面板 / 日志 / 灰度排查，客户端逻辑不得依赖它（请求参数才是合同）。
 
+### 补丁 3.3.1：容量准入查询的规模合同 + 协议协商上界
+
+3.3.1 不改任何正确性语义（Capacity 定义 / exclude-self / submission 状态机 /
+Lease / Event Cursor / Streaming Range 一律不动），只收口两件事。
+
+**1. Provider 有效容量的 remote leg 改由 active run 驱动。**
+
+`provider_submissions` 是历史表：run settled 之后 submission 不会被删除，所以
+`WHERE ps.provider = ? AND ps.state IN ('sending','unknown','accepted')` 的候选
+范围 = 该 provider 建表以来的**全部**执行；而这是准入查询，在**每一次
+`Acquire`** 上执行（不是报表）。migration 0024 消掉了全表扫描，但没有让候选
+区间有界。现在遍历方向反过来：
+
+```text
+runs(active, idx_runs_claim)  STRAIGHT_JOIN  provider_submissions(PRIMARY, run_id)
+```
+
+- `STRAIGHT_JOIN` 固定 join 方向（MySQL 5.7 / TiDB 都支持，优化器不得擅自
+  改成从 ledger 驱动）；`FROM` 顺序本身不足以保证。
+- 状态过滤写成显式 `IN ('queued','running','waiting_input','waiting_external',
+  'cancelling')`。它恰好是 `IsSettled` 的补集，且**必须**是 `IN`：`status` 是
+  `idx_runs_claim` 的前导列，`NOT IN` 用不上该索引区间。这个清单由
+  `TestProviderCapacityStatusListIsExactComplementOfSettled` 钉住，防止新增
+  状态时静默漏掉。
+- **不新增 migration**：EXPLAIN 证明现有 `idx_runs_claim` 已被选中，
+  migration 版本保持 **24**。`idx_provider_submissions_capacity` 保留（诊断与
+  optimizer 备选路径仍可用），只是不再作为准入查询的驱动路径。
+- 验收用 EXPLAIN 而非墙钟时间：`TestProviderCapacityQueryIsDrivenByActiveRuns`
+  在 MySQL 5.7 上断言 `runs → provider_submissions` 的 join 顺序与两个索引的
+  前导列（`status` / `run_id`）。
+
+> ⚠ EXPLAIN 断言必须在**真实数据形状**下跑（一个 provider 有长历史 + 少量活跃
+> run）。在空 provider 上所有候选索引都估 1 行，优化器按 tie-break 可能选
+> `idx_runs_external` / `uniq_provider_submit_key`（前导列只有 provider），
+> 此时 EXPLAIN 说明不了生产的计划。测试因此先造 fixture 再 EXPLAIN。
+
+**2. `stream_protocol` 是协商结果，不是请求回显。**
+
+服务端当前最高实现到 protocol 2，因此 `requested >= 2 → 2`（未来客户端请求 3
+不被拒绝，而是降级到双方共同能力），缺失 / 乱码 / 非正 / 溢出 → legacy 1。
+
+```text
+1 → 1   2 → 2   3 → 2   100 → 2   2147483647 → 2
+missing / junk / 0 / 负数 / Atoi 溢出 → 1
+```
+
+于是三处都只有 1 / 2：`StreamProtocol()` 的返回值、响应头
+`X-Studio-Stream-Protocol`、以及 `studio_sse_stream_protocol_total` 的
+`protocol` label（此前回显原始整数 = 任意已登录客户端可用
+`?stream_protocol=1001/1002/…` 无限制造 Prometheus time series）。
+`TestSSEStreamProtocolMetricCardinalityIsBounded` 用 16 个恶意输入断言
+registry 里最多 2 条 series。
+
 然后：
 
 ```bash
@@ -135,7 +189,12 @@ make test         # 全部单测（不需要数据库）
 make test-race    # -race
 make gen          # 重新生成 OpenAPI/SQL 代码
 STUDIO_TEST_DB=1 STUDIO_TEST_REDIS=1 go test ./tests/integration/ -count=1
-# 浏览器 E2E 另需 Go API + Worker + Vite 三进程：
+# 本地起服务要 4 个进程：api + stream + 执行面 worker + 投递面 worker
+go run ./cmd/api
+go run ./cmd/stream
+go run ./cmd/worker --provider=feishu_aily       # 跑 Run
+go run ./cmd/worker --provider=feishu_delivery   # 发飞书消息（漏了它 = 投递永远停在 pending）
+# 浏览器 E2E 另需 Go API + Worker + Vite：
 C:/software/miniconda3/envs/py311/python.exe tests/e2e_go_chat.py
 ```
 
