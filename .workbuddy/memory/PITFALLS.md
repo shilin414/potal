@@ -16,6 +16,18 @@
 - 只有「能被删坏」的断言才有价值：加测试时必须同时确认它 **mutated FAIL / restored PASS**
   （Batch 4.1.2 的 Mutation N 就是这么补上的）。
 
+## CI 红而本地全绿 —— 定位套路
+1. **先把 `GOMAXPROCS` 限到 2**（GitHub runner 只有 2 vCPU）再复现。本机核多，
+   调度类竞态/采样竞态会被掩盖，不限就永远复现不出来。
+   `for i in $(seq 1 12); do GOMAXPROCS=2 go test <pkg> -count=1 2>&1 | grep -E '^(--- FAIL|    \w+_test)'; done`
+2. **先证明是不是自己引入的**：`git diff <上一次绿的 sha> HEAD -- <文件>` 看那个测试在不在
+   diff 里。不在 → 既有 flake，上一次 CI 只是没抽到，别乱改生产代码。
+3. **看是"生产 bug"还是"测试采样竞态"**：若某标志位是在被测函数**返回之后**才发布的，
+   测试里"waitFor 一个早发布的事实 → 紧接着裸采样晚发布的事实"就是测试自己的竞态。
+   修法是补一条有界 `waitFor`，**原断言行不要动**（这样才不算"放宽"）。
+4. 已知一处（`TestHubManagerSharesOneUpstreamPerRun`）已于 2026-09-16 修好（`6a90295`）。
+5. 本机无 token/`gh`，Actions 日志走匿名 API 会 403；**拿不到日志就只能靠本地压测反推**。
+
 ## 本机 git
 - `core.autocrlf=true` 与仓库 LF 索引相冲：git 重写文件后工作区变 CRLF，`gofmt -l` 误报。
   本仓库已局部 `core.autocrlf=false`；再见到就用 python 把内容归一回 `\n`。

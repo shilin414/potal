@@ -490,6 +490,20 @@ GOMAXPROCS=2 压测 sse 包 ×16      0 失败（修 §10.7 的既有 flake 之�
 GOMAXPROCS=2 压测 go test ./... ×3 0 失败
 ```
 
+### CI 证据
+
+```text
+backend run 35078966146（head 6a90295）  check success / integration success   ← 本批最终绿
+backend run 35077631425（head 00d7ef4）  check FAILURE / integration success   ← §10.7 的既有 flake
+```
+
+`check` job 覆盖 actionlint / gofmt / `go vet` / `go build` / `go test ./... -count=1`，
+其中**本机跑不了的 race 门**（`go test -race`，含 `./internal/transport/sse/...`）也在这个 job 里，
+即 `TestArmInitialIdleTimerSkipsAlreadySubscribedHub` 与两个既有定时器测试都真实过了 race detector。
+`integration` job 在 mysql5.7 + redis7 上跑 migrate×2 + db-backed 包测试 + `tests/integration`。
+
+前端 workflow 只在 `frontend/**` 变更时触发，本批未改前端，故走本机实测（§10.6）。
+
 `-race` 本机仍无法执行（`CGO_ENABLED=0`、无 gcc），该门由 CI 兜住，覆盖
 `./internal/transport/sse/...`。
 
@@ -537,8 +551,8 @@ AC-4.1.2-4  删除 subscriber guard 后新测试必 FAIL（Mutation N）        
 AC-4.1.2-5  恢复 subscriber guard 后新测试 PASS                               PASS
 AC-4.1.2-6  inert-constructor / tiny-TTL-race / canonical-hole 测试继续 PASS   PASS
 AC-4.1.2-7  Mutation L / M 继续有效，Mutation N 有效                           PASS
-AC-4.1.2-8  go test / race / integration 全绿（race 由 CI 兜）                 PASS
-AC-4.1.2-9  Batch 4 / 4.1 / 4.1.1 原测试未删除、未放宽                          PASS
+AC-4.1.2-8  go test / race / integration 全绿（race 由 CI 兜）                 PASS（CI 35078966146）
+AC-4.1.2-9  Batch 4 / 4.1 / 4.1.1 原测试未删除、未放宽                          PASS（§10.7 只加等待、原断言未动）
 ```
 
 ## 10.9 Freeze 判定
