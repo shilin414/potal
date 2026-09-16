@@ -1042,3 +1042,231 @@ func TestHubConcurrentLifecycle(t *testing.T) {
 		t.Fatalf("HubCount = %d after concurrent Close, want 0", got)
 	}
 }
+
+// ───────────── Batch 4.1.1: hub initial idle-timer race (NEW P1) ─────────────
+//
+// Batch 4.1 removed the manager.mu → hub.mu nesting by arming the initial idle
+// timer inside newRunHub WITHOUT hub.mu, reasoning that an unpublished hub is
+// unreachable so the guard could only ever be uncontended. That reasoning was
+// wrong twice over: `armIdleTimerLocked` calls time.AfterFunc, whose callback
+// (evictIfIdle) takes hub.mu and clears `idleTimer`/`closed`, so the timer
+// goroutine races the assignment; and IdleTTL is validated only as `> 0`, so
+// `SSE_HUB_IDLE_TTL=1ns` is a legal configuration under which the callback can
+// win outright — evicting the hub immediately after publication and leaving the
+// caller holding a cancelled one.
+//
+// The fix is an invariant rather than a wider critical section: an unpublished
+// hub is inert, and the timer is armed after publication, under hub.mu.
+
+// TestNewRunHubIsInertBeforePublication pins AC-4.1.1-1 and kills Mutation L.
+//
+// The constructor must allocate and nothing else: no timer, no goroutine, no
+// callback. Both halves matter. The long TTL makes "the timer was armed here"
+// observable without depending on timing; the tiny TTL makes "the callback ran
+// anyway" observable regardless of how fast the constructor is — the exact
+// window the old code left open.
+func TestNewRunHubIsInertBeforePublication(t *testing.T) {
+	// Half 1: with a TTL far beyond the test's lifetime, an armed timer is
+	// simply still there to be seen.
+	long := DefaultHubOptions()
+	long.IdleTTL = time.Hour
+	mgrLong := NewHubManagerWithUpstream(context.Background(), newFakeUpstream(), nil, long)
+	defer mgrLong.Close()
+
+	hub := newRunHub(mgrLong, "run-inert")
+	hub.mu.Lock()
+	timer, closed := hub.idleTimer, hub.closed
+	hub.mu.Unlock()
+	if timer != nil {
+		t.Fatal("newRunHub armed an idle timer: an unpublished hub must be inert — the timer " +
+			"callback races the constructor's own assignment to idleTimer")
+	}
+	if closed {
+		t.Fatal("newRunHub published a hub that is already closed")
+	}
+
+	// Half 2: the same constructor under the SHORTEST legal TTL. Nothing else
+	// can reach this hub, so any state change here came from the constructor.
+	up := newFakeUpstream()
+	tiny := DefaultHubOptions()
+	tiny.IdleTTL = time.Millisecond
+	mgrTiny := NewHubManagerWithUpstream(context.Background(), up, nil, tiny)
+	defer mgrTiny.Close()
+
+	tinyHub := newRunHub(mgrTiny, "run-inert-tiny")
+	time.Sleep(50 * time.Millisecond) // 50 × IdleTTL
+	tinyHub.mu.Lock()
+	timer, closed = tinyHub.idleTimer, tinyHub.closed
+	tinyHub.mu.Unlock()
+	if timer != nil {
+		t.Fatal("an unpublished hub still carries a timer after several IdleTTL windows")
+	}
+	if closed {
+		t.Fatal("an unpublished hub was closed by a timer callback: the constructor started " +
+			"concurrency it must not start")
+	}
+
+	// A hub that was never published must not have reached the registry or
+	// opened a Redis subscription either.
+	if got := mgrTiny.HubCount(); got != 0 {
+		t.Fatalf("HubCount = %d after constructing unpublished hubs, want 0", got)
+	}
+	if got := up.SubscribeCount(); got != 0 {
+		t.Fatalf("Redis Subscribe called %d times for an unpublished hub, want 0", got)
+	}
+}
+
+// TestGetOrCreateArmsInitialIdleTimer pins AC-4.1.1-4: moving the timer out of
+// the constructor must not lose the "created but nobody attached" reclamation.
+//
+// The hub is created and immediately LEFT ALONE — the shape a request that
+// resolved a hub and then failed produces — so the only thing that can remove
+// it is the initial idle timer.
+func TestGetOrCreateArmsInitialIdleTimer(t *testing.T) {
+	up := newFakeUpstream()
+	opts := DefaultHubOptions()
+	opts.IdleTTL = 100 * time.Millisecond
+	mgr := NewHubManagerWithUpstream(context.Background(), up, nil, opts)
+	defer mgr.Close()
+
+	hub := mgr.GetOrCreate("run-initial-timer")
+	if got := mgr.HubCount(); got != 1 {
+		t.Fatalf("HubCount = %d right after GetOrCreate, want 1", got)
+	}
+	// Published AND armed: publication alone would leak the hub forever.
+	hub.mu.Lock()
+	armed := hub.idleTimer != nil
+	hub.mu.Unlock()
+	if !armed {
+		t.Fatal("GetOrCreate published a hub with no initial idle timer: an abandoned hub " +
+			"would leak for the process lifetime")
+	}
+
+	waitFor(t, "the unattached hub to be reclaimed", func() bool { return mgr.HubCount() == 0 })
+	if got := mgr.Lookup("run-initial-timer"); got != nil {
+		t.Fatal("Lookup returned a hub that the initial idle timer should have evicted")
+	}
+	if got := up.SubscribeCount(); got != 1 {
+		t.Fatalf("Redis Subscribe called %d times, want 1: the upstream must still start", got)
+	}
+	waitFor(t, "the upstream to close", func() bool { return up.ActiveChannels() == 0 })
+}
+
+// TestConcurrentSubscriberCancelsInitialIdleTimer pins AC-4.1.1-5, and is the
+// test that would have caught the old bug had the old code been merely racy
+// rather than wrong.
+//
+// The subscriber is attached as soon as the hub becomes VISIBLE in the registry
+// — which is strictly before GetOrCreate arms the timer — so the arm really is
+// racing a subscribe. Only two interleavings exist, and both must leave a live
+// hub: the timer is armed and then stopped by Subscribe, or Subscribe wins and
+// the arm sees a non-empty subscriber set. Either way the hub must outlive
+// several IdleTTL windows.
+func TestConcurrentSubscriberCancelsInitialIdleTimer(t *testing.T) {
+	up := newFakeUpstream()
+	opts := DefaultHubOptions()
+	opts.IdleTTL = 20 * time.Millisecond
+	mgr := NewHubManagerWithUpstream(context.Background(), up, nil, opts)
+	defer mgr.Close()
+
+	for round := 0; round < 40; round++ {
+		runID := fmt.Sprintf("run-initial-race-%d", round)
+
+		created := make(chan *RunHub, 1)
+		go func() { created <- mgr.GetOrCreate(runID) }()
+
+		// Spin on the registry instead of on GetOrCreate's return value: the
+		// entry is published one step earlier than the timer is armed, so this
+		// is the window the fix is about.
+		var hub *RunHub
+		deadline := time.Now().Add(time.Second)
+		for hub == nil {
+			hub = mgr.Lookup(runID)
+			if hub == nil && time.Now().After(deadline) {
+				t.Fatalf("round %d: the hub never became visible in the registry", round)
+			}
+		}
+		<-created
+
+		sub, ok := hub.Subscribe(StreamProtocolRangeDelta)
+		if !ok {
+			t.Fatalf("round %d: Subscribe refused a hub that was just published — a whole "+
+				"IdleTTL cannot have elapsed inside this window", round)
+		}
+		go drainAsync(sub)
+
+		// Hold well past the idle window. If the arm is not properly
+		// synchronised with the subscriber set, this is where the hub dies.
+		time.Sleep(2 * opts.IdleTTL)
+		if got := mgr.Lookup(runID); got != hub {
+			t.Fatalf("round %d: the hub was evicted with a subscriber attached (Lookup = %p, "+
+				"want %p) — the initial idle timer raced Subscribe instead of yielding to it",
+				round, got, hub)
+		}
+		if reason := sub.DropReason(); reason != "" {
+			t.Fatalf("round %d: the subscriber was dropped (%q) although the hub is idle-but-live",
+				round, reason)
+		}
+
+		sub.Close(DropReasonClientGone)
+		waitFor(t, fmt.Sprintf("round %d hub cleanup", round), func() bool {
+			return mgr.HubCount() == 0
+		})
+	}
+}
+
+// TestTinyInitialIdleTTLIsRaceSafe pins AC-4.1.1-6 and is the test whose whole
+// purpose is to make `go test -race` cover the window 4.1.1 found.
+//
+// Every duration above zero is a legal SSE_HUB_IDLE_TTL, and the old code's
+// safety argument was implicitly "the callback cannot possibly fire before the
+// assignment finishes" — true at 10ms, false at 1ns. Racers are also created by
+// GENERATIONS: a 1ns timer evicts the hub the moment it is published, so the
+// next GetOrCreate builds a fresh one for the same run while the previous
+// callback is still walking into removeIfSame.
+//
+// The functional assertions are deliberately weak (no panic, the registry
+// drains, Close returns): the verdict belongs to the race detector, which is
+// the only thing that can see a torn read here.
+func TestTinyInitialIdleTTLIsRaceSafe(t *testing.T) {
+	up := newFakeUpstream()
+	opts := DefaultHubOptions()
+	opts.IdleTTL = time.Nanosecond
+	mgr := NewHubManagerWithUpstream(context.Background(), up, nil, opts)
+
+	var wg sync.WaitGroup
+	for round := 0; round < 60; round++ {
+		runID := fmt.Sprintf("run-tiny-%d", round%6) // re-create the same runs
+		for w := 0; w < 2; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				hub := mgr.GetOrCreate(runID)
+				if hub == nil {
+					return // the manager may have been closed by the closer below
+				}
+				// Attach and detach immediately: arm/stop/arm against a
+				// callback that may already be running.
+				if sub, ok := hub.Subscribe(StreamProtocolRangeDelta); ok {
+					sub.Close(DropReasonClientGone)
+				}
+			}()
+		}
+		// A closer that can land in the middle of a generation swap.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			mgr.HubCount()
+		}()
+	}
+	wg.Wait()
+
+	if got := mgr.HubCount(); got != 0 {
+		waitFor(t, "every 1ns-idle hub to be reclaimed", func() bool { return mgr.HubCount() == 0 })
+	}
+	mgr.Close()
+	if got := mgr.HubCount(); got != 0 {
+		t.Fatalf("HubCount = %d after Close, want 0", got)
+	}
+	waitFor(t, "every upstream to close", func() bool { return up.ActiveChannels() == 0 })
+}

@@ -813,6 +813,110 @@ func TestGatewayFailsClosedWhenGapRepairFails(t *testing.T) {
 	}
 }
 
+// TestGatewayFailsClosedOnCanonicalLogSequenceHole is AC-4.1.1-7/8 and kills
+// Mutation M.
+//
+// The live stream exposes a forward gap, so the repair goes to the log — and
+// the LOG has a hole of its own: 101 then 103, with no 102. The repair used to
+// walk that page and forward anything at or below `through`, so 101 and 103
+// would both reach the client and the cursor would land on 103 while 102 was
+// never seen. A cursor is the highest sequence the client RENDERED, so 102
+// could then never be recovered: the hole would have been laundered through the
+// one component that is supposed to be the ordering authority.
+//
+// The allocator is gap-free by construction (migration 0023 allocates, writes
+// and commits in one transaction), so this state is not reachable through a
+// normal writer today — the test seeds it deliberately. What it pins is the
+// behaviour of the fail-closed path on a hole, which is the only thing that
+// makes "the log is the authority" a guarantee instead of an assumption.
+//
+// The prefix that was already proven contiguous (101) STAYS: an SSE frame
+// cannot be recalled, and the client reconnects from the highest cursor it
+// actually received. The contract is that the first frame which is not proven
+// contiguous is never sent — and neither is anything after it.
+func TestGatewayFailsClosedOnCanonicalLogSequenceHole(t *testing.T) {
+	h := newGatewayHarness(t, HubOptions{}, execution.StatusRunning)
+
+	h.reader.setFirstReadHook(func() {
+		// 102 is missing from the log itself. The write is deliberately
+		// hole-free around it so that nothing but the repair's own continuity
+		// check can notice.
+		h.reader.appendEvents(
+			runEvent(101, execution.EventContentChunk),
+			runEvent(103, execution.EventContentChunk),
+		)
+		// The live frame whose arrival exposes the forward gap: lastDelivered
+		// is 100 (after=100), so 103 > 101 triggers the repair.
+		h.up.tryPublish(h.runID.String(), chunkEvent(103))
+	})
+
+	w := h.open(t, "after=100")
+	w.waitDone(t, 3*time.Second)
+
+	got := w.sequences()
+	if len(got) != 1 || got[0] != 101 {
+		t.Fatalf("delivered = %v, want exactly [101]: 101 is a verified contiguous prefix and may "+
+			"stay, but 103 is on the far side of a hole in the log and must never be forwarded",
+			got)
+	}
+	if n := countSeq(got, 103); n != 0 {
+		t.Fatalf("103 was delivered %d times across a log hole: the client's cursor would land "+
+			"past an event it never saw", n)
+	}
+
+	if results := labelValues(t, h.gw.Metrics, "studio_sse_live_gap_repair_total", "result"); !results[telemetry.LiveGapFailed] || len(results) != 1 {
+		t.Fatalf("studio_sse_live_gap_repair_total results = %v, want exactly {%q}: a hole in the "+
+			"canonical log is an unrepairable gap, not a repairable one", results,
+			telemetry.LiveGapFailed)
+	}
+	// Only 101 was read out of the log, so the replay counter must show 1 and
+	// not 2: the repair stopped at the hole instead of walking past it.
+	if got := counterValue(t, h.gw.Metrics, "studio_sse_replay_events_total"); got != 1 {
+		t.Fatalf("studio_sse_replay_events_total = %v, want 1 (only the verified prefix)", got)
+	}
+}
+
+// TestGatewayRepairsGapFromContiguousLog is the negative control for the test
+// above: the same shape — live 103 arrives while the cursor is at 100 — with a
+// GAP-FREE log [101 102 103].
+//
+// Without this, "the repair refuses everything" would satisfy the hole test
+// while breaking the feature: 4.1's live-gap repair exists precisely so that an
+// out-of-order Redis publish does not cost the client an event.
+func TestGatewayRepairsGapFromContiguousLog(t *testing.T) {
+	h := newGatewayHarness(t, HubOptions{}, execution.StatusRunning)
+
+	h.reader.setFirstReadHook(func() {
+		h.reader.appendEvents(
+			runEvent(101, execution.EventContentChunk),
+			runEvent(102, execution.EventContentChunk),
+			runEvent(103, execution.EventContentChunk),
+		)
+		h.up.tryPublish(h.runID.String(), chunkEvent(103))
+	})
+
+	w := h.open(t, "after=100")
+	waitFrames(t, w, 3)
+
+	got := w.sequences()
+	want := []uint64{101, 102, 103}
+	if len(got) != len(want) {
+		t.Fatalf("delivered = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("delivered = %v, want %v in order, exactly once", got, want)
+		}
+	}
+	if results := labelValues(t, h.gw.Metrics, "studio_sse_live_gap_repair_total", "result"); !results[telemetry.LiveGapRepaired] || len(results) != 1 {
+		t.Fatalf("studio_sse_live_gap_repair_total results = %v, want exactly {%q}", results,
+			telemetry.LiveGapRepaired)
+	}
+	if got := counterValue(t, h.gw.Metrics, "studio_sse_replay_events_total"); got != 3 {
+		t.Fatalf("studio_sse_replay_events_total = %v, want 3", got)
+	}
+}
+
 // TestGatewayDeliversOversizedTerminalWithoutCachingIt is §37: the end-to-end
 // proof that the P1-2 cache rule does not turn into a delivery bug.
 //
