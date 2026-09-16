@@ -385,7 +385,7 @@ AC-4.1.1-5 deterministic test       INCOMPLETE  → 本批关闭
 ## 10.2 改动范围（未触碰任何生产文件）
 
 ```text
-backend-go/internal/transport/sse/hub_test.go                        新增 1 测试 + 改名 1 测试
+backend-go/internal/transport/sse/hub_test.go                        新增 1 测试 + 改名 1 测试 + 修 1 既有 flake（§10.7）
 backend-go/scripts/falsify_review10_patch411.sh                      新增 Mutation N
 docs/potal 第十轮 Batch 4.1.1 整改变更报告（…）.md                    本文件 §4.1 纠名 + 本节
 ```
@@ -486,12 +486,48 @@ migrate 1st / 2nd                applied（二次运行干净 no-op）
 db-backed package tests          execution / delivery / platform 全 ok
 tests/integration                ok 128.788s
 frontend                         tsc 0 error / vitest 18 files 158 tests PASS / vite build ok
+GOMAXPROCS=2 压测 sse 包 ×16      0 失败（修 §10.7 的既有 flake 之后；修前 12 次 1 失败）
+GOMAXPROCS=2 压测 go test ./... ×3 0 失败
 ```
 
 `-race` 本机仍无法执行（`CGO_ENABLED=0`、无 gcc），该门由 CI 兜住，覆盖
 `./internal/transport/sse/...`。
 
-## 10.7 验收对照
+## 10.7 附带修正：既有 flake 导致的 CI 红
+
+首次推送（`00d7ef4`）的 CI run 35077631425 中，`check` job 在 **step 9 `go test (unit;
+integration gated by env)`** 判红，`integration` job 全绿。本机同一条命令全绿，因此必须定位。
+
+在 `GOMAXPROCS=2`（≈ GitHub runner 的 2 vCPU）下压测 sse 包：
+
+```text
+12 次运行 → 1 次 FAIL
+--- FAIL: TestHubManagerSharesOneUpstreamPerRun
+    hub_test.go:332: UpstreamCount = 0, want 1 (upstreams must track RUNS, not connections)
+```
+
+`git diff 8168e5c HEAD -- hub_test.go` 中 `TestHubManagerSharesOneUpstreamPerRun` 出现 **0 次**
+→ 该测试体与本批改动无关，**这是既有 flake**（上一次 CI run 35074005255 通过只是没有抽到
+失败的那一次）。
+
+根因是**测试自身的采样竞态，生产代码正确**：`fakeUpstream.Subscribe` 在返回之前就自增
+`subscribes`（`hub_test.go:37`），而 `runUpstream` 是在它之后**再次取 `hub.mu`** 才置
+`h.upstreamUp = true`（`hub.go:864-866`）。于是：
+
+```text
+waitFor(up.SubscribeCount() == 1)      ← 已满足，退出等待
+  ↓  紧接着裸采样一次
+mgr.UpstreamCount() 读到 upstreamUp == false  →  FAIL
+```
+
+修法：在 §10.2 允许修改的 `hub_test.go` 内，于该断言**之前**插入一条有界等待
+`waitFor(t, ..., func() bool { return mgr.UpstreamCount() == 1 })`，**原断言行一字未改**。
+这不是"放宽"——upstream 永不变 active 时 `waitFor` 仍会失败，断言本身保持原样，
+AC-4.1.2-9「不删除、不放宽」满足。
+
+验证：`GOMAXPROCS=2` 压测该包 **16 次 0 失败**（修前 12 次 1 失败）。
+
+## 10.8 验收对照
 
 ```text
 AC-4.1.2-1  生产代码 hub.go / sse.go 无行为修改                                PASS
@@ -505,7 +541,7 @@ AC-4.1.2-8  go test / race / integration 全绿（race 由 CI 兜）            
 AC-4.1.2-9  Batch 4 / 4.1 / 4.1.1 原测试未删除、未放宽                          PASS
 ```
 
-## 10.8 Freeze 判定
+## 10.9 Freeze 判定
 
 复审第 17 节已判定运行时正确性无新 P0/P1；本批补齐证据后：
 

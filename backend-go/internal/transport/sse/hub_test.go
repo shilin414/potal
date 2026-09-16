@@ -328,6 +328,14 @@ func TestHubManagerSharesOneUpstreamPerRun(t *testing.T) {
 	if got := mgr.SubscriberCount(); got != 100 {
 		t.Fatalf("SubscriberCount = %d, want 100", got)
 	}
+	// The waitFor above observes the FakeUpstream subscribe, but `upstreamUp` is
+	// published by runUpstream one lock acquisition LATER, so sampling
+	// UpstreamCount immediately after it is a schedule race in this test, not a
+	// hub defect: measured ~1 failure in 12 runs at GOMAXPROCS=2 (and it is what
+	// made the Batch 4.1.2 CI check job red). Wait for the same fact the
+	// assertion is about; the assertion itself is unchanged, and a hub whose
+	// upstream never becomes active still fails it.
+	waitFor(t, "the run's upstream to be counted as active", func() bool { return mgr.UpstreamCount() == 1 })
 	if got := mgr.UpstreamCount(); got != 1 {
 		t.Fatalf("UpstreamCount = %d, want 1 (upstreams must track RUNS, not connections)", got)
 	}
