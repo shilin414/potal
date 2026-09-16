@@ -92,7 +92,14 @@ func rawStream(t *testing.T, svc *execution.Service, rdb *redisx.Client, runID i
 	}
 	// A long keepalive keeps the transport quiet; the framing assertions are
 	// about ids, not about liveness.
-	gw := &sse.Gateway{Runs: svc, Redis: rdb, Keepalive: time.Hour}
+	//
+	// Batch 4: the gateway no longer holds a Redis client — it reaches Redis
+	// through the per-run hub. Each test server owns one hub manager and
+	// closes it with the test (LIFO cleanup runs before the shared Redis/DB
+	// teardown).
+	hub := sse.NewHubManager(context.Background(), rdb, nil, sse.HubOptions{})
+	t.Cleanup(hub.Close)
+	gw := &sse.Gateway{Runs: svc, Hub: hub, Keepalive: time.Hour}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gw.Stream(w, r, run)
 	}))

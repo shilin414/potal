@@ -44,10 +44,15 @@ jobs:
       # Race gate for the concurrency-critical execution plane (§31): the
       # worker, heartbeat, execution control, weighted scheduler and delivery
       # worker all mutate shared state across goroutines.
-      - name: go test -race (execution plane)
+      #
+      # The SSE Hub (Batch 4) joins this gate: subscriber add/remove, the idle
+      # timer, terminal fan-out, manager close, slow-consumer drops and cache
+      # mutation all race by construction, and a plain `go test` would not
+      # catch a torn read in any of them.
+      - name: go test -race (execution plane + SSE hub)
         run: >-
           go test -race ./internal/execution/... ./internal/delivery/...
-          ./internal/automation/... -count=1
+          ./internal/automation/... ./internal/transport/sse/... -count=1
 
   # The single database integration gate: real MySQL 5.7 + Redis 7.
   #

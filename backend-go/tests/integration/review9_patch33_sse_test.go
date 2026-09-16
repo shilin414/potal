@@ -19,10 +19,7 @@
 package integration
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
-	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -43,49 +40,15 @@ type sseStream struct {
 }
 
 // openSSEStream opens a running run's stream with the given query string.
+//
+// The reader half lives in openStreamAt (review10_sse_hub_test.go) so the
+// single-hub tests can open several streams against ONE server without a second
+// copy of the frame parser.
 func openSSEStream(t *testing.T, svc *execution.Service, rdb *redisx.Client, runID ids.ID, query string) *sseStream {
 	t.Helper()
 	ts := startSSEServer(t, svc, rdb, runID)
-	ctx, cancel := context.WithCancel(context.Background())
-	url := ts.URL
-	if query != "" {
-		url += "?" + query
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		cancel()
-		ts.Close()
-		t.Fatalf("stream request: %v", err)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		cancel()
-		ts.Close()
-		t.Fatalf("stream request: %v", err)
-	}
-	s := &sseStream{frames: make(chan sseFrame, 64), closed: make(chan struct{}), cancel: cancel}
-	go func() {
-		defer close(s.closed)
-		defer close(s.frames)
-		sc := bufio.NewScanner(resp.Body)
-		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
-		for sc.Scan() {
-			line := strings.TrimSpace(sc.Text())
-			if !strings.HasPrefix(line, "data:") {
-				continue
-			}
-			var f sseFrame
-			if json.Unmarshal([]byte(strings.TrimPrefix(line, "data:")), &f) == nil {
-				s.frames <- f
-			}
-		}
-	}()
-	t.Cleanup(func() {
-		cancel()
-		_ = resp.Body.Close()
-		ts.Close()
-	})
-	return s
+	t.Cleanup(ts.Close)
+	return openStreamAt(t, runURL(ts, runID, query))
 }
 
 // await reads until a frame matches, accumulating everything it passed. A false

@@ -37,6 +37,9 @@ func NewServer(cfg *config.Config, a *App) *transporthttp.Server {
 		Schedules: a.Schedules,
 		Scheduler: a.Scheduler,
 
-		SSE: &sse.Gateway{Runs: a.Runs, Redis: a.Redis, Metrics: a.Metrics},
+		// The SSE gateway reaches Redis ONLY through the hub (Batch 4 §7):
+		// handing it a client would let some future fallback branch restore
+		// one Redis subscription per connection.
+		SSE: &sse.Gateway{Runs: a.Runs, Hub: a.SSEHub, Metrics: a.Metrics},
 	}
 }

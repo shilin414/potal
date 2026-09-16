@@ -470,9 +470,14 @@ func startSSEServer(t *testing.T, svc *execution.Service, rdb *redisx.Client, ru
 // startSSEServerWithRun hands the gateway a CALLER-SUPPLIED run snapshot —
 // exactly what the HTTP handler does (GetRun, then Stream). A stale
 // snapshot is the whole point of 第七轮 P1.
+//
+// Batch 4: Redis is reached through the per-run hub, so this helper builds one
+// hub manager per server and closes it with the test.
 func startSSEServerWithRun(t *testing.T, svc *execution.Service, rdb *redisx.Client, run *execution.Run) *httptest.Server {
 	t.Helper()
-	gw := &sse.Gateway{Runs: svc, Redis: rdb, Keepalive: 500 * time.Millisecond}
+	hub := sse.NewHubManager(context.Background(), rdb, nil, sse.HubOptions{})
+	t.Cleanup(hub.Close)
+	gw := &sse.Gateway{Runs: svc, Hub: hub, Keepalive: 500 * time.Millisecond}
 	// Redis is injected per test; wrap Stream via closure so the test can
 	// pass its own client.
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

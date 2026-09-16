@@ -1,12 +1,16 @@
 // Package sse implements the run event stream gateway:
 //
-//  1. Subscribe the Redis pub/sub channel for live events.
+//  1. Register the connection with its run's Hub, which owns the SINGLE Redis
+//     pub/sub subscription for that run inside this process.
 //  2. Replay persisted RunEvents from the client's DURABLE CURSOR (not
-//     necessarily from 0), page by page, stopping at the first terminal
-//     event.
-//  3. Keepalive comment after 15s of silence.
-//  4. Close as soon as a terminal event is observed — in the replay, in
-//     the live loop, or synthesized from an already-settled run status.
+//     necessarily from 0) — from the Hub's bounded cache when it can prove
+//     continuity for that cursor, otherwise from MySQL, page by page —
+//     stopping at the first terminal event.
+//  3. Drain the subscriber's live queue (live frames buffered while step 2
+//     ran), skipping anything the replay already delivered.
+//  4. Keepalive comment after 15s of silence.
+//  5. Close as soon as a terminal event is observed — in the replay, in
+//     the live queue, or synthesized from an already-settled run status.
 //
 // A terminal event is a HARD boundary (第七轮 P1): replay stops at the
 // first one and the handler returns regardless of what the caller's
@@ -49,8 +53,13 @@
 // protocol 2 simply does not receive transient deltas. It still receives every
 // durable `content.chunk` (written within ~500ms / ~2KB of the bytes being
 // produced), so the worst case is a slightly coarser streaming cadence — never
-// a lost or duplicated answer. The same shape is what the SSE Hub will
-// inherit: capability belongs to the SUBSCRIBER, not to the run.
+// a lost or duplicated answer.
+//
+// Batch 4 (SSE Hub) keeps that contract byte-for-byte and moves the capability
+// DOWN into the subscriber: the Hub fans out to N connections with N different
+// protocols, so `content.delta` is filtered per Subscriber (see
+// Subscriber.accepts). The protocol decision still happens in exactly one
+// place per connection — this handler — and it is still opaque to the client.
 //
 // The declaration is a REQUEST, not a decision (第九轮补丁 3.3.1-B): the server
 // answers with the highest protocol it implements, so `stream_protocol=3` (or
@@ -66,6 +75,7 @@ package sse
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -73,10 +83,8 @@ import (
 	"strings"
 	"time"
 
-	goredis "github.com/redis/go-redis/v9"
-
 	"github.com/creation-agent-studio/backend-go/internal/execution"
-	"github.com/creation-agent-studio/backend-go/internal/platform/redisx"
+	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
 	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
 )
 
@@ -108,10 +116,29 @@ const (
 // logic may depend on it (the request parameter is the contract).
 const StreamProtocolHeader = "X-Studio-Stream-Protocol"
 
+// RunReader is the execution-service surface this package needs: one keyset
+// page of a run's durable events.
+//
+// It is an interface for one reason — testability of the part that loses data
+// when it is wrong. The replay/live handover, the terminal boundary and the
+// cache-miss fallback are only observable through the paged reader, and pinning
+// them should not require a MySQL instance. `*execution.Service` is the
+// production implementation and the only one wired outside tests.
+type RunReader interface {
+	ListEventPage(ctx context.Context, runID ids.ID, after uint64, limit int) (*execution.EventPage, error)
+}
+
 // Gateway serves GET /api/v2/runs/{id}/stream for a single run.
+//
+// It holds NO Redis client (Batch 4 §7). That is a structural guarantee, not a
+// style preference: while this struct could subscribe to Redis directly, some
+// future fallback branch would eventually restore "one Redis subscription per
+// connection" — the exact regression the Hub exists to prevent. The only way
+// to reach Redis from here is through the Hub, which owns at most one
+// subscription per run.
 type Gateway struct {
-	Runs      *execution.Service
-	Redis     *redisx.Client
+	Runs      RunReader
+	Hub       *HubManager
 	Keepalive time.Duration // defaults to 15s
 	Metrics   *telemetry.Metrics
 }
@@ -181,10 +208,8 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 	// server and the client understand, i.e. always 1 or 2 (3.3.1-B). It is
 	// never the raw `stream_protocol` request value: the metric label below
 	// and the response header are both derived from it, so an echoed request
-	// would make a query parameter an unbounded Prometheus label. Everything
-	// below — including the transient-delta filter in the live loop — is
-	// decided from this ONE value, so a connection cannot render half of its
-	// frames under one protocol and half under another.
+	// would make a query parameter an unbounded Prometheus label. In Batch 4
+	// this one value becomes the SUBSCRIBER's capability — never the Hub's.
 	protocol := StreamProtocol(r)
 	if g.Metrics != nil {
 		// The v1/v2 connection ratio is what the 3.3 rollout watches while old
@@ -250,40 +275,57 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 
 	after := ResumeCursor(r)
 
-	var msgCh <-chan *goredis.Message
+	// Register BEFORE replaying (§9). From the moment Subscribe returns, every
+	// live frame — durable chunks AND transient deltas — lands in this
+	// connection's queue. Replaying first would open a window in which a live
+	// delta for bytes far ahead of the replay position is written to the
+	// socket first: the client's rendered byte offset would jump forward and
+	// the historical bytes in between would be discarded as an old range,
+	// leaving a hole in the middle of the answer.
+	hub, sub := g.attachHub(ctx, run, protocol)
+	if sub != nil {
+		defer sub.Close(DropReasonClientGone)
+	}
 
-	// Phase order matters (§35):
-	//   1. SUBSCRIBE first — live events buffer in the pub/sub channel
-	//      from this point; nothing published later can be missed.
-	//   2. Replay persisted events from MySQL (snapshot after subscription).
-	//   3. Drain live frames, skipping sequences already replayed
-	//      (overlap between snapshot and subscription is deduplicated).
-	// lastReplayed starts at the client's cursor, not at 0: a live frame at
+	// lastDelivered starts at the client's cursor, not at 0: a live frame at
 	// or below the cursor was already delivered to this client before the
 	// reconnect, so re-sending it would duplicate content the client has
-	// rendered. Replay above only ever raises it.
-	lastReplayed := after
-	if g.Redis != nil && !execution.IsSettled(run.Status) {
-		var pubsub *goredis.PubSub
-		pubsub = g.Redis.Subscribe(ctx, g.Redis.RunEventsChannel(run.ID.String()))
-		if _, err := pubsub.Receive(ctx); err != nil { // wait for confirmation
-			_ = pubsub.Close()
-			pubsub = nil
-		}
-		defer func() {
-			if pubsub != nil {
-				_ = pubsub.Close()
+	// rendered. Replay below only ever raises it.
+	lastDelivered := after
+	cursor := after
+
+	// Phase 1: the Hub's bounded durable cache, but ONLY when it can prove
+	// continuity for this cursor (AC-8). A cache miss costs one MySQL read; a
+	// wrong hit would silently lose every event in the gap, so "not proven"
+	// is treated as "miss", never as "probably covered".
+	if hub != nil {
+		if events, covered := hub.ReplayAfter(after); covered {
+			for _, ev := range events {
+				if !writeFrame(ev.Sequence, ev.EventType, ev.Payload, false) {
+					return
+				}
+				cursor = ev.Sequence
+				lastDelivered = ev.Sequence
+				if g.Metrics != nil {
+					g.Metrics.SSEHubCacheReplayTotal.Inc()
+				}
+				if ev.IsTerminal() {
+					// The stream has already delivered the end of the run.
+					hub.NoteTerminal(ev.Sequence)
+					return
+				}
 			}
-		}()
-		if pubsub != nil {
-			msgCh = pubsub.Channel(
-				goredis.WithChannelSize(4096),
-				goredis.WithChannelSendTimeout(5*time.Second),
-			)
+		} else if g.Metrics != nil {
+			g.Metrics.SSEHubCacheMissTotal.Inc()
 		}
 	}
 
 	// Phase 2: MySQL replay, PAGE BY PAGE from the durable cursor.
+	//
+	// When phase 1 served the client, this is the tail reconciliation: it
+	// starts at the cache's high-water mark and therefore also picks up
+	// events that are already committed in MySQL but whose Redis publish has
+	// not reached the hub yet. When phase 1 missed, it is the full replay.
 	//
 	// A single unbounded read used to load a run's entire history into
 	// memory before writing the first frame (第九轮 P1-3): a run with 100k
@@ -291,7 +333,6 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 	// bounds both memory and time-to-first-frame, and the terminal-event
 	// hard boundary stops the walk as soon as the run's log ends.
 	replayedTerminal := false
-	cursor := after
 	for {
 		page, err := g.Runs.ListEventPage(ctx, run.ID, cursor, execution.DefaultEventPageSize)
 		if err != nil {
@@ -302,9 +343,16 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 				return
 			}
 			cursor = ev.Sequence
-			lastReplayed = ev.Sequence
+			lastDelivered = ev.Sequence
 			if g.Metrics != nil {
 				g.Metrics.SSEReplayEventsTotal.Inc()
+			}
+			if hub != nil {
+				// Warm the cache for the next viewer. RememberDurable never
+				// fans out — these events are already on their way through
+				// the upstream, and delivering them twice is the duplicate
+				// the durable cursor exists to prevent.
+				hub.RememberDurable(ev.Sequence, ev.EventType, ev.Payload)
 			}
 			if execution.IsTerminalEventName(ev.EventType) {
 				// A terminal event ends the run's lifecycle, so it is the
@@ -326,8 +374,11 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 		// here is what makes the contract "server closes after the
 		// terminal event" hold: the live loop would otherwise wait on
 		// Redis forever, and the terminal message it is waiting for has
-		// already been deduplicated by the `sequence <= lastReplayed`
+		// already been deduplicated by the `sequence <= lastDelivered`
 		// guard (第七轮 P1 — normal outcome race, no bad data required).
+		if hub != nil {
+			hub.NoteTerminal(cursor)
+		}
 		return
 	}
 	if execution.IsSettled(run.Status) {
@@ -360,7 +411,13 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 		}
 		return
 	}
-	if msgCh == nil {
+	if sub == nil {
+		// No live capability for this request: the run is live but the hub
+		// could not carry events (the manager is closed, the upstream failed,
+		// or SUBSCRIBE was not confirmed in time). The durable replay above is
+		// complete and correct; ending here makes the client reconnect — with
+		// its durable cursor — instead of hanging on a stream that can never
+		// advance.
 		return
 	}
 
@@ -371,45 +428,46 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 	keepalive := time.NewTicker(keepaliveAfter)
 	defer keepalive.Stop()
 
+	// Phase 3: drain the subscriber queue. Live frames that arrived during the
+	// replay are already buffered here, in the Hub's arrival order, so nothing
+	// is lost between the two phases and nothing is written twice.
+	//
+	// The protocol filter is NOT here any more: it lives at the subscriber
+	// (Subscriber.accepts), because it is a per-connection capability while
+	// this loop shares one Hub with connections of both protocols.
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case msg, ok := <-msgCh:
+		case <-sub.Done():
+			// The hub dropped this subscriber — slow consumer, hub closed,
+			// upstream lost. The client reconnects with its durable cursor.
+			return
+		case ev, ok := <-sub.Events():
 			if !ok {
 				return
 			}
-			var frame struct {
-				Sequence  uint64         `json:"sequence"`
-				EventType string         `json:"event_type"`
-				Payload   map[string]any `json:"payload"`
-			}
-			if err := json.Unmarshal([]byte(msg.Payload), &frame); err != nil {
-				continue
-			}
+			// Release the queue's byte budget for every dequeued event,
+			// including the ones skipped as duplicates below: holding it until
+			// Close would make a long-lived connection look slow.
+			sub.Release(ev)
 			// Skip events already covered by the replay snapshot.
-			if frame.Sequence != 0 && frame.Sequence <= lastReplayed {
-				continue
-			}
-			// Capability gate (第九轮补丁 3.3-B): a legacy client cannot
-			// reconcile a transient delta against the durable chunk that
-			// carries the same bytes, so it must not receive one at all.
 			//
-			// ONLY content.delta is filtered. Sequence 0 is a transport
-			// marker, not a feature: a future transient control frame that
-			// needs no byte-range reconciliation must still reach legacy
-			// clients, so filtering "every sequence-0 frame" would silently
-			// drop it. The durable chunk path is untouched either way, which
-			// is what keeps the final answer complete for legacy clients.
-			if frame.Sequence == 0 &&
-				frame.EventType == execution.EventContentDelta &&
-				protocol < StreamProtocolRangeDelta {
+			// `lastDelivered` is deliberately NOT advanced here (it tracks the
+			// REPLAY position only). Advancing it on live frames would make the
+			// connection drop any durable sequence below one it had already
+			// delivered — and losing an event is strictly worse than the
+			// duplicate it would prevent, which cannot occur anyway: a run's
+			// sequences are allocated monotonically and published once,
+			// post-commit. This also keeps the pre-Batch-4 dedupe semantics
+			// exactly as they were (AC-14).
+			if ev.Sequence != 0 && ev.Sequence <= lastDelivered {
 				continue
 			}
-			if !writeFrame(frame.Sequence, frame.EventType, frame.Payload, true) {
+			if !writeFrame(ev.Sequence, ev.EventType, ev.Payload, true) {
 				return
 			}
-			if execution.IsTerminalEventName(frame.EventType) {
+			if ev.IsTerminal() {
 				return
 			}
 		case <-keepalive.C:
@@ -418,6 +476,57 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 			}
 		}
 	}
+}
+
+// attachHub resolves the hub for this request and registers a subscriber.
+//
+// It returns a nil hub/subscriber pair whenever the connection must be served
+// by a durable replay only:
+//
+//   - no hub manager is wired (tests, or a process without Redis);
+//   - the run is ALREADY SETTLED and no retained hub exists — a finished run
+//     must never pay for a Redis subscription (§20);
+//   - the hub exists but cannot serve (upstream failed, SUBSCRIBE not
+//     confirmed in time, or it was evicted between the lookup and the
+//     registration).
+//
+// A settled run still REUSES a hub the run created while it was live (§21):
+// the terminal hub keeps its cache for IdleTTL, so a reconnect in that window
+// is served without touching MySQL — but no new upstream is ever opened for
+// it, because `Lookup` never creates.
+func (g *Gateway) attachHub(ctx context.Context, run *execution.Run, protocol int) (*RunHub, *Subscriber) {
+	if g.Hub == nil {
+		return nil, nil
+	}
+	settled := execution.IsSettled(run.Status)
+	runID := run.ID.String()
+
+	// Two attempts: a hub can be evicted (idle timer, upstream failure)
+	// between the lookup and the registration. Recreating one is cheap while
+	// the run is live; a settled run simply keeps the durable-only path.
+	for attempt := 0; attempt < 2; attempt++ {
+		hub := g.Hub.Lookup(runID)
+		if hub == nil {
+			if settled {
+				return nil, nil
+			}
+			hub = g.Hub.GetOrCreate(runID)
+			if hub == nil {
+				return nil, nil
+			}
+		}
+		// Wait for the upstream registration to settle before replaying, so
+		// the "SUBSCRIBE first, replay second" property still holds: any
+		// event published after this point is either in this connection's
+		// queue or already visible to the replay's MySQL read.
+		if !hub.WaitReady(ctx) || !hub.Serving() {
+			return nil, nil
+		}
+		if sub, ok := hub.Subscribe(protocol); ok {
+			return hub, sub
+		}
+	}
+	return nil, nil
 }
 
 // syntheticTerminalEventName maps a SETTLED run status to the terminal

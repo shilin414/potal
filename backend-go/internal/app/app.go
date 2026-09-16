@@ -26,6 +26,7 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/platform/redisx"
 	"github.com/creation-agent-studio/backend-go/internal/platform/storage"
 	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
+	"github.com/creation-agent-studio/backend-go/internal/transport/sse"
 )
 
 // App holds every shared dependency.
@@ -63,6 +64,14 @@ type App struct {
 	// ProviderSlots is the durable (MySQL) provider concurrency semaphore:
 	// ownership-scoped slots, DB-clock expiry, Redis independent.
 	ProviderSlots *execution.ProviderSlots
+
+	// SSEHub is the process-local SSE fan-out registry (Batch 4 — SSE Hub).
+	// It owns ONE Redis pub/sub subscription per run being streamed by this
+	// instance, no matter how many HTTP connections are watching.
+	//
+	// It runs on its OWN runtime context (see sse.NewHubManager) and must be
+	// closed BEFORE a.Redis — see App.Close.
+	SSEHub *sse.HubManager
 }
 
 // Build constructs the graph; ctx bounds connection setup.
@@ -204,6 +213,19 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 		Schedules: schedSvc, Scheduler: schedJob,
 		DeliveryDispatch: disp, DeliverySender: feishuSender, DeliveryLimiter: deliveryLimiter,
 		ProviderSlots: execution.NewProviderSlots(dbh, "feishu_aily", maxInflight, cfg.Runner.LeaseSeconds),
+		// SSE Hub (Batch 4). `ctx` here is the STARTUP context, and it is
+		// passed only so the wiring records what must NOT become the hub's
+		// runtime parent: sse.NewHubManager derives its own context from
+		// context.Background() and lives until App.Close. Deriving it from
+		// this context would cancel every live stream 30s after process
+		// start.
+		SSEHub: sse.NewHubManager(ctx, rdb, metrics, sse.HubOptions{
+			CacheMaxEvents:      cfg.SSE.HubCacheEvents,
+			CacheMaxBytes:       cfg.SSE.HubCacheBytes,
+			SubscriberMaxEvents: cfg.SSE.SubscriberEvents,
+			SubscriberMaxBytes:  cfg.SSE.SubscriberBytes,
+			IdleTTL:             cfg.SSE.HubIdleTTL,
+		}),
 	}, nil
 }
 
@@ -385,7 +407,16 @@ func (g *ExecutionGate) CheckRun(ctx context.Context, run *execution.Run) (execu
 }
 
 // Close releases shared resources.
+//
+// The order is load-bearing (Batch 4 AC-12). The SSE Hub owns Redis pub/sub
+// subscriptions, so it is closed FIRST: closing the Redis client underneath
+// live hubs would tear their upstreams down in a way that reports a Redis
+// outage that never happened, and would leave subscriber goroutines waiting on
+// a pool that is gone.
 func (a *App) Close() {
+	if a.SSEHub != nil {
+		a.SSEHub.Close()
+	}
 	_ = a.Redis.Close()
 	_ = a.DB.Close()
 }
