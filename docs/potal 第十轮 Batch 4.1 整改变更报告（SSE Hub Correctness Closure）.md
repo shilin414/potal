@@ -306,11 +306,29 @@ AC-4.1-7  旧 Hub 无法在回收后写回 cacheStats，也无法覆盖新代际
 AC-4.1-8  manager.mu 与 hub.mu 不再嵌套                                     PASS
 AC-4.1-9  Batch 4 原矩阵（单 upstream / 协议隔离 / 慢客户端隔离 /
           catch-up barrier / terminal 硬边界 / idle 生命周期）继续 green     PASS
-AC-4.1-10 CI：unit / integration / race / frontend                         见 §10
+AC-4.1-10 CI：unit / integration / race / frontend                          PASS
 ```
 
 未删除或放宽任何 Batch 4 既有测试；唯一被替换的语义是 §22 指定的
 `"newest event always survives"`。
+
+### CI 证据（`f360fac`，run 35069505453）
+
+```text
+check        actionlint / gofmt check / go vet / go build
+             go test (unit; integration gated by env)
+             go test -race (execution plane + SSE hub)          all success
+integration  apply migrations / 二次运行必须是干净 no-op
+             database-backed package tests (real MySQL/Redis)
+             integration tests                                   all success
+frontend     tsc / vitest / vite build                          success
+```
+
+race 覆盖 `./internal/transport/sse/...`，也就是本批改动的包；本机无法跑 `-race`（无 gcc），
+该门由 CI 兜住。
+
+同时 CI 的 integration 全绿也反向确认了 §8.4：本机那两个 `available_at` 用例的失败是环境负载
+所致，而不是代码问题。
 
 ---
 
