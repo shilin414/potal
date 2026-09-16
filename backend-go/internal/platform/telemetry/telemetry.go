@@ -129,15 +129,48 @@ type Metrics struct {
 	//	                            — a re-claim found an already-accepted
 	//	                              submission and reconciled instead of
 	//	                              submitting a second provider chat
-	//	SSEReplayEventsTotal        — durable events served by the SSE replay
-	//	                              path (per-connection, so a healthy Hub
-	//	                              keeps this near the event count rather
-	//	                              than multiplying it by viewers)
+	//	SSEReplayEventsTotal        — durable events fetched from the MySQL
+	//	                              replay path (Batch 4 narrowed this from
+	//	                              "every replayed frame": cache replays
+	//	                              are counted by SSEHubCacheReplayTotal
+	//	                              instead, so the two together show
+	//	                              whether the Hub is actually removing
+	//	                              database work rather than just moving it)
 	RunIdempotencyReplayTotal      prometheus.Counter
 	RunIdempotencyConflictTotal    prometheus.Counter
 	ProviderSubmissionUnknownTotal prometheus.Counter
 	ProviderSubmissionDedupTotal   prometheus.Counter
 	SSEReplayEventsTotal           prometheus.Counter
+
+	// Batch 4 — SSE Hub. These are the series that prove the fan-out change
+	// happened, and they are read as RATIOS, never in isolation:
+	//
+	//	SSEHubActive             — live hubs (= runs being watched here)
+	//	SSEHubUpstreamsActive    — confirmed Redis subscriptions
+	//	SSEHubSubscribersActive  — HTTP connections carried by hubs
+	//
+	// The healthy relationship is subscribers ≫ hubs ≈ upstreams. If
+	// upstreams tracks CONNECTIONS instead of hubs, a fallback path has
+	// restored per-connection Redis subscriptions and the batch is not doing
+	// its job.
+	//
+	// SSEHubSubscriberDroppedTotal{reason} is the one to alert on:
+	// slow_consumer means real clients are outrunning their own queue
+	// (consider the limits), while hub_closed/upstream_closed means the hub
+	// is ending streams it should not have to.
+	//
+	// No label here may carry a run/user/conversation id: hop cardinality per
+	// HTTP connection is how an SSE metric takes down a Prometheus instance.
+	SSEHubActive                 prometheus.Gauge
+	SSEHubSubscribersActive      *prometheus.GaugeVec // {protocol}
+	SSEHubUpstreamsActive        prometheus.Gauge
+	SSEHubCreatedTotal           prometheus.Counter
+	SSEHubCacheReplayTotal       prometheus.Counter
+	SSEHubCacheMissTotal         prometheus.Counter
+	SSEHubSubscriberDroppedTotal *prometheus.CounterVec // {reason}
+	SSEHubUpstreamFailureTotal   *prometheus.CounterVec // {stage}
+	SSEHubCacheEvents            prometheus.Gauge
+	SSEHubCacheBytes             prometheus.Gauge
 }
 
 // Provider admission results (ProviderAdmission label values).
@@ -339,7 +372,54 @@ func NewMetrics(service string) *Metrics {
 		}),
 		SSEReplayEventsTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "studio_sse_replay_events_total",
-			Help: "Durable run events served by the SSE replay path.",
+			Help: "Durable run events fetched from the MySQL SSE replay path (cache replays are counted by " +
+				"studio_sse_hub_cache_replay_total instead).",
+		}),
+		SSEHubActive: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "studio_sse_hubs_active",
+			Help: "Process-local SSE run hubs (one per run being streamed by this instance).",
+		}),
+		SSEHubSubscribersActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "studio_sse_hub_subscribers_active",
+			Help: "SSE connections carried by run hubs, by the protocol they negotiated (1 = durable only, " +
+				"2 = transient deltas included).",
+		}, []string{"protocol"}),
+		SSEHubUpstreamsActive: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "studio_sse_hub_upstreams_active",
+			Help: "Confirmed Redis pub/sub subscriptions held by run hubs. Healthy: ≈ hubs, ≪ connections.",
+		}),
+		SSEHubCreatedTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_sse_hub_created_total",
+			Help: "Run hubs created. A rate far above the run-creation rate means hubs are churning " +
+				"(idle TTL too short, or upstreams failing).",
+		}),
+		SSEHubCacheReplayTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_sse_hub_cache_replay_total",
+			Help: "Durable events served from a hub's bounded cache instead of MySQL.",
+		}),
+		SSEHubCacheMissTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_sse_hub_cache_miss_total",
+			Help: "Replay requests the hub cache could not serve (empty, evicted, or a sequence gap): " +
+				"these fall back to MySQL by design.",
+		}),
+		SSEHubSubscriberDroppedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "studio_sse_hub_subscriber_dropped_total",
+			Help: "Subscribers disconnected by the hub itself, by reason. slow_consumer = the connection " +
+				"outran its queue (only that connection is dropped); hub_closed / upstream_closed = the hub " +
+				"ended the stream. A client that simply disconnected is NOT counted here.",
+		}, []string{"reason"}),
+		SSEHubUpstreamFailureTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "studio_sse_hub_upstream_failure_total",
+			Help: "Redis upstream failures by stage: subscribe (SUBSCRIBE not confirmed), receive " +
+				"(subscription ended unexpectedly), channel_closed, decode (malformed event payload).",
+		}, []string{"stage"}),
+		SSEHubCacheEvents: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "studio_sse_hub_cache_events",
+			Help: "Durable events held across all hub caches (bounded by SSE_HUB_CACHE_EVENTS per hub).",
+		}),
+		SSEHubCacheBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "studio_sse_hub_cache_bytes",
+			Help: "Approximate payload bytes held across all hub caches (bounded by SSE_HUB_CACHE_BYTES per hub).",
 		}),
 	}
 	reg.MustRegister(
@@ -358,6 +438,10 @@ func NewMetrics(service string) *Metrics {
 		m.RunIdempotencyReplayTotal, m.RunIdempotencyConflictTotal,
 		m.ProviderSubmissionUnknownTotal, m.ProviderSubmissionDedupTotal,
 		m.SSEReplayEventsTotal,
+		m.SSEHubActive, m.SSEHubSubscribersActive, m.SSEHubUpstreamsActive,
+		m.SSEHubCreatedTotal, m.SSEHubCacheReplayTotal, m.SSEHubCacheMissTotal,
+		m.SSEHubSubscriberDroppedTotal, m.SSEHubUpstreamFailureTotal,
+		m.SSEHubCacheEvents, m.SSEHubCacheBytes,
 	)
 	return m
 }

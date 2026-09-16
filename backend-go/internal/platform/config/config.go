@@ -36,6 +36,7 @@ type Config struct {
 	Storage  StorageConfig
 	Auth     AuthConfig
 	OTel     OTelConfig
+	SSE      SSEConfig
 }
 
 type DatabaseConfig struct {
@@ -165,6 +166,36 @@ type OTelConfig struct {
 	SamplingRate float64
 }
 
+// SSEConfig bounds the process-local SSE Hub (Batch 4 — SSE Hub).
+//
+// Every field is a memory bound on a long-lived process, so a malformed or
+// non-positive value falls back to its default rather than being read as
+// "unlimited": an unbounded replay cache or subscriber queue is exactly the
+// failure the Hub's bounds exist to prevent.
+//
+// The defaults mirror sse.DefaultHubOptions (the same numbers, for the same
+// reasons); sse.HubOptions.normalized applies them a second time so a
+// programmatically constructed config cannot disable a bound either.
+//
+//	2048 durable cache events / run      8 MiB durable cache / run
+//	1024 pending live frames / subscriber  4 MiB pending queue / subscriber
+//	30s idle retention
+type SSEConfig struct {
+	// HubCacheEvents / HubCacheBytes bound the per-run durable replay cache.
+	// BOTH are enforced: one content.chunk can carry a large slice of an
+	// answer, so an event-count-only bound does not bound memory.
+	HubCacheEvents int
+	HubCacheBytes  int64
+	// SubscriberEvents / SubscriberBytes bound one connection's pending live
+	// queue. Exceeding either drops THAT connection only.
+	SubscriberEvents int
+	SubscriberBytes  int64
+	// HubIdleTTL is how long a hub survives with no subscribers. The browser
+	// reconnects ~2s after a drop, so evicting immediately would rebuild the
+	// Redis subscription on every blip.
+	HubIdleTTL time.Duration
+}
+
 // Load reads configuration from the environment, overlaying .env.local
 // then .env from searchPaths (values already in the environment win).
 func Load(searchPaths ...string) (*Config, error) {
@@ -252,6 +283,13 @@ func Load(searchPaths ...string) (*Config, error) {
 			Insecure:     getEnvBool("OTEL_INSECURE", true),
 			ServiceName:  getEnv("OTEL_SERVICE_NAME", "studio-backend"),
 			SamplingRate: getEnvFloat("OTEL_SAMPLING_RATE", 0.1),
+		},
+		SSE: SSEConfig{
+			HubCacheEvents:   getEnvPositiveInt("SSE_HUB_CACHE_EVENTS", 2048),
+			HubCacheBytes:    getEnvPositiveInt64("SSE_HUB_CACHE_BYTES", 8<<20),
+			SubscriberEvents: getEnvPositiveInt("SSE_SUBSCRIBER_QUEUE_EVENTS", 1024),
+			SubscriberBytes:  getEnvPositiveInt64("SSE_SUBSCRIBER_QUEUE_BYTES", 4<<20),
+			HubIdleTTL:       getEnvPositiveDuration("SSE_HUB_IDLE_TTL", 30*time.Second),
 		},
 	}
 
@@ -378,6 +416,45 @@ func getEnvDuration(key string, def time.Duration) time.Duration {
 			return d
 		}
 		if secs, err := strconv.ParseFloat(v, 64); err == nil {
+			return time.Duration(secs * float64(time.Second))
+		}
+	}
+	return def
+}
+
+// getEnvPositiveInt / getEnvPositiveInt64 / getEnvPositiveDuration are the
+// loaders for bounds that have no meaningful "zero" reading.
+//
+// They differ from the plain getEnv* helpers in one deliberate way: a value
+// that PARSES but is non-positive is treated exactly like unparsable input and
+// falls back to the default. For a limit such as a cache size or a queue
+// depth, `SSE_HUB_CACHE_EVENTS=0` is a misconfiguration, not a request for an
+// unbounded buffer — and the plain helpers would happily return the zero and
+// let the caller interpret it.
+func getEnvPositiveInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+func getEnvPositiveInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
+
+func getEnvPositiveDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+		if secs, err := strconv.ParseFloat(v, 64); err == nil && secs > 0 {
 			return time.Duration(secs * float64(time.Second))
 		}
 	}

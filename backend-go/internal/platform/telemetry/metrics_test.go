@@ -179,3 +179,75 @@ func TestSSEStreamProtocolMetricLabelShape(t *testing.T) {
 		}
 	}
 }
+
+// TestSSEHubMetricsAreExported pins the Batch 4 (SSE Hub) observability surface.
+//
+// These are the series the canary reads, and the only ones that can prove the
+// fan-out change actually happened: the healthy relationship is
+// subscribers ≫ hubs ≈ upstreams, and `studio_sse_hub_upstreams_active` is the
+// number that must NOT track connections.
+//
+// The VALUE enumerations for the labeled counters are asserted in the sse
+// package (TestHubMetricLabelsStayBounded), where the drop and failure paths
+// that write them are visible; the label SHAPES are pinned here, because a
+// second label on a per-connection metric is what turns an SSE rollout into a
+// Prometheus incident.
+func TestSSEHubMetricsAreExported(t *testing.T) {
+	m := NewMetrics("test")
+	m.SSEHubSubscribersActive.WithLabelValues("1").Set(0)
+	m.SSEHubSubscribersActive.WithLabelValues("2").Set(0)
+	m.SSEHubSubscriberDroppedTotal.WithLabelValues("slow_consumer").Add(0)
+	m.SSEHubUpstreamFailureTotal.WithLabelValues("subscribe").Add(0)
+	m.SSEHubActive.Set(0)
+	m.SSEHubUpstreamsActive.Set(0)
+	m.SSEHubCacheEvents.Set(0)
+	m.SSEHubCacheBytes.Set(0)
+	m.SSEHubCreatedTotal.Add(0)
+	m.SSEHubCacheReplayTotal.Add(0)
+	m.SSEHubCacheMissTotal.Add(0)
+
+	got := gatherNames(t, m)
+	for _, name := range []string{
+		"studio_sse_hubs_active",
+		"studio_sse_hub_subscribers_active",
+		"studio_sse_hub_upstreams_active",
+		"studio_sse_hub_created_total",
+		"studio_sse_hub_cache_replay_total",
+		"studio_sse_hub_cache_miss_total",
+		"studio_sse_hub_subscriber_dropped_total",
+		"studio_sse_hub_upstream_failure_total",
+		"studio_sse_hub_cache_events",
+		"studio_sse_hub_cache_bytes",
+	} {
+		if _, ok := got[name]; !ok {
+			t.Errorf("metric %s is not exported (Batch 4 SSE Hub surface)", name)
+		}
+	}
+
+	// One label each, and it must be the documented one — never a run id, a
+	// user id or a conversation id.
+	for name, label := range map[string]string{
+		"studio_sse_hub_subscribers_active":       "protocol",
+		"studio_sse_hub_subscriber_dropped_total": "reason",
+		"studio_sse_hub_upstream_failure_total":   "stage",
+	} {
+		family := got[name]
+		if family == nil {
+			t.Fatalf("metric %s is not exported", name)
+		}
+		for _, metric := range family.GetMetric() {
+			lps := metric.GetLabel()
+			if len(lps) != 1 || lps[0].GetName() != label {
+				t.Fatalf("%s labels = %v, want exactly [%s]", name, lps, label)
+			}
+		}
+	}
+
+	// The protocol label on the subscriber gauge is the same bounded value the
+	// negotiation produces.
+	for _, metric := range got["studio_sse_hub_subscribers_active"].GetMetric() {
+		if v := metric.GetLabel()[0].GetValue(); v != "1" && v != "2" {
+			t.Fatalf("studio_sse_hub_subscribers_active has protocol=%q, want only \"1\" or \"2\"", v)
+		}
+	}
+}
