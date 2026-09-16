@@ -81,17 +81,147 @@ func TestDurableRingBoundsByEventCountAndBytes(t *testing.T) {
 			t.Fatalf("HighWater = %d, want 10", got)
 		}
 	})
+}
 
-	t.Run("newest event always survives", func(t *testing.T) {
-		// A single event larger than the whole budget must still be held:
-		// a ring that evicted the event it was just handed could never serve
-		// any cursor, and first/last would be meaningless.
-		ring := NewDurableRing(10, 10)
-		ring.Remember(durableEvent(1, 4096))
-		if ring.Len() != 1 || ring.HighWater() != 1 {
-			t.Fatalf("oversized single event was dropped: len=%d high=%d, want 1/1", ring.Len(), ring.HighWater())
+// TestDurableRingRejectsSingleOversizedEvent is AC-4.1-1/AC-4.1-2 and kills
+// Mutation J (§33).
+//
+// The pre-4.1 ring kept the newest event whatever its size ("a ring that
+// evicted the event it was just handed could never serve any cursor"), which
+// made CacheMaxBytes advisory: ONE oversized durable event stayed resident no
+// matter the budget. That is not academic — the terminal event carries the
+// run's whole answer in `payload.text`, so `run.completed` > 8 MiB is
+// structurally possible, and N such hubs multiply it.
+//
+// The correct answer is neither truncation (a cached event must BE the event)
+// nor exemption: retain NOTHING for it. Coverage is lost, the cursor falls
+// back to MySQL, and the log still holds the frame in full — not cached is not
+// the same as not sent, and not the same as lost.
+func TestDurableRingRejectsSingleOversizedEvent(t *testing.T) {
+	ring := NewDurableRing(10, 10)
+	evicted, discontinuous := ring.Remember(durableEvent(1, 4096))
+	if evicted != 0 {
+		t.Fatalf("evicted = %d for a first oversized event in an empty ring, want 0", evicted)
+	}
+	if !discontinuous {
+		t.Fatal("an oversized event was reported as continuous: the ring retains nothing, " +
+			"so nothing it held can be claimed as covered")
+	}
+	if ring.Len() != 0 || ring.Bytes() != 0 {
+		t.Fatalf("ring = len:%d bytes:%d, want 0/0: an event larger than the whole byte "+
+			"budget must never be retained (AC-4.1-1: Bytes() <= maxBytes, always)",
+			ring.Len(), ring.Bytes())
+	}
+	if _, covered := ring.After(0); covered {
+		t.Fatal("the ring claimed to cover cursor 0 while holding nothing")
+	}
+	if got := ring.ObservedHighWater(); got != 1 {
+		t.Fatalf("observed high-water = %d, want 1: rejecting a payload must not forget the "+
+			"position, or a late frame could reopen the range", got)
+	}
+}
+
+// TestDurableRingOversizedEventBreaksCoverage pins the coverage half of §21:
+// after an oversized barrier every cursor at or below it is a MISS, so the
+// client goes to MySQL for the range instead of being told "nothing to send".
+func TestDurableRingOversizedEventBreaksCoverage(t *testing.T) {
+	ring := NewDurableRing(64, 256)
+	for seq := uint64(1); seq <= 4; seq++ {
+		if _, discontinuous := ring.Remember(durableEvent(seq, 8)); discontinuous {
+			t.Fatalf("seq %d reported a discontinuity inside a contiguous run", seq)
 		}
-	})
+	}
+	if ring.Len() != 4 {
+		t.Fatalf("Len = %d before the barrier, want 4", ring.Len())
+	}
+
+	evicted, discontinuous := ring.Remember(durableEvent(5, 4096))
+	if !discontinuous {
+		t.Fatal("the oversized event did not invalidate the retained segment")
+	}
+	if evicted != 4 {
+		t.Fatalf("evicted = %d, want 4 (the invalidated 1..4 segment)", evicted)
+	}
+	if ring.Len() != 0 || ring.Bytes() != 0 {
+		t.Fatalf("ring = len:%d bytes:%d after the barrier, want 0/0", ring.Len(), ring.Bytes())
+	}
+	if _, covered := ring.After(4); covered {
+		t.Fatal("cache claimed to cover after=4 although 5 is not retained: a client resuming " +
+			"there must be sent 5 from MySQL")
+	}
+	if got := ring.ObservedHighWater(); got != 5 {
+		t.Fatalf("observed high-water = %d, want 5", got)
+	}
+}
+
+// TestDurableRingResumesSegmentAfterOversizedBarrier: the cache must recover —
+// a new contiguous segment starts at the first event AFTER the barrier, and
+// exactly one cursor (the barrier itself) can serve it.
+//
+//	after=4 → MISS   (5 is the barrier: not retained anywhere but MySQL)
+//	after=5 → HIT    ([6 7])
+func TestDurableRingResumesSegmentAfterOversizedBarrier(t *testing.T) {
+	ring := NewDurableRing(64, 256)
+	for seq := uint64(1); seq <= 4; seq++ {
+		ring.Remember(durableEvent(seq, 8))
+	}
+	ring.Remember(durableEvent(5, 4096))
+	for seq := uint64(6); seq <= 7; seq++ {
+		if _, discontinuous := ring.Remember(durableEvent(seq, 8)); discontinuous {
+			t.Fatalf("seq %d did not resume the segment after the barrier", seq)
+		}
+	}
+
+	if _, covered := ring.After(4); covered {
+		t.Fatal("after=4 must MISS: 5 is not retained")
+	}
+	events, covered := ring.After(5)
+	if !covered {
+		t.Fatal("after=5 must HIT: the barrier itself is the last position the client holds, " +
+			"and 6..7 are retained contiguously")
+	}
+	if want := []uint64{6, 7}; len(events) != len(want) || events[0].Sequence != 6 || events[1].Sequence != 7 {
+		t.Fatalf("After(5) = %v, want [6 7]", sequencesOf(events))
+	}
+	if got := ring.FirstSeq(); got != 6 {
+		t.Fatalf("FirstSeq = %d, want 6", got)
+	}
+
+	// A straggler below the barrier must not be appended: the ring has moved
+	// past 5, and re-opening the abandoned range would make the segment
+	// non-contiguous in the other direction.
+	if evicted, discontinuous := ring.Remember(durableEvent(3, 8)); evicted != 0 || discontinuous {
+		t.Fatalf("stale seq 3 after the barrier reported (evicted=%d, discontinuous=%v), want (0,false)",
+			evicted, discontinuous)
+	}
+	if ring.Len() != 2 || ring.FirstSeq() != 6 {
+		t.Fatalf("ring = len:%d first:%d after a stale frame, want 2/6", ring.Len(), ring.FirstSeq())
+	}
+}
+
+// TestDurableRingBytesNeverExceedConfiguredBound is AC-4.1-1 as an invariant
+// over a mixed workload rather than a single shape: at every instant, after
+// every Remember, the retained footprint is within the bound — including the
+// moments right after a payload far larger than the whole budget.
+func TestDurableRingBytesNeverExceedConfiguredBound(t *testing.T) {
+	const maxBytes = 1024
+	ring := NewDurableRing(1000, maxBytes)
+
+	weights := []int{64, 64, 512, 64, 4096, 64, 64, 100, 64, 4096, 8, 2048, 32}
+	for i, weight := range weights {
+		seq := uint64(i + 1)
+		ring.Remember(durableEvent(seq, weight))
+		if got := ring.Bytes(); got > maxBytes {
+			t.Fatalf("after event %d (weight %d): Bytes = %d, want <= %d — the byte bound is a "+
+				"memory-safety limit, not a target", seq, weight, got, maxBytes)
+		}
+		if got := ring.Len(); got > 1000 {
+			t.Fatalf("after event %d: Len = %d, want <= 1000", seq, got)
+		}
+		if got := ring.ObservedHighWater(); got != seq {
+			t.Fatalf("after event %d: observed high-water = %d", seq, got)
+		}
+	}
 }
 
 // TestDurableRingGapInvalidatesContinuity pins AC-8 and kills Mutation F.

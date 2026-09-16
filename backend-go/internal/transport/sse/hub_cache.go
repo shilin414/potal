@@ -27,9 +27,14 @@ import "sync"
 // answer the same question — and that is exactly what makes "reset on gap"
 // safe. A wrong "hit" loses events; a wrong "miss" costs one database read.
 //
-// The ring is bounded by event COUNT *and* bytes. A count-only bound is not
-// enough: one `content.chunk` can carry a large slice of an answer, so a
-// ring that holds 2048 of them can hold far more than the memory budget.
+//  3. The bounds are HARD, including the byte bound (Batch 4.1). An event
+//     whose own weight exceeds maxBytes is not retained at all — it is not
+//     truncated and not squeezed in as "the newest one". A cache is allowed to
+//     miss; a memory bound that one `run.completed` carrying the whole answer
+//     can blow through is not a bound. The segment is invalidated instead, so
+//     every cursor below it falls back to MySQL, where the event still exists
+//     in full. With that rule the ring can always evict its way back under both
+//     limits, so `Bytes() <= maxBytes` holds at every instant.
 type DurableRing struct {
 	mu sync.Mutex
 
@@ -45,6 +50,15 @@ type DurableRing struct {
 
 	firstSeq uint64
 	lastSeq  uint64
+
+	// lastObservedSeq is the highest sequence the ring has ever been OFFERED,
+	// which is not the same thing as lastSeq (§19): the segment can be thrown
+	// away (a gap, or an event too large to retain) while the fact that we are
+	// past that sequence stays true. Keeping them apart is what stops a late
+	// Redis frame from walking the ring backwards — after an oversized event at
+	// 5 has invalidated the segment, a straggler carrying 3 must not be
+	// appended to a segment that now starts at 6.
+	lastObservedSeq uint64
 }
 
 // NewDurableRing builds a ring bounded by maxEvents AND maxBytes. A
@@ -56,11 +70,12 @@ func NewDurableRing(maxEvents int, maxBytes int64) *DurableRing {
 }
 
 // Remember offers one event to the cache. It reports how many cached events
-// were evicted (the caller folds that into the cache gauges) and whether this
-// event was DISCONTINUOUS with what the ring held — i.e. the previous
-// segment was thrown away because a sequence was missing.
+// were discarded (the caller folds that into the cache gauges) and whether the
+// RETAINED SEGMENT was invalidated — i.e. the ring no longer covers what it
+// held before, because a sequence was missing or because this event is too
+// large to retain.
 //
-// Events at or below the current high-water mark are ignored: the same
+// Events at or below the observed high-water mark are ignored: the same
 // durable event legitimately arrives twice (a re-publish, the overlap between
 // the DB replay and the live path), and appending a copy would break the
 // "contiguous, ascending" invariant the replay path depends on. The ring never
@@ -73,28 +88,57 @@ func (r *DurableRing) Remember(ev HubEvent) (evicted int, discontinuous bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	live := len(r.buf) - r.head
-	switch {
-	case live == 0:
-		r.firstSeq = ev.Sequence
-	case ev.Sequence <= r.lastSeq:
+	if ev.Sequence <= r.lastObservedSeq {
 		return 0, false
-	case ev.Sequence == r.lastSeq+1:
-		// Contiguous: the normal live path.
-	default:
+	}
+
+	live := len(r.buf) - r.head
+	if r.lastObservedSeq > 0 && ev.Sequence != r.lastObservedSeq+1 {
+		// A sequence is missing, so nothing retained can answer a cursor
+		// inside the hole. Fail closed: drop the whole segment.
 		evicted = live
-		r.buf = r.buf[:0]
-		r.head = 0
-		r.bytes = 0
-		r.firstSeq = ev.Sequence
+		r.resetSegmentLocked()
 		discontinuous = true
 	}
 
+	r.lastObservedSeq = ev.Sequence
+
+	if r.maxBytes > 0 && int64(ev.ApproxBytes) > r.maxBytes {
+		// Bigger than the entire budget. Retaining it would make
+		// `Bytes() <= maxBytes` false no matter how much else is evicted —
+		// and truncating it is not an option either, because a cached event
+		// must be the event. So retain NOTHING here: the ring keeps its
+		// high-water mark (it has seen this sequence) and loses its
+		// coverage, which turns every cursor at or below this event into a
+		// MySQL read. The event itself is untouched on the wire and in the
+		// log — not cached ≠ not sent ≠ lost (AC-4.1-2).
+		evicted += len(r.buf) - r.head
+		r.resetSegmentLocked()
+		return evicted, true
+	}
+
+	if len(r.buf) == r.head {
+		r.firstSeq = ev.Sequence
+	}
 	r.buf = append(r.buf, ev)
 	r.bytes += int64(ev.ApproxBytes)
 	r.lastSeq = ev.Sequence
 	r.compactLocked()
 	return evicted + r.evictLocked(), discontinuous
+}
+
+// resetSegmentLocked discards every retained entry. lastObservedSeq is NOT
+// touched: the ring has still seen that position, and forgetting it would let
+// a late frame re-open a range the ring already gave up on.
+func (r *DurableRing) resetSegmentLocked() {
+	for i := range r.buf {
+		r.buf[i] = HubEvent{}
+	}
+	r.buf = r.buf[:0]
+	r.head = 0
+	r.bytes = 0
+	r.firstSeq = 0
+	r.lastSeq = 0
 }
 
 // After returns the cached events with sequence > after and whether the cache
@@ -168,15 +212,33 @@ func (r *DurableRing) FirstSeq() uint64 {
 	return r.firstSeq
 }
 
-// evictLocked drops the oldest entries until the ring fits both bounds. At
-// least the newest entry always survives: a cache that evicted the event it
-// was just handed could never serve any cursor, and dropping below one entry
-// would leave firstSeq/lastSeq meaningless.
+// ObservedHighWater is the highest sequence the ring has been offered,
+// retained or not (§19). It is deliberately NOT HighWater: an event too large
+// to cache is still an event the ring has moved past, and the difference is
+// what keeps a late frame from reopening an abandoned range.
+func (r *DurableRing) ObservedHighWater() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.lastObservedSeq
+}
+
+// evictLocked drops the oldest entries until the ring fits both bounds.
+//
+// It may empty the ring: an oversized event is refused before it is appended
+// (see Remember), so every retained entry is individually within the byte
+// budget and dropping entries always brings the ring back under both limits.
+// The old "keep the newest entry whatever its size" exemption is exactly what
+// made maxBytes advisory — one 4 KiB `run.completed` under `CacheMaxBytes=1024`
+// stayed resident forever (Batch 4.1, AC-4.1-1).
+//
+// An empty ring is a MISS, not a wrong hit: firstSeq/lastSeq reset to 0 and
+// After() refuses every cursor, which sends the client to MySQL for a full
+// replay. That is the cheap direction of the only trade this cache makes.
 func (r *DurableRing) evictLocked() int {
 	evicted := 0
 	for {
 		live := len(r.buf) - r.head
-		if live <= 1 {
+		if live == 0 {
 			break
 		}
 		overEvents := r.maxEvents > 0 && live > r.maxEvents
@@ -191,6 +253,9 @@ func (r *DurableRing) evictLocked() int {
 	}
 	if len(r.buf) > r.head {
 		r.firstSeq = r.buf[r.head].Sequence
+	} else {
+		r.firstSeq = 0
+		r.lastSeq = 0
 	}
 	return evicted
 }
