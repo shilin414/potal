@@ -7,6 +7,7 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 
+	"github.com/creation-agent-studio/backend-go/internal/execution"
 	"github.com/creation-agent-studio/backend-go/internal/platform/config"
 	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
 )
@@ -209,4 +210,131 @@ func gaugeSum(t *testing.T, m *telemetry.Metrics, family string) float64 {
 		}
 	}
 	return sum
+}
+
+// TestStaleHubCannotRestoreCacheMetricsAfterEviction is AC-4.1-7 and kills
+// Mutation K (§34).
+//
+// A hub can be past the point where it released hub.mu — inside `remember`, not
+// yet at the gauge report — when the idle timer evicts it. Without an identity
+// check the evicted generation writes its numbers back into `cacheStats` for a
+// run that now has NO hub: `hubs_active=0` with `cache_bytes>0`, which is a
+// state no dashboard can explain and no new event will ever correct, because a
+// finished run produces none. The stream is fine; every decision made from the
+// metrics is not.
+func TestStaleHubCannotRestoreCacheMetricsAfterEviction(t *testing.T) {
+	metrics := telemetry.NewMetrics("test")
+	mgr := NewHubManagerWithUpstream(context.Background(), newFakeUpstream(), metrics, HubOptions{})
+	t.Cleanup(mgr.Close)
+
+	hub := mgr.GetOrCreate("run-stale-metrics")
+	hub.RememberDurable(1, execution.EventContentChunk, map[string]any{"text": "one"})
+	if got := gaugeSum(t, metrics, "studio_sse_hub_cache_events"); got != 1 {
+		t.Fatalf("studio_sse_hub_cache_events = %v after one cached event, want 1", got)
+	}
+
+	// The hub leaves the registry (idle eviction / upstream failure).
+	if !mgr.removeIfSame("run-stale-metrics", hub) {
+		t.Fatal("removeIfSame refused to evict the current hub")
+	}
+	if got := gaugeSum(t, metrics, "studio_sse_hub_cache_events"); got != 0 {
+		t.Fatalf("studio_sse_hub_cache_events = %v after eviction, want 0", got)
+	}
+
+	// The straggling report from the evicted generation.
+	mgr.reportCache("run-stale-metrics", hub, 10, 4096)
+
+	if got := mgr.HubCount(); got != 0 {
+		t.Fatalf("HubCount = %d, want 0", got)
+	}
+	if got := gaugeSum(t, metrics, "studio_sse_hub_cache_events"); got != 0 {
+		t.Fatalf("studio_sse_hub_cache_events = %v: an evicted hub restored its cache gauge, so the "+
+			"process now reports cache for a hub that does not exist", got)
+	}
+	if got := gaugeSum(t, metrics, "studio_sse_hub_cache_bytes"); got != 0 {
+		t.Fatalf("studio_sse_hub_cache_bytes = %v: phantom cache bytes from an evicted generation", got)
+	}
+}
+
+// TestOldHubCannotOverwriteNewHubCacheMetrics is the second half of AC-4.1-7:
+// the fence is per GENERATION, not merely "is the run tracked".
+//
+// After a reconnect the run has a NEW hub, and the old generation's delayed
+// report arrives. It must be discarded on identity, not accepted because the
+// run id is still present.
+func TestOldHubCannotOverwriteNewHubCacheMetrics(t *testing.T) {
+	metrics := telemetry.NewMetrics("test")
+	mgr := NewHubManagerWithUpstream(context.Background(), newFakeUpstream(), metrics, HubOptions{})
+	t.Cleanup(mgr.Close)
+
+	old := mgr.GetOrCreate("run-generation")
+	old.RememberDurable(1, execution.EventContentChunk, map[string]any{"text": "old"})
+	if !mgr.removeIfSame("run-generation", old) {
+		t.Fatal("removeIfSame refused to evict the first generation")
+	}
+
+	current := mgr.GetOrCreate("run-generation")
+	if current == old {
+		t.Fatal("GetOrCreate returned the evicted generation")
+	}
+	for seq := uint64(1); seq <= 2; seq++ {
+		current.RememberDurable(seq, execution.EventContentChunk, map[string]any{"text": "new"})
+	}
+	if got := gaugeSum(t, metrics, "studio_sse_hub_cache_events"); got != 2 {
+		t.Fatalf("studio_sse_hub_cache_events = %v for the new generation, want 2", got)
+	}
+
+	// The old generation reports late, with values nobody should believe.
+	mgr.reportCache("run-generation", old, 99, 999999)
+
+	if got := gaugeSum(t, metrics, "studio_sse_hub_cache_events"); got != 2 {
+		t.Fatalf("studio_sse_hub_cache_events = %v, want 2: a superseded hub overwrote the live "+
+			"generation's cache gauge", got)
+	}
+	if got := gaugeSum(t, metrics, "studio_sse_hub_cache_bytes"); got > 99999 {
+		t.Fatalf("studio_sse_hub_cache_bytes = %v, want the LIVE hub's value", got)
+	}
+	if got := mgr.HubCount(); got != 1 {
+		t.Fatalf("HubCount = %d, want 1", got)
+	}
+}
+
+// TestGetOrCreateSweepsAnUnusableHubInPlace pins the registry half of the
+// Batch 4.1 lock-order refactor.
+//
+// `Serving()` takes hub.mu, and GetOrCreate must call it with manager.mu
+// RELEASED — which is only safe because the lookup, the replacement and the
+// sweep are re-done in a loop rather than held together. This test reproduces
+// the window failUpstream leaves open (the hub is marked unusable under hub.mu,
+// the map has not been swept yet) and pins the observable contract: a fresh
+// generation takes the run's slot, the run has exactly one hub, and the
+// replaced generation's cache statistics do not survive it.
+func TestGetOrCreateSweepsAnUnusableHubInPlace(t *testing.T) {
+	metrics := telemetry.NewMetrics("test")
+	mgr := NewHubManagerWithUpstream(context.Background(), newFakeUpstream(), metrics, HubOptions{})
+	t.Cleanup(mgr.Close)
+
+	hub := mgr.GetOrCreate("run-nonserving")
+	hub.RememberDurable(1, execution.EventContentChunk, map[string]any{"text": "x"})
+
+	// The in-between state, set the way the hub sets it itself.
+	hub.mu.Lock()
+	hub.closed = true
+	hub.unhealthy = true
+	hub.mu.Unlock()
+
+	replacement := mgr.GetOrCreate("run-nonserving")
+	if replacement == hub {
+		t.Fatal("GetOrCreate handed back a hub that cannot serve live events")
+	}
+	if got := mgr.HubCount(); got != 1 {
+		t.Fatalf("HubCount = %d after replacing a dead hub, want 1", got)
+	}
+	if got := replacement.CacheLen(); got != 0 {
+		t.Fatalf("the replacement hub started with %d cached events, want 0", got)
+	}
+	if got := gaugeSum(t, metrics, "studio_sse_hub_cache_events"); got != 0 {
+		t.Fatalf("studio_sse_hub_cache_events = %v: the replaced generation's cache statistics "+
+			"survived the sweep", got)
+	}
 }

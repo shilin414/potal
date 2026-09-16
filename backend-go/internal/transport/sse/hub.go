@@ -392,26 +392,48 @@ func (m *HubManager) Lookup(runID string) *RunHub {
 // one run: the map is consulted and updated under one lock, and the check is
 // on the CURRENT entry, so a hub that has become unusable is replaced rather
 // than reused.
+//
+// Lock discipline (AC-4.1-8): `hub.Serving()` takes hub.mu, so it is called
+// with manager.mu RELEASED. Holding both would nest manager.mu → hub.mu, and
+// the whole hub lifecycle is designed around those two locks being
+// independent — one exception is enough for a future hub.mu → manager.mu path
+// to close the cycle. The loop makes the release safe: every iteration either
+// returns (a serving hub, or the one it just published) or removes a hub that
+// cannot serve, so it terminates.
 func (m *HubManager) GetOrCreate(runID string) *RunHub {
-	m.mu.Lock()
-	if m.closed {
-		m.mu.Unlock()
-		return nil
-	}
-	if hub := m.hubs[runID]; hub != nil && hub.Serving() {
-		m.mu.Unlock()
-		return hub
-	}
-	hub := newRunHub(m, runID)
-	m.hubs[runID] = hub
-	if m.metrics != nil {
-		m.metrics.SSEHubActive.Set(float64(len(m.hubs)))
-		m.metrics.SSEHubCreatedTotal.Inc()
-	}
-	m.mu.Unlock()
+	for {
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return nil
+		}
+		hub := m.hubs[runID]
+		if hub == nil {
+			hub = newRunHub(m, runID)
+			m.hubs[runID] = hub
+			if m.metrics != nil {
+				m.metrics.SSEHubActive.Set(float64(len(m.hubs)))
+				m.metrics.SSEHubCreatedTotal.Inc()
+			}
+			m.mu.Unlock()
 
-	go hub.runUpstream()
-	return hub
+			// Started after the lock is released, exactly as before: the
+			// goroutine takes hub.mu and does Redis I/O, neither of which
+			// belongs under manager.mu.
+			go hub.runUpstream()
+			return hub
+		}
+		m.mu.Unlock()
+
+		if hub.Serving() {
+			return hub
+		}
+		// Stale generation: evict THIS instance (pointer-compared, so a
+		// concurrently published replacement is untouched) and build a fresh
+		// one on the next iteration. A hub created by another goroutine in
+		// the meantime is found by the lookup above and reused.
+		m.removeIfSame(runID, hub)
+	}
 }
 
 // removeIfSame deletes runID's hub ONLY if the map still holds this exact
@@ -436,10 +458,28 @@ func (m *HubManager) removeIfSame(runID string, hub *RunHub) bool {
 
 // reportCache publishes one hub's cache size and re-derives the process-wide
 // cache gauges. Called with NO hub lock held.
-func (m *HubManager) reportCache(runID string, events int, bytes int64) {
+//
+// The hub identity check is the same generation guard removeIfSame uses
+// (AC-4.1-7), and it is not decoration. A stale hub can be mid-`remember`
+// — past the point where it released hub.mu, not yet at this call — while the
+// idle timer evicts it (dropping its cacheStats entry) and a NEW hub for the
+// same run is created. Without the check the old hub would then write the
+// previous generation's numbers back, leaving a phantom cache whose owner no
+// longer exists — `hubs_active=0` with `cache_bytes>0` — visible to every
+// canary and dashboard until that run next produces a durable event, which
+// for a finished run is never. Wrong metrics do not corrupt the stream, but
+// they corrupt every decision made from one.
+//
+// Cache statistics and eviction must therefore agree on ONE notion of "the
+// hub that owns this run".
+func (m *HubManager) reportCache(runID string, hub *RunHub, events int, bytes int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
+		return
+	}
+	if m.hubs[runID] != hub {
+		// Stale generation: this hub has been evicted or replaced.
 		return
 	}
 	m.cacheStats[runID] = hubCacheStat{events: events, bytes: bytes}
@@ -611,9 +651,14 @@ func newRunHub(m *HubManager, runID string) *RunHub {
 	}
 	// A hub starts idle: if nobody attaches (a request that resolved the hub
 	// and then failed), the timer evicts it instead of leaking it forever.
-	hub.mu.Lock()
+	//
+	// The timer is armed WITHOUT taking hub.mu. The hub is not in the
+	// manager's map yet, so no other goroutine can reach it and the guard
+	// would only ever be uncontended — while GetOrCreate calls this under
+	// manager.mu, where taking hub.mu would nest manager.mu → hub.mu and
+	// break the lock-order invariant AC-4.1-8 restores. Do NOT move this
+	// after the hub is published.
 	hub.armIdleTimerLocked()
-	hub.mu.Unlock()
 	return hub
 }
 
@@ -742,7 +787,7 @@ func (h *RunHub) remember(ev HubEvent) {
 	_, _ = h.cache.Remember(ev)
 	events, size := h.cache.Len(), h.cache.Bytes()
 	h.mu.Unlock()
-	h.manager.reportCache(h.runID, events, size)
+	h.manager.reportCache(h.runID, h, events, size)
 }
 
 // NoteTerminal records that the durable log ended, without fanning anything
@@ -865,7 +910,7 @@ func (h *RunHub) dispatch(ev HubEvent) {
 	h.mu.Unlock()
 
 	if !ev.IsTransient() {
-		h.manager.reportCache(h.runID, events, size)
+		h.manager.reportCache(h.runID, h, events, size)
 	}
 
 	for _, sub := range subs {
