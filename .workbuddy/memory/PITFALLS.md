@@ -1,0 +1,89 @@
+# 本机环境与工具踩坑（Creation Agent Studio）
+
+> 从 `MEMORY.md` 拆出：这里是「本机怎么跑、哪些命令会翻车」的操作知识，
+> 不是代码不变量。开工前或遇到怪现象时读一遍。代码规则见 `MEMORY.md`。
+
+## 反证驱动（falsification）
+- 驱动目录 `backend-go/scripts/`：`falsify_review9*.sh`、`falsify_review10.sh`(A–G)、
+  `falsify_review10_patch41.sh`(H–K)、`falsify_review10_patch411.sh`(L/M/N)。
+- **⚠️ 绝不可与其它 `go test` 并发**：脚本改真实源码，任何在 mutation 在位期间构建的测试二进制
+  都在编译坏代码。反证一次只跑一个。
+- **改代码后必须同步复核旧脚本锚点**：锚点失配会直接终止驱动（`assert ... missing`）。
+- 跑完双查：`grep -rn FALSIFICATION backend-go --include='*.go' --include='*.sql'` +
+  `find . -name '*.orig'`（两个都必须为空；脚本自己也会查并在非空时判 fail）。
+- 反证脚本结构：`snapshot` → python 变异（带 `assert`）→ `verdict` 取 FAIL/PASS → `revert`；
+  `trap cleanup EXIT` 兜中断。文本变异用 python，**不要用 bash 嵌套 heredoc**（本机会被截断）。
+- 只有「能被删坏」的断言才有价值：加测试时必须同时确认它 **mutated FAIL / restored PASS**
+  （Batch 4.1.2 的 Mutation N 就是这么补上的）。
+
+## 本机 git
+- `core.autocrlf=true` 与仓库 LF 索引相冲：git 重写文件后工作区变 CRLF，`gofmt -l` 误报。
+  本仓库已局部 `core.autocrlf=false`；再见到就用 python 把内容归一回 `\n`。
+- **`refs/remotes/<name>/<branch>`（两层）写入有缺陷**（PortableGit 2.55 / 系统 2.53 都复现）：
+  `git fetch/push` 返回 0、reflog 也写了，但 `.git/refs/remotes/origin/` 目录不存在 → 引用丢失，
+  `git status -sb` 误报 `[ahead N]` / `[gone]`。**push 本身是成功的**。
+  修复：`mkdir -p .git/refs/remotes/origin`（**承重步骤，漏了必失败**）→
+  `printf '%s\n' "$(git ls-remote origin refs/heads/dev | cut -f1)" > .git/refs/remotes/origin/dev`
+  → `sed -i` 双写 `packed-refs` → `for-each-ref` + `ls-remote` 核对。
+- **看到 ahead/gone 不要急着重推**：先 `git ls-remote origin refs/heads/<branch>` 与本地对比。
+- **⚠️ 不要为对照基线 `git checkout <sha>`**：本机实测会被 SIGTERM 打断，留下「工作区文件被删 +
+  `.git/index.lock` 残留 + 分支没切过去」。恢复：备份未提交改动到仓库外 → `rm .git/index.lock` →
+  `git reset --hard HEAD` → 从备份恢复。对照基线用 `git checkout <sha> -- <路径>`。
+- 无 `gh`；查 CI 用匿名 GitHub API。
+
+## Git Bash / shell
+- 常丢 coreutils：命令前加 `export PATH="/usr/bin:/bin:/c/software/Git/cmd:$PATH"`，
+  否则 `dirname` / `sleep` / `head` / `grep -A` 会 `command not found`
+  （表现为 `shell-runtime-bash-env.sh: line 3: dirname: command not found`，可忽略但要加 PATH）。
+- `grep -A/-B` 在本机 shell 里可能不可靠 → 优先用 Grep 工具。
+- Python：`~/.workbuddy/binaries/python/versions/3.13.12/python`。
+- 临时 Go 程序放 `backend-go/tmp-xxx/`（跑完删）。
+- 断言时间戳未变用 `CAST(col AS CHAR)` 比较，别比 `DATETIME` 对象。
+
+## 数据库 / Redis
+- MySQL 5.7 `192.168.211.26:20336/xiaoan`、Redis `192.168.211.239:6380`，
+  凭据在 `backend-go/.env.local`；DSN 保持 UTC 不动。
+- 开关：`STUDIO_TEST_DB=1` / `STUDIO_TEST_REDIS=1`（不设则集成用例静默 skip）。
+- 集成门禁顺序（本机 ≈2.5 分钟）：
+  `go run ./cmd/migrate` ×2（**第二次必须干净 no-op**）→
+  `go test ./internal/execution/... ./internal/delivery/... ./internal/platform/...` →
+  `go test ./tests/integration/...`。
+- 全库 COUNT=0 会被 fixture 假红；清理圈定 `provider LIKE 'itest%'`。
+- 改 `db/queries/*.sql` 后跑 `~/go/bin/sqlc.exe generate`。
+- **本机集成 flake**：`TestRetryRunAndOutboxShareRetryAt` /
+  `TestReaperRequeueIsImmediatelyClaimableAndInSync` 要求两次独立写的 `available_at` 差 ≤50ms，
+  实测 60–110ms（A/B 交替已证基线同样失败）；`TestTickAndRunNowConcurrent` 全量跑因库污染失败、
+  隔离跑通过。**故集成测试不要与前端 build 等重负载并发跑。**
+
+## CI 映射
+- 前端：`npx tsc --noEmit` / `npx vitest run` / `npx vite build`（不跑 eslint）。
+- 后端：actionlint / gofmt check / `go vet` / `go build` / `go test ./... -count=1`，
+  另加 **race** 门 `go test -race ./internal/execution/... ./internal/delivery/...
+  ./internal/automation/... ./internal/transport/sse/... -count=1`，
+  以及 integration job（mysql5.7 + redis7 service containers）。
+- **本机 `CGO_ENABLED=0` 且无 gcc，`-race` 跑不了**（`CGO_ENABLED=1` 实测 `gcc not found`），
+  并发正确性只能由 CI 的 race job 兜住 → 本地提交前至少保证功能断言全绿。
+
+## Redis pub/sub 与 SSE 测试
+- pub/sub **不为未来订阅者缓冲**：集成测试里"证明网关已经订阅"必须**循环重发直到收到**。
+- 区分两类 SSE 测试："测 transient 帧本身"必须声明 `stream_protocol=2`；
+  "测 legacy 兼容"不要声明。
+- Gateway 装配：`sse.Gateway` 已无 `Redis` 字段；
+  用 `sse.NewHubManager(ctx, rdb, nil, opts)` + `t.Cleanup(hub.Close)`。
+- **手造 durable SSE 帧是契约负债**：必须 `appendLiveEvent`（真实落库）或
+  `seedDurableEvent`（插行 + 推进 `next_event_sequence`）；liveness 探针用 **transient 帧**。
+
+## 本地起环境
+5 个进程：api / stream / worker(`--provider=feishu_aily`) /
+**worker(`--provider=feishu_delivery`)** / vite。
+漏掉 delivery 时飞书收不到（`delivery_executions` 停在 `pending`）。
+`(cmd &)` 自 detach 活不下来，常驻必须 `run_in_background`。
+
+## 数据层踩坑
+- **sqlc 隐式改名连带破调用点与反证锚点**：`ps.run_id <> ?` 被改写成 `r.id <> ?` 会让参数名从
+  `RunID_2` 变 `ID`；要保名就写 `ps.run_id <> ?`。
+- **`CASFinishDelivery` 双占位符**：`sent_at = IF(?='succeeded',…)` 的第二个 `?` 生成成
+  `Column5`，调用方必须把 status 传两次。
+- **EXPLAIN 断言只在真实数据形状下有意义**：空 provider 上所有候选索引都估 1 行；须先造
+  「5k settled + 2 活跃」。`table` 列有别名时返回别名；索引前导列查
+  `information_schema.STATISTICS`，**按 shape 断言不按 key 名**。
