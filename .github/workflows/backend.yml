@@ -49,10 +49,15 @@ jobs:
       # timer, terminal fan-out, manager close, slow-consumer drops and cache
       # mutation all race by construction, and a plain `go test` would not
       # catch a torn read in any of them.
-      - name: go test -race (execution plane + SSE hub)
+      #
+      # The worker dispatcher (Batch 5) joins too: concurrent Execute across
+      # the post-boot registry is part of its contract (TestDispatcher-
+      # ConcurrentExecuteRaceSafe).
+      - name: go test -race (execution plane + SSE hub + worker dispatch)
         run: >-
           go test -race ./internal/execution/... ./internal/delivery/...
-          ./internal/automation/... ./internal/transport/sse/... -count=1
+          ./internal/automation/... ./internal/transport/sse/...
+          ./internal/workerdispatch/... -count=1
 
   # The single database integration gate: real MySQL 5.7 + Redis 7.
   #
