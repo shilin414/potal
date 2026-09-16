@@ -135,7 +135,11 @@ type Metrics struct {
 	//	                              are counted by SSEHubCacheReplayTotal
 	//	                              instead, so the two together show
 	//	                              whether the Hub is actually removing
-	//	                              database work rather than just moving it)
+	//	                              database work rather than just moving it).
+	//	                              Batch 4.1's live gap repair reads the
+	//	                              canonical log here too — it IS a MySQL
+	//	                              replay, just a triggered one, and
+	//	                              SSELiveGapRepairTotal explains why.
 	RunIdempotencyReplayTotal      prometheus.Counter
 	RunIdempotencyConflictTotal    prometheus.Counter
 	ProviderSubmissionUnknownTotal prometheus.Counter
@@ -171,7 +175,29 @@ type Metrics struct {
 	SSEHubUpstreamFailureTotal   *prometheus.CounterVec // {stage}
 	SSEHubCacheEvents            prometheus.Gauge
 	SSEHubCacheBytes             prometheus.Gauge
+
+	// SSELiveGapRepairTotal{result} is Batch 4.1's own series, and it answers
+	// a different question from SSEReplayEventsTotal: NOT "how many events
+	// came from MySQL" but "how often did the live path have to stop and
+	// repair an ordering hole". A steady non-zero `repaired` rate means Redis
+	// publish order and DB sequence order are drifting apart often enough to
+	// matter; `failed` means a connection was closed to avoid losing an
+	// event, which is a page, not a slow burn.
+	//
+	// `result` is a closed two-value enumeration, for the usual reason.
+	SSELiveGapRepairTotal *prometheus.CounterVec // {result}
 }
+
+// Live gap repair results (SSELiveGapRepairTotal label values).
+const (
+	// LiveGapRepaired: the hole was filled from MySQL and the connection
+	// continued with a contiguous cursor.
+	LiveGapRepaired = "repaired"
+	// LiveGapFailed: the canonical log could not supply the hole, so the
+	// connection was ENDED (fail closed) rather than skipping frames. The
+	// client reconnects from its last contiguous cursor.
+	LiveGapFailed = "failed"
+)
 
 // Provider admission results (ProviderAdmission label values).
 const (
@@ -421,6 +447,13 @@ func NewMetrics(service string) *Metrics {
 			Name: "studio_sse_hub_cache_bytes",
 			Help: "Approximate payload bytes held across all hub caches (bounded by SSE_HUB_CACHE_BYTES per hub).",
 		}),
+		SSELiveGapRepairTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "studio_sse_live_gap_repair_total",
+			Help: "Durable live gaps repaired from the canonical event log, by result. repaired = the " +
+				"missing range was read from MySQL and sent in order; failed = it could not be read, so " +
+				"the connection ended instead of skipping frames. These events are also counted by " +
+				"studio_sse_replay_events_total, because they ARE a MySQL replay.",
+		}, []string{"result"}),
 	}
 	reg.MustRegister(
 		m.HTTPDuration, m.HTTPRequests, m.SSEActive, m.QueueDepth,
@@ -442,6 +475,7 @@ func NewMetrics(service string) *Metrics {
 		m.SSEHubCreatedTotal, m.SSEHubCacheReplayTotal, m.SSEHubCacheMissTotal,
 		m.SSEHubSubscriberDroppedTotal, m.SSEHubUpstreamFailureTotal,
 		m.SSEHubCacheEvents, m.SSEHubCacheBytes,
+		m.SSELiveGapRepairTotal,
 	)
 	return m
 }

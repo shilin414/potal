@@ -20,6 +20,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -91,10 +92,22 @@ func (s *sseStream) first(match func(sseFrame) bool) (sseFrame, bool) {
 	return sseFrame{}, false
 }
 
-// publishLiveFrame pushes one raw live frame onto a run's pub/sub channel —
-// exactly what the executor's live fan-out publishes.
-func publishLiveFrame(t *testing.T, rdb *redisx.Client, runID ids.ID, seq uint64, eventType string, payload map[string]any) {
+// publishTransientFrame pushes one raw TRANSIENT live frame (sequence 0) onto a
+// run's pub/sub channel — exactly what the executor's live fan-out publishes for
+// `content.delta`.
+//
+// It refuses any other sequence on purpose (Batch 4.1). A durable frame is a
+// claim about the run's persisted log, and the gateway now guarantees that the
+// durable frames written to one connection are contiguous, repairing any hole
+// from MySQL — so a hand-published durable sequence that MySQL does not know
+// about is interpreted as a hole the log cannot fill and the connection is
+// ended. Durable fixtures go through appendLiveEvent instead.
+func publishTransientFrame(t *testing.T, rdb *redisx.Client, runID ids.ID, seq uint64, eventType string, payload map[string]any) {
 	t.Helper()
+	if seq != 0 {
+		t.Fatalf("publishTransientFrame called with sequence %d: a durable frame must be persisted "+
+			"through the service (appendLiveEvent) so the canonical log can back it", seq)
+	}
 	ctx := context.Background()
 	if err := rdb.Publish(ctx, rdb.RunEventsChannel(runID.String()), mustJSON(map[string]any{
 		"run_id":     runID.String(),
@@ -133,14 +146,26 @@ func streamRun(t *testing.T, provider string) (*execution.Service, *redisx.Clien
 // response headers being flushed and the gateway's SUBSCRIBE is dropped — and
 // the read side of this test would then be asserting on a stream that never had
 // a subscriber.
-const protocolSyncSequence = 9000
+//
+// The marker is TRANSIENT (sequence 0), and that is load-bearing after Batch
+// 4.1. A durable frame is a claim about the run's persisted log: the gateway
+// now guarantees that the durable frames it writes to one connection are
+// CONTIGUOUS, repairing any hole from MySQL — so a probe that fabricates an
+// out-of-band durable sequence (the old 9000 marker) would be read as a hole
+// the log cannot fill, and the gateway would correctly end the connection.
+// Sequence 0 carries no position, is never cached, never advances a cursor and
+// is delivered to every subscriber, which is all a liveness probe needs.
+//
+// `run.started` rather than `content.delta`: only content.delta is capability
+// filtered, and this probe must reach a protocol-1 connection too.
+const protocolSyncEvent = "run.started"
 
 func syncStream(t *testing.T, rdb *redisx.Client, runID ids.ID, s *sseStream) {
 	t.Helper()
 	const marker = "protocol-sync"
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		publishLiveFrame(t, rdb, runID, protocolSyncSequence, "run.started", map[string]any{"text": marker})
+		publishTransientFrame(t, rdb, runID, 0, protocolSyncEvent, map[string]any{"text": marker})
 		if s.await(func(f sseFrame) bool { return f.Payload["text"] == marker }, 300*time.Millisecond) {
 			// A duplicate marker may still be in flight; it is harmless (the
 			// assertions below match on the frames under test, not on a count)
@@ -150,6 +175,46 @@ func syncStream(t *testing.T, rdb *redisx.Client, runID ids.ID, s *sseStream) {
 		}
 	}
 	t.Fatal("the gateway never delivered the subscription marker — the stream is not live")
+}
+
+// appendLiveEvent persists one durable event through the REAL service path —
+// allocation, insert, post-commit publish — and returns the sequence the run's
+// allocator assigned.
+//
+// Fabricated durable sequences stopped being usable fixtures in Batch 4.1: the
+// gateway treats a durable frame the canonical log cannot supply as an
+// unrecoverable ordering hole and ends the connection (fail closed), so every
+// durable frame a test publishes must exist in MySQL. Going through
+// AppendEvent also makes the fixture honest in the other direction — the
+// frame reaches Redis exactly the way a real one does.
+//
+// The run must be exclusively owned by the test: the sequence is predicted
+// nowhere, it is READ BACK, so a concurrent appender would change the answer.
+func appendLiveEvent(t *testing.T, svc *execution.Service, runID ids.ID, eventType string, payload map[string]any) uint64 {
+	t.Helper()
+	ctx := context.Background()
+	if err := svc.AppendEvent(ctx, runID, eventType, payload); err != nil {
+		t.Fatalf("append %s: %v", eventType, err)
+	}
+	return runEventTail(t, svc, runID)
+}
+
+// runEventTail is the highest sequence currently persisted for the run.
+//
+// One page is enough for a test fixture, and asking for more than a page would
+// make the answer ambiguous (a keyset page reports where it STOPPED, not where
+// the log ends), so more rows than one page is a fixture bug and says so.
+func runEventTail(t *testing.T, svc *execution.Service, runID ids.ID) uint64 {
+	t.Helper()
+	page, err := svc.ListEventPage(context.Background(), runID, 0, execution.MaxEventPageSize)
+	if err != nil {
+		t.Fatalf("read the run's log tail: %v", err)
+	}
+	if page.HasMore {
+		t.Fatalf("the run holds more than %d events: this fixture assumes a single page",
+			execution.MaxEventPageSize)
+	}
+	return page.NextAfter
 }
 
 func isLiveDelta(f sseFrame) bool {
@@ -170,13 +235,16 @@ func TestSSELegacyClientReceivesNoTransientDelta(t *testing.T) {
 	// second. Redis preserves publish order, so once the chunk has arrived any
 	// delta that was going to be emitted would already be in the transcript —
 	// its absence is a decision, not a scheduling artefact.
-	publishLiveFrame(t, rdb, runID, 0, execution.EventContentDelta,
+	publishTransientFrame(t, rdb, runID, 0, execution.EventContentDelta,
 		map[string]any{"text": protocolLiveDeltaText, "offset": 1})
-	publishLiveFrame(t, rdb, runID, 9001, execution.EventContentChunk,
+	chunkSeq := appendLiveEvent(t, svc, runID, execution.EventContentChunk,
 		map[string]any{"text": protocolLiveDeltaText, "offset": 1})
 
-	if !s.await(func(f sseFrame) bool { return f.Sequence == 9001 }, 5*time.Second) {
-		t.Fatal("the durable content.chunk never arrived — legacy clients must still receive the answer")
+	if !s.await(func(f sseFrame) bool {
+		return f.Sequence == chunkSeq && f.EventType == execution.EventContentChunk
+	}, 5*time.Second) {
+		t.Fatalf("the durable content.chunk never arrived — legacy clients must still receive the "+
+			"answer; transcript=%v", frameSummary(s.all))
 	}
 	if s.saw(isLiveDelta) {
 		t.Fatalf("legacy client received a transient content.delta: an append-only client renders "+
@@ -194,13 +262,13 @@ func TestSSEProtocol2ClientReceivesOffsets(t *testing.T) {
 	s := openSSEStream(t, svc, rdb, runID, "stream_protocol=2")
 	syncStream(t, rdb, runID, s)
 
-	publishLiveFrame(t, rdb, runID, 0, execution.EventContentDelta,
+	publishTransientFrame(t, rdb, runID, 0, execution.EventContentDelta,
 		map[string]any{"text": protocolLiveDeltaText, "offset": 7})
-	publishLiveFrame(t, rdb, runID, 9001, execution.EventContentChunk,
+	chunkSeq := appendLiveEvent(t, svc, runID, execution.EventContentChunk,
 		map[string]any{"text": protocolLiveDeltaText, "offset": 7})
 
-	if !s.await(func(f sseFrame) bool { return f.Sequence == 9001 }, 5*time.Second) {
-		t.Fatal("the durable content.chunk never arrived")
+	if !s.await(func(f sseFrame) bool { return f.Sequence == chunkSeq }, 5*time.Second) {
+		t.Fatalf("the durable content.chunk never arrived; transcript=%v", frameSummary(s.all))
 	}
 	delta, ok := s.first(isLiveDelta)
 	if !ok {
@@ -213,7 +281,7 @@ func TestSSEProtocol2ClientReceivesOffsets(t *testing.T) {
 			"payload; without it protocol 2 means nothing", delta.Payload["offset"], delta.Payload["offset"])
 	}
 	if !s.saw(func(f sseFrame) bool {
-		return f.Sequence == 9001 && f.EventType == execution.EventContentChunk
+		return f.Sequence == chunkSeq && f.EventType == execution.EventContentChunk
 	}) {
 		t.Fatal("durable chunk missing for a protocol-2 client")
 	}
@@ -227,43 +295,57 @@ func TestSSEProtocol2ClientReceivesOffsets(t *testing.T) {
 // must not change it either — the only difference is the transient delta.
 func TestSSECursorSemanticsIgnoreStreamProtocol(t *testing.T) {
 	cases := []struct {
-		name      string
-		query     string
-		wantDelta bool
+		name        string
+		querySuffix string
+		wantDelta   bool
 	}{
-		{name: "protocol2", query: "after=100&stream_protocol=2", wantDelta: true},
-		{name: "legacy", query: "after=100", wantDelta: false},
+		{name: "protocol2", querySuffix: "&stream_protocol=2", wantDelta: true},
+		{name: "legacy", querySuffix: "", wantDelta: false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			svc, rdb, runID := streamRun(t, "feishu_aily")
-			s := openSSEStream(t, svc, rdb, runID, tc.query)
+
+			// The cursor is the sequence the run's NEXT durable event will
+			// take, so "at the cursor" and "above the cursor" are REAL events
+			// produced by the real allocator — Batch 4.1 makes a durable frame
+			// the log cannot back an unrecoverable hole, so those two cannot be
+			// fabricated any more.
+			cursor := runEventTail(t, svc, runID) + 1
+			query := fmt.Sprintf("after=%d%s", cursor, tc.querySuffix)
+
+			s := openSSEStream(t, svc, rdb, runID, query)
 			syncStream(t, rdb, runID, s)
 
-			// 100 is AT the cursor → already delivered to this client before
-			// the reconnect, so it must not be re-sent. 101 is above it.
-			publishLiveFrame(t, rdb, runID, 100, execution.EventContentChunk,
+			// `cursor` is AT the client's position → already delivered to this
+			// client before the reconnect, so it must not be re-sent. The next
+			// one is above it and must arrive.
+			atSeq := appendLiveEvent(t, svc, runID, execution.EventContentChunk,
 				map[string]any{"text": "at-cursor", "offset": 0})
-			publishLiveFrame(t, rdb, runID, 101, execution.EventContentChunk,
+			if atSeq != cursor {
+				t.Fatalf("the run's allocator gave the at-cursor event sequence %d, want %d "+
+					"(the fixture assumes the run is exclusively owned by this test)", atSeq, cursor)
+			}
+			aboveSeq := appendLiveEvent(t, svc, runID, execution.EventContentChunk,
 				map[string]any{"text": "above-cursor", "offset": 4})
-			publishLiveFrame(t, rdb, runID, 0, execution.EventContentDelta,
+			publishTransientFrame(t, rdb, runID, 0, execution.EventContentDelta,
 				map[string]any{"text": protocolLiveDeltaText, "offset": 9})
 
-			if !s.await(func(f sseFrame) bool { return f.Sequence == 101 }, 5*time.Second) {
-				t.Fatal("the frame above the cursor never arrived")
+			if !s.await(func(f sseFrame) bool { return f.Sequence == aboveSeq }, 5*time.Second) {
+				t.Fatalf("the frame above the cursor never arrived; transcript=%v", frameSummary(s.all))
 			}
 			// Give the trailing delta a moment to land before judging it.
 			time.Sleep(300 * time.Millisecond)
 			_ = s.await(func(f sseFrame) bool { return false }, 200*time.Millisecond)
 
-			if s.saw(func(f sseFrame) bool { return f.Sequence == 100 }) {
+			if s.saw(func(f sseFrame) bool { return f.Sequence == cursor }) {
 				t.Fatal("a durable frame AT the cursor was re-delivered: the cursor semantics changed")
 			}
-			if !s.saw(func(f sseFrame) bool { return f.Sequence == 101 }) {
+			if !s.saw(func(f sseFrame) bool { return f.Sequence == aboveSeq }) {
 				t.Fatal("a durable frame ABOVE the cursor was dropped")
 			}
 			if got := s.saw(isLiveDelta); got != tc.wantDelta {
-				t.Fatalf("transient delta delivered=%v, want %v for %q", got, tc.wantDelta, tc.query)
+				t.Fatalf("transient delta delivered=%v, want %v for %q", got, tc.wantDelta, query)
 			}
 		})
 	}
@@ -279,7 +361,7 @@ func TestSSELegacyClientClosesOnTerminalEvent(t *testing.T) {
 	s := openSSEStream(t, svc, rdb, runID, "")
 	syncStream(t, rdb, runID, s)
 
-	publishLiveFrame(t, rdb, runID, 9002, execution.EventRunCompleted,
+	appendLiveEvent(t, svc, runID, execution.EventRunCompleted,
 		map[string]any{"status": execution.StatusSucceeded, "text": "final"})
 
 	if !s.await(func(f sseFrame) bool { return f.EventType == execution.EventRunCompleted }, 5*time.Second) {

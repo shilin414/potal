@@ -36,7 +36,15 @@ import (
 // hub, one upstream, N subscribers) rather than only the frames.
 func startHubSSEServer(t *testing.T, svc *execution.Service, rdb *redisx.Client, run *execution.Run) (*httptest.Server, *sse.HubManager) {
 	t.Helper()
-	hub := sse.NewHubManager(context.Background(), rdb, nil, sse.HubOptions{})
+	return startHubSSEServerWithOptions(t, svc, rdb, run, sse.HubOptions{})
+}
+
+// startHubSSEServerWithOptions is the same server with an explicit hub
+// configuration, for the Batch 4.1 tests that assert a BOUND (the cache limits
+// are only observable when they are smaller than the fixture).
+func startHubSSEServerWithOptions(t *testing.T, svc *execution.Service, rdb *redisx.Client, run *execution.Run, opts sse.HubOptions) (*httptest.Server, *sse.HubManager) {
+	t.Helper()
+	hub := sse.NewHubManager(context.Background(), rdb, nil, opts)
 	t.Cleanup(hub.Close)
 	gw := &sse.Gateway{Runs: svc, Hub: hub, Keepalive: time.Hour}
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -92,10 +100,18 @@ func runURL(ts *httptest.Server, runID ids.ID, query string) string {
 	return url
 }
 
-// publishTerminal pushes the durable terminal frame of a run.
-func publishTerminal(t *testing.T, rdb *redisx.Client, runID ids.ID, seq uint64) {
+// publishTerminal persists the run's durable terminal event through the real
+// service path and returns the sequence the allocator gave it.
+//
+// The sequence is READ BACK rather than assumed (Batch 4.1): the gateway only
+// writes durable frames that are contiguous with the client's cursor, so a
+// hand-published terminal with a made-up sequence would now be treated as an
+// ordering hole and the connection would be closed instead — the assertion
+// below needs the real number anyway.
+func publishTerminal(t *testing.T, svc *execution.Service, runID ids.ID) uint64 {
 	t.Helper()
-	publishLiveFrame(t, rdb, runID, seq, execution.EventRunCompleted, map[string]any{"status": execution.StatusSucceeded})
+	return appendLiveEvent(t, svc, runID, execution.EventRunCompleted,
+		map[string]any{"status": execution.StatusSucceeded})
 }
 
 // contentCursor is the durable cursor a real client would resume from: the
@@ -151,19 +167,19 @@ func TestSSEHubTwoStreamsShareOneUpstream(t *testing.T) {
 		t.Fatalf("SubscriberCount = %d, want 2", got)
 	}
 
-	publishTerminal(t, rdb, runID, 9100)
+	terminalSeq := publishTerminal(t, svc, runID)
 
-	if !a.await(func(f sseFrame) bool { return f.Sequence == 9100 }, 5*time.Second) {
+	if !a.await(func(f sseFrame) bool { return f.Sequence == terminalSeq }, 5*time.Second) {
 		t.Fatalf("stream A never received the terminal frame; transcript=%v", frameSummary(a.all))
 	}
-	if !b.await(func(f sseFrame) bool { return f.Sequence == 9100 }, 5*time.Second) {
+	if !b.await(func(f sseFrame) bool { return f.Sequence == terminalSeq }, 5*time.Second) {
 		t.Fatalf("stream B never received the terminal frame; transcript=%v", frameSummary(b.all))
 	}
 	for name, s := range map[string]*sseStream{"A": a, "B": b} {
-		if f, ok := s.first(func(f sseFrame) bool { return f.Sequence == 9100 }); !ok ||
+		if f, ok := s.first(func(f sseFrame) bool { return f.Sequence == terminalSeq }); !ok ||
 			f.EventType != execution.EventRunCompleted {
-			t.Fatalf("stream %s terminal frame = %+v, want %s at sequence 9100",
-				name, f, execution.EventRunCompleted)
+			t.Fatalf("stream %s terminal frame = %+v, want %s at sequence %d",
+				name, f, execution.EventRunCompleted, terminalSeq)
 		}
 	}
 
@@ -199,18 +215,20 @@ func TestSSEHubMixedProtocolsOnOneRun(t *testing.T) {
 	// by the time the chunk is in hand, a delta that was going to be emitted
 	// already would be. The text is the shared fixture the delta matcher
 	// (isLiveDelta) matches on.
-	publishLiveFrame(t, rdb, runID, 0, execution.EventContentDelta,
+	publishTransientFrame(t, rdb, runID, 0, execution.EventContentDelta,
 		map[string]any{"text": protocolLiveDeltaText, "offset": 11})
-	publishLiveFrame(t, rdb, runID, 9200, execution.EventContentChunk,
+	chunkSeq := appendLiveEvent(t, svc, runID, execution.EventContentChunk,
 		map[string]any{"text": protocolLiveDeltaText, "offset": 11})
 
 	const answer = protocolLiveDeltaText
 
-	if !legacy.await(func(f sseFrame) bool { return f.Sequence == 9200 }, 5*time.Second) {
-		t.Fatal("the legacy subscriber never received the durable chunk")
+	if !legacy.await(func(f sseFrame) bool { return f.Sequence == chunkSeq }, 5*time.Second) {
+		t.Fatalf("the legacy subscriber never received the durable chunk; transcript=%v",
+			frameSummary(legacy.all))
 	}
-	if !v2.await(func(f sseFrame) bool { return f.Sequence == 9200 }, 5*time.Second) {
-		t.Fatal("the v2 subscriber never received the durable chunk")
+	if !v2.await(func(f sseFrame) bool { return f.Sequence == chunkSeq }, 5*time.Second) {
+		t.Fatalf("the v2 subscriber never received the durable chunk; transcript=%v",
+			frameSummary(v2.all))
 	}
 
 	// The DELTA is published BEFORE the chunk, and Redis preserves order — so
@@ -228,7 +246,7 @@ func TestSSEHubMixedProtocolsOnOneRun(t *testing.T) {
 
 	// Both must end up with the same durable answer.
 	for name, s := range map[string]*sseStream{"legacy": legacy, "v2": v2} {
-		f, ok := s.first(func(f sseFrame) bool { return f.Sequence == 9200 })
+		f, ok := s.first(func(f sseFrame) bool { return f.Sequence == chunkSeq })
 		if !ok {
 			t.Fatalf("%s: durable answer missing", name)
 		}

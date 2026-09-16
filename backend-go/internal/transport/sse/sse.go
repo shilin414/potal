@@ -36,6 +36,20 @@
 // silently restart every replay from the beginning, re-rendering the whole
 // answer.
 //
+// DURABLE ORDERING (Batch 4.1). This gateway guarantees that the durable
+// frames written to ONE connection are monotonically CONTIGUOUS — 101 then
+// 102, never 102 then 101 and never a hole. That is a PROMISE TO THE CLIENT,
+// not an implementation detail: a resumable client derives its reconnect
+// cursor from the highest sequence it has rendered, so a consumer that
+// received 102 and never 101 would ask for `after=102` on its next connect
+// and lose 101 permanently — and a consumer that received a terminal event
+// out of order would stop reading before its predecessors arrived.
+//
+// The guarantee cannot be delegated to the publisher. Redis pub/sub delivery
+// order is publish order, and a durable event is published AFTER its
+// transaction commits, so two writers can commit 101 then 102 and publish in
+// the opposite order. MySQL is the ordering authority; see repairDurableGap.
+//
 // PROTOCOL CAPABILITY (第九轮补丁 3.3-B). Transient `content.delta` frames are
 // only safe to render for a client that can reconcile them against the durable
 // `content.chunk` frames that carry the same text:
@@ -291,6 +305,13 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 	// or below the cursor was already delivered to this client before the
 	// reconnect, so re-sending it would duplicate content the client has
 	// rendered. Replay below only ever raises it.
+	//
+	// From Batch 4.1 on it means something stronger than "replay position":
+	// it is the highest CONTIGUOUS durable sequence this connection has been
+	// sent (AC-4.1-6). The live loop below advances it only for
+	// `lastDelivered+1` and fills forward holes from MySQL instead of skipping
+	// them — the reconnect cursor a client derives from these frames is the
+	// highest sequence it RENDERED, so a skipped frame is unrecoverable.
 	lastDelivered := after
 	cursor := after
 
@@ -451,23 +472,49 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 			// including the ones skipped as duplicates below: holding it until
 			// Close would make a long-lived connection look slow.
 			sub.Release(ev)
-			// Skip events already covered by the replay snapshot.
-			//
-			// `lastDelivered` is deliberately NOT advanced here (it tracks the
-			// REPLAY position only). Advancing it on live frames would make the
-			// connection drop any durable sequence below one it had already
-			// delivered — and losing an event is strictly worse than the
-			// duplicate it would prevent, which cannot occur anyway: a run's
-			// sequences are allocated monotonically and published once,
-			// post-commit. This also keeps the pre-Batch-4 dedupe semantics
-			// exactly as they were (AC-14).
-			if ev.Sequence != 0 && ev.Sequence <= lastDelivered {
+			// A transient frame is a transport marker, not a position: it
+			// never touches the durable cursor and is never repaired.
+			if ev.IsTransient() {
+				if !writeFrame(0, ev.EventType, ev.Payload, true) {
+					return
+				}
 				continue
 			}
-			if !writeFrame(ev.Sequence, ev.EventType, ev.Payload, true) {
+			if ev.Sequence <= lastDelivered {
+				// A duplicate, or a stale publish that arrived after its own
+				// newer neighbour (see repairDurableGap for why that is
+				// normal). Re-sending it would make the client render the
+				// same content twice.
+				continue
+			}
+			if ev.Sequence == lastDelivered+1 {
+				if !writeFrame(ev.Sequence, ev.EventType, ev.Payload, true) {
+					return
+				}
+				lastDelivered = ev.Sequence
+				if ev.IsTerminal() {
+					return
+				}
+				continue
+			}
+			// FORWARD GAP: sequence > lastDelivered+1. Writing it here would
+			// advance this client's durable cursor past bytes it never saw —
+			// and because the browser's cursor is the highest sequence it has
+			// RENDERED, the skipped frames could never be recovered by a
+			// reconnect either. Repair from the canonical log instead.
+			//
+			// `lastDelivered` therefore means "the highest CONTIGUOUS durable
+			// sequence written to this connection", not "the highest sequence
+			// observed" (AC-4.1-6).
+			newLast, terminal, ok := g.repairDurableGap(ctx, run, hub, lastDelivered, ev.Sequence, writeFrame)
+			if !ok {
+				// Fail closed: end the transport and let the client
+				// reconnect from its last contiguous cursor. Losing the
+				// connection costs a reconnect; guessing here loses content.
 				return
 			}
-			if ev.IsTerminal() {
+			lastDelivered = newLast
+			if terminal {
 				return
 			}
 		case <-keepalive.C:
@@ -476,6 +523,124 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 			}
 		}
 	}
+}
+
+// repairDurableGap fills a FORWARD hole in the durable stream from the
+// canonical event log, writing [from+1 .. through] in order.
+//
+// Redis is a low-latency NOTIFICATION channel, not an ordering authority. Two
+// writers allocate 101 and 102 under the run row's serialization point, commit
+// in that order, and can still PUBLISH in the other one — the publish happens
+// after COMMIT, so a goroutine descheduled between the two lands late. Redis
+// therefore legitimately delivers 102 before 101.
+//
+// The receive side cannot just skip 101: the client's reconnect cursor is the
+// highest sequence it has RENDERED, so a skipped frame is lost for good, not
+// merely for this connection (and if the late frame were the terminal one, the
+// client would stop reading before its predecessor ever arrived).
+//
+// MySQL can always answer the question, and this is the one place where the
+// two orderings are reconciled:
+//
+//   - `through` has been PUBLISHED, which means its transaction COMMITTED,
+//     which means its sequence was ALLOCATED — and allocation is serialized
+//     on the run row, so every lower sequence had already committed and
+//     released that lock. Anything at or below `through` is already readable
+//     here. Nothing is guessed: the range is read, page by page, from the log
+//     that defines the order.
+//   - `from` is the client's contiguous position, so the range is exactly the
+//     hole and nothing else is re-read.
+//
+// It returns the new contiguous position. Fail-closed is the whole point of
+// the (last, terminal, ok) shape: on ANY failure nothing after `from` was
+// safely delivered, ok is false, and the caller ends the connection so the
+// client reconnects and replays normally. A duplicate frame is a cosmetic
+// defect; a dropped durable event is lost content, so the repair never
+// continues past a hole it could not fill.
+func (g *Gateway) repairDurableGap(
+	ctx context.Context,
+	run *execution.Run,
+	hub *RunHub,
+	from uint64,
+	through uint64,
+	writeFrame func(sequence uint64, eventType string, payload map[string]any, withCreated bool) bool,
+) (last uint64, terminal bool, ok bool) {
+	last = from
+	for last < through {
+		page, err := g.Runs.ListEventPage(ctx, run.ID, last, execution.DefaultEventPageSize)
+		if err != nil {
+			g.countLiveGapRepair(telemetry.LiveGapFailed)
+			return from, false, false
+		}
+		progressed := false
+		for _, ev := range page.Items {
+			if ev.Sequence <= last {
+				continue
+			}
+			if ev.Sequence > through {
+				// The page ran past the event whose arrival exposed the
+				// hole. That frame is written by the caller on the next
+				// iteration; stopping exactly at `through` keeps this repair
+				// from delivering anything twice.
+				break
+			}
+			// `withCreated` is false: the timestamp is a property of the
+			// frame's ARRIVAL at the transport, and this frame arrived in
+			// the past — the replay phase below writes its frames the same
+			// way.
+			if !writeFrame(ev.Sequence, ev.EventType, ev.Payload, false) {
+				// The socket is gone. Not a repair failure (nothing was
+				// skipped), so it is not counted as one.
+				return last, false, false
+			}
+			last = ev.Sequence
+			progressed = true
+			// A gap repair IS a MySQL replay, and SSEReplayEventsTotal is
+			// already scoped to exactly that: durable events read from the
+			// log and written to a client. SSELiveGapRepairTotal records WHY
+			// this extra read happened.
+			if g.Metrics != nil {
+				g.Metrics.SSEReplayEventsTotal.Inc()
+			}
+			if hub != nil {
+				// Warm the cache for the next viewer, exactly as the replay
+				// phase does — and never fan out, for the same reason.
+				hub.RememberDurable(ev.Sequence, ev.EventType, ev.Payload)
+			}
+			if execution.IsTerminalEventName(ev.EventType) {
+				// The terminal is a hard boundary even when it arrives
+				// through a repair: everything after it is history the run
+				// did not produce. Without this the trigger frame — say
+				// run.completed at 102 — would be delivered while 101, its
+				// predecessor, was skipped (AC-4.1-4).
+				if hub != nil {
+					hub.NoteTerminal(ev.Sequence)
+				}
+				g.countLiveGapRepair(telemetry.LiveGapRepaired)
+				return last, true, true
+			}
+		}
+		if !progressed || !page.HasMore {
+			break
+		}
+	}
+	if last != through {
+		// The log could not supply a contiguous range up to the frame whose
+		// arrival exposed the hole. That should not happen (§11), but "should
+		// not happen" is not a delivery guarantee: end the connection and let
+		// the client's next replay decide, rather than passing the hole on.
+		g.countLiveGapRepair(telemetry.LiveGapFailed)
+		return from, false, false
+	}
+	g.countLiveGapRepair(telemetry.LiveGapRepaired)
+	return last, false, true
+}
+
+func (g *Gateway) countLiveGapRepair(result string) {
+	if g.Metrics == nil {
+		return
+	}
+	g.Metrics.SSELiveGapRepairTotal.WithLabelValues(result).Inc()
 }
 
 // attachHub resolves the hub for this request and registers a subscriber.

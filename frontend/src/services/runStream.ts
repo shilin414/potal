@@ -91,6 +91,23 @@ export function openRunStream(
   // The highest durable sequence already dispatched to the consumer. It is
   // the ONLY state that survives a transport break, which is why it lives
   // here rather than in the store: the store may hold a different run.
+  //
+  // SERVER CONTRACT (Batch 4.1, backend-go/internal/transport/sse): the
+  // durable frames written to ONE connection are monotonically CONTIGUOUS —
+  // the gateway refuses a forward jump (sequence > last + 1) and repairs the
+  // hole from MySQL before continuing. That is exactly what makes "highest
+  // sequence seen" a safe resume cursor. It is NOT a property the publisher
+  // provides: a durable event is published AFTER its transaction commits, so
+  // Redis can legitimately deliver 102 before 101 (see
+  // docs/potal 第十轮 Batch 4.1 整改变更报告…md).
+  //
+  // If a future backend change lets a non-contiguous frame through again,
+  // this cursor becomes unsafe in the quiet way: the skipped frame is never
+  // rendered and `after=<highest seen>` resumes past it, so it is lost for
+  // good rather than merely out of order. Defense in depth on this side would
+  // be: on `sequence > last + 1`, drop the connection and reconnect from the
+  // last contiguous position — deliberately not implemented here, so that
+  // the guarantee stays the SERVER's and every consumer gets it.
   let lastDurableSequence = 0;
 
   const dispatch = (event: RunEventRecord, sseId?: number) => {

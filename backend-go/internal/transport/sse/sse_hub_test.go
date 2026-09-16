@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -32,6 +33,13 @@ type fakeRunReader struct {
 	events   []execution.EventRecord
 	requests []uint64
 
+	// readErr, when set, fails page reads. failFrom is the 1-based read whose
+	// failure starts (0 = every read once readErr is set). It models MySQL
+	// going away exactly when the gateway needs it — the gap-repair path that
+	// must fail closed rather than guess.
+	readErr  error
+	failFrom int
+
 	// onFirstRead runs ONCE, concurrently with the first page read — the
 	// window between "the subscriber is registered" and "the replay has
 	// finished" that the hub exists to protect.
@@ -46,6 +54,11 @@ func newFakeRunReader(runID ids.ID, events []execution.EventRecord) *fakeRunRead
 func (r *fakeRunReader) ListEventPage(_ context.Context, _ ids.ID, after uint64, limit int) (*execution.EventPage, error) {
 	r.mu.Lock()
 	r.requests = append(r.requests, after)
+	if r.readErr != nil && (r.failFrom <= 0 || len(r.requests) >= r.failFrom) {
+		err := r.readErr
+		r.mu.Unlock()
+		return nil, err
+	}
 	hook := r.onFirstRead
 	if !r.fired {
 		r.fired = true
@@ -72,6 +85,26 @@ func (r *fakeRunReader) ListEventPage(_ context.Context, _ ids.ID, after uint64,
 	}
 	page.HasMore = limit > 0 && len(page.Items) == limit
 	return page, nil
+}
+
+// appendEvents adds rows to the log AFTER the reader is already serving.
+//
+// The page snapshot is taken before onFirstRead runs, so a hook that appends
+// here models precisely the production shape the gap repair exists for: the
+// client reconciled against a log that did not yet contain the event, and the
+// event exists by the time a LATER read asks for it.
+func (r *fakeRunReader) appendEvents(events ...execution.EventRecord) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, events...)
+}
+
+// failReadsFrom makes read number `n` (1-based) and every later read fail.
+func (r *fakeRunReader) failReadsFrom(n int, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failFrom = n
+	r.readErr = err
 }
 
 func (r *fakeRunReader) observed() []uint64 {
@@ -636,4 +669,227 @@ func TestGatewayDegradesToDurableReplayWhenUpstreamFails(t *testing.T) {
 	if got := w.sequences(); len(got) != 3 {
 		t.Fatalf("delivered %v, want the full durable replay [1 2 3]", got)
 	}
+}
+
+// ───────────── Batch 4.1: durable live ordering (P1-1) ─────────────
+//
+// These three tests all rest on one production fact: a durable event is
+// published AFTER its transaction commits, so two writers can allocate 101
+// then 102, commit in that order, and still reach Redis in the other order.
+// The publisher cannot be asked to fix it and the sequence allocator is not
+// broken — the gateways's job is to never let the CLIENT see the hole.
+
+// TestGatewayRepairsOutOfOrderDurableLiveEvent is AC-4.1-3 and kills
+// Mutation H (§32).
+//
+// Redis delivers 102 and then 101. A gateway that writes what it is given
+// hands the client 102 first, and the client's durable cursor — the highest
+// sequence it RENDERED — is then past 101. Reconnect with `after=102` and 101
+// is gone for good: not delayed, not reordered, LOST. The fix is to refuse the
+// forward jump and fill [101] from MySQL, which is the ordering authority.
+func TestGatewayRepairsOutOfOrderDurableLiveEvent(t *testing.T) {
+	h := newGatewayHarness(t, HubOptions{}, execution.StatusRunning)
+
+	h.reader.setFirstReadHook(func() {
+		// Both halves are load-bearing: the events must be MISSING from the
+		// replay snapshot (so the client's cursor really is 100 with 101
+		// unseen) and present when the repair asks again.
+		h.reader.appendEvents(
+			runEvent(101, execution.EventContentChunk),
+			runEvent(102, execution.EventToolCompleted),
+		)
+		h.up.tryPublish(h.runID.String(), chunkEvent(102))
+		h.up.tryPublish(h.runID.String(), chunkEvent(101))
+	})
+
+	w := h.open(t, "after=100")
+	waitFrames(t, w, 2)
+
+	got := w.sequences()
+	want := []uint64{101, 102}
+	if len(got) != len(want) {
+		t.Fatalf("delivered = %v, want %v (101 must be repaired into the stream, not skipped)",
+			got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("delivered = %v, want %v in order, exactly once", got, want)
+		}
+	}
+	// The late 101 that Redis delivered afterwards must be a no-op: it is at
+	// or below the repaired cursor.
+	if n := countSeq(got, 101); n != 1 {
+		t.Fatalf("101 was delivered %d times, want exactly 1", n)
+	}
+
+	if requests := h.reader.observed(); len(requests) != 2 || requests[0] != 100 || requests[1] != 100 {
+		t.Fatalf("durable reads = %v, want [100 100]: the replay from the client cursor, then the "+
+			"repair from the same contiguous position", requests)
+	}
+	if got := counterValue(t, h.gw.Metrics, "studio_sse_live_gap_repair_total"); got != 1 {
+		t.Fatalf("studio_sse_live_gap_repair_total = %v, want 1", got)
+	}
+	if results := labelValues(t, h.gw.Metrics, "studio_sse_live_gap_repair_total", "result"); !results[telemetry.LiveGapRepaired] || len(results) != 1 {
+		t.Fatalf("studio_sse_live_gap_repair_total results = %v, want exactly {%q}: the label is a "+
+			"closed enumeration, never a run id, a sequence or an error string", results,
+			telemetry.LiveGapRepaired)
+	}
+	if got := counterValue(t, h.gw.Metrics, "studio_sse_replay_events_total"); got != 2 {
+		t.Fatalf("studio_sse_replay_events_total = %v, want 2: a repaired frame IS a MySQL replay",
+			got)
+	}
+}
+
+// TestGatewayRepairsGapBeforeTerminal is AC-4.1-4.
+//
+// Redis delivers ONLY run.completed(102) while 101 is missing. Writing the
+// terminal would make the client set `sawTerminal` and stop reading — 101 then
+// has no route to the browser at all, because the cursor it resumes from is
+// already 102. The terminal is a hard boundary, but the frames BEFORE it are
+// not optional.
+func TestGatewayRepairsGapBeforeTerminal(t *testing.T) {
+	h := newGatewayHarness(t, HubOptions{}, execution.StatusRunning)
+
+	h.reader.setFirstReadHook(func() {
+		h.reader.appendEvents(
+			runEvent(101, execution.EventContentChunk),
+			runEvent(102, execution.EventRunCompleted),
+		)
+		h.up.tryPublish(h.runID.String(), terminalEvent(102, execution.EventRunCompleted))
+	})
+
+	w := h.open(t, "after=100")
+	w.waitDone(t, 3*time.Second)
+
+	got := w.sequences()
+	want := []uint64{101, 102}
+	if len(got) != len(want) || got[0] != 101 || got[1] != 102 {
+		t.Fatalf("delivered = %v, want %v: the run.completed that arrived out of order must NOT be "+
+			"written on its own — the client would stop reading and never see 101", got, want)
+	}
+	frames := w.frames()
+	if last := frames[len(frames)-1]; last.EventType != execution.EventRunCompleted {
+		t.Fatalf("last frame = %+v, want %s", last, execution.EventRunCompleted)
+	}
+}
+
+// TestGatewayFailsClosedWhenGapRepairFails is AC-4.1-5 and kills Mutation I
+// (§32).
+//
+// The hole cannot be filled (MySQL is gone), so there are two bad answers and
+// one right one. Sending the frame that exposed the hole loses 101 silently;
+// waiting forever hangs the stream. The right one is to END the connection
+// WITHOUT writing anything: the client reconnects from its last CONTIGUOUS
+// cursor and the normal replay delivers the range.
+func TestGatewayFailsClosedWhenGapRepairFails(t *testing.T) {
+	h := newGatewayHarness(t, HubOptions{}, execution.StatusRunning)
+	// Read 1 is the replay (fine); read 2 is the repair, and MySQL is gone.
+	h.reader.failReadsFrom(2, errors.New("mysql gone away"))
+
+	h.reader.setFirstReadHook(func() {
+		h.up.tryPublish(h.runID.String(), chunkEvent(2))
+	})
+
+	w := h.open(t, "after=0")
+	w.waitDone(t, 3*time.Second)
+
+	if got := w.sequences(); len(got) != 0 {
+		t.Fatalf("delivered %v, want NOTHING: after 0 the next contiguous sequence is 1, and writing "+
+			"2 would advance the client's cursor past a frame it never saw", got)
+	}
+	if requests := h.reader.observed(); len(requests) != 2 {
+		t.Fatalf("durable reads = %v, want 2 (the replay and the repair attempt): a repair that never "+
+			"asked MySQL is not a repair", requests)
+	}
+	if got := counterValue(t, h.gw.Metrics, "studio_sse_live_gap_repair_total"); got != 1 {
+		t.Fatalf("studio_sse_live_gap_repair_total = %v, want 1 (failed)", got)
+	}
+	if results := labelValues(t, h.gw.Metrics, "studio_sse_live_gap_repair_total", "result"); !results[telemetry.LiveGapFailed] || len(results) != 1 {
+		t.Fatalf("studio_sse_live_gap_repair_total results = %v, want exactly {%q}", results,
+			telemetry.LiveGapFailed)
+	}
+	if got := counterValue(t, h.gw.Metrics, "studio_sse_replay_events_total"); got != 0 {
+		t.Fatalf("studio_sse_replay_events_total = %v, want 0: nothing was written from the log", got)
+	}
+}
+
+// TestGatewayDeliversOversizedTerminalWithoutCachingIt is §37: the end-to-end
+// proof that the P1-2 cache rule does not turn into a delivery bug.
+//
+// The terminal frame carries the run's WHOLE answer, so it is the event most
+// likely to exceed SSE_HUB_CACHE_BYTES. The requirements are all three at once,
+// and the test asserts them in that order:
+//
+//	the subscriber receives it IN FULL   (not cached ≠ not sent)
+//	the hub cache stays within its bound (CacheMaxBytes is a memory bound)
+//	a reconnect still gets it from MySQL (not cached ≠ lost)
+func TestGatewayDeliversOversizedTerminalWithoutCachingIt(t *testing.T) {
+	opts := DefaultHubOptions()
+	opts.CacheMaxBytes = 1024
+	opts.SubscriberMaxBytes = 64 << 10
+
+	h := newGatewayHarness(t, opts, execution.StatusRunning, runEvent(1, execution.EventContentChunk))
+
+	w := h.open(t, "after=0")
+	waitFrames(t, w, 1)
+
+	answer := strings.Repeat("x", 4096)
+	h.up.publish(t, h.runID.String(), HubEvent{
+		Sequence:  2,
+		EventType: execution.EventRunCompleted,
+		Payload:   map[string]any{"status": execution.StatusSucceeded, "text": answer},
+	})
+
+	frames := waitFrames(t, w, 2)
+	w.waitDone(t, 3*time.Second)
+
+	live := frames[len(frames)-1]
+	if live.EventType != execution.EventRunCompleted {
+		t.Fatalf("last live frame = %+v, want %s", live, execution.EventRunCompleted)
+	}
+	if got, _ := live.Payload["text"].(string); got != answer {
+		t.Fatalf("the live terminal frame carried %d bytes of text, want %d: an event too large to "+
+			"cache is still delivered in full — the cache is not the transport", len(got), len(answer))
+	}
+
+	hub := h.mgr.Lookup(h.runID.String())
+	if hub == nil {
+		t.Fatal("the hub was evicted before the cache bound could be read")
+	}
+	if got := hub.CacheBytes(); got > opts.CacheMaxBytes {
+		t.Fatalf("hub cache holds %d bytes with CacheMaxBytes = %d: the byte bound is a memory "+
+			"safety limit, not a target", got, opts.CacheMaxBytes)
+	}
+	if got := hub.CacheLen(); got != 0 {
+		t.Fatalf("hub cache still holds %d events after a terminal larger than the whole budget, want 0",
+			got)
+	}
+
+	// The log keeps the frame, so the reconnect is served the same terminal in
+	// full — no user-visible difference from a cached one.
+	h.reader.appendEvents(execution.EventRecord{
+		Sequence:  2,
+		EventType: execution.EventRunCompleted,
+		Payload:   map[string]any{"status": execution.StatusSucceeded, "text": answer},
+	})
+
+	reconnect := h.open(t, "after=1")
+	again := waitFrames(t, reconnect, 1)
+	reconnect.waitDone(t, 3*time.Second)
+
+	if got, _ := again[0].Payload["text"].(string); got != answer {
+		t.Fatalf("the reconnect got %d bytes of terminal text, want %d: a cache miss must fall back "+
+			"to the log, where the event is complete", len(got), len(answer))
+	}
+}
+
+// countSeq counts how many frames carried a given durable sequence.
+func countSeq(seqs []uint64, want uint64) int {
+	n := 0
+	for _, seq := range seqs {
+		if seq == want {
+			n++
+		}
+	}
+	return n
 }
