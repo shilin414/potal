@@ -83,23 +83,22 @@ trap cleanup EXIT
 PKG=./internal/transport/sse/
 
 echo "=== A. §5.1: GetOrCreate mints a new hub per call ==="
+# Batch 4.1 (§28) turned GetOrCreate into a loop, so the mutation is now "the
+# registry lookup returns nothing": same defect, one line, and the loop's
+# creation branch still runs — which is what mints a hub (and a Redis
+# subscription) per request.
 snapshot internal/transport/sse/hub.go
 python - <<'PYEOF'
 import io
 p = 'internal/transport/sse/hub.go'
 s = io.open(p, encoding='utf-8').read()
-old = (
-    "\tif hub := m.hubs[runID]; hub != nil && hub.Serving() {\n"
-    "\t\tm.mu.Unlock()\n"
-    "\t\treturn hub\n"
-    "\t}\n"
-    "\thub := newRunHub(m, runID)\n"
-)
+old = "\t\thub := m.hubs[runID]\n\t\tif hub == nil {\n"
 assert old in s, "mutation A anchor missing"
 new = (
-    "\t// FALSIFICATION: no registry lookup — every request builds its own hub,\n"
-    "\t// i.e. one Redis subscription per SSE connection.\n"
-    "\thub := newRunHub(m, runID)\n"
+    "\t\t// FALSIFICATION: no registry lookup — every request builds its own hub,\n"
+    "\t\t// i.e. one Redis subscription per SSE connection.\n"
+    "\t\thub := (*RunHub)(nil)\n"
+    "\t\tif hub == nil {\n"
 )
 s = s.replace(old, new, 1)
 io.open(p, 'w', encoding='utf-8', newline='\n').write(s)
@@ -235,28 +234,24 @@ report "hub lifecycle is independent of the startup context (restored)" PASS \
   "$(verdict $PKG TestHubRuntimeContextSurvivesStartupContextExpiry)"
 
 echo "=== F. §11.1/§42: a sequence gap still claims cache continuity ==="
+# Batch 4.1 (§20) re-expressed the gap reset as resetSegmentLocked() and split
+# "what the ring has seen" from "what it retains"; the anchor below moved with
+# it. The defect is unchanged: the segment keeps extending through a hole.
 snapshot internal/transport/sse/hub_cache.go
 python - <<'PYEOF'
 import io
 p = 'internal/transport/sse/hub_cache.go'
 s = io.open(p, encoding='utf-8').read()
 old = (
-    "\tdefault:\n"
     "\t\tevicted = live\n"
-    "\t\tr.buf = r.buf[:0]\n"
-    "\t\tr.head = 0\n"
-    "\t\tr.bytes = 0\n"
-    "\t\tr.firstSeq = ev.Sequence\n"
+    "\t\tr.resetSegmentLocked()\n"
     "\t\tdiscontinuous = true\n"
-    "\t}\n"
 )
 assert old in s, "mutation F anchor missing"
 new = (
-    "\tdefault:\n"
     "\t\t// FALSIFICATION: extend through the gap, silently claiming to\n"
     "\t\t// cover the sequences that were never seen.\n"
     "\t\tevicted = 0\n"
-    "\t}\n"
 )
 s = s.replace(old, new, 1)
 io.open(p, 'w', encoding='utf-8', newline='\n').write(s)
