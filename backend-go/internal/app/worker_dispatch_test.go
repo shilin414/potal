@@ -23,6 +23,16 @@ func TestBuildRegistersFeishuAilyAgentDispatchPlan(t *testing.T) {
 		t.Skip("set STUDIO_TEST_DB=1 and STUDIO_TEST_REDIS=1 to run the dispatch wiring integration test")
 	}
 
+	// The CI integration job provides ONLY database/Redis env vars — the
+	// first 5.1 CI run died in Build on crypto.NewAESGCM("") because no
+	// TOKEN_ENCRYPTION_KEY existed there (no .env.local in CI). Supply a
+	// throwaway key: this test proves WIRING, not key material. APP_ENV is
+	// pinned to development so a future CI-side production setting cannot
+	// drag validateProduction (FEISHU_APP_SECRET / DB_PASSWORD checks) into
+	// a wiring test.
+	t.Setenv("APP_ENV", "development")
+	t.Setenv("TOKEN_ENCRYPTION_KEY", "batch5-1-app-wiring-integration-key")
+
 	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatalf("load config: %v", err)
