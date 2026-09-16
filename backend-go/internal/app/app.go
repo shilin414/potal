@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -27,6 +28,7 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/platform/storage"
 	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
 	"github.com/creation-agent-studio/backend-go/internal/transport/sse"
+	"github.com/creation-agent-studio/backend-go/internal/workerdispatch"
 )
 
 // App holds every shared dependency.
@@ -63,7 +65,15 @@ type App struct {
 	DeliveryLimiter  *execution.RateLimiter
 	// ProviderSlots is the durable (MySQL) provider concurrency semaphore:
 	// ownership-scoped slots, DB-clock expiry, Redis independent.
+	// Batch 5: kept as the feishu_aily compatibility alias — all NEW worker
+	// wiring resolves capacity through WorkerDispatch plans instead.
 	ProviderSlots *execution.ProviderSlots
+
+	// WorkerDispatch is the Batch 5 worker dispatcher registry: it routes a
+	// claimed Run to the concrete executor owning its
+	// (provider, runtime_type) pair. cmd/worker resolves its --provider
+	// through it and never binds a concrete executor directly anymore.
+	WorkerDispatch *workerdispatch.Registry
 
 	// SSEHub is the process-local SSE fan-out registry (Batch 4 — SSE Hub).
 	// It owns ONE Redis pub/sub subscription per run being streamed by this
@@ -202,6 +212,34 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 			"provider", "feishu_aily", "value", maxInflight)
 	}
 
+	// Provider-wide capacity semaphore (Batch 5 §7): ONE slots object per
+	// PROVIDER, shared by every runtime route of that provider — per-runtime
+	// slots would silently multiply the real provider limit.
+	ailySlots := execution.NewProviderSlots(dbh, "feishu_aily", maxInflight, cfg.Runner.LeaseSeconds)
+
+	// Worker dispatcher wiring (Batch 5 §22): register the providers this
+	// deployment can execute. A registration error is a boot-time fatal
+	// configuration error — app.Build fails, it never degrades to a warning.
+	// Today: feishu_aily:agent → the existing Aily executor (unchanged
+	// semantics: auth, submission ledger, streaming, polling, reconciliation
+	// and artifacts all stay inside the executor). Adding a runtime later
+	// means one more Routes entry, not a Worker or main-loop change.
+	dispatchRegistry := workerdispatch.NewRegistry(runs.WorkerOwned(), log, metrics)
+	if err := dispatchRegistry.RegisterProvider(workerdispatch.ProviderSpec{
+		Key:   "feishu_aily",
+		Slots: ailySlots,
+		Routes: map[string]execution.Handler{
+			catalog.RuntimeTypeAgent: ailyExecutor,
+		},
+		Health: workerdispatch.HealthFunc(func() bool {
+			return ailyExecutor.ChatsL.Degraded() ||
+				ailyExecutor.PollsL.Degraded() ||
+				ailyExecutor.ArtifactsL.Degraded()
+		}),
+	}); err != nil {
+		return nil, fmt.Errorf("register worker dispatch provider: %w", err)
+	}
+
 	return &App{
 		Cfg: cfg, Log: log, DB: dbh, Redis: rdb, Metrics: metrics, Storage: st,
 		IdentityRepo: identityRepo, Sessions: sessions, StateCodec: stateCodec,
@@ -212,7 +250,8 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 			cfg.Runner.UserRunQPS, time.Second),
 		Schedules: schedSvc, Scheduler: schedJob,
 		DeliveryDispatch: disp, DeliverySender: feishuSender, DeliveryLimiter: deliveryLimiter,
-		ProviderSlots: execution.NewProviderSlots(dbh, "feishu_aily", maxInflight, cfg.Runner.LeaseSeconds),
+		ProviderSlots:  ailySlots,
+		WorkerDispatch: dispatchRegistry,
 		// SSE Hub (Batch 4). `ctx` here is the STARTUP context, and it is
 		// passed only so the wiring records what must NOT become the hub's
 		// runtime parent: sse.NewHubManager derives its own context from
