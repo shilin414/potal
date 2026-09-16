@@ -352,6 +352,39 @@ func TestHandlerErrorPassesThrough(t *testing.T) {
 	}
 }
 
+// TestSnapshotProviderMismatchFailsClosed: the provider half of the frozen
+// snapshot guard gets its OWN deterministic proof (Batch 5.1, P2-3). The
+// runtime_type column agrees on purpose, so the only way this test fails is
+// a diverging snapshot provider_key — deleting the runtime guard (or the
+// lookup) cannot make it pass or fail.
+func TestSnapshotProviderMismatchFailsClosed(t *testing.T) {
+	sink := &fakeSink{}
+	r := newTestRegistry(t, sink)
+	handler := &fakeHandler{}
+	plan := registeredPlan(t, r, ProviderSpec{
+		Key:    "feishu_aily",
+		Routes: map[string]execution.Handler{catalog.RuntimeTypeAgent: handler},
+	})
+
+	run := claimedRun("feishu_aily", catalog.RuntimeTypeAgent, map[string]any{
+		"provider_key": "other_provider",
+		"runtime_type": catalog.RuntimeTypeAgent,
+	})
+	if err := plan.Handler.Execute(context.Background(), run); err != nil {
+		t.Fatalf("provider snapshot mismatch must terminal-fail cleanly, got: %v", err)
+	}
+	if got := handler.callCount(); got != 0 {
+		t.Fatalf("handler calls = %d, want 0", got)
+	}
+	calls, code, _, _ := sink.state()
+	if calls != 1 {
+		t.Fatalf("failure sink calls = %d, want 1", calls)
+	}
+	if code != ErrCodeRuntimeRouteSnapshotMismatch {
+		t.Fatalf("failure code = %q, want %q", code, ErrCodeRuntimeRouteSnapshotMismatch)
+	}
+}
+
 // TestDuplicateProviderRegistrationRejected: the second registration of the
 // same provider must be an error — last-write-wins would hide a double
 // wiring.
@@ -381,6 +414,75 @@ func TestNilHandlerRegistrationRejected(t *testing.T) {
 	})
 	if !errors.Is(err, ErrNilHandler) {
 		t.Fatalf("err = %v, want ErrNilHandler", err)
+	}
+	if _, err := r.ResolveProvider("feishu_aily"); !errors.Is(err, ErrUnknownProvider) {
+		t.Fatalf("a rejected spec must not be registered; ResolveProvider err = %v", err)
+	}
+}
+
+// TestTypedNilHandlerRegistrationRejected: Go's typed-nil trap — a nil *T
+// stored in the execution.Handler interface is NOT `== nil`. The plain-nil
+// check would register the wiring and only panic at the first business
+// request; registration must refuse it at boot instead (Batch 5.1, P2-2).
+func TestTypedNilHandlerRegistrationRejected(t *testing.T) {
+	sink := &fakeSink{}
+	r := newTestRegistry(t, sink)
+	var handler *fakeHandler // typed nil: non-nil interface, nil pointer
+	err := r.RegisterProvider(ProviderSpec{
+		Key:    "feishu_aily",
+		Routes: map[string]execution.Handler{catalog.RuntimeTypeAgent: handler},
+	})
+	if !errors.Is(err, ErrNilHandler) {
+		t.Fatalf("err = %v, want ErrNilHandler", err)
+	}
+	if _, err := r.ResolveProvider("feishu_aily"); !errors.Is(err, ErrUnknownProvider) {
+		t.Fatalf("a rejected spec must not be registered; ResolveProvider err = %v", err)
+	}
+}
+
+// TestNilFailureSinkRegistrationRejected: without a working sink the
+// dispatcher cannot terminal-fail unroutable runs — that is a boot wiring
+// error, not something to discover mid-traffic.
+func TestNilFailureSinkRegistrationRejected(t *testing.T) {
+	r := NewRegistry(nil, testLogger(), telemetry.NewMetrics("test"))
+	err := r.RegisterProvider(ProviderSpec{
+		Key:    "feishu_aily",
+		Routes: map[string]execution.Handler{catalog.RuntimeTypeAgent: &fakeHandler{}},
+	})
+	if !errors.Is(err, ErrNilFailureSink) {
+		t.Fatalf("err = %v, want ErrNilFailureSink", err)
+	}
+}
+
+// TestTypedNilFailureSinkRegistrationRejected: the same typed-nil trap on
+// the sink interface (Batch 5.1, P2-2).
+func TestTypedNilFailureSinkRegistrationRejected(t *testing.T) {
+	var sink *fakeSink // typed nil: non-nil FailureSink interface, nil pointer
+	r := NewRegistry(sink, testLogger(), telemetry.NewMetrics("test"))
+	err := r.RegisterProvider(ProviderSpec{
+		Key:    "feishu_aily",
+		Routes: map[string]execution.Handler{catalog.RuntimeTypeAgent: &fakeHandler{}},
+	})
+	if !errors.Is(err, ErrNilFailureSink) {
+		t.Fatalf("err = %v, want ErrNilFailureSink", err)
+	}
+}
+
+// TestTypedNilHealthProbeRejected: HealthFunc(nil) inside the HealthProbe
+// interface is non-nil and would panic the worker's metrics goroutine on
+// its first tick — a panic in a plain goroutine kills the whole process.
+// Registration must refuse it (Batch 5.1, P2-2).
+func TestTypedNilHealthProbeRejected(t *testing.T) {
+	sink := &fakeSink{}
+	r := newTestRegistry(t, sink)
+	var health HealthFunc // nil function inside a non-nil interface
+	err := r.RegisterProvider(ProviderSpec{
+		Key:    "feishu_aily",
+		Routes: map[string]execution.Handler{catalog.RuntimeTypeAgent: &fakeHandler{}},
+		Health: health,
+	})
+	if !errors.Is(err, ErrNilHealthProbe) {
+		t.Fatalf("err = %v, want ErrNilHealthProbe", err)
 	}
 	if _, err := r.ResolveProvider("feishu_aily"); !errors.Is(err, ErrUnknownProvider) {
 		t.Fatalf("a rejected spec must not be registered; ResolveProvider err = %v", err)
