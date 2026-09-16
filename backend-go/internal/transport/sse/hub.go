@@ -400,6 +400,12 @@ func (m *HubManager) Lookup(runID string) *RunHub {
 // to close the cycle. The loop makes the release safe: every iteration either
 // returns (a serving hub, or the one it just published) or removes a hub that
 // cannot serve, so it terminates.
+//
+// The create branch keeps the same discipline through publication: the registry
+// insert happens under manager.mu, and everything that can run concurrently
+// with another goroutine (the upstream goroutine, the initial idle timer)
+// happens after the release. The constructor itself is inert, so nothing here
+// touches a hub.mu-guarded field without that lock (AC-4.1.1-1/3).
 func (m *HubManager) GetOrCreate(runID string) *RunHub {
 	for {
 		m.mu.Lock()
@@ -417,10 +423,23 @@ func (m *HubManager) GetOrCreate(runID string) *RunHub {
 			}
 			m.mu.Unlock()
 
-			// Started after the lock is released, exactly as before: the
-			// goroutine takes hub.mu and does Redis I/O, neither of which
-			// belongs under manager.mu.
+			// The hub is now PUBLISHED: it is reachable from the registry, so
+			// every write to its mutable lifecycle state goes through hub.mu
+			// from here on (AC-4.1.1-2). Both of the calls below take that
+			// lock themselves — neither is made under manager.mu, which is
+			// what keeps the two locks non-nesting (AC-4.1.1-3).
+			//
+			// Upstream first, idle timer second. The order is not
+			// correctness-critical (either interleaving with Subscribe is
+			// safe, see armInitialIdleTimer), but starting the upstream
+			// before the hub can be evicted means the eviction path never
+			// races the SUBSCRIBE that the eviction is about to cancel.
 			go hub.runUpstream()
+
+			// A hub starts idle: if nobody attaches (a request that resolved
+			// the hub and then failed), the timer evicts it instead of
+			// leaking it forever (AC-4.1.1-4).
+			hub.armInitialIdleTimer()
 			return hub
 		}
 		m.mu.Unlock()
@@ -638,9 +657,34 @@ type RunHub struct {
 	idleTimer   *time.Timer
 }
 
+// newRunHub builds a hub that is INERT: it allocates the struct and creates the
+// runtime context, and does nothing else. No timer, no goroutine, no callback
+// (AC-4.1.1-1).
+//
+// "Unpublished RunHub is inert" is the invariant that makes the two locks
+// independent. The hub is not in the manager's map yet, so — before 4.1.1 —
+// arming the idle timer here looked harmless: nothing else could reach the
+// hub, so the guard would only ever be uncontended. That was wrong for two
+// reasons:
+//
+//  1. `armIdleTimerLocked` is not a field assignment. It calls
+//     `time.AfterFunc`, whose callback (`evictIfIdle`) takes hub.mu and clears
+//     `idleTimer`/`closed`. `IdleTTL` is only validated as `> 0`, so
+//     `SSE_HUB_IDLE_TTL=1ns` is a legal configuration and the callback can
+//     start running BEFORE the assignment to `h.idleTimer` completes — a real
+//     data race between the constructing goroutine and the timer goroutine.
+//  2. Worse, that callback then evicts itself: the timer goroutine walks into
+//     `removeIfSame` while GetOrCreate is still holding manager.mu, removes
+//     the hub immediately after it is published, and the caller keeps a
+//     closed/cancelled hub whose `runUpstream` may observe a dead context.
+//
+// Publishing first and arming second (`armInitialIdleTimer`) gives both paths
+// a lock: see the two legal interleavings in that method's comment. Do NOT
+// re-arm anything in here, and do NOT "fix" the race by bounding IdleTTL from
+// below — that only lowers the probability, it never establishes happens-before.
 func newRunHub(m *HubManager, runID string) *RunHub {
 	ctx, cancel := context.WithCancel(m.ctx)
-	hub := &RunHub{
+	return &RunHub{
 		runID:       runID,
 		manager:     m,
 		ctx:         ctx,
@@ -649,17 +693,6 @@ func newRunHub(m *HubManager, runID string) *RunHub {
 		subscribers: make(map[uint64]*Subscriber),
 		cache:       NewDurableRing(m.opts.CacheMaxEvents, m.opts.CacheMaxBytes),
 	}
-	// A hub starts idle: if nobody attaches (a request that resolved the hub
-	// and then failed), the timer evicts it instead of leaking it forever.
-	//
-	// The timer is armed WITHOUT taking hub.mu. The hub is not in the
-	// manager's map yet, so no other goroutine can reach it and the guard
-	// would only ever be uncontended — while GetOrCreate calls this under
-	// manager.mu, where taking hub.mu would nest manager.mu → hub.mu and
-	// break the lock-order invariant AC-4.1-8 restores. Do NOT move this
-	// after the hub is published.
-	hub.armIdleTimerLocked()
-	return hub
 }
 
 // RunID is the run this hub fans out.
@@ -1008,9 +1041,48 @@ func (h *RunHub) shutdown(reason string) {
 	h.manager.removeIfSame(h.runID, h)
 }
 
+// armInitialIdleTimer arms the "created but nobody attached" eviction window
+// for a hub that has just been PUBLISHED into the registry (AC-4.1.1-1/4/5).
+//
+// This is the only seam between the constructor and the timer: newRunHub must
+// stay inert, so the timer cannot be armed there, and it cannot be armed under
+// manager.mu either (that would nest manager.mu → hub.mu). Arming after the
+// release keeps the locks independent — and now that hub.mu is actually held,
+// the guard inside armIdleTimerLocked is a real guard rather than an
+// uncontended no-op.
+//
+// Only two interleavings are possible with a concurrent Subscribe, and both
+// are safe:
+//
+//	A. armInitialIdleTimer takes hub.mu first → timer armed → Subscribe takes
+//	   hub.mu → stops the timer → subscriber joins.
+//	B. Subscribe takes hub.mu first → subscriber joins → armInitialIdleTimer
+//	   takes hub.mu → sees subscribers != 0 → arms nothing.
+//
+// Neither depends on IdleTTL being large enough for the constructor to win a
+// race (AC-4.1.1-6), which is exactly the defect 4.1.1 closes.
+func (h *RunHub) armInitialIdleTimer() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.closed {
+		return
+	}
+	if len(h.subscribers) != 0 {
+		return
+	}
+	h.armIdleTimerLocked()
+}
+
 // armIdleTimerLocked starts the reuse window after the last subscriber left
 // (§22). Evicting immediately would tear down and rebuild the Redis
 // subscription on every ~2s frontend reconnect.
+//
+// The `Locked` suffix is a contract, not a naming convention: the caller MUST
+// hold hub.mu (AC-4.1.1-2). `time.AfterFunc` hands the callback to another
+// goroutine immediately, and that callback clears `idleTimer` and sets
+// `closed` — so arming without the lock races the timer it just created,
+// whatever IdleTTL is configured.
 func (h *RunHub) armIdleTimerLocked() {
 	if h.closed || h.idleTimer != nil {
 		return
@@ -1018,6 +1090,7 @@ func (h *RunHub) armIdleTimerLocked() {
 	h.idleTimer = time.AfterFunc(h.manager.opts.IdleTTL, h.evictIfIdle)
 }
 
+// stopIdleTimerLocked also requires hub.mu; see armIdleTimerLocked.
 func (h *RunHub) stopIdleTimerLocked() {
 	if h.idleTimer != nil {
 		h.idleTimer.Stop()
