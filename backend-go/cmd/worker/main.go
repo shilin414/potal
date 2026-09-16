@@ -1,6 +1,12 @@
 // studio-worker — the execution plane. Consumes provider queues
 // (Outbox → Redis Streams → CAS claim → lease → handler) and can be
 // scaled per provider (--provider=feishu_aily).
+//
+// Batch 5: the concrete executor is NO LONGER bound here. The execution
+// branch resolves its --provider through the worker dispatch registry and
+// runs the returned plan; an unregistered provider fails the process
+// before any consumer exists. feishu_delivery stays a separate role — it
+// delivers scheduled results, it is not a Run runtime.
 package main
 
 import (
@@ -18,6 +24,7 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/execution"
 	"github.com/creation-agent-studio/backend-go/internal/platform/logging"
 	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
+	"github.com/creation-agent-studio/backend-go/internal/workerdispatch"
 )
 
 func main() {
@@ -61,6 +68,24 @@ func main() {
 	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// Execution provider plan (Batch 5 §24): resolved BEFORE any consumer
+	// goroutine starts. An unregistered provider is a startup failure with
+	// exit code 2 — it must never create a consumer group, XREADGROUP,
+	// claim a Run or call a provider (§26).
+	var plan *workerdispatch.Plan
+	if *provider != delivery.ProviderKey {
+		plan, err = a.WorkerDispatch.ResolveProvider(*provider)
+		if err != nil {
+			logger.Error("worker provider is not registered",
+				"provider", *provider, "err", err)
+			os.Exit(2)
+		}
+		logger.Info("worker provider registered",
+			"provider", plan.Provider,
+			"runtime_types", plan.RuntimeTypes,
+			"concurrency", cfg.Runner.Concurrency)
+	}
+
 	var wg sync.WaitGroup
 
 	// Outbox relay: MySQL → Redis Streams (§22). Also routes delivery
@@ -83,73 +108,81 @@ func main() {
 			worker.Run(runCtx)
 		}()
 	} else {
-		// Provider worker pool.
+		// Provider worker pool (Batch 5 §25): the plan owns the Handler and
+		// the provider-wide slots — this binary never names a concrete
+		// executor anymore.
 		worker := &execution.Worker{
 			Svc:             a.Runs,
 			RDB:             a.Redis,
-			Provider:        *provider,
+			Provider:        plan.Provider,
 			WorkerID:        cfg.Runner.WorkerID,
 			Group:           "workers",
-			Handler:         a.AilyExecutor,
+			Handler:         plan.Handler,
 			Concurrency:     cfg.Runner.Concurrency,
 			Lease:           cfg.Runner.LeaseSeconds,
 			Heartbeat:       cfg.Runner.HeartbeatInterval,
 			ScanEvery:       cfg.Runner.ReaperInterval,
 			Log:             logger,
-			ProviderSlots:   a.ProviderSlots,
+			ProviderSlots:   plan.Slots,
 			Gate:            app.NewExecutionGate(a.Catalog),
 			PriorityWeights: cfg.Runner.PriorityWeights,
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			logger.Info("worker consuming", "provider", *provider, "concurrency", cfg.Runner.Concurrency)
+			logger.Info("worker consuming", "provider", plan.Provider, "concurrency", cfg.Runner.Concurrency)
 			worker.Run(runCtx)
 		}()
 	}
 
-	// Provider limiter degraded metric (修复计划 §51): expose the Redis
-	// GCRA fallback state so a Redis outage is visible on the dashboard.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-runCtx.Done():
-				return
-			case <-ticker.C:
-				degraded := 0.0
-				if a.AilyExecutor.ChatsL.Degraded() || a.AilyExecutor.PollsL.Degraded() || a.AilyExecutor.ArtifactsL.Degraded() {
-					degraded = 1.0
-				}
-				a.Metrics.ProviderLimiterDegraded.Set(degraded)
-				// Provider capacity, all three faces (第九轮补丁 3.3-A §二十):
-				// effective is the bound admission enforces; controlled is what
-				// a live worker owns; uncontrolled is real provider work nobody
-				// owns. effective ≈ controlled and uncontrolled ≈ 0 is healthy —
-				// a sustained uncontrolled rise is the alert.
-				if depth, err := a.ProviderSlots.Depth(runCtx); err == nil {
-					a.Metrics.ProviderInflight.WithLabelValues("feishu_aily").Set(float64(depth))
-					a.Metrics.ProviderCapacityDepth.
-						WithLabelValues("feishu_aily", telemetry.CapacityEffective).Set(float64(depth))
-				}
-				if depth, err := a.ProviderSlots.ControlledDepth(runCtx); err == nil {
-					a.Metrics.ProviderCapacityDepth.
-						WithLabelValues("feishu_aily", telemetry.CapacityControlled).Set(float64(depth))
-				}
-				if depth, err := a.ProviderSlots.UncontrolledDepth(runCtx); err == nil {
-					a.Metrics.ProviderCapacityDepth.
-						WithLabelValues("feishu_aily", telemetry.CapacityUncontrolled).Set(float64(depth))
-					if depth > 0 {
-						logger.Warn("provider capacity is uncontrolled: real provider work has no live slot",
-							"provider", "feishu_aily", "uncontrolled_depth", depth)
+	// Provider execution health monitor (Batch 5 §28/§29): only an
+	// execution worker has a provider plan, so only it samples provider
+	// capacity and limiter health — the delivery worker no longer samples
+	// Aily state it does not use.
+	if plan != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-runCtx.Done():
+					return
+				case <-ticker.C:
+					degraded := 0.0
+					if plan.Health != nil && plan.Health.LimiterDegraded() {
+						degraded = 1.0
+					}
+					a.Metrics.ProviderLimiterDegraded.Set(degraded)
+					// Provider capacity, all three faces (第九轮补丁 3.3-A §二十):
+					// effective is the bound admission enforces; controlled is what
+					// a live worker owns; uncontrolled is real provider work nobody
+					// owns. effective ≈ controlled and uncontrolled ≈ 0 is healthy —
+					// a sustained uncontrolled rise is the alert.
+					if plan.Slots != nil {
+						if depth, err := plan.Slots.Depth(runCtx); err == nil {
+							a.Metrics.ProviderInflight.WithLabelValues(plan.Provider).Set(float64(depth))
+							a.Metrics.ProviderCapacityDepth.
+								WithLabelValues(plan.Provider, telemetry.CapacityEffective).Set(float64(depth))
+						}
+						if depth, err := plan.Slots.ControlledDepth(runCtx); err == nil {
+							a.Metrics.ProviderCapacityDepth.
+								WithLabelValues(plan.Provider, telemetry.CapacityControlled).Set(float64(depth))
+						}
+						if depth, err := plan.Slots.UncontrolledDepth(runCtx); err == nil {
+							a.Metrics.ProviderCapacityDepth.
+								WithLabelValues(plan.Provider, telemetry.CapacityUncontrolled).Set(float64(depth))
+							if depth > 0 {
+								logger.Warn("provider capacity is uncontrolled: real provider work has no live slot",
+									"provider", plan.Provider, "uncontrolled_depth", depth)
+							}
+						}
 					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 
 	<-runCtx.Done()
 	logger.Info("worker shutting down (in-flight runs keep their leases; the reaper recovers orphans)")
