@@ -2,8 +2,9 @@
 # Falsification driver — 第十轮 Batch 4.1.1「Hub Initial Timer Race Closure」
 # (复审报告 §7-§24).
 #
-# Two mutations, one per item the patch claims to have closed; each must make
-# its matching test FAIL, then PASS again after the code is restored:
+# Three mutations, one per lifecycle defence the patch claims to have closed;
+# each must make its matching test FAIL, then PASS again after the code is
+# restored (Batch 4.1.2 added N, the subscriber guard):
 #
 #   L. the initial idle timer goes back INSIDE the newRunHub constructor (§24)
 #        → TestNewRunHubIsInertBeforePublication FAIL
@@ -15,6 +16,21 @@
 #        → TestGatewayFailsClosedOnCanonicalLogSequenceHole FAIL
 #      (a hole in the log is stepped over and the client's cursor lands past an
 #       event it never saw)
+#   N. armInitialIdleTimer drops its "a subscriber is already attached" guard
+#      (Batch 4.1.2, review §10/§12)
+#        → TestArmInitialIdleTimerSkipsAlreadySubscribedHub FAIL
+#      (the initial timer is armed on a hub that already has a subscriber, so the
+#       reuse window ends at a deadline fixed BEFORE that subscriber existed.
+#       Nothing is lost — the callback re-checks the subscriber set — but a
+#       subscriber that leaves inside the initial TTL no longer gets a full
+#       IdleTTL, which costs Redis SUBSCRIBE churn and extra hub generations
+#       under a reconnect storm. Hence P2, and hence a root-cause assertion on
+#       `idleTimer == nil` rather than a wall-clock retention window.)
+#
+# Mutation N has no second half in the race gate: dropping the guard produces no
+# unsynchronised access (every reader of the field still holds hub.mu), so
+# `go test -race` stays green. Only the deterministic interleaving test can see
+# it — which is exactly why AC-4.1.2-2..5 exist.
 #
 # Mutation M is deliberately NOT paired with the positive control
 # (TestGatewayRepairsGapFromContiguousLog): that test passes both before and
@@ -76,7 +92,10 @@ cleanup() {
 trap cleanup EXIT
 
 PKG=./internal/transport/sse/
-INERT_TESTS='TestNewRunHubIsInertBeforePublication|TestGetOrCreateArmsInitialIdleTimer|TestConcurrentSubscriberCancelsInitialIdleTimer'
+INERT_TESTS='TestNewRunHubIsInertBeforePublication|TestGetOrCreateArmsInitialIdleTimer|TestSubscriberStopsArmedInitialIdleTimer'
+# Mutation N targets the subscriber guard, so its test must be the one that
+# BUILDS "subscriber attached → arm" instead of hoping a scheduler produces it.
+GUARD_TESTS='TestArmInitialIdleTimerSkipsAlreadySubscribedHub'
 HOLE_TESTS='TestGatewayFailsClosedOnCanonicalLogSequenceHole'
 
 echo "=== L. §24: the initial idle timer is armed inside the constructor again ==="
@@ -143,6 +162,45 @@ report "a hole in the canonical log fails closed (mutated)" FAIL \
 revert internal/transport/sse/sse.go
 report "a hole in the canonical log fails closed (restored)" PASS \
   "$(verdict $PKG "$HOLE_TESTS")"
+
+echo "=== N. §10/§12: armInitialIdleTimer no longer defers to an attached subscriber ==="
+snapshot internal/transport/sse/hub.go
+python - <<'PYEOF'
+import io
+p = 'internal/transport/sse/hub.go'
+s = io.open(p, encoding='utf-8').read()
+old = (
+    "\tif h.closed {\n"
+    "\t\treturn\n"
+    "\t}\n"
+    "\tif len(h.subscribers) != 0 {\n"
+    "\t\treturn\n"
+    "\t}\n"
+    "\th.armIdleTimerLocked()\n"
+    "}\n"
+)
+assert s.count(old) == 1, "mutation N anchor missing or ambiguous"
+new = (
+    "\tif h.closed {\n"
+    "\t\treturn\n"
+    "\t}\n"
+    "\t// FALSIFICATION: the subscriber guard is gone, so a hub that already has\n"
+    "\t// a subscriber still gets an idle timer armed on it. The callback still\n"
+    "\t// re-checks the subscriber set, so nothing is lost outright — but the\n"
+    "\t// hub's reuse window now ends at a deadline fixed before that subscriber\n"
+    "\t// existed, and a detach inside the window no longer restarts a full\n"
+    "\t// IdleTTL.\n"
+    "\th.armIdleTimerLocked()\n"
+    "}\n"
+)
+s = s.replace(old, new, 1)
+io.open(p, 'w', encoding='utf-8', newline='\n').write(s)
+PYEOF
+report "a subscriber already attached suppresses the initial arm (mutated)" FAIL \
+  "$(verdict $PKG "$GUARD_TESTS")"
+revert internal/transport/sse/hub.go
+report "a subscriber already attached suppresses the initial arm (restored)" PASS \
+  "$(verdict $PKG "$GUARD_TESTS")"
 
 echo "=== control: the gap repair still repairs a gap-free log ==="
 report "a gap-free log is still repaired end to end" PASS \

@@ -1152,17 +1152,27 @@ func TestGetOrCreateArmsInitialIdleTimer(t *testing.T) {
 	waitFor(t, "the upstream to close", func() bool { return up.ActiveChannels() == 0 })
 }
 
-// TestConcurrentSubscriberCancelsInitialIdleTimer pins AC-4.1.1-5, and is the
-// test that would have caught the old bug had the old code been merely racy
-// rather than wrong.
+// TestSubscriberStopsArmedInitialIdleTimer covers the "A" interleaving of
+// armInitialIdleTimer for AC-4.1.1-5, and is the test that would have caught
+// the old bug had the old code been merely racy rather than wrong.
 //
-// The subscriber is attached as soon as the hub becomes VISIBLE in the registry
-// — which is strictly before GetOrCreate arms the timer — so the arm really is
-// racing a subscribe. Only two interleavings exist, and both must leave a live
-// hub: the timer is armed and then stopped by Subscribe, or Subscribe wins and
-// the arm sees a non-empty subscriber set. Either way the hub must outlive
-// several IdleTTL windows.
-func TestConcurrentSubscriberCancelsInitialIdleTimer(t *testing.T) {
+// It is named for what it actually establishes. The subscriber is attached as
+// soon as the hub becomes VISIBLE in the registry, but GetOrCreate does not
+// return until AFTER it has armed the timer, so the sleep on `<-created` below
+// makes the real order
+//
+//	arm timer → GetOrCreate returns → Subscribe → stop the armed timer
+//
+// and NOT "Subscribe strictly happens-before the arm". The review of 4.1.1
+// (Batch 4.1.2) flagged the old name and comment as describing an interleaving
+// this code path cannot produce. The other branch — the arm observing a
+// non-empty subscriber set and arming nothing — is pinned deterministically by
+// TestArmInitialIdleTimerSkipsAlreadySubscribedHub.
+//
+// Both interleavings must leave a live hub, so this remains the integration
+// check that a subscriber arriving in the just-published window cannot lose the
+// hub to the initial idle timer.
+func TestSubscriberStopsArmedInitialIdleTimer(t *testing.T) {
 	up := newFakeUpstream()
 	opts := DefaultHubOptions()
 	opts.IdleTTL = 20 * time.Millisecond
@@ -1212,6 +1222,93 @@ func TestConcurrentSubscriberCancelsInitialIdleTimer(t *testing.T) {
 		waitFor(t, fmt.Sprintf("round %d hub cleanup", round), func() bool {
 			return mgr.HubCount() == 0
 		})
+	}
+}
+
+// TestArmInitialIdleTimerSkipsAlreadySubscribedHub pins AC-4.1.2-2/3: the
+// subscriber guard inside armInitialIdleTimer, deterministically.
+//
+// TestSubscriberStopsArmedInitialIdleTimer can only ever reach interleaving A
+// (timer armed, then stopped by Subscribe), because GetOrCreate re-arms nothing
+// and returns only after the arm. Nothing in the concurrent test establishes
+//
+//	registry published → subscriber attached → armInitialIdleTimer
+//
+// and a goroutine schedule cannot be asked to produce it on demand: the window
+// is a few instructions wide, so any test relying on it would be a lottery.
+// This test BUILDS the state instead. Same package, so `newRunHub` and
+// `manager.hubs` are reachable, and the hub is published exactly the way
+// GetOrCreate publishes it — under manager.mu, with the arm left to the caller.
+//
+// The assertion is on the ROOT CAUSE (`idleTimer` is still nil), not on a
+// wall-clock retention window: an armed-but-not-yet-fired timer IS the defect,
+// and reading the field keeps the check independent of timing and of the
+// scheduler (AC-4.1.2-3). The reuse window itself is covered by the hub
+// lifecycle tests; the tail of this test re-exercises the hand-off so skipping
+// the arm cannot leave a hub that is never reclaimed.
+//
+// Delete the `len(h.subscribers) != 0` guard and this test fails while the rest
+// of the suite stays green: the timer callback also checks the subscriber set,
+// so the damage is a shortened reuse window (Redis SUBSCRIBE churn, extra hub
+// generations), not a lost hub. That is why AC-4.1.2-4 needs this anti-test
+// rather than a functional assertion.
+func TestArmInitialIdleTimerSkipsAlreadySubscribedHub(t *testing.T) {
+	up := newFakeUpstream()
+	opts := DefaultHubOptions()
+	// Long enough that "the timer was armed" is observable as a non-nil field
+	// rather than as an eviction racing the assertion, and short enough that
+	// the post-detach eviction still lands inside waitFor's window.
+	opts.IdleTTL = 250 * time.Millisecond
+	mgr := NewHubManagerWithUpstream(context.Background(), up, nil, opts)
+	defer mgr.Close()
+
+	const runID = "run-subscriber-before-initial-arm"
+
+	hub := newRunHub(mgr, runID)
+
+	// Publication without the arm: this is GetOrCreate's registry insert, one
+	// step before it calls armInitialIdleTimer.
+	mgr.mu.Lock()
+	mgr.hubs[runID] = hub
+	mgr.mu.Unlock()
+
+	sub, ok := hub.Subscribe(StreamProtocolRangeDelta)
+	if !ok {
+		t.Fatal("Subscribe refused a freshly published hub")
+	}
+
+	// Interleaving B: the subscriber is already attached when the initial arm
+	// runs, so the arm must observe it and start no timer at all.
+	hub.armInitialIdleTimer()
+
+	hub.mu.Lock()
+	timer := hub.idleTimer
+	hub.mu.Unlock()
+	if timer != nil {
+		t.Fatal("armInitialIdleTimer armed an idle timer although a subscriber was already " +
+			"attached: the hub's reuse window now ends at a deadline fixed before that " +
+			"subscriber existed, so the detach below cannot start a full IdleTTL and the " +
+			"Redis SUBSCRIBE is torn down early")
+	}
+
+	// No timer was armed, so the hub must outlive several IdleTTL windows.
+	time.Sleep(2 * opts.IdleTTL)
+	if got := mgr.Lookup(runID); got != hub {
+		t.Fatalf("the hub was evicted although a subscriber was attached (Lookup = %p, want %p)",
+			got, hub)
+	}
+	if reason := sub.DropReason(); reason != "" {
+		t.Fatalf("the subscriber was dropped (%q) although the hub is idle-but-live", reason)
+	}
+
+	// Detaching must start a FULL reuse window from this instant — the exact
+	// window the guard protects. This is also the lifecycle hand-off: an
+	// armInitialIdleTimer that skips the arm must not leave the hub stranded in
+	// the registry forever.
+	sub.Close(DropReasonClientGone)
+	waitFor(t, "the detached hub to be reclaimed", func() bool { return mgr.HubCount() == 0 })
+	if got := mgr.Lookup(runID); got != nil {
+		t.Fatal("Lookup returned a hub that the idle timer should have evicted")
 	}
 }
 

@@ -181,17 +181,24 @@ Gap repair 失败时：
 ```text
 TestNewRunHubIsInertBeforePublication          AC-4.1.1-1
 TestGetOrCreateArmsInitialIdleTimer            AC-4.1.1-4
-TestConcurrentSubscriberCancelsInitialIdleTimer AC-4.1.1-5
+TestSubscriberStopsArmedInitialIdleTimer       AC-4.1.1-5（交错 A）
 TestTinyInitialIdleTTLIsRaceSafe               AC-4.1.1-6
 ```
+
+> **名字已于 Batch 4.1.2 修正**：本批原名为 `TestConcurrentSubscriberCancelsInitialIdleTimer`，
+> 其注释声称"subscriber 严格早于 arm"，但 `<-created` 返回时 `armInitialIdleTimer()` 已经执行完，
+> 代码建立的是"timer 已 arm → Subscribe → stop timer"（交错 A）。AC-4.1.1-5 的另一半
+> （交错 B：subscriber 先到 → 不 arm）由 Batch 4.1.2 的
+> `TestArmInitialIdleTimerSkipsAlreadySubscribedHub` 确定性覆盖，详见 §10。
 
 * **Inert**：两半。长 TTL（1h）下"constructor 里 arm 了 timer"是可直接观测的非 nil；短 TTL
   （1ms）下等 50 个 IdleTTL 窗口后 `closed` 仍必须是 false —— 后半段就是**旧代码会失败的
   那一半**（旧代码里 callback 会把 `closed` 置真）。
 * **Arms**：`GetOrCreate` 后 Hub 无人认领，断言"立刻已 armed"（证明 timer 没被搬丢）→
   `IdleTTL` 后 `HubCount == 0`（AC-4.1.1-4）。
-* **Concurrent**：40 轮，每轮在 Hub **刚可见于注册表**（严格早于 arm）时立刻 Subscribe，然后
-  挂住 2 × IdleTTL，断言 Hub 仍在、`Subscriber.DropReason() == ""`。
+* **Stops-armed-timer**：40 轮，每轮在 Hub **刚可见于注册表**时立刻 Subscribe（该时刻早于
+  arm，但测试自身要等 `GetOrCreate` 返回，因此真实时序是"arm 已发生 → Subscribe 停表"），
+  然后挂住 2 × IdleTTL，断言 Hub 仍在、`Subscriber.DropReason() == ""`。
 * **Tiny TTL**：`IdleTTL = 1ns`，60 轮并发 GetOrCreate / Subscribe / Close，制造跨代际
   （1ns 会让 Hub 一 publish 就被回收，下一轮重建）与 arm/stop/arm 交错。功能断言刻意很弱
   （不 panic、注册表能排空、Close 正常返回）——**真正的裁决交给 race detector**。
@@ -356,3 +363,155 @@ FROZEN（Batch 4.1 报告的 FROZEN 判定自本批起恢复有效）
 **下一步：Batch 5 — Worker Dispatcher。**
 
 本轮严格按复审 §27 收口，未继续扩大 SSE 修改范围。
+
+---
+
+# 10. Batch 4.1.2 — Initial Arm Interleaving Test Closure（test-only）
+
+复审报告《potal 第十轮 Batch 4.1.1 最新代码复审暨 Batch 4.1.2 测试加固执行报告》结论为
+P0 0 / P1 0 / P2 1：生产实现正确，缺的是 **AC-4.1.1-5 另一半的确定性测试证据**。本批只补测试
+与反证，**不重新修改 Hub 生产实现**。
+
+## 10.1 复审判定（已复核确认）
+
+```text
+Initial Idle Timer runtime fix      PASS
+manager.mu / hub.mu non-nesting     PASS
+canonical-log continuity            PASS
+SSE Hub race CI                     PASS
+AC-4.1.1-5 deterministic test       INCOMPLETE  → 本批关闭
+```
+
+## 10.2 改动范围（未触碰任何生产文件）
+
+```text
+backend-go/internal/transport/sse/hub_test.go                        新增 1 测试 + 改名 1 测试
+backend-go/scripts/falsify_review10_patch411.sh                      新增 Mutation N
+docs/potal 第十轮 Batch 4.1.1 整改变更报告（…）.md                    本文件 §4.1 纠名 + 本节
+```
+
+`hub.go` / `sse.go` / `hub_cache.go` / `hub_subscription.go` / frontend / DB / migration /
+OpenAPI / Provider / Execution Kernel **均未修改**（AC-4.1.2-1）。
+
+## 10.3 原测试改名 + 注释纠偏
+
+```text
+TestConcurrentSubscriberCancelsInitialIdleTimer
+  → TestSubscriberStopsArmedInitialIdleTimer
+```
+
+原因（复审 §5/§11）：`<-created` 只有在 `GetOrCreate` **完整返回后**才收到值，而返回顺序是
+
+```text
+registry insert → unlock manager.mu → go runUpstream → armInitialIdleTimer() → return hub
+```
+
+因此 `<-created` 返回时 arm 已经完成，该测试真实建立的是
+
+```text
+arm timer → GetOrCreate return → Subscribe → stop already-armed timer     （交错 A）
+```
+
+而不是注释声称的"Subscribe 严格早于 arm"（交错 B）。测试本身仍有价值（锁正确前提下的 stop
+可靠性，以及集成层的"新发布窗口内到达的 subscriber 不会丢掉 Hub"），因此**保留、改名、改写
+注释**，不再声称它覆盖交错 B。原 Batch 4 / 4.1 / 4.1.1 测试**无删除、无放宽**（AC-4.1.2-9）。
+
+## 10.4 新增确定性测试
+
+```text
+TestArmInitialIdleTimerSkipsAlreadySubscribedHub   AC-4.1.2-2/3
+```
+
+交错 B 的窗口只有几条指令宽，靠 goroutine 调度撞出来是抽签，所以该测试**直接构造状态**
+（同 package：`newRunHub` 与 `manager.hubs` 可达），按 `GetOrCreate` 的方式发布但由调用方 arm：
+
+```text
+newRunHub(mgr, runID)
+  → mgr.mu 下写入 mgr.hubs[runID]        （= GetOrCreate 的 registry insert，只少 arm 那一步）
+  → hub.Subscribe(StreamProtocolRangeDelta)
+  → hub.armInitialIdleTimer()            （subscriber 已存在的 arm）
+  → 断言 hub.idleTimer == nil            （根因断言）
+  → sleep 2×IdleTTL：Hub 必须仍在、DropReason() == ""
+  → sub.Close()：必须重新 arm 并回收      （证明跳过 arm 没把 lifecycle 绕掉）
+```
+
+**为什么断言 `idleTimer == nil` 而不是 wall-clock retention window**（复审 §14）：已 arm 但尚未
+触发的 timer **就是**缺陷本身；读字段与调度、与 `IdleTTL` 取值都无关（AC-4.1.2-3）。而"detach
+后重新获得完整 IdleTTL"这类 wall-clock 断言会引入 flake。
+
+`IdleTTL = 250ms` 的选取：足够长，使"被 arm 了"表现为非 nil 字段而不是一次与断言竞争的回收；
+又足够短，使 detach 后的回收仍落在 `waitFor` 的 3s 窗口内。
+
+## 10.5 Mutation N
+
+`scripts/falsify_review10_patch411.sh` 新增：
+
+```text
+N. armInitialIdleTimer 删掉 `if len(h.subscribers) != 0 { return }`
+   → TestArmInitialIdleTimerSkipsAlreadySubscribedHub   MUST FAIL
+   → 恢复源码                                          MUST PASS
+```
+
+至此 4.1.1 的三条生命周期防线各有可失败反证：
+
+```text
+L  constructor 必须 inert
+N  subscriber-before-arm 不得 arm timer
+M  canonical log hole 必须 fail closed
+```
+
+Mutation N **没有 race gate 的第二半**：删掉 guard 不产生未同步访问（字段读写仍在 `hub.mu` 下），
+`go test -race` 会继续绿；只有确定性交错测试看得见它。这正是 AC-4.1.2-2..5 存在的理由，也说明
+"-race PASS" 不能替代业务不变量测试（复审 §7）。
+
+## 10.6 本地实测证据
+
+```text
+go test ./... -count=1                                        all ok（含 sse 4.747s）
+go test -run 五个定时器相关测试 -v                             5/5 PASS
+    TestArmInitialIdleTimerSkipsAlreadySubscribedHub  0.75s   ← 新增
+    TestSubscriberStopsArmedInitialIdleTimer          2.46s   ← 改名后
+    TestNewRunHubIsInertBeforePublication             0.05s
+    TestGetOrCreateArmsInitialIdleTimer               0.10s
+    TestTinyInitialIdleTTLIsRaceSafe                  0.00s
+falsify_review10.sh               falsifications ok=14 bad=0
+falsify_review10_patch41.sh       falsifications ok=8  bad=0
+falsify_review10_patch411.sh      falsifications ok=7  bad=0
+    L mutated FAIL / restored PASS
+    M mutated FAIL / restored PASS
+    N mutated FAIL / restored PASS          ← 新增
+    control gap-free log still repaired PASS
+    无 FALSIFICATION 残留、无 *.orig 残留
+migrate 1st / 2nd                applied（二次运行干净 no-op）
+db-backed package tests          execution / delivery / platform 全 ok
+tests/integration                ok 128.788s
+frontend                         tsc 0 error / vitest 18 files 158 tests PASS / vite build ok
+```
+
+`-race` 本机仍无法执行（`CGO_ENABLED=0`、无 gcc），该门由 CI 兜住，覆盖
+`./internal/transport/sse/...`。
+
+## 10.7 验收对照
+
+```text
+AC-4.1.2-1  生产代码 hub.go / sse.go 无行为修改                                PASS
+AC-4.1.2-2  确定性测试覆盖「subscriber 已存在 → arm 不得启动 timer」            PASS
+AC-4.1.2-3  该测试不依赖 goroutine scheduler 或 1ns timing                     PASS
+AC-4.1.2-4  删除 subscriber guard 后新测试必 FAIL（Mutation N）                PASS
+AC-4.1.2-5  恢复 subscriber guard 后新测试 PASS                               PASS
+AC-4.1.2-6  inert-constructor / tiny-TTL-race / canonical-hole 测试继续 PASS   PASS
+AC-4.1.2-7  Mutation L / M 继续有效，Mutation N 有效                           PASS
+AC-4.1.2-8  go test / race / integration 全绿（race 由 CI 兜）                 PASS
+AC-4.1.2-9  Batch 4 / 4.1 / 4.1.1 原测试未删除、未放宽                          PASS
+```
+
+## 10.8 Freeze 判定
+
+复审第 17 节已判定运行时正确性无新 P0/P1；本批补齐证据后：
+
+```text
+Batch 4 + 4.1 + 4.1.1 + 4.1.2
+FROZEN —— SSE Hub 永久冻结，不再扩大 Batch 4 生产功能范围
+```
+
+**下一步：Batch 5 — Worker Dispatcher。**
