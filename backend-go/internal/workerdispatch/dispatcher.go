@@ -37,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"sort"
 	"sync"
 
@@ -44,6 +45,31 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/execution"
 	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
 )
+
+// isNilLike reports whether v is nil in a way that would panic when used —
+// including Go's TYPED-NIL trap: a nil *T stored in an interface is NOT
+// `== nil` (the interface carries the type), so a plain `handler == nil`
+// check lets `var executor *SomeExecutor` through registration and only
+// panics at the first business request. Registration must reject it at
+// boot instead (Batch 5.1, P2-2).
+func isNilLike(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Chan,
+		reflect.Func,
+		reflect.Interface,
+		reflect.Map,
+		reflect.Pointer,
+		reflect.Slice,
+		reflect.UnsafePointer:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
 
 // Dispatch result values — the closed `result` label set of
 // studio_worker_dispatch_total. `routed` means the Handler was FOUND and
@@ -86,6 +112,14 @@ var (
 	ErrProviderSlotMismatch = errors.New("workerdispatch: ProviderSlots belong to a different provider")
 	ErrDuplicateProvider    = errors.New("workerdispatch: provider already registered (duplicate registration is a wiring bug, not a replacement)")
 	ErrUnknownProvider      = errors.New("workerdispatch: provider is not registered")
+	// ErrNilFailureSink: the registry cannot terminal-fail unroutable runs
+	// without a working FailureSink, so a nil (or typed-nil) one is a boot
+	// wiring error, not a defer-to-first-failure one (Batch 5.1, P2-2).
+	ErrNilFailureSink = errors.New("workerdispatch: failure sink must not be nil")
+	// ErrNilHealthProbe: HealthFunc(nil) inside the interface is non-nil
+	// and would panic the worker's metrics goroutine on its first tick —
+	// a panic in a plain goroutine kills the whole process (Batch 5.1).
+	ErrNilHealthProbe = errors.New("workerdispatch: health probe must not be a nil function")
 )
 
 // HealthProbe reports whether the provider's rate limiters are running on
@@ -188,19 +222,26 @@ func NewRegistry(failureSink FailureSink, log *slog.Logger, metrics *telemetry.M
 // RegisterProvider validates the spec strictly and registers it. Any error
 // here is a wiring bug; app.Build must fail the process, not log a warning.
 //
-// Validation contract (Batch 5 §9):
+// Validation contract (Batch 5 §9, hardened by 5.1 P2-2):
+//   - the registry's FailureSink must be usable (nil or typed-nil refused —
+//     the dispatcher needs it to terminal-fail unroutable runs);
 //   - key must not be empty;
 //   - at least one route — a provider with no executor must not start a worker;
 //   - runtime_type must not be empty;
 //   - runtime_type "none" is refused — fixed-page apps never create runs,
 //     so no worker may ever claim to execute them;
-//   - handlers must not be nil — a nil route must die at boot, not at the
-//     first business request;
+//   - handlers must not be nil (including TYPED nil — a nil *T inside the
+//     interface passes `== nil` and would panic at the first request);
+//   - Health, when present, must be a real probe (HealthFunc(nil) inside
+//     the interface would panic the worker metrics goroutine);
 //   - Slots, when present, must belong to THIS provider — otherwise
 //     other_agent executions would silently burn feishu_aily capacity;
 //   - duplicate registration is refused (last-write-wins would hide a
 //     double wiring of the same provider).
 func (r *Registry) RegisterProvider(spec ProviderSpec) error {
+	if isNilLike(r.failureSink) {
+		return ErrNilFailureSink
+	}
 	if spec.Key == "" {
 		return ErrEmptyProviderKey
 	}
@@ -214,9 +255,12 @@ func (r *Registry) RegisterProvider(spec ProviderSpec) error {
 		if rt == catalog.RuntimeTypeNone {
 			return fmt.Errorf("%w: provider %q", ErrRuntimeTypeNone, spec.Key)
 		}
-		if handler == nil {
+		if isNilLike(handler) {
 			return fmt.Errorf("%w: provider %q runtime %q", ErrNilHandler, spec.Key, rt)
 		}
+	}
+	if spec.Health != nil && isNilLike(spec.Health) {
+		return fmt.Errorf("%w: provider %q", ErrNilHealthProbe, spec.Key)
 	}
 	if spec.Slots != nil && spec.Slots.Provider != spec.Key {
 		return fmt.Errorf("%w: spec key %q, slots provider %q",
