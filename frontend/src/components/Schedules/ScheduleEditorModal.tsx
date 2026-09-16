@@ -118,11 +118,25 @@ export function ScheduleEditorModal({
   );
   void selectedApp; // 展示预留：选中智能体的头像/名称随后续迭代上屏
 
+  /**
+   * 校验并读回表单值。
+   *
+   * 必须用 `getFieldsValue(true)`（全量 store）而不是 `validateFields()` 的返回值：
+   * 后者只包含**已注册 Form.Item 的路径**（rc-field-form 用注册路径重建对象），
+   * 因此通过 `setFieldsValue` 写入、但没有对应 Form.Item 的字段会被静默丢弃 ——
+   * 飞书投递的 `deliveries[0].target_name/target_type`（只有 target_id 注册了
+   * Form.Item）以及 misfire_policy/deadline_policy/execution_window_seconds
+   * 都会消失，后端随即以 `delivery target_type must be user or chat` 拒绝创建。
+   */
+  const readValues = useCallback(async (): Promise<ScheduleFormValues> => {
+    await form.validateFields();
+    return form.getFieldsValue(true) as ScheduleFormValues;
+  }, [form]);
+
   const refreshPreview = useCallback(async () => {
     try {
       setPreviewing(true);
-      const values = await form.validateFields();
-      const payload = formToPayload(values);
+      const payload = formToPayload(await readValues());
       const runs = await previewScheduleRuns(payload);
       setPreview(runs);
     } catch {
@@ -130,12 +144,11 @@ export function ScheduleEditorModal({
     } finally {
       setPreviewing(false);
     }
-  }, [form]);
+  }, [readValues]);
 
   const handleOk = async () => {
     try {
-      const values = await form.validateFields();
-      const payload = formToPayload(values);
+      const payload = formToPayload(await readValues());
       if (!deliveryOn) payload.deliveries = undefined;
       setSaving(true);
       if (editing) {
