@@ -15,11 +15,17 @@
 #        → TestMissingRuntimeFailsClosed FAIL
 #   D. an unknown provider resolves to feishu_aily anyway (§26/§34)
 #        → TestUnknownProviderCannotResolve FAIL
-#   E. the snapshot mismatch guard is deleted outright (§14)
+#   E. the snapshot mismatch guards are deleted outright (§14)
 #        → TestCanonicalColumnsWinOverSnapshot FAIL
 #      (B and E fail the same test through DIFFERENT defects: B routes on
 #       the snapshot and lands in route_missing; E keeps the canonical
 #       lookup and executes the diverging run.)
+#   H. ONLY the snapshot provider_key guard is deleted, runtime guard intact
+#      (Batch 5.1, P2-3/P2-4)
+#        → TestSnapshotProviderMismatchFailsClosed FAIL
+#      (the provider half of the guard gets its own deterministic test, so
+#       deleting it alone can no longer hide from every unit test and
+#       mutation)
 #   F. duplicate provider registration becomes last-write-wins (§9.7)
 #        → TestDuplicateProviderRegistrationRejected FAIL
 #   G. a ProviderSlots wired to another provider is accepted (§9.6)
@@ -76,6 +82,7 @@ PKG=./internal/workerdispatch/
 SRC=internal/workerdispatch/dispatcher.go
 PAIR_TESTS='TestRuntimeTypeSelectsDifferentHandlers'
 SNAP_TESTS='TestCanonicalColumnsWinOverSnapshot'
+PROV_SNAP_TESTS='TestSnapshotProviderMismatchFailsClosed'
 MISSING_TESTS='TestMissingRuntimeFailsClosed'
 UNKNOWN_TESTS='TestUnknownProviderCannotResolve'
 DUP_TESTS='TestDuplicateProviderRegistrationRejected'
@@ -242,6 +249,34 @@ report "the snapshot guard fails closed (mutated)" FAIL \
 revert "$SRC"
 report "the snapshot guard fails closed (restored)" PASS \
   "$(verdict $PKG "$SNAP_TESTS")"
+
+echo "=== H. Batch 5.1 P2-3: ONLY the snapshot provider_key guard is deleted ==="
+snapshot "$SRC"
+python - <<'PYEOF'
+import io
+p = 'internal/workerdispatch/dispatcher.go'
+s = io.open(p, encoding='utf-8').read()
+old = (
+    "\tif snapProvider := run.SnapshotString(\"provider_key\"); snapProvider != \"\" && snapProvider != run.Provider {\n"
+    "\t\td.observe(run, DispatchSnapshotMismatch)\n"
+    "\t\td.log.Error(\"worker runtime route snapshot mismatch\",\n"
+    "\t\t\t\"provider\", run.Provider,\n"
+    "\t\t\t\"runtime_type\", run.RuntimeType,\n"
+    "\t\t\t\"snapshot_provider\", snapProvider)\n"
+    "\t\treturn d.failTerminal(ctx, claimed, ErrCodeRuntimeRouteSnapshotMismatch,\n"
+    "\t\t\tfmt.Sprintf(\"runtime snapshot provider_key %q diverges from canonical runs.provider %q\",\n"
+    "\t\t\t\tsnapProvider, run.Provider))\n"
+    "\t}\n"
+)
+assert s.count(old) == 1, "mutation H anchor missing or ambiguous"
+s = s.replace(old, "", 1)
+io.open(p, 'w', encoding='utf-8', newline='\n').write(s)
+PYEOF
+report "the provider snapshot guard fails closed (mutated)" FAIL \
+  "$(verdict $PKG "$PROV_SNAP_TESTS")"
+revert "$SRC"
+report "the provider snapshot guard fails closed (restored)" PASS \
+  "$(verdict $PKG "$PROV_SNAP_TESTS")"
 
 echo "=== F. §9.7: duplicate provider registration becomes last-write-wins ==="
 snapshot "$SRC"
