@@ -551,12 +551,28 @@ func (g *Gateway) Stream(w http.ResponseWriter, r *http.Request, run *execution.
 //   - `from` is the client's contiguous position, so the range is exactly the
 //     hole and nothing else is re-read.
 //
+// A page is only accepted while it is CONTIGUOUS (`ev.Sequence == last+1`).
+// That the log is gap-free is an allocator property (migration 0023), not
+// something this reader should take on faith: it is the last line of defence
+// for a client whose only recovery route is its own contiguous cursor, so a
+// hole in the canonical log is treated as an unrepairable gap, not stepped
+// over.
+//
 // It returns the new contiguous position. Fail-closed is the whole point of
-// the (last, terminal, ok) shape: on ANY failure nothing after `from` was
-// safely delivered, ok is false, and the caller ends the connection so the
-// client reconnects and replays normally. A duplicate frame is a cosmetic
-// defect; a dropped durable event is lost content, so the repair never
-// continues past a hole it could not fill.
+// the (last, terminal, ok) shape: on ANY failure, `ok` is false and the caller
+// ends the connection so the client reconnects and replays normally. What the
+// contract does NOT promise is "nothing was written": the contiguous prefix
+// that was already verified and put on the wire is kept — an SSE frame cannot
+// be recalled — and the client resumes from the highest cursor it actually
+// received. The guarantee is the operative one:
+//
+//	the first durable frame that is not proven contiguous is never sent,
+//	and neither is anything after it.
+//
+// That is what makes a hole in this path cost a reconnect instead of a chunk
+// of lost content. A duplicate frame is a cosmetic defect; a dropped durable
+// event is lost content, so the repair never continues past a hole it could
+// not fill.
 func (g *Gateway) repairDurableGap(
 	ctx context.Context,
 	run *execution.Run,
@@ -583,6 +599,24 @@ func (g *Gateway) repairDurableGap(
 				// iteration; stopping exactly at `through` keeps this repair
 				// from delivering anything twice.
 				break
+			}
+			if ev.Sequence != last+1 {
+				// The log ITSELF has a hole. Everything up to `last` was
+				// verified contiguous and is already on the wire, so it
+				// stays; nothing at or after the hole may be forwarded
+				// (AC-4.1.1-7/8). Reporting this as a failure rather than
+				// skipping ahead is the point: a reader whose authority is
+				// the log cannot silently paper over a gap in the log.
+				//
+				// This is defensive. The allocator is gap-free by
+				// construction — SELECT ... FOR UPDATE, UPDATE +1 and the
+				// INSERT share one transaction (migration 0023) — so no
+				// ordinary writer can produce this state today. The check
+				// exists because "should not happen" is not a delivery
+				// guarantee, and because this function's whole job is to
+				// fail closed when the durable order cannot be trusted.
+				g.countLiveGapRepair(telemetry.LiveGapFailed)
+				return last, false, false
 			}
 			// `withCreated` is false: the timestamp is a property of the
 			// frame's ARRIVAL at the transport, and this frame arrived in
