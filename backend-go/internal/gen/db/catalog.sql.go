@@ -1489,7 +1489,16 @@ WHERE newer_b.id IS NULL
   AND ((? AND a.kind = 'chat')
        OR (? AND a.kind <> 'chat')
        OR ?)
-  AND (? OR b.id IS NOT NULL)
+  -- 三次复审 P1-R4: ` + "`" + `allow_unbound` + "`" + ` is the MANAGEMENT chat-catalog knob
+  -- (include_unbound), NOT part of the consume predicate. A fixed
+  -- application never needed a binding to be consumable — the consume line
+  -- above already says so — so kind <> 'chat' rows must not be filtered by
+  -- this flag. Before this change, ` + "`" + `kind=fixed&mode=consume` + "`" + ` without
+  -- include_unbound=true silently dropped every binding-less fixed app,
+  -- and MobileCatalogSheet compensated with ` + "`" + `includeUnbound: type==='app'` + "`" + `.
+  AND (a.kind <> 'chat'
+       OR ?
+       OR b.id IS NOT NULL)
   AND (? IS NULL
        OR a.name COLLATE utf8mb4_unicode_ci LIKE ?
        OR COALESCE(a.description, '') COLLATE utf8mb4_unicode_ci LIKE ?

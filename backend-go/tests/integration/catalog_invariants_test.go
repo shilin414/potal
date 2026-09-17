@@ -516,6 +516,47 @@ func TestSequentialIDSurfacesStayOpaqueAndFavoritesWork(t *testing.T) {
 	}
 }
 
+// ─────────────────────────────── P1-R4: fixed consume needs no unbound flag ──
+
+// `kind=fixed&mode=consume` WITHOUT include_unbound must still return
+// binding-less fixed applications: the consume predicate never required a
+// binding for kind <> 'chat', so the separate allow_unbound filter must not
+// apply to them (三次复审 P1-R4). This is the contract MobileCatalogSheet
+// used to compensate for with `includeUnbound: type === 'app'`.
+func TestFixedConsumeDoesNotNeedIncludeUnbound(t *testing.T) {
+	svc, repo, _ := invariantEnv(t)
+	staff := int64(777112)
+	ctx := context.Background()
+
+	fixed, _, err := svc.Create(ctx, &catalog.CreateInput{
+		Name: "itest_fixed_unbound", Kind: "task", IsPublic: true,
+		CreatorID: staff, IsStaff: true,
+	})
+	if err != nil {
+		t.Fatalf("seed unbound fixed app: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Delete(ctx, fixed.ID, staff, true) })
+
+	page, err := repo.ListApplicationPage(ctx, catalog.ApplicationPageQuery{
+		Scope: "public", Mode: catalog.PageModeConsume, Kind: catalog.PageQueryKindFixed,
+		IncludeUnbound: false,
+		Search:         "itest_fixed_unbound", Limit: 10,
+		CallerID: staff, IsStaff: false,
+	})
+	if err != nil {
+		t.Fatalf("fixed consume page: %v", err)
+	}
+	found := false
+	for _, row := range page {
+		if row.App.ID == fixed.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("an unbound fixed application must be returned by kind=fixed&mode=consume without include_unbound")
+	}
+}
+
 func sameID(a, b *int64) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil

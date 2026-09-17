@@ -462,6 +462,40 @@ export function createAgentApplication(
   return api.post<ManagedAgent>('/v2/applications', payload);
 }
 
+/**
+ * The AUTHORING detail read (三次复审 P0-R4.1): the backend answers this
+ * only to the creator / staff — it carries the provider-authoring fields
+ * (`external_resource_id`, `identity_mode`, `execution_mode`). Consumers
+ * must go through `resolveApplication` / `fetchApplicationPage` /
+ * `fetchWorkspaceBootstrap`, whose consumer DTO omits those fields.
+ *
+ * Centralized here (P2-R2): this module is the ONLY place allowed to write
+ * an applications URL; the ESLint `no-restricted-syntax` rule enforces it.
+ */
+export function fetchApplicationDetail(
+  applicationId: number,
+): Promise<RuntimeAgentDetail> {
+  return api.get<RuntimeAgentDetail>(`/v2/applications/${applicationId}`);
+}
+
+/** The compact authoring shape `GET /v2/applications/{id}` answers with. */
+export interface RuntimeAgentDetail {
+  name: string;
+  slug: string;
+  description: string;
+  icon: string;
+  category_slug?: string;
+  is_public: boolean;
+  is_default_agent?: boolean;
+  runtime_type?: string;
+  provider_key?: string;
+  external_resource_id?: string;
+  identity_mode?: string;
+  execution_mode?: string;
+  /** 技能配置, maintained by the agent editor form (§9). */
+  skills?: AgentSkill[];
+}
+
 export function updateAgentApplication(
   applicationId: number,
   // `enabled`（应用中心开关）只存在于更新：创建时固定为启用。

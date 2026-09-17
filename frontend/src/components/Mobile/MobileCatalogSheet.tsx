@@ -138,7 +138,9 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
 
   // ── Server-paged mode (production) ──
   // agent sheets exclude unbound chat apps (the old 'all' catalog slice did
-  // too); app sheets include them (fixed pages always used to be visible).
+  // too). Fixed applications never needed a binding to be consumable, and
+  // since 三次复审 P1-R4 the consume SQL itself returns unbound fixed rows —
+  // the previous `includeUnbound: type === 'app'` compensation is gone.
   // The drawer keeps this component mounted while closed, so the fetch is
   // gated on `open` — a closed sheet issues no traffic, and reopening
   // refreshes page one, so rows changed elsewhere appear without a
@@ -151,7 +153,6 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
     // used `scope=manage` alone, which let a staff user open an agent that
     // then refused every send.
     mode: 'consume',
-    includeUnbound: type === 'app',
     category: category === 'all' ? null : category,
     query,
     limit: MOBILE_SHEET_PAGE_SIZE,

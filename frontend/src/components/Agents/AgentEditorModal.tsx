@@ -20,11 +20,13 @@ import { api } from '@/services/api';
 import {
   createAgentApplication,
   fetchAgentRuntimes,
+  fetchApplicationDetail,
   updateAgentApplication,
   validateAgentRuntime,
   type AgentRuntimeDescriptor,
   type AgentSkill,
   type AgentSkillInput,
+  type RuntimeAgentDetail,
 } from '@/services/runApi';
 
 export type AgentEditorMode = 'runtime' | 'local';
@@ -62,23 +64,6 @@ interface LocalAgentDetail {
   system_prompt: string;
   skill_bindings: Array<{ skill_id: string }>;
   is_public: boolean;
-}
-
-interface RuntimeAgentDetail {
-  name: string;
-  slug: string;
-  description: string;
-  icon: string;
-  category_slug?: string;
-  is_public: boolean;
-  is_default_agent?: boolean;
-  runtime_type?: string;
-  provider_key?: string;
-  external_resource_id?: string;
-  identity_mode?: string;
-  execution_mode?: string;
-  /** 技能配置, maintained by this form (§9). */
-  skills?: AgentSkill[];
 }
 
 interface AgentFormValues {
@@ -152,7 +137,9 @@ const AgentEditorModal = ({
     const detailRequest = agentId
       ? (mode === 'local'
         ? api.get<LocalAgentDetail>(`/agents/${agentId}/`)
-        : api.get<RuntimeAgentDetail>(`/v2/applications/${agentId}`))
+        // The authoring detail read goes through runApi (P2-R2): every
+        // applications URL lives in ONE module.
+        : fetchApplicationDetail(agentId))
       : Promise.resolve(null);
 
     Promise.all([

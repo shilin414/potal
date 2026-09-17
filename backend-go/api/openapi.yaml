@@ -402,7 +402,13 @@ paths:
         - name: include_unbound
           in: query
           schema: { type: string }
-          description: Truthy when case-insensitively in {1,true,yes}; keeps binding-less rows.
+          description: >
+            Truthy when case-insensitively in {1,true,yes}; keeps binding-less
+            CHAT rows (the management chat catalog's knob). It no longer
+            affects `fixed` rows in any mode: a fixed application never needs
+            a binding to be consumable, so `kind=fixed&mode=consume` returns
+            unbound fixed applications whether or not this flag is set
+            (三次复审 P1-R4).
         - name: q
           in: query
           schema: { type: string }

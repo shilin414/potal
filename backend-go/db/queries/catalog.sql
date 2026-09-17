@@ -299,7 +299,16 @@ WHERE newer_b.id IS NULL
   AND ((sqlc.arg('kind_chat_only') AND a.kind = 'chat')
        OR (sqlc.arg('kind_fixed_only') AND a.kind <> 'chat')
        OR sqlc.arg('kind_all'))
-  AND (sqlc.arg('allow_unbound') OR b.id IS NOT NULL)
+  -- 三次复审 P1-R4: `allow_unbound` is the MANAGEMENT chat-catalog knob
+  -- (include_unbound), NOT part of the consume predicate. A fixed
+  -- application never needed a binding to be consumable — the consume line
+  -- above already says so — so kind <> 'chat' rows must not be filtered by
+  -- this flag. Before this change, `kind=fixed&mode=consume` without
+  -- include_unbound=true silently dropped every binding-less fixed app,
+  -- and MobileCatalogSheet compensated with `includeUnbound: type==='app'`.
+  AND (a.kind <> 'chat'
+       OR sqlc.arg('allow_unbound')
+       OR b.id IS NOT NULL)
   AND (sqlc.narg('search') IS NULL
        OR a.name COLLATE utf8mb4_unicode_ci LIKE sqlc.arg('search_name_like')
        OR COALESCE(a.description, '') COLLATE utf8mb4_unicode_ci LIKE sqlc.arg('search_desc_like')
