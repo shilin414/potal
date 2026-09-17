@@ -170,6 +170,12 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 		Owned:   runs.WorkerOwned(),
 		Adapter: ailyAdapter,
 		Auth:    ailyAuth,
+		// Storage: request attachments are only STAGED by the HTTP upload
+		// endpoint (pending row, empty provider id), so the worker needs the
+		// blob store to read those bytes and upload them to Aily
+		// (第十一轮 P0-2). Without it a run carrying attachments fails
+		// instead of silently dropping the files.
+		Storage: st,
 		// Pre-submit kill switch (第三轮 P1-B, Gate 2): same revocable-state
 		// gate as the worker's claim-time check (Gate 1), re-run inside the
 		// handler right before BeginProviderAttempt.

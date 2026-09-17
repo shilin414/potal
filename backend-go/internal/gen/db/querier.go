@@ -8,6 +8,8 @@ import (
 	"context"
 	"database/sql"
 	"time"
+
+	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
 )
 
 type Querier interface {
@@ -433,6 +435,12 @@ type Querier interface {
 	GetAgentThreadByID(ctx context.Context, id []byte) (AgentThread, error)
 	GetApplicationByID(ctx context.Context, id uint64) (GetApplicationByIDRow, error)
 	GetApplicationBySlug(ctx context.Context, slug string) (GetApplicationBySlugRow, error)
+	// Read-modify-write guard for default_config (the only JSON column the Go
+	// backend WRITES). FOR UPDATE, not a bare read: 技能配置 replaces just the
+	// `skills` key and must not clobber the other keys a legacy editor stored
+	// there (guided_entry_prompt_key), so the merge needs the row pinned for the
+	// duration of the transaction.
+	GetApplicationDefaultConfigForUpdate(ctx context.Context, id uint64) (dbtypes.JSONText, error)
 	GetAttachmentByID(ctx context.Context, id []byte) (RuntimeAttachment, error)
 	GetBindingByID(ctx context.Context, id uint64) (RuntimeBinding, error)
 	GetCategoryByName(ctx context.Context, name string) (ApplicationCategory, error)
@@ -606,6 +614,9 @@ type Querier interface {
 	// (CurrentDBTime minus the grace), never from the application clock — the
 	// same rule every other timing decision in this package follows.
 	ListParkedWaitingExternalRunIDs(ctx context.Context, arg ListParkedWaitingExternalRunIDsParams) ([][]byte, error)
+	// 第十一轮 P0-2: the worker attachment bridge reads the attachments THIS
+	// run owns.
+	ListClaimedAttachmentsByRun(ctx context.Context, runID []byte) ([]RuntimeAttachment, error)
 	ListPendingOutbox(ctx context.Context, limit int32) ([]OutboxEvent, error)
 	// Provider admission order. Base priority is explicit and waiting time
 	// adds a bounded bonus so scheduled/background work cannot starve.
@@ -641,6 +652,10 @@ type Querier interface {
 	// create one" — it makes those caps real instead of best-effort. Callers
 	// hold it inside the same transaction that inserts the run/schedule.
 	LockUserRow(ctx context.Context, id uint64) (uint64, error)
+	// 第十一轮 P0-3: fenced attachment writeback. Both the attachment id AND
+	// its run_id are predicates, so a stale worker (or a mistyped id) can
+	// never stamp an external id onto another run's attachment.
+	MarkAttachmentUploadedFenced(ctx context.Context, arg MarkAttachmentUploadedFencedParams) (sql.Result, error)
 	MarkOccurrenceDeliverySnapshotCaptured(ctx context.Context, id uint64) (sql.Result, error)
 	MarkOccurrenceQueued(ctx context.Context, arg MarkOccurrenceQueuedParams) (sql.Result, error)
 	// Run claim fan-out: the occurrence linked to this run enters 'running'.
@@ -761,6 +776,7 @@ type Querier interface {
 	UnbindConversationAttachments(ctx context.Context, conversationID sql.NullInt64) error
 	UpdateApplication(ctx context.Context, arg UpdateApplicationParams) (sql.Result, error)
 	UpdateApplicationAvatar(ctx context.Context, arg UpdateApplicationAvatarParams) error
+	UpdateApplicationDefaultConfig(ctx context.Context, arg UpdateApplicationDefaultConfigParams) error
 	UpdateBinding(ctx context.Context, arg UpdateBindingParams) (sql.Result, error)
 	UpdateFeishuIdentityLogin(ctx context.Context, arg UpdateFeishuIdentityLoginParams) error
 	// Set-once semantic guarded in Go (only write when empty).

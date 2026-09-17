@@ -787,12 +787,22 @@ VALUES (?, ?, ?, ?, ?, ?, ?, 'external', 'pending', NULL);
 -- name: UpsertRunArtifact :exec
 -- Guarded by unique (run_id, external_artifact_id); empty external ids get
 -- their own row keyed by the generated PK.
+--
+-- 第十一轮 P0-6: name is backfilled. The streaming discovery frame often
+-- carries no name while the final reconciliation does (or vice versa), so
+-- the SECOND write must be able to fill in what the first one lacked.
+-- IF(VALUES(name) = '', name, VALUES(name)) makes it monotone in one
+-- direction only: an empty incoming name never erases a known one, and a
+-- late real name always lands. Without this a multi-image answer kept one
+-- artifact row nameless forever, which is what made the second image render
+-- without a label / stay unreferenced by the markdown rewriter.
 INSERT INTO run_artifacts (id, run_id, provider, external_artifact_id, provider_artifact_type,
     name, normalized_type, storage_type, resolution_status, metadata)
 VALUES (?, ?, ?, ?, ?, ?, ?, 'external', 'pending', NULL)
 ON DUPLICATE KEY UPDATE
     provider_artifact_type = VALUES(provider_artifact_type),
-    normalized_type = VALUES(normalized_type);
+    normalized_type = VALUES(normalized_type),
+    name = IF(VALUES(name) = '', name, VALUES(name));
 
 -- name: GetRunArtifactByID :one
 SELECT id, run_id, provider, external_artifact_id, provider_artifact_type, name,
@@ -845,12 +855,48 @@ UPDATE runtime_attachments SET run_id = ?, conversation_id = ? WHERE id = ?;
 -- name: SetAttachmentUploaded :exec
 UPDATE runtime_attachments SET external_attachment_id = ?, status = 'uploaded' WHERE id = ?;
 
+-- name: ListClaimedAttachmentsByRun :many
+-- 第十一轮 P0-2: the worker attachment bridge reads the attachments THIS
+-- run owns. The run_id predicate is the ownership scope — the caller must
+-- pass the run id from its ExecutionOwnership fence, never a request value.
+SELECT id, run_id, conversation_id, provider, external_attachment_id, attachment_type,
+       name, source_type, source_url, storage_key, content_type, size_bytes,
+       auth_mode, auth_subject_key, status, metadata, created_by, created_at, updated_at
+FROM runtime_attachments
+WHERE run_id = ?
+ORDER BY created_at;
+
+-- name: MarkAttachmentUploadedFenced :execresult
+-- 第十一轮 P0-3: fenced attachment writeback. Both the attachment id AND
+-- its run_id are predicates, so a stale worker (or a mistyped id) can
+-- never stamp an external id onto another run's attachment. RowsAffected
+-- != 1 means the attachment is gone / not this run's → the caller stops.
+UPDATE runtime_attachments
+SET external_attachment_id = ?, status = 'uploaded'
+WHERE id = ? AND run_id = ? AND external_attachment_id = '';
+
 -- name: DeleteAttachment :exec
 DELETE FROM runtime_attachments WHERE id = ?;
 
 -- name: AppendUserAttachmentToRunInput :execresult
 -- Late-attachment race guard: only while queued.
-UPDATE runs SET input = JSON_ARRAY_APPEND(input, '$.agent_attachment_ids', ?)
+--
+-- 第十一轮 P0-1: studio_attachment_ids is the STUDIO id list (local
+-- runtime_attachments.id). The provider id is minted by the worker at
+-- upload time and never stored on the run input.
+--
+-- JSON_SET first, JSON_ARRAY_APPEND second: a bare JSON_ARRAY_APPEND on a
+-- path that does not exist yet yields NULL, which silently ERASED the whole
+-- run input for every run created without attachments (measured against
+-- MySQL 5.7: `JSON_ARRAY_APPEND('{"a":1}','$.k','v')` → NULL). Seeding the
+-- key with an empty array makes the append total instead of destructive.
+UPDATE runs
+SET input = JSON_ARRAY_APPEND(
+        JSON_SET(input, '$.studio_attachment_ids',
+                 IF(JSON_CONTAINS_PATH(input, 'one', '$.studio_attachment_ids'),
+                    JSON_EXTRACT(input, '$.studio_attachment_ids'),
+                    JSON_ARRAY())),
+        '$.studio_attachment_ids', ?)
 WHERE id = ? AND status = 'queued';
 
 -- name: ClaimAttachmentForRun :execresult

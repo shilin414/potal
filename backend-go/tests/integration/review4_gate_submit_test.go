@@ -68,6 +68,27 @@ type submitRecorder struct {
 	// getResults counts GetChatResult calls, i.e. POLLS: a run whose
 	// external identity was never durably accepted must never poll.
 	getResults int
+
+	// 第十一轮: attachment-bridge observation points.
+	//
+	// uploads records each provider upload (bytes POSTed to
+	// /attachments); chatAttachments records the attachment id list of
+	// each chat submit. Together they make the two claims of this batch
+	// testable: "the bytes were uploaded exactly once" and "the chat
+	// referenced the PROVIDER id, never the studio id".
+	uploads         []recordedUpload
+	chatAttachments [][]string
+	// uploadErr makes /attachments fail like a real transport, and
+	// uploadID overrides the id a successful upload returns.
+	uploadErr error
+	uploadID  string
+}
+
+// recordedUpload is one observed /attachments call.
+type recordedUpload struct {
+	Filename string
+	Type     string
+	Bytes    int
 }
 
 // cannedSSE is a minimal stream: it carries the chat identity and then
@@ -100,6 +121,7 @@ func (r *submitRecorder) polled() int {
 func (r *submitRecorder) StartChat(ctx context.Context, agentID, token string, contentItems []map[string]any, attachmentIDs []string, sessionID string) (string, string, error) {
 	r.mu.Lock()
 	r.startChats++
+	r.chatAttachments = append(r.chatAttachments, append([]string(nil), attachmentIDs...))
 	fail := r.chatErr
 	r.mu.Unlock()
 	if h := r.hook("start_chat"); h != nil {
@@ -118,6 +140,7 @@ func (r *submitRecorder) StartChat(ctx context.Context, agentID, token string, c
 func (r *submitRecorder) OpenStreamChat(ctx context.Context, agentID, token string, contentItems []map[string]any, attachmentIDs []string, sessionID string) (io.ReadCloser, error) {
 	r.mu.Lock()
 	r.openStreams++
+	r.chatAttachments = append(r.chatAttachments, append([]string(nil), attachmentIDs...))
 	body := r.streamBody
 	fail := r.streamErr
 	r.mu.Unlock()
@@ -138,7 +161,38 @@ func (r *submitRecorder) GetChatResult(ctx context.Context, agentID, token, chat
 }
 
 func (r *submitRecorder) UploadAttachment(ctx context.Context, agentID, token string, data []byte, filename, attachmentType, docURL string) (string, error) {
+	r.mu.Lock()
+	r.uploads = append(r.uploads, recordedUpload{Filename: filename, Type: attachmentType, Bytes: len(data)})
+	err := r.uploadErr
+	id := r.uploadID
+	r.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	if id != "" {
+		return id, nil
+	}
 	return "att-1", nil
+}
+
+// uploadsMade reports how many times the executor actually POSTed bytes to
+// the provider. This is what "already uploaded → do not re-upload" (§37
+// item 7/8) is asserted on.
+func (r *submitRecorder) uploadsMade() []recordedUpload {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]recordedUpload(nil), r.uploads...)
+}
+
+// chatAttachmentIDs returns the attachment ids of the LAST chat request —
+// the §38 invariant's observation point: these must be provider ids.
+func (r *submitRecorder) chatAttachmentIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.chatAttachments) == 0 {
+		return nil
+	}
+	return r.chatAttachments[len(r.chatAttachments)-1]
 }
 
 func (r *submitRecorder) GetArtifact(ctx context.Context, agentID, token, artifactID string) (*aily.ArtifactDownload, error) {

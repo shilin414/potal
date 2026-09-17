@@ -81,7 +81,13 @@ func (q *Queries) AppendRunEvent(ctx context.Context, arg AppendRunEventParams) 
 }
 
 const appendUserAttachmentToRunInput = `-- name: AppendUserAttachmentToRunInput :execresult
-UPDATE runs SET input = JSON_ARRAY_APPEND(input, '$.agent_attachment_ids', ?)
+UPDATE runs
+SET input = JSON_ARRAY_APPEND(
+        JSON_SET(input, '$.studio_attachment_ids',
+                 IF(JSON_CONTAINS_PATH(input, 'one', '$.studio_attachment_ids'),
+                    JSON_EXTRACT(input, '$.studio_attachment_ids'),
+                    JSON_ARRAY())),
+        '$.studio_attachment_ids', ?)
 WHERE id = ? AND status = 'queued'
 `
 
@@ -91,6 +97,11 @@ type AppendUserAttachmentToRunInputParams struct {
 }
 
 // Late-attachment race guard: only while queued.
+// 第十一轮 P0-1: studio_attachment_ids is the STUDIO id list (local
+// runtime_attachments.id). The provider id is minted by the worker at
+// upload time and never stored on the run input.
+// JSON_SET first, JSON_ARRAY_APPEND second: a bare JSON_ARRAY_APPEND on a
+// path that does not exist yet yields NULL, which would erase the input.
 func (q *Queries) AppendUserAttachmentToRunInput(ctx context.Context, arg AppendUserAttachmentToRunInputParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, appendUserAttachmentToRunInput, arg.JSONARRAYAPPEND, arg.ID)
 }
@@ -2550,6 +2561,81 @@ func (q *Queries) SetAttachmentUploaded(ctx context.Context, arg SetAttachmentUp
 	return err
 }
 
+const listClaimedAttachmentsByRun = `-- name: ListClaimedAttachmentsByRun :many
+SELECT id, run_id, conversation_id, provider, external_attachment_id, attachment_type,
+       name, source_type, source_url, storage_key, content_type, size_bytes,
+       auth_mode, auth_subject_key, status, metadata, created_by, created_at, updated_at
+FROM runtime_attachments
+WHERE run_id = ?
+ORDER BY created_at
+`
+
+// 第十一轮 P0-2: the worker attachment bridge reads the attachments THIS
+// run owns. The run_id predicate is the ownership scope — the caller must
+// pass the run id from its ExecutionOwnership fence, never a request value.
+func (q *Queries) ListClaimedAttachmentsByRun(ctx context.Context, runID []byte) ([]RuntimeAttachment, error) {
+	rows, err := q.db.QueryContext(ctx, listClaimedAttachmentsByRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []RuntimeAttachment
+	for rows.Next() {
+		var i RuntimeAttachment
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.ConversationID,
+			&i.Provider,
+			&i.ExternalAttachmentID,
+			&i.AttachmentType,
+			&i.Name,
+			&i.SourceType,
+			&i.SourceUrl,
+			&i.StorageKey,
+			&i.ContentType,
+			&i.SizeBytes,
+			&i.AuthMode,
+			&i.AuthSubjectKey,
+			&i.Status,
+			&i.Metadata,
+			&i.CreatedBy,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const markAttachmentUploadedFenced = `-- name: MarkAttachmentUploadedFenced :execresult
+UPDATE runtime_attachments
+SET external_attachment_id = ?, status = 'uploaded'
+WHERE id = ? AND run_id = ? AND external_attachment_id = ''
+`
+
+type MarkAttachmentUploadedFencedParams struct {
+	ExternalAttachmentID string
+	ID                   []byte
+	RunID                []byte
+}
+
+// 第十一轮 P0-3: fenced attachment writeback. Both the attachment id AND
+// its run_id are predicates, so a stale worker (or a mistyped id) can
+// never stamp an external id onto another run's attachment. RowsAffected
+// != 1 means the attachment is gone / not this run's → the caller stops.
+func (q *Queries) MarkAttachmentUploadedFenced(ctx context.Context, arg MarkAttachmentUploadedFencedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, markAttachmentUploadedFenced, arg.ExternalAttachmentID, arg.ID, arg.RunID)
+}
+
 const touchProviderSlot = `-- name: TouchProviderSlot :execresult
 UPDATE provider_execution_slots
 SET heartbeat_at = GREATEST(CURRENT_TIMESTAMP(3), DATE_ADD(heartbeat_at, INTERVAL 1000 MICROSECOND)),
@@ -2626,7 +2712,8 @@ INSERT INTO run_artifacts (id, run_id, provider, external_artifact_id, provider_
 VALUES (?, ?, ?, ?, ?, ?, ?, 'external', 'pending', NULL)
 ON DUPLICATE KEY UPDATE
     provider_artifact_type = VALUES(provider_artifact_type),
-    normalized_type = VALUES(normalized_type)
+    normalized_type = VALUES(normalized_type),
+    name = IF(VALUES(name) = '', name, VALUES(name))
 `
 
 type UpsertRunArtifactParams struct {

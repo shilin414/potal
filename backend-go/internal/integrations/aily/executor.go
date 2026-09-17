@@ -11,6 +11,7 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/catalog"
 	"github.com/creation-agent-studio/backend-go/internal/execution"
 	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
+	"github.com/creation-agent-studio/backend-go/internal/platform/storage"
 	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
 )
 
@@ -41,6 +42,14 @@ type Executor struct {
 	PollBackoff []time.Duration
 	Log         *slog.Logger
 	Metrics     *telemetry.Metrics
+	// Storage reads the staged attachment bytes the browser uploaded
+	// (第十一轮 P0-2). Request attachments are persisted as `pending`
+	// runtime_attachments rows with an EMPTY provider id, so the worker is
+	// the only plane that can turn them into real Aily agent_attachment_id
+	// values — see prepareAttachments. Nil means this deployment cannot
+	// carry attachments; a run that has them fails loudly rather than
+	// silently dropping the user's files.
+	Storage storage.Storage
 	// Gate is the PRE-SUBMIT kill switch (第三轮 P1-B, Gate 2). The
 	// worker's claim-time gate (Gate 1) runs before the handler, but the
 	// run may still wait here for auth resolution and a limiter token
@@ -435,6 +444,30 @@ func kindName(k error) string {
 	}
 }
 
+// classifyAttachmentError resolves an attachment-preparation failure
+// (第十一轮 P0-4).
+//
+// This is deliberately NOT classifyError's job, and deliberately not
+// onSubmitFailure's either: the upload happens BEFORE the submit boundary,
+// so POST /chats was never sent and the provider cannot be holding anything.
+// Parking the run in waiting_external here would be a lie — the run would
+// wait forever for an external call that never happened, which is exactly
+// the symptom this batch fixes. The run fails, with a code that names the
+// attachment stage so operators can tell it apart from a chat failure.
+//
+// ErrLostOwnership still wins: a fenced-out worker must stop writing.
+func (e *Executor) classifyAttachmentError(ctx context.Context, claimed *execution.ClaimedRun, err error) error {
+	if errors.Is(err, execution.ErrLostOwnership) {
+		return err
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	// Wrap so the caller's provider classifier cannot reinterpret this as a
+	// submit failure: the enclosed error carries the real cause.
+	return &preSubmitStop{err: e.failRun(ctx, claimed, "aily_attachment_upload_failed", err.Error())}
+}
+
 // thread loads (or lazily creates) the conversation's AgentThread via the
 // owned service, enforcing the identity binding invariant: one
 // user/agent/mode per thread.
@@ -587,11 +620,39 @@ func (c *deltaCoalescer) chunk() (payload map[string]any, ok bool) {
 }
 
 // executeStreaming drives the interactive SSE path.
+//
+// Execution order (第十一轮 P0-4 — the attachment bridge sits strictly
+// BEFORE the submit boundary):
+//
+//	1. thread()                     — conversation/provider session binding
+//	2. attachment preflight gate     — kill switch, because the uploads below
+//	                                   are provider IO
+//	3. prepareAttachments()          — studio ids → real Aily ids
+//	4. build SubmitInput             — carries the PROVIDER ids
+//	5. ValidateSubmit()              — local, no IO, no attempt consumed
+//	6. beginSubmit()                 — final gate + 'sending' + attempt CAS
+//	7. StreamPrepared()              — POST /chats
+//
+// Step 2 exists as a separate checkpoint because step 3 is the first thing
+// in the run that talks to the provider. Step 6 stays where it was: it is
+// the boundary that means "a chat may now exist upstream", so nothing that
+// can fail may sit between it and the POST.
 func (e *Executor) executeStreaming(ctx context.Context, claimed *execution.ClaimedRun, auth *catalog.ProviderAuthContext, agentID string) error {
 	run := claimed.Run
 	threadID, sessionID, err := e.thread(ctx, claimed)
 	if err != nil {
 		return err
+	}
+
+	// Attachment preflight gate (第十一轮 P0-4). Uploading is provider IO, so
+	// a run that has not been submitted yet must still obey the kill switch
+	// before its bytes reach Aily. Gated → the run is already resolved.
+	if len(run.StudioAttachmentIDs()) > 0 && execution.PreSubmitGate(ctx, e.Owned, claimed, e.Gate, e.Log) {
+		return &preSubmitStop{}
+	}
+	prepared, err := e.prepareAttachments(ctx, claimed, auth, agentID)
+	if err != nil {
+		return e.classifyAttachmentError(ctx, claimed, err)
 	}
 
 	submit := &catalog.SubmitInput{
@@ -600,7 +661,7 @@ func (e *Executor) executeStreaming(ctx context.Context, claimed *execution.Clai
 		ExternalResourceID:    agentID,
 		Payload:               run.Input,
 		SessionID:             sessionID,
-		ExternalAttachmentIDs: run.AttachmentIDs(),
+		ExternalAttachmentIDs: prepared.ExternalIDs,
 		Stream:                true,
 		TimeoutSeconds:        run.SnapshotInt("timeout_seconds", 300),
 	}
@@ -767,12 +828,21 @@ func (e *Executor) executeStreaming(ctx context.Context, claimed *execution.Clai
 	return e.reconcile(ctx, claimed, externalRunID)
 }
 
-// executeBackground submits async and polls until terminal.
+// executeBackground submits async and polls until terminal. The execution
+// order matches executeStreaming (第十一轮 P0-4): the attachment bridge runs
+// before the submit boundary, behind its own preflight gate.
 func (e *Executor) executeBackground(ctx context.Context, claimed *execution.ClaimedRun, auth *catalog.ProviderAuthContext, agentID string) error {
 	run := claimed.Run
 	threadID, sessionID, err := e.thread(ctx, claimed)
 	if err != nil {
 		return err
+	}
+	if len(run.StudioAttachmentIDs()) > 0 && execution.PreSubmitGate(ctx, e.Owned, claimed, e.Gate, e.Log) {
+		return &preSubmitStop{}
+	}
+	prepared, err := e.prepareAttachments(ctx, claimed, auth, agentID)
+	if err != nil {
+		return e.classifyAttachmentError(ctx, claimed, err)
 	}
 	submit := &catalog.SubmitInput{
 		RunID:                 run.ID.String(),
@@ -780,7 +850,7 @@ func (e *Executor) executeBackground(ctx context.Context, claimed *execution.Cla
 		ExternalResourceID:    agentID,
 		Payload:               run.Input,
 		SessionID:             sessionID,
-		ExternalAttachmentIDs: run.AttachmentIDs(),
+		ExternalAttachmentIDs: prepared.ExternalIDs,
 		TimeoutSeconds:        run.SnapshotInt("timeout_seconds", 300),
 	}
 	// Local validation BEFORE the gate (第四轮 P1-1): no attempt, no

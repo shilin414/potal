@@ -307,6 +307,19 @@ func (c *Client) GetChatResult(ctx context.Context, agentID, token, chatID strin
 // ─────────────────────────────────────────────────────── attachments ──
 
 // UploadAttachment uploads an input attachment; returns agent_attachment_id.
+//
+// 第十一轮 P0-5: an upload is only successful when it yields an actual id.
+// The old body ignored BOTH json.Unmarshal errors and an empty
+// agent_attachment_id, so a malformed body or a response missing the field
+// returned ("", nil) — a success with no id. The caller would then either
+// send an empty attachment list (dropping the user's file silently) or
+// persist an empty external id. Both are now ErrServer, which keeps the
+// outcome on the "provider may hold it, we do not know" path where the
+// caller's own policy decides (upload retry is safe; a chat resend is not).
+//
+// Transport failures are wrapped so the caller can tell a RETRYABLE upload
+// failure (5xx / timeout, no id was produced) from a definitive refusal
+// (4xx / auth, the provider looked at the request and refused it).
 func (c *Client) UploadAttachment(ctx context.Context, agentID, token string, data []byte, filename, attachmentType, docURL string) (string, error) {
 	var body bytes.Buffer
 	boundary := "studioBoundary" + randomHex(12)
@@ -336,19 +349,50 @@ func (c *Client) UploadAttachment(ctx context.Context, agentID, token string, da
 	req.Header.Set("Content-Type", "multipart/form-data; boundary="+boundary)
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", err
+		// Same classification the do() helper applies: a deadline is a
+		// timeout (retryable), anything else is transport-level. Both mean
+		// NO id was minted, so the caller may safely retry the upload.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return "", &APIError{Kind: ErrTimeout, Msg: err.Error()}
+		}
+		return "", &APIError{Kind: ErrServer, Msg: "attachment transport: " + err.Error()}
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", &APIError{Kind: ErrServer, Msg: "attachment response unreadable: " + err.Error()}
+	}
 	if apiErr := c.classify(resp, raw); apiErr != nil {
 		return "", apiErr
 	}
 	var env apiEnvelope
-	_ = json.Unmarshal(raw, &env)
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return "", &APIError{
+			Kind:       ErrServer,
+			Msg:        "invalid attachment response",
+			HTTPStatus: resp.StatusCode,
+		}
+	}
 	var out struct {
 		AgentAttachmentID string `json:"agent_attachment_id"`
 	}
-	_ = json.Unmarshal(env.Data, &out)
+	if err := json.Unmarshal(env.Data, &out); err != nil {
+		return "", &APIError{
+			Kind:       ErrServer,
+			Msg:        "invalid attachment data",
+			HTTPStatus: resp.StatusCode,
+		}
+	}
+	if strings.TrimSpace(out.AgentAttachmentID) == "" {
+		// HTTP 200 with code 0 but no id: the provider accepted the bytes
+		// yet gave us nothing to reference them by. Treated as a server
+		// error so the caller never records an empty provider id.
+		return "", &APIError{
+			Kind:       ErrServer,
+			Msg:        "attachment upload returned empty agent_attachment_id",
+			HTTPStatus: resp.StatusCode,
+		}
+	}
 	return out.AgentAttachmentID, nil
 }
 

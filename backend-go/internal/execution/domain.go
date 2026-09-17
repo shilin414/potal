@@ -171,7 +171,35 @@ func (r *Run) ContentText() string {
 	return out
 }
 
-// AttachmentIDs returns the external attachment ids pinned on the run.
+// StudioAttachmentIDs returns the STUDIO attachment ids pinned on the run
+// (第十一轮 P0-1) — i.e. runtime_attachments.id values, which only exist
+// inside this system.
+//
+// This is the ONLY accessor the worker attachment bridge may read: the ids
+// are resolved to real provider ids by uploading each pending row through
+// the adapter, and the chat payload is built from THOSE ids. Sending a
+// studio id to a provider is never correct — the provider has never seen
+// it, so the request either fails or (worse) the provider cannot attach
+// anything while the run still looks submitted.
+func (r *Run) StudioAttachmentIDs() []string {
+	raw, _ := r.Input["studio_attachment_ids"].([]any)
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// AttachmentIDs is the LEGACY accessor (pre-第十一轮) and reads the
+// mis-named "agent_attachment_ids" key, which historically held STUDIO
+// ids. It is kept only so historical runs can still be inspected; the
+// executor must never use it: a value read here is a studio id by
+// construction and would be rejected by the provider.
+//
+// Deprecated: use StudioAttachmentIDs (local) or resolve provider ids
+// through the attachment bridge.
 func (r *Run) AttachmentIDs() []string {
 	raw, _ := r.Input["agent_attachment_ids"].([]any)
 	out := make([]string, 0, len(raw))

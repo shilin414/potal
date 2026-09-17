@@ -295,12 +295,21 @@ func (s *Service) CreateRunInTx(ctx context.Context, tx *sql.Tx, in *CreateRunIn
 		"content": contentItems,
 		"mode":    defaultStr(in.ExecutionMode, "interactive"),
 	}
+	// STUDIO attachment ids, never provider ids (第十一轮 P0-1). The ids
+	// list runtime_attachments rows that THIS run owns; the provider id is
+	// minted later, by the worker, from the actual upload response. Writing
+	// them under "agent_attachment_ids" used to hand Aily a studio UUID it
+	// had never seen, which is exactly the bug this key rename closes.
+	//   - "studio_attachment_ids" → runtime_attachments.id        (local)
+	//   - must never carry a provider id: Run.StudioAttachmentIDs()
+	//     feeds the upload bridge, and the Aily chat payload is built from
+	//     the resolved external ids only.
 	if len(in.AttachmentIDs) > 0 {
 		ids0 := make([]any, 0, len(in.AttachmentIDs))
 		for _, a := range in.AttachmentIDs {
 			ids0 = append(ids0, a)
 		}
-		input["agent_attachment_ids"] = ids0
+		input["studio_attachment_ids"] = ids0
 	}
 
 	priority := in.Priority

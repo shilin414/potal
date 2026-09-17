@@ -12,6 +12,8 @@ import React, { useCallback, useMemo, useState } from 'react';
 import { Spin } from 'antd';
 import ReactMarkdown from 'react-markdown';
 
+import { resolveArtifactRef } from './artifactRef';
+
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
 
 /**
@@ -59,24 +61,15 @@ export const MarkdownWithArtifacts: React.FC<{
   const resolveUrl = openArtifactUrl
     ?? useCallback((artifactId: string) => `${API_BASE}/v2/artifacts/${artifactId}/open`, []);
 
-  /** Matched /open URL, or null when the ref is still unresolved. */
-  const resolveArtifactSrc = useCallback((src: string): string | null => {
-    const path = src.replace(/^\.?\/?/, '').split(/[?#]/)[0];
-    const match = path.match(/^artifacts?\/([^/]+)(?:\/.*)?$/i);
-    if (match) {
-      const refName = decodeURIComponent(match[1]);
-      const hit = (artifacts || []).find((a) => {
-        const names = [a.name, (a.name || '').split(/[\\/]/).pop() || ''];
-        return names.includes(refName) || (a.name || '').startsWith(refName);
-      });
-      if (hit) return resolveUrl(hit.artifactId);
-    }
-    // Also tolerate a bare filename that matches an artifact name exactly.
-    const bare = (artifacts || []).find(
-      (a) => a.name && a.name === path.split('/').pop());
-    if (bare) return resolveUrl(bare.artifactId);
-    return null;
-  }, [artifacts, resolveUrl]);
+  /**
+   * Matched /open URL, or null when the ref is still unresolved. The matching
+   * rules live in ./artifactRef so they can be unit-tested: a nested
+   * `artifacts/<name>/<sub>/<file>` ref used to resolve to nothing, which is
+   * why only the first of two generated images appeared.
+   */
+  const resolveArtifactSrc = useCallback(
+    (src: string): string | null => resolveArtifactRef(src, artifacts, resolveUrl),
+    [artifacts, resolveUrl]);
 
   // Stable component identities: ReactMarkdown's `components` prop is a
   // render-time lookup table, and an inline object would give every <img> a

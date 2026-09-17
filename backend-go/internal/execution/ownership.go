@@ -157,6 +157,24 @@ func (w *WorkerOwnedService) ListRunArtifacts(ctx context.Context, runID ids.ID)
 	return w.svc.q(ctx).ListRunArtifacts(ctx, runID.Bytes())
 }
 
+// ListClaimedAttachments returns the runtime_attachments rows this run owns
+// (第十一轮 P0-2). Scope is the ownership fence, so a worker can only see
+// the attachments of the run it holds.
+func (w *WorkerOwnedService) ListClaimedAttachments(ctx context.Context, claimed *ClaimedRun) ([]db.RuntimeAttachment, error) {
+	return w.svc.ListClaimedAttachments(ctx, claimed.Ownership)
+}
+
+// MarkAttachmentUploaded records the provider attachment id an upload
+// produced (第十一轮 P0-3), fenced by run ownership and set-once on the
+// external id column.
+//
+// ErrAttachmentNotClaimed means no row matched (not this run's, deleted, or
+// already uploaded) — NOT a lost lease, so the caller may continue after
+// re-reading the row.
+func (w *WorkerOwnedService) MarkAttachmentUploaded(ctx context.Context, claimed *ClaimedRun, attachmentID ids.ID, externalID string) error {
+	return w.svc.MarkAttachmentUploadedOwned(ctx, claimed.Ownership, attachmentID, externalID)
+}
+
 // BindProviderSession binds the provider session id onto the
 // conversation's agent thread — set-once / idempotent, never a blind
 // overwrite, and fenced by run ownership (修复计划 §27-28).
