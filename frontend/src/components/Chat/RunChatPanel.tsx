@@ -21,9 +21,9 @@ import {
 import {
   CheckOutlined,
   CopyOutlined,
+  ExportOutlined,
   PaperClipOutlined,
   SendOutlined,
-  ShareAltOutlined,
   TeamOutlined,
 } from '@ant-design/icons';
 import Avatar from 'antd/es/avatar';
@@ -210,6 +210,39 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
     (msg: ChatMessage) => /^\d+$/.test(msg.id) && msg.status !== 'streaming',
     [],
   );
+
+  /**
+   * 最后一个「回复」（最后一条助手消息）。
+   * 复制/分享只挂在这一条的气泡下方——不再散落在每个气泡的右上角。
+   */
+  const lastReplyIndex = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].role === 'assistant') return i;
+    }
+    return -1;
+  }, [messages]);
+
+  // 「复制」的即时反馈：短暂切成「已复制」再回到「复制」。
+  const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
+  const copyTimer = useRef<number | null>(null);
+
+  const handleCopyMessage = async (msg: ChatMessage) => {
+    const text = msg.content ?? '';
+    if (!text.trim()) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      antdMessage.error('复制失败，请手动选择文本复制');
+      return;
+    }
+    setCopiedMsgId(msg.id);
+    if (copyTimer.current) window.clearTimeout(copyTimer.current);
+    copyTimer.current = window.setTimeout(() => setCopiedMsgId(null), 1600);
+  };
+
+  useEffect(() => () => {
+    if (copyTimer.current) window.clearTimeout(copyTimer.current);
+  }, []);
 
   // Switching conversations must reset the selection (no cross-conversation
   // accidental forwarding — same guard the reference implementation added).
@@ -447,7 +480,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
     return (
       <div
         key={msg.id}
-        className={`animate-fade-in mb-4 flex gap-3 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}
+        className={`run-chat-msg-row ${isUser ? 'run-chat-msg-row--user ' : ''}animate-fade-in mb-4 flex gap-3 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}
       >
         <Avatar
           size={36}
@@ -484,20 +517,6 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
                   <span className="run-chat-cancelled-tag">已取消</span>
                 </Tooltip>
               )}
-              {!selectMode && isShareable(msg) && (
-                <Tooltip title="转发这条消息">
-                  <button
-                    className="run-chat-msg-share"
-                    title="转发这条消息"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void startSelect(index);
-                    }}
-                  >
-                    <ShareAltOutlined />
-                  </button>
-                </Tooltip>
-              )}
             </div>
           {isUser ? (
             <span>{msg.content}</span>
@@ -527,6 +546,39 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
               {msg.artifacts.map((a) => <ArtifactCard key={a.artifactId} artifact={a} />)}
             </div>
           ) : null}
+          {/* 只在最后一个回复的下方出现：转发在左、复制在右，都是纯图标按钮。 */}
+          {index === lastReplyIndex && !selectMode && msg.status !== 'streaming' && (
+            <div className="run-chat-actions">
+              <Tooltip title="转发这条回复">
+                <button
+                  type="button"
+                  className="run-chat-action"
+                  aria-label="转发这条回复"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void startSelect(index);
+                  }}
+                >
+                  <ExportOutlined />
+                </button>
+              </Tooltip>
+              {msg.content?.trim() ? (
+                <Tooltip title={copiedMsgId === msg.id ? '已复制' : '复制这条回复'}>
+                  <button
+                    type="button"
+                    className={`run-chat-action${copiedMsgId === msg.id ? ' run-chat-action--copied' : ''}`}
+                    aria-label={copiedMsgId === msg.id ? '已复制' : '复制这条回复'}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void handleCopyMessage(msg);
+                    }}
+                  >
+                    {copiedMsgId === msg.id ? <CheckOutlined /> : <CopyOutlined />}
+                  </button>
+                </Tooltip>
+              ) : null}
+            </div>
+          )}
           </div>
         </div>
       </div>

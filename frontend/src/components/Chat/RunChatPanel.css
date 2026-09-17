@@ -254,34 +254,50 @@
   cursor: pointer;
 }
 
-/* 消息气泡上的转发入口：气泡 hover 时浮现，位于头部行末。 */
-.run-chat-msg-share {
-  margin-left: auto;
+/* 消息操作行：只挂在最后一个回复的气泡底部（转发 · 复制），纯图标圆形按钮。
+   常驻显示而不是 hover 才浮现——触屏没有 hover，悬停式入口在移动端等于不可发现。 */
+.run-chat-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--color-border);
+}
+
+.run-chat-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
   border: none;
-  background: none;
-  padding: 0 2px;
-  color: var(--color-text-dim);
-  font-size: 13px;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--color-text-sec);
+  font-size: 15px;
   line-height: 1;
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.15s ease, color 0.15s ease;
+  /* 没有文字，点按区域就是这颗圆钮本身；去掉系统高亮块 */
+  -webkit-tap-highlight-color: transparent;
 }
 
-.run-chat-bubble:hover .run-chat-msg-share,
-.run-chat-msg-share:focus-visible {
-  opacity: 1;
-}
-
-.run-chat-msg-share:hover {
+.run-chat-action:hover {
+  background: var(--color-bg-elevated);
   color: var(--color-primary);
 }
 
-/* 触屏设备没有 hover：转发入口常驻显示，直接点按即可进入多选转发。 */
-@media (hover: none) {
-  .run-chat-msg-share {
-    opacity: 1;
-  }
+.run-chat-action:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--color-primary) 55%, transparent);
+  outline-offset: 1px;
+}
+
+/* 复制成功的即时反馈：图标换成对勾并转成成功色（没有文字可换，只靠图形）。 */
+.run-chat-action--copied,
+.run-chat-action--copied:hover {
+  background: color-mix(in srgb, var(--color-success, #52c41a) 14%, transparent);
+  color: var(--color-success, #52c41a);
 }
 
 /* 选中圆点：贴着气泡一侧（用户消息在其气泡左侧，即对话中缝方向）。 */
@@ -406,5 +422,12 @@
 
   .run-chat-share-link {
     flex-direction: column;
+  }
+
+  /* 错误横幅与消息区共用同一条左边线（--chat-gutter 定义在 chatSurface.css 的移动端块；
+     这里带 24px 兜底，万一变量缺失也不会塌成 0）。 */
+  .run-chat-error-banner {
+    padding-left: var(--chat-gutter, 24px);
+    padding-right: var(--chat-gutter, 24px);
   }
 }

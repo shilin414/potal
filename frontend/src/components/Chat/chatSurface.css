@@ -139,4 +139,35 @@
   .chat-sender-name {
     max-width: 12rem;
   }
+
+  /* 参考 ChatGPT 移动端：两侧都不显示头像，取消头像带来的左侧缩进。
+     （身份仍由气泡头部 senderLabel 承担。）用 .chat-container 前缀提高特异度，
+     否则会与 antd 运行时注入的 .ant-avatar 平手、胜负取决于样式表顺序。 */
+  .chat-container .run-chat-avatar {
+    display: none;
+  }
+
+  /* 助手回复铺满整行宽度：不再受 75% 上限与头像缩进限制。 */
+  .chat-container .run-chat-msg-body {
+    max-width: 100%;
+  }
+
+  /* 用户提问不铺满：贴在右侧，左侧留一段空白（行方向为 flex-row-reverse）。 */
+  .chat-container .run-chat-msg-row--user .run-chat-msg-body {
+    max-width: 85%;
+  }
+
+  /* 窄屏收紧左右边距（24px → 12px）。消息区、空态、输入框共用同一条边线，
+     必须一起改：只改一边会让气泡与输入框的左边缘错位。
+     值在这里定义一次；RunChatPanel.css 的错误横幅也用这个变量（它同在 .chat-container 内）。 */
+  .chat-container {
+    --chat-gutter: 12px;
+  }
+
+  .chat-messages,
+  .chat-empty,
+  .chat-input-area {
+    padding-left: var(--chat-gutter);
+    padding-right: var(--chat-gutter);
+  }
 }
