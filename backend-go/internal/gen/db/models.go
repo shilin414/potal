@@ -325,7 +325,7 @@ type RunRequest struct {
 
 type RuntimeAttachment struct {
 	ID                   []byte
-	RunID                sql.NullString
+	RunID                []byte
 	ConversationID       sql.NullInt64
 	Provider             string
 	ExternalAttachmentID string

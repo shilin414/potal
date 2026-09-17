@@ -19,14 +19,22 @@ import type { V2Application } from '@/services/runApi';
 export const MOBILE_RECENT_LIMIT = 3;
 
 /**
- * How many rows a selector renders before 加载更多.
+ * The SERVER page size the pickers request (执行报告 §25, 2026-09-17).
  *
- * The catalog arrives whole from `GET /v2/applications` — no server-side
- * pagination — and the shared dev DB carries integration-test rows, so this
- * list is routinely 1800+ entries. Rendering all of them on open is what made
- * the mobile sheet "进去非常卡"; the cap is the fix. It is a RENDER budget
- * only: search and 最近使用 still read the complete pool below, so nothing
- * becomes unreachable, it just stops being rendered up front.
+ * Before the paged endpoint this constant was a RENDER budget over the whole
+ * catalog (1800+ rows downloaded, first 60 rendered). Now the sheet asks
+ * `GET /v2/applications/page?limit=60` and 加载更多 fetches the next cursor
+ * page — the browser only ever holds what the user actually scrolled to.
+ * `MOBILE_SHEET_MAX_ROWS` keeps its name and value for the legacy local-pool
+ * mode (unit tests project a fully-injected catalog and still need the cap).
+ */
+export const MOBILE_SHEET_PAGE_SIZE = 60;
+
+/**
+ * How many rows the LEGACY local-pool mode renders before 加载更多.
+ *
+ * Paged mode no longer downloads a whole catalog, so this only guards the
+ * test/fallback path where a complete pool is handed to the sheet.
  */
 export const MOBILE_SHEET_MAX_ROWS = 60;
 

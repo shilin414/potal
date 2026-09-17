@@ -7,27 +7,34 @@
  * (§4.1): the difference is only which slice of the catalog shows and what the
  * title says.
  *
+ * Two data modes (执行报告 §25, 2026-09-17):
+ *
+ *  · SERVER-PAGED (production): `applications` is left undefined and the
+ *    sheet fetches `GET /v2/applications/page` itself — first page on open,
+ *    next cursor page on 加载更多, search/category sent to the backend. The
+ *    list never depends on the whole-catalog mirror again.
+ *  · LOCAL POOL (tests / fallback): when `applications` IS passed, the sheet
+ *    behaves exactly as before — a pure projection of the given rows, no
+ *    requests. Unit tests pin this mode.
+ *
  * What it deliberately is NOT:
- *   · not a route — picking an item returns the application to the caller,
- *     which decides where to navigate. The sheet stays provider- and
- *     router-agnostic;
+ *   · not a route — picking an item returns the application to the caller;
  *   · not a management surface — Provider / Runtime / 使用次数 / 编辑 / 删除
  *     stay in 智能体市场 (§5.5);
  *   · not the desktop Dropdown — that is `ApplicationSwitcher`, untouched.
- *
- * Search is pure and local (design report §38): the catalog is already in the
- * store, so opening the sheet issues no request and the first open is instant.
  */
 import React, { useEffect, useMemo, useState } from 'react';
 import { Drawer, Input, Skeleton } from 'antd';
 import { CheckOutlined, SearchOutlined } from '@ant-design/icons';
 import type { V2Application } from '@/services/runApi';
+import { useApplicationPage } from '@/hooks/useApplicationPage';
 import AgentAvatar from '@/components/Agents/AgentAvatar';
 import {
   buildMobileCategoryTabs,
   buildRecentItems,
   filterMobileCatalog,
   MOBILE_SHEET_MAX_ROWS,
+  MOBILE_SHEET_PAGE_SIZE,
   splitMobileCatalog,
 } from '@/lib/mobileCatalog';
 import './MobileSheets.css';
@@ -35,11 +42,21 @@ import './MobileSheets.css';
 export interface MobileCatalogSheetProps {
   open: boolean;
   type: 'agent' | 'app';
-  applications: V2Application[];
-  recentIds: number[];
+  /**
+   * Legacy local pool. UNDEFINED in production — the sheet then pages the
+   * server itself; unit tests pass a pool to stay request-free.
+   */
+  applications?: V2Application[];
   /** The application in play right now — marked with ✓ (§5.5). */
   activeApplicationId?: number | null;
-  /** Show row skeletons instead of an 空列表 while the catalog loads (§15.1). */
+  /**
+   * Server-paged mode only: the object for `activeApplicationId`, injected
+   * by the caller so the tick renders even when the active row is not on a
+   * fetched page (e.g. an unbound agent the list legitimately omits).
+   */
+  activeApplication?: V2Application | null;
+  recentIds: number[];
+  /** Show row skeletons instead of an 空列表 while loading (§15.1). */
   loading?: boolean;
   onClose: () => void;
   onSelect: (application: V2Application) => void;
@@ -105,39 +122,69 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
   open,
   type,
   applications,
-  recentIds,
   activeApplicationId,
-  loading = false,
+  activeApplication,
+  recentIds,
+  loading: localLoading = false,
   onClose,
   onSelect,
 }) => {
   const [category, setCategory] = useState('all');
   const [query, setQuery] = useState('');
   const [searchMode, setSearchMode] = useState(false);
-  /** Render budget for the list below 最近使用 (see MOBILE_SHEET_MAX_ROWS). */
-  const [visibleCount, setVisibleCount] = useState(MOBILE_SHEET_MAX_ROWS);
+
+  // ── Server-paged mode (production) ──
+  // agent sheets exclude unbound chat apps (the old 'all' catalog slice did
+  // too); app sheets include them (fixed pages always used to be visible).
+  // The drawer keeps this component mounted while closed, so the fetch is
+  // gated on `open` — a closed sheet issues no traffic, and reopening
+  // refreshes page one, so rows changed elsewhere appear without a
+  // whole-app reload.
+  const paged = useApplicationPage({
+    kind: type === 'agent' ? 'chat' : 'fixed',
+    scope: 'manage',
+    includeUnbound: type === 'app',
+    category: category === 'all' ? null : category,
+    query,
+    limit: MOBILE_SHEET_PAGE_SIZE,
+    enabled: open,
+  });
+
+  // The active row is injected so the ✓ renders even when the active
+  // application is not on a fetched page (e.g. an unbound agent the list
+  // legitimately omits).
+  const serverPool = useMemo(() => {
+    if (!activeApplication
+      || paged.items.some((app) => app.id === activeApplication.id)) {
+      return paged.items;
+    }
+    return [activeApplication, ...paged.items];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [paged.items, activeApplication]);
+  const serverLoading = paged.loading || paged.loadingMore;
 
   // A reopened sheet must never be stuck on the previous search or tab — that
-  // is the classic "why is my list empty" bug (§5.2).
+  // is the classic "why is my list empty" bug (§5.2). A reopen in paged mode
+  // also refetches page one (enabled flips true), so rows changed elsewhere
+  // appear too.
   useEffect(() => {
     if (open) return;
     setCategory('all');
     setQuery('');
     setSearchMode(false);
-    setVisibleCount(MOBILE_SHEET_MAX_ROWS);
   }, [open]);
 
-  // A new filter is a new result set: it starts at page one, and the query is
-  // cleared so the rows revealed by 加载更多 are always the SAME result the
-  // user is filtering, never a slice of a stale one.
-  useEffect(() => {
-    setVisibleCount(MOBILE_SHEET_MAX_ROWS);
-  }, [category, query, type]);
-
+  // ── Shared derivation ──
+  // Paged mode reads the server pages; local mode (tests) projects the
+  // injected pool. Everything below is mode-agnostic.
   const pool = useMemo(() => {
-    const split = splitMobileCatalog(applications);
-    return type === 'agent' ? split.agents : split.apps;
-  }, [applications, type]);
+    if (applications !== undefined) {
+      const split = splitMobileCatalog(applications);
+      return type === 'agent' ? split.agents : split.apps;
+    }
+    return serverPool;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [applications, type, serverPool]);
 
   const recent = useMemo(
     () => buildRecentItems(pool, recentIds, type),
@@ -146,19 +193,30 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
 
   const tabs = useMemo(() => buildMobileCategoryTabs(pool), [pool]);
 
-  // Filtering happens on the COMPLETE pool; only rendering is capped. Search
-  // must stay able to find an agent that is not on the first page, otherwise
-  // capping the render would quietly hide part of the catalog from admins.
   const filtered = useMemo(
-    () => filterMobileCatalog(pool, category, query),
-    [pool, category, query],
+    () => (applications !== undefined
+      ? filterMobileCatalog(pool, category, query)
+      : pool),
+    [applications, pool, category, query],
   );
 
+  // LEGACY local-pool mode only: a render budget over the injected pool (the
+  // test/fallback path can still hand the sheet a whole catalog — keep the
+  // "cap the render, never the filter" guarantee). Server-paged mode needs no
+  // budget: the browser only ever holds fetched pages.
+  const [visibleCount, setVisibleCount] = useState(MOBILE_SHEET_MAX_ROWS);
+  useEffect(() => {
+    setVisibleCount(MOBILE_SHEET_MAX_ROWS);
+  }, [category, query, type]);
   const rendered = useMemo(
-    () => filtered.slice(0, visibleCount),
-    [filtered, visibleCount],
+    () => (applications !== undefined
+      ? filtered.slice(0, visibleCount)
+      : filtered),
+    [applications, filtered, visibleCount],
   );
-  const hasMore = filtered.length > rendered.length;
+  const localHasMore = filtered.length > rendered.length;
+  const hasMore = applications !== undefined ? localHasMore : paged.hasMore;
+  const loading = applications !== undefined ? localLoading : serverLoading;
 
   const searching = searchMode && query.trim().length > 0;
   // 最近使用 is hidden while searching so the results own the whole list (§5.4).
@@ -245,9 +303,11 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
               <button
                 type="button"
                 className="mobile-sheet__more-btn"
-                onClick={() => setVisibleCount((current) => current + MOBILE_SHEET_MAX_ROWS)}
+                onClick={() => (applications !== undefined
+                  ? setVisibleCount((current: number) => current + MOBILE_SHEET_MAX_ROWS)
+                  : void paged.loadMore())}
               >
-                加载更多（还有 {filtered.length - rendered.length} 个）
+                加载更多
               </button>
             )}
           </>

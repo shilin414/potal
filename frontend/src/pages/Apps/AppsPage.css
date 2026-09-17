@@ -4,6 +4,18 @@
   overflow-y: auto;
 }
 
+/* 加载更多 / 已显示全部 (server-paged, 执行报告 §24) */
+.apps-page__more {
+  display: flex;
+  justify-content: center;
+  padding: 24px 0;
+}
+
+.apps-page__count {
+  color: var(--color-text-tertiary, var(--color-text-sec));
+  font-size: 13px;
+}
+
 /* App Grid */
 .app-grid {
   display: grid;

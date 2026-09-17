@@ -501,7 +501,7 @@ func (s *Server) validateAttachments(ctx context.Context, attachmentIDs []string
 			return err
 		}
 		if !row.CreatedBy.Valid || int64(row.CreatedBy.Int64) != userID ||
-			row.Provider != providerKey || row.Status != "pending" || row.RunID.Valid {
+			row.Provider != providerKey || row.Status != "pending" || len(row.RunID) > 0 {
 			return errors.New("invalid attachment")
 		}
 	}

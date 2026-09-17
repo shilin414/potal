@@ -8,6 +8,7 @@ package gendb
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
@@ -181,6 +182,51 @@ type DeleteFavoriteParams struct {
 func (q *Queries) DeleteFavorite(ctx context.Context, arg DeleteFavoriteParams) error {
 	_, err := q.db.ExecContext(ctx, deleteFavorite, arg.UserID, arg.ApplicationID)
 	return err
+}
+
+const favoritesByApplications = `-- name: FavoritesByApplications :many
+SELECT application_id FROM application_favorites
+WHERE user_id = ? AND application_id IN (/*SLICE:favorite_app_ids*/?)
+`
+
+type FavoritesByApplicationsParams struct {
+	UserID         uint64
+	FavoriteAppIds []uint64
+}
+
+// Favorites restricted to one page's ids (same §20 rationale).
+func (q *Queries) FavoritesByApplications(ctx context.Context, arg FavoritesByApplicationsParams) ([]uint64, error) {
+	query := favoritesByApplications
+	var queryParams []interface{}
+	queryParams = append(queryParams, arg.UserID)
+	if len(arg.FavoriteAppIds) > 0 {
+		for _, v := range arg.FavoriteAppIds {
+			queryParams = append(queryParams, v)
+		}
+		query = strings.Replace(query, "/*SLICE:favorite_app_ids*/?", strings.Repeat(",?", len(arg.FavoriteAppIds))[1:], 1)
+	} else {
+		query = strings.Replace(query, "/*SLICE:favorite_app_ids*/?", "NULL", 1)
+	}
+	rows, err := q.db.QueryContext(ctx, query, queryParams...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uint64{}
+	for rows.Next() {
+		var application_id uint64
+		if err := rows.Scan(&application_id); err != nil {
+			return nil, err
+		}
+		items = append(items, application_id)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const findBinding = `-- name: FindBinding :one
@@ -761,6 +807,207 @@ func (q *Queries) ListActiveProviders(ctx context.Context) ([]Provider, error) {
 	return items, nil
 }
 
+const listApplicationPage = `-- name: ListApplicationPage :many
+SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
+       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled,
+       a.usage_count, a.tags, a.default_config, a.created_by, a.organization_id,
+       a.created_at, a.updated_at,
+       c.slug AS category_slug, c.name AS category_name,
+       b.id AS binding_id, b.provider_id AS binding_provider_id, b.provider_key AS binding_provider_key,
+       b.runtime_type AS binding_runtime_type, b.external_resource_id AS binding_external_resource_id,
+       b.identity_mode AS binding_identity_mode, b.execution_mode AS binding_execution_mode,
+       b.session_policy AS binding_session_policy, b.artifact_policy AS binding_artifact_policy,
+       b.capabilities AS binding_capabilities, b.config AS binding_config,
+       b.timeout_seconds AS binding_timeout_seconds, b.enabled AS binding_enabled
+FROM applications a
+LEFT JOIN application_categories c ON c.id = a.category_id
+LEFT JOIN runtime_bindings b
+  ON b.application_id = a.id AND b.enabled = 1
+LEFT JOIN runtime_bindings newer_b
+  ON newer_b.application_id = b.application_id
+ AND newer_b.enabled = 1
+ AND newer_b.id > b.id
+WHERE newer_b.id IS NULL
+  AND (? OR (a.enabled = 1 AND (
+        (? AND a.created_by = ?)
+        OR (? AND a.is_public = 1))))
+  AND ((? AND a.kind = 'chat')
+       OR (? AND a.kind <> 'chat')
+       OR ?)
+  AND (? OR b.id IS NOT NULL)
+  AND (? IS NULL
+       OR a.name LIKE ?
+       OR COALESCE(a.description, '') LIKE ?)
+  AND (? IS NULL
+       OR (? AND a.category_id IS NULL)
+       OR c.slug = ?)
+  AND (a.created_at > ?
+       OR (a.created_at = ? AND a.id > ?))
+ORDER BY a.created_at, a.id
+LIMIT ?
+`
+
+type ListApplicationPageParams struct {
+	ShowAll         interface{}
+	MineOnly        interface{}
+	PageCallerID    sql.NullInt64
+	PublicOnly      interface{}
+	KindChatOnly    interface{}
+	KindFixedOnly   interface{}
+	KindAll         interface{}
+	AllowUnbound    interface{}
+	Search          interface{}
+	SearchNameLike  string
+	SearchDescLike  sql.NullString
+	CategorySlug    sql.NullString
+	CategoryIsNull  interface{}
+	CursorCreatedGt time.Time
+	CursorCreatedEq time.Time
+	CursorIDGt      uint64
+	Limit           int32
+}
+
+type ListApplicationPageRow struct {
+	ID                        uint64
+	Slug                      string
+	Name                      string
+	Description               string
+	Icon                      string
+	AvatarKey                 string
+	Color                     string
+	Kind                      string
+	RendererKey               string
+	ExecutorKey               string
+	CategoryID                sql.NullInt64
+	IsPublic                  bool
+	IsDefaultAgent            bool
+	Enabled                   bool
+	UsageCount                uint32
+	Tags                      dbtypes.JSONText
+	DefaultConfig             dbtypes.JSONText
+	CreatedBy                 sql.NullInt64
+	OrganizationID            sql.NullInt64
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
+	CategorySlug              sql.NullString
+	CategoryName              sql.NullString
+	BindingID                 sql.NullInt64
+	BindingProviderID         sql.NullInt64
+	BindingProviderKey        sql.NullString
+	BindingRuntimeType        sql.NullString
+	BindingExternalResourceID sql.NullString
+	BindingIdentityMode       sql.NullString
+	BindingExecutionMode      sql.NullString
+	BindingSessionPolicy      sql.NullString
+	BindingArtifactPolicy     sql.NullString
+	BindingCapabilities       dbtypes.JSONText
+	BindingConfig             dbtypes.JSONText
+	BindingTimeoutSeconds     sql.NullInt32
+	BindingEnabled            sql.NullBool
+}
+
+// True keyset pagination for the catalog (执行报告 §14–§21, 2026-09-17).
+//
+// ONE query produces the page: the enabled binding is anti-joined (the
+// newest enabled binding wins, mirroring GetEnabledBinding's
+// `ORDER BY id DESC LIMIT 1`), which replaces the legacy
+// ListEnabledBindings + N×ApplicationByID walk (the N+1 the report calls
+// out in §18) AND covers unbound rows for free (b.id IS NULL).
+//
+// The WHERE clause fully encodes the visible() access policy so the Go
+// layer does NOT re-filter (re-filtering would under-fill pages and break
+// cursor determinism):
+//
+//	staff            → everything (show_all);
+//	regular users    → enabled = 1, plus
+//	  scope=mine     → own rows (private included),
+//	  scope=public/manage → is_public = 1.
+//
+// kind: exclude_fixed → chat only; exclude_chat → non-chat ("fixed");
+// neither → all. exclude_unbound drops binding-less rows (the legacy
+// include_unbound=false semantics). Search is a case-insensitive substring
+// match on name / description, mirroring the previous client-side filter.
+// The cursor is the (created_at, id) keyset in ascending order — the same
+// order the legacy list used, so page one keeps the existing UI ordering.
+func (q *Queries) ListApplicationPage(ctx context.Context, arg ListApplicationPageParams) ([]ListApplicationPageRow, error) {
+	rows, err := q.db.QueryContext(ctx, listApplicationPage,
+		arg.ShowAll,
+		arg.MineOnly,
+		arg.PageCallerID,
+		arg.PublicOnly,
+		arg.KindChatOnly,
+		arg.KindFixedOnly,
+		arg.KindAll,
+		arg.AllowUnbound,
+		arg.Search,
+		arg.SearchNameLike,
+		arg.SearchDescLike,
+		arg.CategorySlug,
+		arg.CategoryIsNull,
+		arg.CategorySlug,
+		arg.CursorCreatedGt,
+		arg.CursorCreatedEq,
+		arg.CursorIDGt,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListApplicationPageRow{}
+	for rows.Next() {
+		var i ListApplicationPageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.Description,
+			&i.Icon,
+			&i.AvatarKey,
+			&i.Color,
+			&i.Kind,
+			&i.RendererKey,
+			&i.ExecutorKey,
+			&i.CategoryID,
+			&i.IsPublic,
+			&i.IsDefaultAgent,
+			&i.Enabled,
+			&i.UsageCount,
+			&i.Tags,
+			&i.DefaultConfig,
+			&i.CreatedBy,
+			&i.OrganizationID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.CategorySlug,
+			&i.CategoryName,
+			&i.BindingID,
+			&i.BindingProviderID,
+			&i.BindingProviderKey,
+			&i.BindingRuntimeType,
+			&i.BindingExternalResourceID,
+			&i.BindingIdentityMode,
+			&i.BindingExecutionMode,
+			&i.BindingSessionPolicy,
+			&i.BindingArtifactPolicy,
+			&i.BindingCapabilities,
+			&i.BindingConfig,
+			&i.BindingTimeoutSeconds,
+			&i.BindingEnabled,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listApplicationsByVisibility = `-- name: ListApplicationsByVisibility :many
 SELECT a.id, a.slug, a.name, a.description, a.icon, a.avatar_key, a.color, a.kind, a.renderer_key,
        a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled, a.usage_count, a.tags,
@@ -1130,6 +1377,61 @@ func (q *Queries) UserUsageByApplication(ctx context.Context, userID sql.NullInt
 	items := []UserUsageByApplicationRow{}
 	for rows.Next() {
 		var i UserUsageByApplicationRow
+		if err := rows.Scan(&i.ApplicationID, &i.UsageCount, &i.LastUsedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const userUsageByApplications = `-- name: UserUsageByApplications :many
+SELECT application_id, COUNT(*) AS usage_count, MAX(created_at) AS last_used_at
+FROM runs
+WHERE user_id = ? AND application_id IN (/*SLICE:page_app_ids*/?)
+GROUP BY application_id
+`
+
+type UserUsageByApplicationsParams struct {
+	UserID     sql.NullInt64
+	PageAppIds []sql.NullInt64
+}
+
+type UserUsageByApplicationsRow struct {
+	ApplicationID sql.NullInt64
+	UsageCount    int64
+	LastUsedAt    interface{}
+}
+
+// Per-page personal usage (执行报告 §20): only the ids on the current page
+// are aggregated, instead of the user's ENTIRE run history on every list
+// call. idx_runs_user_application_created (migration 0025) keeps it cheap.
+func (q *Queries) UserUsageByApplications(ctx context.Context, arg UserUsageByApplicationsParams) ([]UserUsageByApplicationsRow, error) {
+	query := userUsageByApplications
+	var queryParams []interface{}
+	queryParams = append(queryParams, arg.UserID)
+	if len(arg.PageAppIds) > 0 {
+		for _, v := range arg.PageAppIds {
+			queryParams = append(queryParams, v)
+		}
+		query = strings.Replace(query, "/*SLICE:page_app_ids*/?", strings.Repeat(",?", len(arg.PageAppIds))[1:], 1)
+	} else {
+		query = strings.Replace(query, "/*SLICE:page_app_ids*/?", "NULL", 1)
+	}
+	rows, err := q.db.QueryContext(ctx, query, queryParams...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []UserUsageByApplicationsRow{}
+	for rows.Next() {
+		var i UserUsageByApplicationsRow
 		if err := rows.Scan(&i.ApplicationID, &i.UsageCount, &i.LastUsedAt); err != nil {
 			return nil, err
 		}

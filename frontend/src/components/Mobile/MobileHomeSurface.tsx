@@ -32,7 +32,6 @@ import './MobileHomeSurface.css';
 const MobileHomeSurface: React.FC = () => {
   const navigate = useNavigate();
   const applications = useApplicationCatalogStore((state) => state.applications);
-  const catalogLoading = useApplicationCatalogStore((state) => state.isLoading);
   const recentApplicationIds = useWorkspaceStore((state) => state.recentApplicationIds);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
 
@@ -86,20 +85,17 @@ const MobileHomeSurface: React.FC = () => {
       <MobileCatalogSheet
         open={sheet === 'agent'}
         type="agent"
-        applications={applications}
         recentIds={recentApplicationIds}
         activeApplicationId={defaultApplication?.id ?? null}
-        loading={catalogLoading}
+        activeApplication={defaultApplication}
         onClose={() => setSheet(null)}
         onSelect={open}
       />
       <MobileCatalogSheet
         open={sheet === 'app'}
         type="app"
-        applications={applications}
         recentIds={recentApplicationIds}
         activeApplicationId={null}
-        loading={catalogLoading}
         onClose={() => setSheet(null)}
         onSelect={open}
       />

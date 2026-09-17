@@ -5,6 +5,8 @@ import (
 )
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,11 +88,30 @@ type applicationDetail struct {
 	Skills []catalog.Skill `json:"skills"`
 }
 
+// avatarVersion derives the cache-busting version of an avatar from its
+// storage key alone (执行报告 §9.1).
+//
+// The previous version was `app.UpdatedAt.Unix()`, which broke caching for
+// EVERY avatar on EVERY unrelated write: `updated_at` is
+// `ON UPDATE CURRENT_TIMESTAMP(3)`, and each run bumps `usage_count`, so
+// chatting with an agent changed its avatar URL and re-downloaded the image
+// (identical bytes) on the next render. The storage key
+// `application-avatars/{appID}/{UnixNano}.{ext}` is minted once per upload and
+// never changes afterwards, so a sha256 fingerprint of it changes ONLY when
+// the avatar is uploaded / cleared / re-uploaded — the correct semantics.
+// Chatting, usage_count bumps, favourites, renames, category edits, runtime
+// changes, enable/public toggles and default-agent promotions all keep the
+// same URL, letting the browser serve from cache.
+func avatarVersion(avatarKey string) string {
+	sum := sha256.Sum256([]byte(avatarKey))
+	return hex.EncodeToString(sum[:8])
+}
+
 func avatarURL(app *catalog.Application) string {
 	if app.AvatarKey == "" {
 		return ""
 	}
-	return fmt.Sprintf("/api/v2/applications/%d/avatar?v=%d", app.ID, app.UpdatedAt.Unix())
+	return fmt.Sprintf("/api/v2/applications/%d/avatar?v=%s", app.ID, avatarVersion(app.AvatarKey))
 }
 
 func (s *Server) appDetail(app *catalog.Application, binding *catalog.Binding, caller *AuthenticatedUser) applicationDetail {
@@ -170,11 +191,10 @@ func (s *Server) ListApplications(w http.ResponseWriter, r *http.Request, params
 		}
 	}
 
-	// personal usage per application (own runs only)
-	usage := map[int64]struct {
-		Count int64
-		Last  *string
-	}{}
+	// personal usage per application (own runs only) — the legacy whole-list
+	// endpoint keeps its user-wide aggregation until callers migrate to the
+	// paged endpoint (which aggregates only the page ids, §20).
+	usage := map[int64]pageUsage{}
 	rows, err := s.DB.QueryContext(ctx,
 		`SELECT application_id, COUNT(*) AS n, MAX(created_at) AS last_used FROM runs WHERE user_id = ? AND application_id IS NOT NULL GROUP BY application_id`,
 		caller.ID)
@@ -184,10 +204,7 @@ func (s *Server) ListApplications(w http.ResponseWriter, r *http.Request, params
 			var appID, n int64
 			var last sql.NullTime
 			if err := rows.Scan(&appID, &n, &last); err == nil {
-				entry := struct {
-					Count int64
-					Last  *string
-				}{Count: n}
+				entry := pageUsage{Count: n}
 				if last.Valid {
 					t := last.Time.UTC().Format(time.RFC3339)
 					entry.Last = &t
@@ -261,11 +278,143 @@ func isTruthy(v string) bool {
 	return false
 }
 
+// ────────────────────────────── keyset-paginated catalog (执行报告 §14–§17) ──
+
+// pageUsage / pageFavorites are the per-page aggregates (§20): only the ids
+// on the returned page are ever queried.
+type pageUsage struct {
+	Count int64
+	Last  *string
+}
+
+func (s *Server) ListApplicationPage(w http.ResponseWriter, r *http.Request, params genapi.ListApplicationPageParams) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
+	ctx := r.Context()
+
+	kind := catalog.PageQueryKindChat
+	if params.Kind != nil {
+		switch k := string(*params.Kind); k {
+		case catalog.PageQueryKindChat, catalog.PageQueryKindFixed, catalog.PageQueryKindAll:
+			kind = k
+		}
+	}
+	scope := "public"
+	if params.Scope != nil {
+		switch sc := string(*params.Scope); sc {
+		case "public", "mine", "manage":
+			scope = sc
+		}
+	}
+	includeUnbound := params.IncludeUnbound != nil && isTruthy(*params.IncludeUnbound)
+	search := ""
+	if params.Q != nil {
+		search = strings.TrimSpace(*params.Q)
+	}
+	category := ""
+	if params.CategorySlug != nil {
+		category = strings.TrimSpace(*params.CategorySlug)
+	}
+	limit := 24
+	if params.Limit != nil && *params.Limit > 0 {
+		limit = *params.Limit
+		if limit > 100 {
+			limit = 100
+		}
+	}
+
+	var cursorCreated time.Time
+	var cursorID int64
+	if params.Cursor != nil && strings.TrimSpace(*params.Cursor) != "" {
+		t, id, err := catalog.DecodePageCursor(*params.Cursor)
+		if err != nil {
+			writeDetail(w, http.StatusBadRequest, "invalid cursor")
+			return
+		}
+		cursorCreated, cursorID = t, id
+	}
+
+	// limit+1 probe: has_more without a COUNT(*) (§15).
+	page, err := s.CatalogRepo.ListApplicationPage(ctx, catalog.ApplicationPageQuery{
+		Scope:           scope,
+		Kind:            kind,
+		IncludeUnbound:  includeUnbound,
+		Search:          search,
+		CategorySlug:    category,
+		Limit:           limit + 1,
+		CursorCreatedAt: cursorCreated,
+		CursorID:        cursorID,
+		CallerID:        caller.ID,
+		IsStaff:         caller.IsStaff,
+	})
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	hasMore := len(page) > limit
+	if hasMore {
+		page = page[:limit]
+	}
+	nextCursor := ""
+	if hasMore && len(page) > 0 {
+		last := page[len(page)-1]
+		nextCursor = catalog.EncodePageCursor(last.App.CreatedAt, last.App.ID)
+	}
+
+	appIDs := make([]int64, 0, len(page))
+	for _, item := range page {
+		appIDs = append(appIDs, item.App.ID)
+	}
+	usage, err := s.CatalogRepo.UsageByApplications(ctx, caller.ID, appIDs)
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	favorites, err := s.CatalogRepo.FavoritesByApplications(ctx, caller.ID, appIDs)
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	providers := map[int64]*catalog.Provider{}
+	if provs, err := s.CatalogRepo.ListActiveProviders(ctx); err == nil {
+		for i := range provs {
+			providers[provs[i].ID] = &provs[i]
+		}
+	}
+
+	favMap := map[int64]bool{}
+	for id, fav := range favorites {
+		favMap[id] = fav
+	}
+	usageMap := map[int64]pageUsage{}
+	for id, u := range usage {
+		entry := pageUsage{Count: u.Count}
+		if u.Last != nil {
+			t := u.Last.UTC().Format(time.RFC3339)
+			entry.Last = &t
+		}
+		usageMap[id] = entry
+	}
+
+	items := make([]applicationListItem, 0, len(page))
+	for _, item := range page {
+		items = append(items, s.buildListItem(item, providers, favMap, usageMap, caller))
+	}
+	// Hand-rolled response (same pattern as ListApplications): the item shape
+	// is the shared applicationListItem, not the generated model struct.
+	writeJSON(w, http.StatusOK, struct {
+		Items      []applicationListItem `json:"items"`
+		NextCursor string                `json:"next_cursor"`
+		HasMore    bool                  `json:"has_more"`
+	}{Items: items, NextCursor: nextCursor, HasMore: hasMore})
+}
+
 func (s *Server) buildListItem(item catalog.ApplicationWithBinding, providers map[int64]*catalog.Provider,
-	favorites map[int64]bool, usage map[int64]struct {
-		Count int64
-		Last  *string
-	}, caller *AuthenticatedUser) applicationListItem {
+	favorites map[int64]bool, usage map[int64]pageUsage, caller *AuthenticatedUser) applicationListItem {
 	app := item.App
 	capsAny := map[string]any{}
 	var rt, pk, ext, im, em string
@@ -568,6 +717,18 @@ func (s *Server) GetApplicationAvatar(w http.ResponseWriter, r *http.Request, id
 		writeDetail(w, http.StatusNotFound, "avatar not set")
 		return
 	}
+	// Long-lived conditional caching (执行报告 §10): the URL is versioned by
+	// the avatar's storage key, so an unchanged avatar keeps the same URL and
+	// may be cached for a year. The ETag supports legacy URLs without the
+	// version parameter (or a proxy stripping it) via If-None-Match → 304.
+	version := avatarVersion(app.AvatarKey)
+	etag := `"` + version + `"`
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+	if matchesETag(r.Header.Get("If-None-Match"), etag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
 	rc, _, err := s.Storage.Open(r.Context(), app.AvatarKey)
 	if err != nil {
 		writeDetail(w, http.StatusNotFound, "avatar not set")
@@ -579,8 +740,26 @@ func (s *Server) GetApplicationAvatar(w http.ResponseWriter, r *http.Request, id
 		ct = "application/octet-stream"
 	}
 	w.Header().Set("Content-Type", ct)
-	w.Header().Set("Cache-Control", "private, max-age=300")
 	_, _ = io.Copy(w, rc)
+}
+
+// matchesETag reports whether an If-None-Match header covers the current
+// etag. Deliberately lenient (list / W/-prefixed / weak comparison): the
+// value is a server-minted 16-hex fingerprint, so a false positive would
+// require a sha256 collision on the same storage key.
+func matchesETag(ifNoneMatch, etag string) bool {
+	if ifNoneMatch == "" {
+		return false
+	}
+	if strings.TrimSpace(ifNoneMatch) == "*" {
+		return true
+	}
+	for _, candidate := range strings.Split(ifNoneMatch, ",") {
+		if strings.TrimSpace(candidate) == etag {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) UploadApplicationAvatar(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {

@@ -100,3 +100,12 @@ sql:
             go_type:
               import: "github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
               type: "JSONText"
+          # runtime_attachments.run_id is a NULLable BINARY(16). sqlc's mysql
+          # engine maps that to sql.NullString, which would churn the 第十一轮
+          # attachment-bridge call sites (they pass uuid.Bytes()). A []byte
+          # override keeps the committed shape: slices scan NULL into nil, so
+          # nullable rows are safe and the ownership fence keeps passing the
+          # raw 16 bytes.
+          - column: "runtime_attachments.run_id"
+            go_type:
+              type: "[]byte"

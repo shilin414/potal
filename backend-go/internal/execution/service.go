@@ -381,7 +381,10 @@ func (s *Service) CreateRunInTx(ctx context.Context, tx *sql.Tx, in *CreateRunIn
 			return runID, fmt.Errorf("attachment claim: %w", err)
 		}
 		res, err := q.ClaimAttachmentForRun(ctx, db.ClaimAttachmentForRunParams{
-			RunID:          sql.NullString{String: string(runID.Bytes()), Valid: true},
+			// run_id is BINARY(16); bind the raw 16 bytes exactly like the
+			// fence call sites in attachments.go (sqlc override pins the
+			// column to []byte — NULLable, and a nil scan never panics).
+			RunID:          runID.Bytes(),
 			ConversationID: convArg,
 			ID:             attID.Bytes(),
 			CreatedBy:      sql.NullInt64{Int64: in.UserID, Valid: true},

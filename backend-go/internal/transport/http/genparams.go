@@ -7,7 +7,6 @@ import (
 
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 	"github.com/creation-agent-studio/backend-go/internal/platform/dbtypes"
-	"github.com/creation-agent-studio/backend-go/internal/platform/ids"
 )
 
 func nstr(s string) sql.NullString { return sql.NullString{String: s, Valid: s != ""} }
@@ -57,7 +56,11 @@ func genCreateAttachmentParams(id []byte, provider, attachmentType, name, docURL
 
 func genCreateAttachmentParamsExt(id, runID []byte, provider, attachmentType, name, docURL, storageKey, contentType string, size int64, authMode, authSubject string, createdBy int64, externalID string) db.CreateAttachmentParams {
 	out := genCreateAttachmentParams(id, provider, attachmentType, name, docURL, storageKey, contentType, size, authMode, authSubject, createdBy)
-	out.RunID = nstr(ids.ID(runID).String())
+	// run_id is BINARY(16): bind the raw 16 bytes. (The previous
+	// nstr(uuid.String()) wrapped the 36-char text form, which strict-mode
+	// MySQL would reject with 1406 Data too long — a gen/db hand-sync drift
+	// the sqlc regeneration surfaced; see the sqlc.yaml []byte override.)
+	out.RunID = runID
 	out.ExternalAttachmentID = externalID
 	out.Status = "uploaded"
 	return out
@@ -65,7 +68,7 @@ func genCreateAttachmentParamsExt(id, runID []byte, provider, attachmentType, na
 
 func genBindAttachmentParams(attID, runID []byte, conversationID uint64) db.BindAttachmentToRunParams {
 	return db.BindAttachmentToRunParams{
-		RunID:          nstr(ids.ID(runID).String()),
+		RunID:          runID,
 		ConversationID: nint(int64(conversationID)),
 		ID:             attID,
 	}

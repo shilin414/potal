@@ -335,6 +335,61 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
 
+  /api/v2/applications/page:
+    get:
+      operationId: listApplicationPage
+      tags: [applications]
+      summary: Keyset-paginated application catalog page (执行报告 §14–§17)
+      description: |
+        True server-side pagination: LIMIT / cursor-condition evaluate inside
+        SQL, one anti-joined query per page (no N+1), and personal usage /
+        favorites aggregate ONLY the ids on the returned page. The legacy
+        GET /api/v2/applications keeps its whole-catalog array shape for
+        callers not yet migrated; new surfaces must use this endpoint.
+      parameters:
+        - name: kind
+          in: query
+          schema: { type: string, enum: [chat, fixed, all], default: chat }
+          description: >
+            `fixed` means kind <> 'chat' (应用中心: pages/forms/dashboards/tasks).
+            Invalid values fall back to chat.
+        - name: scope
+          in: query
+          schema: { type: string, enum: [public, mine, manage], default: public }
+          description: Invalid values fall back to public.
+        - name: include_unbound
+          in: query
+          schema: { type: string }
+          description: Truthy when case-insensitively in {1,true,yes}; keeps binding-less rows.
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Case-insensitive substring match on name / description.
+        - name: category_slug
+          in: query
+          schema: { type: string }
+          description: >
+            Exact category match; the sentinel `__uncategorized__` matches rows
+            without any category (mobile 其他 tab).
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 24 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: Opaque next_cursor from a previous response (base64 JSON of created_at+id).
+      responses:
+        "200":
+          description: One page of application list items (same item shape as the legacy array)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplicationPage" }
+        "400":
+          description: invalid cursor
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
   /api/v2/applications/{id}:
     parameters:
       - $ref: "#/components/parameters/ApplicationId"
@@ -1818,6 +1873,20 @@ components:
           description: >-
             Agent-scoped 技能配置. Always present; `[]` when the agent has none.
           items: { $ref: "#/components/schemas/ApplicationSkill" }
+
+    ApplicationPage:
+      type: object
+      description: >
+        One keyset page of the catalog (GET /api/v2/applications/page). Items
+        carry the same shape as the legacy bare-array endpoint. next_cursor is
+        opaque and empty when has_more is false.
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/ApplicationListItem" }
+        next_cursor: { type: string }
+        has_more: { type: boolean }
 
     ApplicationSkill:
       type: object

@@ -1,0 +1,156 @@
+/**
+ * useApplicationPage — ONE server-paged catalog hook (执行报告 §22–§24).
+ *
+ * The smart-agent market, the app center and the mobile pickers used to each
+ * roll their own browser-side filtering over the WHOLE catalog
+ * (`GET /v2/applications` has no server-side cap; the shared dev DB once
+ * carried 1800+ rows). This hook replaces those copies with the real paged
+ * endpoint:
+ *
+ *   · the server evaluates LIMIT + the cursor condition in SQL;
+ *   · `q` / `category` are sent to the backend (300 ms debounced), so search
+ *     covers the entire catalog instead of the pages already loaded;
+ *   · a filter change resets to page one — keeping a grown cursor across a
+ *     narrowed result set would skip past what the user is looking at;
+ *   · `loadMore` appends the next cursor page, deduplicating by id so an
+ *     application edited between page fetches cannot render twice;
+ *   · `patchItem` applies a local update (favourite / enabled / public
+ *     toggles) without re-downloading anything (执行报告 §31).
+ */
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  fetchApplicationPage,
+  type V2Application,
+} from '@/services/runApi';
+
+export interface UseApplicationPageOptions {
+  kind: 'chat' | 'fixed' | 'all';
+  scope?: 'public' | 'manage' | 'mine';
+  includeUnbound?: boolean;
+  /** Client-side category filter, sent to the backend as category_slug. */
+  category?: string | null;
+  /** Client-side search, sent to the backend as q (debounced). */
+  query?: string;
+  /** Page size (default 24 — the same budget the market page renders). */
+  limit?: number;
+  /** Debounce for query changes (default 300 ms). */
+  debounceMs?: number;
+  /**
+   * False suppresses ALL fetching (e.g. a mobile sheet still mounted inside
+   * a closed Drawer). Turning it true triggers the first page.
+   */
+  enabled?: boolean;
+}
+
+const UNCATEGORIZED = '__uncategorized__';
+
+const dedupeById = (items: V2Application[]): V2Application[] => {
+  const seen = new Set<number>();
+  const out: V2Application[] = [];
+  for (const item of items) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    out.push(item);
+  }
+  return out;
+};
+
+export function useApplicationPage(options: UseApplicationPageOptions) {
+  const {
+    kind, scope, includeUnbound, category, query, limit = 24,
+    debounceMs = 300, enabled = true,
+  } = options;
+
+  const [items, setItems] = useState<V2Application[]>([]);
+  const [cursor, setCursor] = useState('');
+  const [hasMore, setHasMore] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // The debounce only smooths TYPING: category switches and the initial
+  // mount fire immediately (a tab switch must not lag 300 ms).
+  const [debouncedQuery, setDebouncedQuery] = useState(query ?? '');
+  useEffect(() => {
+    const next = query ?? '';
+    if (next === debouncedQuery) return undefined;
+    const timer = setTimeout(() => setDebouncedQuery(next), debounceMs);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, debounceMs]);
+
+  // A new filter combination is a NEW result set: reset to page one. The
+  // request id guards against out-of-order responses when the user types
+  // faster than the network answers.
+  const requestIdRef = useRef(0);
+  const fetchFirstPage = useCallback(async () => {
+    if (!enabled) return; // closed sheet / gated surface — no traffic
+    const requestId = ++requestIdRef.current;
+    setLoading(true);
+    setError(null);
+    try {
+      const page = await fetchApplicationPage({
+        kind,
+        scope,
+        includeUnbound,
+        q: debouncedQuery,
+        categorySlug: category || undefined,
+        limit,
+      });
+      if (requestIdRef.current !== requestId) return; // a newer query won
+      setItems(dedupeById(page.items));
+      setCursor(page.next_cursor);
+      setHasMore(page.has_more);
+    } catch (err: any) {
+      if (requestIdRef.current !== requestId) return;
+      // An error leaves the previous items in place (they are still real
+      // data); only the indicator flips, and 加载更多 is suppressed.
+      setError(err?.response?.data?.detail || '加载列表失败');
+      setCursor('');
+      setHasMore(false);
+    } finally {
+      if (requestIdRef.current === requestId) setLoading(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [enabled, kind, scope, includeUnbound, debouncedQuery, category, limit]);
+
+  useEffect(() => { void fetchFirstPage(); }, [fetchFirstPage]);
+
+  const loadMore = useCallback(async () => {
+    if (!enabled || !cursor || loadingMore || loading) return;
+    const requestId = requestIdRef.current;
+    setLoadingMore(true);
+    try {
+      const page = await fetchApplicationPage({
+        kind, scope, includeUnbound, q: debouncedQuery,
+        categorySlug: category || undefined, limit, cursor,
+      });
+      if (requestIdRef.current !== requestId) return; // filters changed mid-flight
+      setItems((current) => dedupeById([...current, ...page.items]));
+      setCursor(page.next_cursor);
+      setHasMore(page.has_more);
+    } catch (err: any) {
+      // 加载更多 keeps the already-rendered pages; the next click retries.
+      setError(err?.response?.data?.detail || '加载更多失败');
+    } finally {
+      if (requestIdRef.current === requestId) setLoadingMore(false);
+    }
+  }, [enabled, kind, scope, includeUnbound, debouncedQuery, category, limit, cursor, loadingMore, loading]);
+
+  /** Local update of ONE card (执行报告 §31 — never a full reload). */
+  const patchItem = useCallback((id: number, patch: Partial<V2Application>) => {
+    setItems((current) => current.map((item) => (
+      item.id === id ? { ...item, ...patch } : item)));
+  }, []);
+
+  /** Replace one item wholesale (e.g. after an avatar upload). */
+  const replaceItem = useCallback((id: number, next: V2Application) => {
+    setItems((current) => current.map((item) => (
+      item.id === id ? { ...next, id } : item)));
+  }, []);
+
+  return {
+    items, hasMore, loading, loadingMore, error,
+    loadMore, refresh: fetchFirstPage, patchItem, replaceItem,
+  };
+}

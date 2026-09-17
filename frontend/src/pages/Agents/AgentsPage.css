@@ -247,6 +247,15 @@
   background: var(--color-bg-elevated);
 }
 
+/* The runtime card's avatar is the shared AgentAvatar component (执行报告
+ * §11); the old `.agent-card-avatar` img rules above stay for the legacy
+ * local-agent cards. Inline-flex keeps the component's own layout winning
+ * regardless of CSS injection order (single-class specificity tie). */
+.agent-card-avatar-slot {
+  display: inline-flex;
+  margin-bottom: 16px;
+}
+
 .agent-card-main {
   display: inline-flex;
   align-items: center;

@@ -6,11 +6,15 @@
  * open the same `MobileCatalogSheet(type="agent")`, so "pick an agent" is one
  * component and one gesture everywhere (§7.1, §20).
  *
+ * The sheet itself fetches its rows from the paged endpoint (执行报告 §25) —
+ * this component hands it only the ACTIVE application (for the ✓ marker), not
+ * a full agent array.
+ *
  * `ApplicationSwitcher` itself is left untouched for desktop: the report
  * explicitly warns against threading `if (compact)` through one component to
  * make it serve both a Dropdown and a Bottom Sheet (§7.3).
  */
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { Spin } from 'antd';
 import { DownOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
@@ -27,30 +31,13 @@ interface Props {
   activeApplicationId?: number | null;
 }
 
-/**
- * The list handed to the sheet, order-preserving and deduplicated by id.
- *
- * `chats` is `chatApplicationsList` and `active` is looked up inside it, so
- * the two are normally the same array and this returns it UNTOUCHED — which
- * matters, because it keeps the sheet's `useMemo`s stable across renders. The
- * copy path only runs for the one edge case it exists for: the route names an
- * agent the catalog has not (re)loaded yet, so the sheet would otherwise show
- * a list without the agent currently on screen.
- */
-function applicationsForSheet(
-  chats: V2Application[],
-  active: V2Application | null,
-): V2Application[] {
-  if (!active || chats.some((app) => app.id === active.id)) return chats;
-  return [active, ...chats];
-}
-
 const MobileAgentSwitcher: React.FC<Props> = ({ activeApplicationId }) => {
   const navigate = useNavigate();
-  // Assigned to a short local name on purpose: this is the SELECTOR, so the
-  // store only notifies this component when the derived array is replaced,
-  // not on every unrelated update (favourites, load flags, …).
-  const chats = useApplicationCatalogStore((state) => state.chatApplicationsList);
+  // The catalog mirror is the lookup for the ACTIVE agent's name/avatar.
+  // (The P1 workspace-bootstrap endpoint will replace this whole-catalog
+  // load; the picker already reads the paged endpoint directly.)
+  const applicationById = useApplicationCatalogStore(
+    (state) => state.applicationById);
   const isLoading = useApplicationCatalogStore((state) => state.isLoading);
   const load = useApplicationCatalogStore((state) => state.load);
   const storeActiveId = useWorkspaceStore((state) => state.activeApplicationId);
@@ -58,22 +45,20 @@ const MobileAgentSwitcher: React.FC<Props> = ({ activeApplicationId }) => {
   const openApplication = useWorkspaceStore((state) => state.openApplication);
   const [open, setOpen] = useState(false);
 
-  useEffect(() => { void load(); }, [load]);
+  React.useEffect(() => { void load(); }, [load]);
 
   // The route wins when it names an agent (a deep link into /chat/:slug); the
   // workspace store is the fallback for the idle home surface.
   const effectiveActiveId = activeApplicationId ?? storeActiveId;
 
-  const active = chats.find((app) => app.id === effectiveActiveId) || null;
+  const active = applicationById(effectiveActiveId) || null;
 
-  const loading = isLoading && !chats.length;
+  const loading = isLoading;
 
   const handleSelect = (application: V2Application) => {
     openApplication(application.id);
     navigate(routeForApplication(application));
   };
-
-  const sheetApplications = applicationsForSheet(chats, active);
 
   return (
     <>
@@ -109,10 +94,9 @@ const MobileAgentSwitcher: React.FC<Props> = ({ activeApplicationId }) => {
       <MobileCatalogSheet
         open={open}
         type="agent"
-        applications={sheetApplications}
         recentIds={recentApplicationIds}
         activeApplicationId={effectiveActiveId}
-        loading={isLoading}
+        activeApplication={active}
         onClose={() => setOpen(false)}
         onSelect={handleSelect}
       />

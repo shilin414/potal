@@ -1,0 +1,80 @@
+{
+  "checks": [
+    {
+      "name": "agents uses the paged endpoint",
+      "ok": true,
+      "detail": "2 page request(s)"
+    },
+    {
+      "name": "first agents page passes limit=24",
+      "ok": true,
+      "detail": "http://localhost:3030/api/v2/applications/page?scope=manage&include_unbound=true&limit=24"
+    },
+    {
+      "name": "paged response carries <= 24 items",
+      "ok": true,
+      "detail": "items=24"
+    },
+    {
+      "name": "paged response shape (has_more/next_cursor)",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "加载更多 sends a cursor request",
+      "ok": true,
+      "detail": "http://localhost:3030/api/v2/applications/page?scope=manage&include_unbound=true&limit=24&cursor=eyJjIjoiMjAyNi0wOS0xN1QxMDo0NDozNS4yODlaIiwiaSI6MzIxOTh9"
+    },
+    {
+      "name": "cards still render after 加载更多",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "search fires q= to the paged endpoint",
+      "ok": true,
+      "detail": "http://localhost:3030/api/v2/applications/page?scope=manage&include_unbound=true&q=%E5%88%9B%E4%BD%9C&limit=24"
+    },
+    {
+      "name": "app center pages with kind=fixed",
+      "ok": true,
+      "detail": "http://localhost:3030/api/v2/applications/page?kind=fixed&scope=manage&include_unbound=true&limit=24"
+    },
+    {
+      "name": "app center renders app cards",
+      "ok": true,
+      "detail": "6 cards"
+    },
+    {
+      "name": "avatar URLs are fingerprint-versioned (16 hex)",
+      "ok": true,
+      "detail": "2 avatar URL(s)"
+    },
+    {
+      "name": "avatar Cache-Control is year-long immutable",
+      "ok": true,
+      "detail": "private, max-age=31536000, immutable"
+    },
+    {
+      "name": "avatar response carries an ETag",
+      "ok": true,
+      "detail": "\"d51d756d477b9ffb\""
+    },
+    {
+      "name": "If-None-Match revalidation answers 304",
+      "ok": true,
+      "detail": "status=304"
+    },
+    {
+      "name": "home surface renders after the changes",
+      "ok": true,
+      "detail": ""
+    },
+    {
+      "name": "no console errors",
+      "ok": false,
+      "detail": "Warning: [antd: message] Static function can not consume context like dynamic theme. Please use 'App' component instead.; Warning: [antd: Modal] `destroyOnClose` is deprecated. Please use `destroyOnHidden` instead."
+    }
+  ],
+  "console": []
+}

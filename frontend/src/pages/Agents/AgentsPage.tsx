@@ -12,7 +12,7 @@
  * The provider label on each card comes from `GET /api/v2/runtimes`, so no
  * provider name is hard-coded in the frontend.
  */
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Avatar, Button, Empty, Input, Popconfirm, Segmented, Spin, Tag, Tooltip, message,
 } from 'antd';
@@ -25,17 +25,19 @@ import { useAgentStore } from '@/stores/useAgentStore';
 import { useApplicationCatalogStore } from '@/stores/useApplicationCatalogStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
+import { useApplicationPage } from '@/hooks/useApplicationPage';
 import AgentDetailModal from '@/components/Agents/AgentDetailModal';
 import AgentEditorModal, { type AgentEditorMode } from '@/components/Agents/AgentEditorModal';
 import AgentAvatarModal from '@/components/Agents/AgentAvatarModal';
+import AgentAvatar from '@/components/Agents/AgentAvatar';
 import { api } from '@/services/api';
 import {
   deleteAgentApplication,
   fetchAgentRuntimes,
-  fetchManageableAgents,
   setDefaultAgent,
   type AgentRuntimeDescriptor,
   type ManagedAgent,
+  type V2Application,
 } from '@/services/runApi';
 import './AgentsPage.css';
 
@@ -44,13 +46,13 @@ const { Search } = Input;
 const AGENT_ICONS = ['🎬', '✍️', '🎙️', '✂️', '🎨', '🎵', '💡', '🔧'];
 
 /**
- * How many cards the grid renders before 加载更多.
+ * The server page size — the ONLY pagination budget (执行报告 §22).
  *
- * The catalog is served whole by `GET /v2/applications` (no pagination), so
- * rendering it in one pass means one DOM node per application — on a catalog
- * polluted by integration-test rows (1800+) that is a multi-second freeze on
- * entry, which is what "进去非常卡" is. The filters stay client-side and are
- * applied to the FULL list first, so 加载更多 can never disagree with them.
+ * Before the paged endpoint existed this constant sliced a whole-catalog
+ * array in the browser (`visibleCount`/`slice`): 加载更多 rendered fewer DOM
+ * nodes but still downloaded every application. Now the grid shows exactly
+ * what `GET /v2/applications/page?limit=24` returned, and 加载更多 fetches
+ * the next server page.
  */
 const PAGE_SIZE = 24;
 
@@ -59,10 +61,8 @@ const PAGE_SIZE = 24;
  *
  * `.agent-card` is `animation: fadeIn .4s ... both`, and `both` holds the
  * FIRST keyframe (opacity: 0) for the whole `animation-delay`. An uncapped
- * `index * delay` therefore makes a large catalog look EMPTY: card #1300
- * would stay invisible for over a minute. Capping the stagger keeps the
- * entrance animation while making "how long until the grid is readable"
- * independent of how many agents exist.
+ * `index * delay` therefore makes a large catalog look EMPTY. The cap keeps
+ * the entrance animation independent of list position.
  */
 const STAGGER_MS = 40;
 const STAGGER_MAX_STEPS = 8;
@@ -85,9 +85,27 @@ const AgentsPage: React.FC = () => {
     setSearchQuery,
   } = useAgentStore();
 
-  // Runtime agents (Applications + bindings).
-  const [appAgents, setAppAgents] = useState<ManagedAgent[]>([]);
-  const [loadingApps, setLoadingApps] = useState(false);
+  // Runtime agents (Applications + bindings) — SERVER-paged (执行报告 §22):
+  // search and the category rail go to the backend as q / category_slug, and
+  // 加载更多 fetches the next cursor page instead of revealing a browser-side
+  // slice of a fully-downloaded catalog.
+  const {
+    items: appAgents,
+    hasMore: appsHasMore,
+    loading: loadingApps,
+    loadingMore: loadingMoreApps,
+    loadMore: loadMoreApps,
+    refresh: refreshAppAgents,
+    patchItem: patchAppAgent,
+  } = useApplicationPage({
+    kind: 'chat',
+    scope: 'manage',
+    includeUnbound: true,
+    category: selectedCategory,
+    query: searchQuery,
+    limit: PAGE_SIZE,
+  });
+
   const [runtimes, setRuntimes] = useState<AgentRuntimeDescriptor[]>([]);
   const [source, setSource] = useState<SourceFilter>('all');
 
@@ -99,25 +117,12 @@ const AgentsPage: React.FC = () => {
   const [avatarAgent, setAvatarAgent] = useState<ManagedAgent | null>(null);
   const [deletingAgentId, setDeletingAgentId] = useState<number | null>(null);
   const [busyAppId, setBusyAppId] = useState<number | null>(null);
-  /** How many cards of the filtered result the grid currently renders. */
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
 
   const reloadCatalog = useApplicationCatalogStore((state) => state.load);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
   // 智能体接入是管理员能力：普通用户只消费市场。
   const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
   const isFirstRun = useRef(true);
-
-  const loadAppAgents = useCallback(async () => {
-    setLoadingApps(true);
-    try {
-      setAppAgents(await fetchManageableAgents());
-    } finally {
-      setLoadingApps(false);
-    }
-  }, []);
-
-  useEffect(() => { void loadAppAgents(); }, [loadAppAgents]);
 
   useEffect(() => {
     fetchAgentRuntimes().then(setRuntimes).catch(() => setRuntimes([]));
@@ -137,54 +142,35 @@ const AgentsPage: React.FC = () => {
     return () => clearTimeout(timer);
   }, [selectedCategory, searchQuery, loadAgents]);
 
-  // A new result set always starts at page one: keeping a grown visibleCount
-  // across a search would skip straight past the matches the user is looking
-  // at, and shrinking the result (typing more) would leave a stale tail.
-  useEffect(() => {
-    setVisibleCount(PAGE_SIZE);
-  }, [selectedCategory, searchQuery, source]);
-
   const refreshAll = useCallback(async () => {
     await Promise.all([
       loadAgents(useAgentStore.getState().selectedCategory || undefined),
-      loadAppAgents(),
+      refreshAppAgents(),
       reloadCatalog(true),
     ]);
-  }, [loadAgents, loadAppAgents, reloadCatalog]);
+  }, [loadAgents, refreshAppAgents, reloadCatalog]);
 
   /** Runtime label per card, read from the runtime catalog (never hard-coded). */
-  const labelFor = useCallback((agent: ManagedAgent) => {
+  const labelFor = useCallback((agent: V2Application) => {
     if (!agent.provider_key) return '未绑定运行时';
     return runtimes.find((item) => (
       item.key === `${agent.provider_key}:${agent.runtime_type}`
     ))?.label || agent.provider_key;
   }, [runtimes]);
 
-  const visibleAppAgents = useMemo(() => {
-    const keyword = searchQuery.trim().toLowerCase();
-    return appAgents.filter((agent) => {
-      if (selectedCategory && agent.category_slug !== selectedCategory) return false;
-      if (!keyword) return true;
-      return agent.name.toLowerCase().includes(keyword)
-        || (agent.description || '').toLowerCase().includes(keyword);
-    });
-  }, [appAgents, searchQuery, selectedCategory]);
-
   const showRuntime = source !== 'local';
   const showLocal = source !== 'runtime';
-  // Filter FIRST, page SECOND: `visibleCount` is a budget shared by the two
-  // sections (as they are in one grid), so 加载更多 reveals the next slice of
-  // the same filtered result instead of a different one.
-  const pagedRuntime = showRuntime ? visibleAppAgents.slice(0, visibleCount) : [];
-  const pagedLocal = showLocal
-    ? agents.slice(0, Math.max(0, visibleCount - pagedRuntime.length))
-    : [];
-  const totalMatched = (showRuntime ? visibleAppAgents.length : 0)
+  // The runtime section is server-paged: `appAgents` is exactly what the API
+  // returned for the current filters. The LOCAL (legacy GraphFlow) section is
+  // the Django `/agents` listing — a small, separately server-searched set —
+  // so it renders whole; only the runtime side carries 加载更多.
+  const pagedRuntime = showRuntime ? appAgents : [];
+  const pagedLocal = showLocal ? agents : [];
+  const totalLoaded = (showRuntime ? appAgents.length : 0)
     + (showLocal ? agents.length : 0);
-  const hasMore = totalMatched > pagedRuntime.length + pagedLocal.length;
 
   const isBusy = isLoading || loadingApps;
-  const isEmpty = (!showRuntime || visibleAppAgents.length === 0)
+  const isEmpty = (!showRuntime || appAgents.length === 0)
     && (!showLocal || agents.length === 0);
 
   const openEditor = (agentId: number | null, mode: AgentEditorMode) => {
@@ -193,7 +179,7 @@ const AgentsPage: React.FC = () => {
     setEditorOpen(true);
   };
 
-  const openRuntimeAgent = async (agent: ManagedAgent) => {
+  const openRuntimeAgent = async (agent: V2Application) => {
     if (!agent.is_bound) {
       message.warning('该智能体还没有可用的运行时绑定，无法对话；请先编辑补全。');
       return;
@@ -205,7 +191,7 @@ const AgentsPage: React.FC = () => {
     navigate(`/chat/${agent.slug}`);
   };
 
-  const handleSetDefault = async (agent: ManagedAgent, next: boolean) => {
+  const handleSetDefault = async (agent: V2Application, next: boolean) => {
     setBusyAppId(agent.id);
     try {
       await setDefaultAgent(agent.id, next);
@@ -220,7 +206,7 @@ const AgentsPage: React.FC = () => {
     }
   };
 
-  const handleDeleteRuntimeAgent = async (agent: ManagedAgent) => {
+  const handleDeleteRuntimeAgent = async (agent: V2Application) => {
     setBusyAppId(agent.id);
     try {
       await deleteAgentApplication(agent.id);
@@ -246,7 +232,7 @@ const AgentsPage: React.FC = () => {
     }
   };
 
-  const runtimeCard = (agent: ManagedAgent, index: number) => (
+  const runtimeCard = (agent: V2Application, index: number) => (
     <div
       key={`app-${agent.id}`}
       className="agent-card"
@@ -270,7 +256,9 @@ const AgentsPage: React.FC = () => {
               size="small"
               icon={<PictureOutlined />}
               aria-label={`修改 ${agent.name} 的头像`}
-              onClick={() => setAvatarAgent(agent)}
+              // The avatar modal predates the paged endpoint and speaks the
+              // authoring payload; the paged item carries the same fields.
+              onClick={() => setAvatarAgent(agent as ManagedAgent)}
             />
           </Tooltip>
           <Tooltip title={agent.is_default_agent ? '取消默认智能体' : '设为工作台默认智能体'}>
@@ -304,17 +292,15 @@ const AgentsPage: React.FC = () => {
           </Popconfirm>
         </div>
       )}
-      {agent.avatar_url ? (
-        <img
-          className="agent-card-avatar"
-          src={agent.avatar_url}
-          alt={`${agent.name} 头像`}
-        />
-      ) : (
-        <div className={`agent-card-icon icon-gradient-${(index % 6) + 1}`}>
-          {agent.icon || '🤖'}
-        </div>
-      )}
+      {/* One avatar component everywhere (执行报告 §11): same lazy loading,
+          fallback, shape and error handling as the switcher / home / chat. */}
+      <AgentAvatar
+        application={agent}
+        size={48}
+        shape="square"
+        tint={agent.color}
+        className="agent-card-avatar-slot"
+      />
       <div className="agent-card-name">
         {agent.name}
         {agent.is_default_agent && <span className="agent-card-main">主</span>}
@@ -451,15 +437,16 @@ const AgentsPage: React.FC = () => {
 
       {!isEmpty && (
         <div className="agents-page__more">
-          {hasMore ? (
+          {showRuntime && appsHasMore ? (
             <Button
-              onClick={() => setVisibleCount((current) => current + PAGE_SIZE)}
+              onClick={() => void loadMoreApps()}
+              loading={loadingMoreApps}
             >
-              加载更多（还有 {totalMatched - pagedRuntime.length - pagedLocal.length} 个）
+              加载更多智能体
             </Button>
           ) : (
-            totalMatched > PAGE_SIZE && (
-              <span className="agents-page__count">已显示全部 {totalMatched} 个</span>
+            totalLoaded > PAGE_SIZE && (
+              <span className="agents-page__count">已显示全部 {totalLoaded} 个</span>
             )
           )}
         </div>
@@ -482,10 +469,9 @@ const AgentsPage: React.FC = () => {
         open={Boolean(avatarAgent)}
         onClose={() => setAvatarAgent(null)}
         onSaved={async (updated) => {
-          // Keep the card in sync without a full reload, then refresh the
-          // catalog so the workspace switcher shows the new avatar too.
-          setAppAgents((current) => current.map((item) => (
-            item.id === updated.id ? { ...item, ...updated } : item)));
+          // Patch the card in place (执行报告 §31 — no reload), then refresh
+          // the catalog mirror so the workspace switcher shows it too.
+          patchAppAgent(updated.id, { avatar_url: updated.avatar_url });
           setAvatarAgent((current) => (
             current && current.id === updated.id ? { ...current, ...updated } : current));
           await reloadCatalog(true);

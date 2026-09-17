@@ -97,11 +97,16 @@ type AppendUserAttachmentToRunInputParams struct {
 }
 
 // Late-attachment race guard: only while queued.
+//
 // 第十一轮 P0-1: studio_attachment_ids is the STUDIO id list (local
 // runtime_attachments.id). The provider id is minted by the worker at
 // upload time and never stored on the run input.
+//
 // JSON_SET first, JSON_ARRAY_APPEND second: a bare JSON_ARRAY_APPEND on a
-// path that does not exist yet yields NULL, which would erase the input.
+// path that does not exist yet yields NULL, which silently ERASED the whole
+// run input for every run created without attachments (measured against
+// MySQL 5.7: `JSON_ARRAY_APPEND('{"a":1}','$.k','v')` → NULL). Seeding the
+// key with an empty array makes the append total instead of destructive.
 func (q *Queries) AppendUserAttachmentToRunInput(ctx context.Context, arg AppendUserAttachmentToRunInputParams) (sql.Result, error) {
 	return q.db.ExecContext(ctx, appendUserAttachmentToRunInput, arg.JSONARRAYAPPEND, arg.ID)
 }
@@ -153,7 +158,7 @@ UPDATE runtime_attachments SET run_id = ?, conversation_id = ? WHERE id = ?
 `
 
 type BindAttachmentToRunParams struct {
-	RunID          sql.NullString
+	RunID          []byte
 	ConversationID sql.NullInt64
 	ID             []byte
 }
@@ -298,7 +303,7 @@ WHERE id = ? AND created_by = ? AND status = 'pending' AND run_id IS NULL
 `
 
 type ClaimAttachmentForRunParams struct {
-	RunID          sql.NullString
+	RunID          []byte
 	ConversationID sql.NullInt64
 	ID             []byte
 	CreatedBy      sql.NullInt64
@@ -772,7 +777,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
 
 type CreateAttachmentParams struct {
 	ID                   []byte
-	RunID                sql.NullString
+	RunID                []byte
 	ConversationID       sql.NullInt64
 	Provider             string
 	ExternalAttachmentID string
@@ -1930,6 +1935,61 @@ func (q *Queries) ListAllRunEvents(ctx context.Context, runID []byte) ([]RunEven
 	return items, nil
 }
 
+const listClaimedAttachmentsByRun = `-- name: ListClaimedAttachmentsByRun :many
+SELECT id, run_id, conversation_id, provider, external_attachment_id, attachment_type,
+       name, source_type, source_url, storage_key, content_type, size_bytes,
+       auth_mode, auth_subject_key, status, metadata, created_by, created_at, updated_at
+FROM runtime_attachments
+WHERE run_id = ?
+ORDER BY created_at
+`
+
+// 第十一轮 P0-2: the worker attachment bridge reads the attachments THIS
+// run owns. The run_id predicate is the ownership scope — the caller must
+// pass the run id from its ExecutionOwnership fence, never a request value.
+func (q *Queries) ListClaimedAttachmentsByRun(ctx context.Context, runID []byte) ([]RuntimeAttachment, error) {
+	rows, err := q.db.QueryContext(ctx, listClaimedAttachmentsByRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RuntimeAttachment{}
+	for rows.Next() {
+		var i RuntimeAttachment
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.ConversationID,
+			&i.Provider,
+			&i.ExternalAttachmentID,
+			&i.AttachmentType,
+			&i.Name,
+			&i.SourceType,
+			&i.SourceUrl,
+			&i.StorageKey,
+			&i.ContentType,
+			&i.SizeBytes,
+			&i.AuthMode,
+			&i.AuthSubjectKey,
+			&i.Status,
+			&i.Metadata,
+			&i.CreatedBy,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listExpiredLeaseRunIDs = `-- name: ListExpiredLeaseRunIDs :many
 SELECT run_id FROM run_leases
 WHERE expires_at <= CURRENT_TIMESTAMP(3)
@@ -2314,6 +2374,26 @@ func (q *Queries) LockProviderAdmission(ctx context.Context, provider string) (s
 	return q.db.ExecContext(ctx, lockProviderAdmission, provider)
 }
 
+const markAttachmentUploadedFenced = `-- name: MarkAttachmentUploadedFenced :execresult
+UPDATE runtime_attachments
+SET external_attachment_id = ?, status = 'uploaded'
+WHERE id = ? AND run_id = ? AND external_attachment_id = ''
+`
+
+type MarkAttachmentUploadedFencedParams struct {
+	ExternalAttachmentID string
+	ID                   []byte
+	RunID                []byte
+}
+
+// 第十一轮 P0-3: fenced attachment writeback. Both the attachment id AND
+// its run_id are predicates, so a stale worker (or a mistyped id) can
+// never stamp an external id onto another run's attachment. RowsAffected
+// != 1 means the attachment is gone / not this run's → the caller stops.
+func (q *Queries) MarkAttachmentUploadedFenced(ctx context.Context, arg MarkAttachmentUploadedFencedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, markAttachmentUploadedFenced, arg.ExternalAttachmentID, arg.ID, arg.RunID)
+}
+
 const markOutboxPublished = `-- name: MarkOutboxPublished :exec
 UPDATE outbox_events SET status = 'published', published_at = CURRENT_TIMESTAMP(3) WHERE id = ?
 `
@@ -2561,81 +2641,6 @@ func (q *Queries) SetAttachmentUploaded(ctx context.Context, arg SetAttachmentUp
 	return err
 }
 
-const listClaimedAttachmentsByRun = `-- name: ListClaimedAttachmentsByRun :many
-SELECT id, run_id, conversation_id, provider, external_attachment_id, attachment_type,
-       name, source_type, source_url, storage_key, content_type, size_bytes,
-       auth_mode, auth_subject_key, status, metadata, created_by, created_at, updated_at
-FROM runtime_attachments
-WHERE run_id = ?
-ORDER BY created_at
-`
-
-// 第十一轮 P0-2: the worker attachment bridge reads the attachments THIS
-// run owns. The run_id predicate is the ownership scope — the caller must
-// pass the run id from its ExecutionOwnership fence, never a request value.
-func (q *Queries) ListClaimedAttachmentsByRun(ctx context.Context, runID []byte) ([]RuntimeAttachment, error) {
-	rows, err := q.db.QueryContext(ctx, listClaimedAttachmentsByRun, runID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []RuntimeAttachment
-	for rows.Next() {
-		var i RuntimeAttachment
-		if err := rows.Scan(
-			&i.ID,
-			&i.RunID,
-			&i.ConversationID,
-			&i.Provider,
-			&i.ExternalAttachmentID,
-			&i.AttachmentType,
-			&i.Name,
-			&i.SourceType,
-			&i.SourceUrl,
-			&i.StorageKey,
-			&i.ContentType,
-			&i.SizeBytes,
-			&i.AuthMode,
-			&i.AuthSubjectKey,
-			&i.Status,
-			&i.Metadata,
-			&i.CreatedBy,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const markAttachmentUploadedFenced = `-- name: MarkAttachmentUploadedFenced :execresult
-UPDATE runtime_attachments
-SET external_attachment_id = ?, status = 'uploaded'
-WHERE id = ? AND run_id = ? AND external_attachment_id = ''
-`
-
-type MarkAttachmentUploadedFencedParams struct {
-	ExternalAttachmentID string
-	ID                   []byte
-	RunID                []byte
-}
-
-// 第十一轮 P0-3: fenced attachment writeback. Both the attachment id AND
-// its run_id are predicates, so a stale worker (or a mistyped id) can
-// never stamp an external id onto another run's attachment. RowsAffected
-// != 1 means the attachment is gone / not this run's → the caller stops.
-func (q *Queries) MarkAttachmentUploadedFenced(ctx context.Context, arg MarkAttachmentUploadedFencedParams) (sql.Result, error) {
-	return q.db.ExecContext(ctx, markAttachmentUploadedFenced, arg.ExternalAttachmentID, arg.ID, arg.RunID)
-}
-
 const touchProviderSlot = `-- name: TouchProviderSlot :execresult
 UPDATE provider_execution_slots
 SET heartbeat_at = GREATEST(CURRENT_TIMESTAMP(3), DATE_ADD(heartbeat_at, INTERVAL 1000 MICROSECOND)),
@@ -2728,6 +2733,15 @@ type UpsertRunArtifactParams struct {
 
 // Guarded by unique (run_id, external_artifact_id); empty external ids get
 // their own row keyed by the generated PK.
+//
+// 第十一轮 P0-6: name is backfilled. The streaming discovery frame often
+// carries no name while the final reconciliation does (or vice versa), so
+// the SECOND write must be able to fill in what the first one lacked.
+// IF(VALUES(name) = ”, name, VALUES(name)) makes it monotone in one
+// direction only: an empty incoming name never erases a known one, and a
+// late real name always lands. Without this a multi-image answer kept one
+// artifact row nameless forever, which is what made the second image render
+// without a label / stay unreferenced by the markdown rewriter.
 func (q *Queries) UpsertRunArtifact(ctx context.Context, arg UpsertRunArtifactParams) error {
 	_, err := q.db.ExecContext(ctx, upsertRunArtifact,
 		arg.ID,

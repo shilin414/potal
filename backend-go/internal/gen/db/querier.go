@@ -34,6 +34,16 @@ type Querier interface {
 	// loudly on uniq_run_event_sequence instead of silently renumbering.
 	AppendRunEvent(ctx context.Context, arg AppendRunEventParams) (sql.Result, error)
 	// Late-attachment race guard: only while queued.
+	//
+	// 第十一轮 P0-1: studio_attachment_ids is the STUDIO id list (local
+	// runtime_attachments.id). The provider id is minted by the worker at
+	// upload time and never stored on the run input.
+	//
+	// JSON_SET first, JSON_ARRAY_APPEND second: a bare JSON_ARRAY_APPEND on a
+	// path that does not exist yet yields NULL, which silently ERASED the whole
+	// run input for every run created without attachments (measured against
+	// MySQL 5.7: `JSON_ARRAY_APPEND('{"a":1}','$.k','v')` → NULL). Seeding the
+	// key with an empty array makes the append total instead of destructive.
 	AppendUserAttachmentToRunInput(ctx context.Context, arg AppendUserAttachmentToRunInputParams) (sql.Result, error)
 	ApplicationSlugExists(ctx context.Context, slug string) (int64, error)
 	// ─────────────────────────────────────────────── waiting_external ──
@@ -426,6 +436,8 @@ type Querier interface {
 	FailParkedExternalRun(ctx context.Context, arg FailParkedExternalRunParams) (sql.Result, error)
 	FailRunFenced(ctx context.Context, arg FailRunFencedParams) (sql.Result, error)
 	FailStuckDeliveries(ctx context.Context, arg FailStuckDeliveriesParams) (sql.Result, error)
+	// Favorites restricted to one page's ids (same §20 rationale).
+	FavoritesByApplications(ctx context.Context, arg FavoritesByApplicationsParams) ([]uint64, error)
 	FindBinding(ctx context.Context, arg FindBindingParams) (RuntimeBinding, error)
 	// Worker-owned mutations lock and validate the exact live lease after
 	// locking the run row. Expired ownership cannot be revived or used in the
@@ -577,10 +589,36 @@ type Querier interface {
 	// FIFO per schedule: scheduled_at first, id as the tiebreaker.
 	ListAdmissiblePendingOccurrences(ctx context.Context, limit int32) ([]ScheduleOccurrence, error)
 	ListAllRunEvents(ctx context.Context, runID []byte) ([]RunEvent, error)
+	// True keyset pagination for the catalog (执行报告 §14–§21, 2026-09-17).
+	//
+	// ONE query produces the page: the enabled binding is anti-joined (the
+	// newest enabled binding wins, mirroring GetEnabledBinding's
+	// `ORDER BY id DESC LIMIT 1`), which replaces the legacy
+	// ListEnabledBindings + N×ApplicationByID walk (the N+1 the report calls
+	// out in §18) AND covers unbound rows for free (b.id IS NULL).
+	//
+	// The WHERE clause fully encodes the visible() access policy so the Go
+	// layer does NOT re-filter (re-filtering would under-fill pages and break
+	// cursor determinism):
+	//   staff            → everything (show_all);
+	//   regular users    → enabled = 1, plus
+	//     scope=mine     → own rows (private included),
+	//     scope=public/manage → is_public = 1.
+	// kind: exclude_fixed → chat only; exclude_chat → non-chat ("fixed");
+	// neither → all. exclude_unbound drops binding-less rows (the legacy
+	// include_unbound=false semantics). Search is a case-insensitive substring
+	// match on name / description, mirroring the previous client-side filter.
+	// The cursor is the (created_at, id) keyset in ascending order — the same
+	// order the legacy list used, so page one keeps the existing UI ordering.
+	ListApplicationPage(ctx context.Context, arg ListApplicationPageParams) ([]ListApplicationPageRow, error)
 	// show_all lets staff bypass the SQL pre-filter; the authoritative
 	// scope check still happens in Go (visible()).
 	ListApplicationsByVisibility(ctx context.Context, arg ListApplicationsByVisibilityParams) ([]ListApplicationsByVisibilityRow, error)
 	ListBindingsByApplication(ctx context.Context, applicationID uint64) ([]RuntimeBinding, error)
+	// 第十一轮 P0-2: the worker attachment bridge reads the attachments THIS
+	// run owns. The run_id predicate is the ownership scope — the caller must
+	// pass the run id from its ExecutionOwnership fence, never a request value.
+	ListClaimedAttachmentsByRun(ctx context.Context, runID []byte) ([]RuntimeAttachment, error)
 	ListConversationsByApplication(ctx context.Context, arg ListConversationsByApplicationParams) ([]Conversation, error)
 	// Sidebar history: latest message + count via correlated scalar subqueries
 	// in the SELECT list (window functions are MySQL 8 only — the project must
@@ -614,9 +652,6 @@ type Querier interface {
 	// (CurrentDBTime minus the grace), never from the application clock — the
 	// same rule every other timing decision in this package follows.
 	ListParkedWaitingExternalRunIDs(ctx context.Context, arg ListParkedWaitingExternalRunIDsParams) ([][]byte, error)
-	// 第十一轮 P0-2: the worker attachment bridge reads the attachments THIS
-	// run owns.
-	ListClaimedAttachmentsByRun(ctx context.Context, runID []byte) ([]RuntimeAttachment, error)
 	ListPendingOutbox(ctx context.Context, limit int32) ([]OutboxEvent, error)
 	// Provider admission order. Base priority is explicit and waiting time
 	// adds a bounded bonus so scheduled/background work cannot starve.
@@ -654,7 +689,8 @@ type Querier interface {
 	LockUserRow(ctx context.Context, id uint64) (uint64, error)
 	// 第十一轮 P0-3: fenced attachment writeback. Both the attachment id AND
 	// its run_id are predicates, so a stale worker (or a mistyped id) can
-	// never stamp an external id onto another run's attachment.
+	// never stamp an external id onto another run's attachment. RowsAffected
+	// != 1 means the attachment is gone / not this run's → the caller stops.
 	MarkAttachmentUploadedFenced(ctx context.Context, arg MarkAttachmentUploadedFencedParams) (sql.Result, error)
 	MarkOccurrenceDeliverySnapshotCaptured(ctx context.Context, id uint64) (sql.Result, error)
 	MarkOccurrenceQueued(ctx context.Context, arg MarkOccurrenceQueuedParams) (sql.Result, error)
@@ -788,9 +824,22 @@ type Querier interface {
 	UpdateUserProfile(ctx context.Context, arg UpdateUserProfileParams) (sql.Result, error)
 	// Guarded by unique (run_id, external_artifact_id); empty external ids get
 	// their own row keyed by the generated PK.
+	//
+	// 第十一轮 P0-6: name is backfilled. The streaming discovery frame often
+	// carries no name while the final reconciliation does (or vice versa), so
+	// the SECOND write must be able to fill in what the first one lacked.
+	// IF(VALUES(name) = '', name, VALUES(name)) makes it monotone in one
+	// direction only: an empty incoming name never erases a known one, and a
+	// late real name always lands. Without this a multi-image answer kept one
+	// artifact row nameless forever, which is what made the second image render
+	// without a label / stay unreferenced by the markdown rewriter.
 	UpsertRunArtifact(ctx context.Context, arg UpsertRunArtifactParams) error
 	UpsertScheduleDelivery(ctx context.Context, arg UpsertScheduleDeliveryParams) (sql.Result, error)
 	UserUsageByApplication(ctx context.Context, userID sql.NullInt64) ([]UserUsageByApplicationRow, error)
+	// Per-page personal usage (执行报告 §20): only the ids on the current page
+	// are aggregated, instead of the user's ENTIRE run history on every list
+	// call. idx_runs_user_application_created (migration 0025) keeps it cheap.
+	UserUsageByApplications(ctx context.Context, arg UserUsageByApplicationsParams) ([]UserUsageByApplicationsRow, error)
 	UsernameExists(ctx context.Context, username string) (int64, error)
 }
 

@@ -288,6 +288,54 @@ export async function fetchManageableAgents(): Promise<ManagedAgent[]> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 服务端游标分页 (执行报告 §14–§24, 2026-09-17)
+//
+// GET /v2/applications/page evaluates LIMIT + the cursor condition inside
+// SQL and aggregates personal usage / favourites for the returned page ids
+// only. The legacy /v2/applications whole-array endpoint stays for callers
+// not yet migrated (catalog store, mention router — see the P1 bootstrap).
+// ---------------------------------------------------------------------------
+
+/** One keyset page of the application catalog. */
+export interface ApplicationPage {
+  items: V2Application[];
+  /** Opaque keyset anchor; '' when has_more is false. */
+  next_cursor: string;
+  has_more: boolean;
+}
+
+export interface ApplicationPageQuery {
+  /** 'chat' (market) | 'fixed' (应用中心, kind <> 'chat') | 'all'. */
+  kind?: 'chat' | 'fixed' | 'all';
+  scope?: 'public' | 'manage' | 'mine';
+  /** Keep binding-less rows (the marketplace needs them repairable). */
+  includeUnbound?: boolean;
+  /** Case-insensitive name/description substring, evaluated in SQL. */
+  q?: string;
+  /** Exact category slug; '__uncategorized__' matches rows with no category. */
+  categorySlug?: string;
+  /** Page size, 1..100 (default 24). */
+  limit?: number;
+  /** next_cursor from the previous page. */
+  cursor?: string | null;
+}
+
+export async function fetchApplicationPage(
+  options: ApplicationPageQuery = {},
+): Promise<ApplicationPage> {
+  const params: Record<string, string> = {};
+  const kind = options.kind ?? 'chat';
+  if (kind !== 'chat') params.kind = kind;
+  if (options.scope && options.scope !== 'public') params.scope = options.scope;
+  if (options.includeUnbound) params.include_unbound = 'true';
+  if (options.q && options.q.trim()) params.q = options.q.trim();
+  if (options.categorySlug) params.category_slug = options.categorySlug;
+  if (options.limit) params.limit = String(options.limit);
+  if (options.cursor) params.cursor = options.cursor;
+  return api.get<ApplicationPage>('/v2/applications/page', params);
+}
+
 export function fetchAgentRuntimes(): Promise<AgentRuntimeDescriptor[]> {
   return api.get<AgentRuntimeDescriptor[]>('/v2/runtimes');
 }

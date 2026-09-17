@@ -219,3 +219,77 @@ LEFT JOIN application_categories c ON c.id = a.category_id
 WHERE (sqlc.arg('show_all') OR a.is_public = ? OR a.created_by = ?)
 ORDER BY a.created_at
 LIMIT ?;
+
+-- name: ListApplicationPage :many
+-- True keyset pagination for the catalog (执行报告 §14–§21, 2026-09-17).
+--
+-- ONE query produces the page: the enabled binding is anti-joined (the
+-- newest enabled binding wins, mirroring GetEnabledBinding's
+-- `ORDER BY id DESC LIMIT 1`), which replaces the legacy
+-- ListEnabledBindings + N×ApplicationByID walk (the N+1 the report calls
+-- out in §18) AND covers unbound rows for free (b.id IS NULL).
+--
+-- The WHERE clause fully encodes the visible() access policy so the Go
+-- layer does NOT re-filter (re-filtering would under-fill pages and break
+-- cursor determinism):
+--   staff            → everything (show_all);
+--   regular users    → enabled = 1, plus
+--     scope=mine     → own rows (private included),
+--     scope=public/manage → is_public = 1.
+-- kind: exclude_fixed → chat only; exclude_chat → non-chat ("fixed");
+-- neither → all. exclude_unbound drops binding-less rows (the legacy
+-- include_unbound=false semantics). Search is a case-insensitive substring
+-- match on name / description, mirroring the previous client-side filter.
+-- The cursor is the (created_at, id) keyset in ascending order — the same
+-- order the legacy list used, so page one keeps the existing UI ordering.
+SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
+       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled,
+       a.usage_count, a.tags, a.default_config, a.created_by, a.organization_id,
+       a.created_at, a.updated_at,
+       c.slug AS category_slug, c.name AS category_name,
+       b.id AS binding_id, b.provider_id AS binding_provider_id, b.provider_key AS binding_provider_key,
+       b.runtime_type AS binding_runtime_type, b.external_resource_id AS binding_external_resource_id,
+       b.identity_mode AS binding_identity_mode, b.execution_mode AS binding_execution_mode,
+       b.session_policy AS binding_session_policy, b.artifact_policy AS binding_artifact_policy,
+       b.capabilities AS binding_capabilities, b.config AS binding_config,
+       b.timeout_seconds AS binding_timeout_seconds, b.enabled AS binding_enabled
+FROM applications a
+LEFT JOIN application_categories c ON c.id = a.category_id
+LEFT JOIN runtime_bindings b
+  ON b.application_id = a.id AND b.enabled = 1
+LEFT JOIN runtime_bindings newer_b
+  ON newer_b.application_id = b.application_id
+ AND newer_b.enabled = 1
+ AND newer_b.id > b.id
+WHERE newer_b.id IS NULL
+  AND (sqlc.arg('show_all') OR (a.enabled = 1 AND (
+        (sqlc.arg('mine_only') AND a.created_by = sqlc.arg('page_caller_id'))
+        OR (sqlc.arg('public_only') AND a.is_public = 1))))
+  AND ((sqlc.arg('kind_chat_only') AND a.kind = 'chat')
+       OR (sqlc.arg('kind_fixed_only') AND a.kind <> 'chat')
+       OR sqlc.arg('kind_all'))
+  AND (sqlc.arg('allow_unbound') OR b.id IS NOT NULL)
+  AND (sqlc.narg('search') IS NULL
+       OR a.name LIKE sqlc.arg('search_name_like')
+       OR COALESCE(a.description, '') LIKE sqlc.arg('search_desc_like'))
+  AND (sqlc.narg('category_slug') IS NULL
+       OR (sqlc.arg('category_is_null') AND a.category_id IS NULL)
+       OR c.slug = sqlc.arg('category_slug'))
+  AND (a.created_at > sqlc.arg('cursor_created_gt')
+       OR (a.created_at = sqlc.arg('cursor_created_eq') AND a.id > sqlc.arg('cursor_id_gt')))
+ORDER BY a.created_at, a.id
+LIMIT ?;
+
+-- name: UserUsageByApplications :many
+-- Per-page personal usage (执行报告 §20): only the ids on the current page
+-- are aggregated, instead of the user's ENTIRE run history on every list
+-- call. idx_runs_user_application_created (migration 0025) keeps it cheap.
+SELECT application_id, COUNT(*) AS usage_count, MAX(created_at) AS last_used_at
+FROM runs
+WHERE user_id = ? AND application_id IN (sqlc.slice('page_app_ids'))
+GROUP BY application_id;
+
+-- name: FavoritesByApplications :many
+-- Favorites restricted to one page's ids (same §20 rationale).
+SELECT application_id FROM application_favorites
+WHERE user_id = ? AND application_id IN (sqlc.slice('favorite_app_ids'));
