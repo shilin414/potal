@@ -55,11 +55,30 @@ func NewWorker(d *sql.DB, rdb *redisx.Client, workerID string, sender Sender, li
 
 func (w *Worker) stream() string { return w.RDB.Key("queue", ProviderKey) }
 
+// isMissingGroup reports whether err means the stream or its consumer group
+// is gone (Redis restart, key eviction, a FLUSHDB from a shared dev Redis).
+// XREADGROUP then fails with NOGROUP on every call: without recovery the pool
+// warns forever while dueScanLoop keeps re-adding messages nobody reads
+// (2026-09-16 实测：11 小时 133k 条 warn + stream 里 6290 条孤儿消息)。
+func isMissingGroup(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "NOGROUP")
+}
+
+func isBusyGroup(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "BUSYGROUP")
+}
+
+// ensureGroup creates the consumer group idempotently; BUSYGROUP is the
+// healthy "already exists" case, not a failure.
+func (w *Worker) ensureGroup(ctx context.Context) {
+	if err := w.RDB.XGroupCreateMkStream(ctx, w.stream(), group, "0").Err(); err != nil && !isBusyGroup(err) {
+		w.Log.Warn("delivery stream group create failed", "err", err, "stream", w.stream())
+	}
+}
+
 // Run starts the consumer pool plus recovery loops until ctx is done.
 func (w *Worker) Run(ctx context.Context) {
-	if err := w.RDB.XGroupCreateMkStream(ctx, w.stream(), group, "0").Err(); err != nil {
-		w.Log.Warn("delivery stream group create failed", "err", err)
-	}
+	w.ensureGroup(ctx)
 	var wg sync.WaitGroup
 	n := w.Concurrency
 	if n <= 0 {
@@ -101,7 +120,16 @@ func (w *Worker) loop(ctx context.Context, consumer int) {
 			if ctx.Err() != nil {
 				return
 			}
-			w.Log.Warn("delivery xreadgroup failed", "err", err)
+			if isMissingGroup(err) {
+				// Recreate and catch up: a fresh group reads every entry that
+				// was never delivered to it (including the ones dueScanLoop
+				// re-added while the group was missing). CAS still dedupes.
+				w.Log.Warn("delivery stream/consumer group missing, recreating",
+					"stream", w.stream(), "err", err)
+				w.ensureGroup(ctx)
+			} else {
+				w.Log.Warn("delivery xreadgroup failed", "err", err)
+			}
 			select {
 			case <-ctx.Done():
 				return
