@@ -49,7 +49,7 @@ func (s *Service) ListClaimedAttachments(ctx context.Context, own ExecutionOwner
 //	    WHERE id = ? AND run_id = ? AND external_attachment_id = ''
 //	COMMIT
 //
-// The write is deliberately conditional on external_attachment_id = '' so
+// The write is deliberately conditional on external_attachment_id = `”` so
 // the column stays SET-ONCE: a second worker that re-uploads (or a retry
 // that raced the first write) cannot replace an id the chat payload may
 // already reference.

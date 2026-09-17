@@ -624,14 +624,14 @@ func (c *deltaCoalescer) chunk() (payload map[string]any, ok bool) {
 // Execution order (第十一轮 P0-4 — the attachment bridge sits strictly
 // BEFORE the submit boundary):
 //
-//	1. thread()                     — conversation/provider session binding
-//	2. attachment preflight gate     — kill switch, because the uploads below
-//	                                   are provider IO
-//	3. prepareAttachments()          — studio ids → real Aily ids
-//	4. build SubmitInput             — carries the PROVIDER ids
-//	5. ValidateSubmit()              — local, no IO, no attempt consumed
-//	6. beginSubmit()                 — final gate + 'sending' + attempt CAS
-//	7. StreamPrepared()              — POST /chats
+//  1. thread()                     — conversation/provider session binding
+//  2. attachment preflight gate     — kill switch, because the uploads below
+//     are provider IO
+//  3. prepareAttachments()          — studio ids → real Aily ids
+//  4. build SubmitInput             — carries the PROVIDER ids
+//  5. ValidateSubmit()              — local, no IO, no attempt consumed
+//  6. beginSubmit()                 — final gate + 'sending' + attempt CAS
+//  7. StreamPrepared()              — POST /chats
 //
 // Step 2 exists as a separate checkpoint because step 3 is the first thing
 // in the run that talks to the provider. Step 6 stays where it was: it is

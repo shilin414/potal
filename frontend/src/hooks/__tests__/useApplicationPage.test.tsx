@@ -31,7 +31,9 @@ const app = (id: number, name = `agent-${id}`): V2Application => ({
 });
 
 const page = (ids: number[], next: string, hasMore: boolean): ApplicationPage => ({
-  items: ids.map(app), next_cursor: next, has_more: hasMore,
+  // Explicit arrow: `ids.map(app)` would feed the array index into app's
+  // optional `name: string` parameter.
+  items: ids.map((id) => app(id)), next_cursor: next, has_more: hasMore,
 });
 
 const flush = async (ms = 0) => {
@@ -47,7 +49,7 @@ function mountProbe(options: Record<string, unknown>, latest: Probe<ReturnType<t
   document.body.appendChild(host);
   const root = createRoot(host);
   function Probe() {
-    latest.current = useApplicationPage(options as Parameters<typeof useApplicationPage>[0]);
+    latest.current = useApplicationPage(options as unknown as Parameters<typeof useApplicationPage>[0]);
     return null;
   }
   return { host, root, element: React.createElement(Probe) };

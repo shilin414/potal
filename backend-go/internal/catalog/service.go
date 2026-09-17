@@ -62,17 +62,17 @@ var (
 
 // CreateInput mirrors ApplicationCreateRequest.
 type CreateInput struct {
-	Name            string
-	Slug            string
-	Description     string
-	Icon            string
-	Color           string
-	CategorySlug    string
-	CategoryName    string
-	IsPublic        bool
-	Kind            string
-	RendererKey     string
-	Runtime         *BindingInput
+	Name         string
+	Slug         string
+	Description  string
+	Icon         string
+	Color        string
+	CategorySlug string
+	CategoryName string
+	IsPublic     bool
+	Kind         string
+	RendererKey  string
+	Runtime      *BindingInput
 	// Skills is the agent-scoped 技能配置 stored in default_config.
 	Skills          []Skill
 	SetDefaultAgent bool
@@ -394,7 +394,8 @@ func (s *Service) applySkillsTx(ctx context.Context, tx *sql.Tx, appID int64, sk
 }
 
 // Delete removes an application unless conversations/runs reference it.
-func (s *Service) Delete(ctx context.Context, appID, callerID int64, isStaff bool) error {	app, err := s.ApplicationByID(ctx, appID)
+func (s *Service) Delete(ctx context.Context, appID, callerID int64, isStaff bool) error {
+	app, err := s.ApplicationByID(ctx, appID)
 	if err != nil {
 		return err
 	}
