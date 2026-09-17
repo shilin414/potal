@@ -1,6 +1,8 @@
 package http
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"sort"
 	"strings"
@@ -293,6 +295,18 @@ func bootstrapCategoryRail(rows []catalog.BootstrapCategory) []applicationCatego
 // catalog's own (`catalog.VisibleTo`), so a link can never open something the
 // market would hide, and an invisible application answers 404 like a
 // nonexistent one — existence is not leaked to a probe.
+//
+// Resolution is a CONSUMPTION entry point (二次复审 P0-5, 三次复审 P0-R3):
+// the facts come from ONE joined read (`ConsumptionBundleByID`) and go
+// through `catalog.Consumable`, which since P0-R3 also requires the binding's
+// PROVIDER to exist and be active — the same predicate AuthorizeExecution
+// enforces. Without it a staff caller could open /chat/whatever and only
+// discover at send time that the run is refused because an admin had
+// switched the provider off.
+//
+// Error mapping (三次复审 P1-R1): ErrNotFound → 404; ANY other failure
+// (DB timeout, connection reset) → 500. Collapsing both into 404 made a
+// backend outage tell the frontend "应用不存在" and destroyed deep links.
 func (s *Server) ResolveApplication(w http.ResponseWriter, r *http.Request, params genapi.ResolveApplicationParams) {
 	caller := userFrom(r.Context())
 	if caller == nil {
@@ -314,29 +328,31 @@ func (s *Server) ResolveApplication(w http.ResponseWriter, r *http.Request, para
 		return
 	}
 
-	var app *catalog.Application
+	var bundle *catalog.ConsumptionBundle
 	var err error
 	if slug != "" {
-		app, err = s.CatalogRepo.ApplicationBySlug(ctx, slug)
+		bundle, err = s.resolveBundleBySlug(ctx, slug)
 	} else {
-		app, err = s.CatalogRepo.ApplicationByID(ctx, id)
+		bundle, err = s.CatalogRepo.ConsumptionBundleByID(ctx, id)
 	}
 	if err != nil {
-		writeDetail(w, http.StatusNotFound, "application not found")
+		if errors.Is(err, catalog.ErrNotFound) {
+			writeDetail(w, http.StatusNotFound, "application not found")
+			return
+		}
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	app := bundle.Application
 	if !catalog.VisibleTo(app, catalog.VisibleScopeManage, caller.ID, caller.IsStaff) {
 		writeDetail(w, http.StatusNotFound, "application not found")
 		return
 	}
-
-	binding, _ := s.CatalogRepo.EnabledBinding(ctx, app.ID)
-	// Resolution is a CONSUMPTION entry point (二次复审 P0-5): a deep link
-	// is "open this and let me talk to it", so the same `Usable` predicate
-	// AuthorizeExecution enforces applies here. Without it a staff caller
-	// could open /chat/disabled-agent and only discover at send time that
-	// the run is refused.
-	if !catalog.Usable(app, binding) {
+	if !catalog.Consumable(catalog.ConsumptionFacts{
+		Application:    app,
+		Binding:        bundle.Binding,
+		ProviderStatus: bundle.ProviderStatus,
+	}) {
 		writeDetail(w, http.StatusNotFound, "application not found")
 		return
 	}
@@ -358,9 +374,20 @@ func (s *Server) ResolveApplication(w http.ResponseWriter, r *http.Request, para
 	}
 	providers := s.activeProviders(ctx)
 	item := s.buildListItem(
-		catalog.ApplicationWithBinding{App: app, Binding: binding},
+		catalog.ApplicationWithBinding{App: app, Binding: bundle.Binding},
 		providers, favorites, usageMapOf(usage), caller)
 	writeJSON(w, http.StatusOK, item)
+}
+
+// resolveBundleBySlug resolves the consumption bundle by slug. The bundle
+// query keys on id, so the slug is translated first — same ErrNotFound /
+// DB-error split as the id path (三次复审 P1-R1).
+func (s *Server) resolveBundleBySlug(ctx context.Context, slug string) (*catalog.ConsumptionBundle, error) {
+	app, err := s.CatalogRepo.ApplicationBySlug(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	return s.CatalogRepo.ConsumptionBundleByID(ctx, app.ID)
 }
 
 // ResolveApplicationMention implements GET /api/v2/applications/resolve-mention
@@ -408,10 +435,17 @@ func (s *Server) ResolveApplicationMention(w http.ResponseWriter, r *http.Reques
 	// substring search above may miss when the display name is unrelated
 	// (e.g. slug `sales-agent`, name `销售助手`) — the client-side router
 	// accepted it, so the server side must too. The same consume gate
-	// applies: an exact slug hit that cannot be run is not a candidate.
+	// applies (三次复审 P0-R3: provider included): an exact slug hit that
+	// cannot be run is not a candidate. The bundle read needs no error
+	// triage here — a miss or a lookup failure simply yields no candidate.
 	if app, err := s.CatalogRepo.ApplicationBySlug(ctx, q); err == nil &&
 		catalog.VisibleTo(app, catalog.VisibleScopeManage, caller.ID, caller.IsStaff) {
-		if binding, _ := s.CatalogRepo.EnabledBinding(ctx, app.ID); catalog.Usable(app, binding) {
+		if bundle, err := s.CatalogRepo.ConsumptionBundleByID(ctx, app.ID); err == nil &&
+			catalog.Consumable(catalog.ConsumptionFacts{
+				Application:    app,
+				Binding:        bundle.Binding,
+				ProviderStatus: bundle.ProviderStatus,
+			}) {
 			out = prependMention(out, mentionCandidate{
 				ID: app.ID, Slug: app.Slug, Name: app.Name, Kind: app.Kind,
 			})

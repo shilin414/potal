@@ -395,9 +395,10 @@ paths:
             disabled, private and binding-less rows so they can repair them.
             `consume` is every surface that opens or runs something
             (切换器 / 移动端目录 / bootstrap 分组): it requires
-            `enabled = 1` and, for `kind = chat`, an enabled runtime binding —
-            exactly the predicate `AuthorizeExecution` enforces, so the UI can
-            no longer offer an application that the run API then refuses.
+            `enabled = 1` and, for `kind = chat`, an enabled runtime binding
+            whose provider exists and is active — exactly the predicate
+            `AuthorizeExecution` enforces, so the UI can no longer offer an
+            application that the run API then refuses.
         - name: include_unbound
           in: query
           schema: { type: string }
@@ -522,14 +523,18 @@ paths:
     get:
       operationId: getApplication
       tags: [applications]
-      summary: Application detail (compact authoring shape)
+      summary: Application detail (compact authoring shape, manage-only)
       description: >
         Carries provider-authoring fields (`external_resource_id`,
         `identity_mode`, `execution_mode`), so it is NOT a public read: the
-        caller must be authenticated and the application must be VISIBLE to
-        them (二次复审 P0-3). Invisible and nonexistent both answer 404 —
-        otherwise the sequential id would let any logged-in user enumerate
-        every agent's provider resource id.
+        caller must be authenticated and must be able to MANAGE the
+        application (creator or staff — 三次复审 P0-R4.1). Visible-to-all
+        used to hand every logged-in caller back the authoring fields the
+        consumer DTO split had removed from list/resolve. Consumers read
+        through /applications/resolve, /applications/page and
+        /workspace/bootstrap instead. Non-manageable and nonexistent both
+        answer 404 — otherwise the sequential id would let any logged-in
+        user enumerate every agent's provider resource id.
       responses:
         "200":
           description: Detail
@@ -542,7 +547,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
         "404":
-          description: unknown or not visible to this caller
+          description: unknown or not manageable by this caller
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
@@ -560,13 +565,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApplicationDetail" }
-        "403":
-          description: only creator or staff
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/DetailError" }
         "404":
-          description: application not found
+          description: unknown or not manageable (opaque — sequential ids must not be enumerable, 三次复审 P0-R4.2)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
@@ -577,8 +577,8 @@ paths:
       responses:
         "204":
           description: Deleted
-        "403":
-          description: only creator or staff
+        "404":
+          description: unknown or not manageable (opaque — 三次复审 P0-R4.2)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
@@ -594,7 +594,12 @@ paths:
     post:
       operationId: favoriteApplication
       tags: [applications]
-      summary: Pin application (idempotent)
+      summary: Pin application (idempotent, visibility-checked)
+      description: >
+        三次复审 P0-R4.3: the favorite relation exists only for applications
+        the caller can SEE, so a hidden-but-real id answers the same opaque
+        404 as an unknown one — favoriting must not become an existence
+        oracle. Fixed applications keep their favorite relation (the ✩).
       responses:
         "200":
           description: Favorite state
@@ -602,14 +607,14 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/FavoriteResult" }
         "404":
-          description: application not found
+          description: application not found (or not visible — indistinguishable on purpose)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
     delete:
       operationId: unfavoriteApplication
       tags: [applications]
-      summary: Unpin application (idempotent)
+      summary: Unpin application (idempotent, visibility-checked)
       responses:
         "200":
           description: Favorite state
@@ -617,7 +622,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/FavoriteResult" }
         "404":
-          description: application not found
+          description: application not found (or not visible — indistinguishable on purpose)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }

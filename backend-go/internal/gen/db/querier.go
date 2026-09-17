@@ -94,7 +94,9 @@ type Querier interface {
 	//
 	//   * the visibility policy  — `show_all` (staff) OR `is_public = 1`;
 	//   * the CONSUME policy     — `enabled = 1` AND, for kind='chat', an
-	//                              enabled runtime binding (P0-5); a bootstrap
+	//                              enabled runtime binding whose provider exists
+	//                              and is active (P0-5 + 三次复审 P0-R3); a
+	//                              bootstrap
 	//                              group is a shortcut the user will click, so
 	//                              it must never offer something the run API
 	//                              would refuse.
@@ -525,6 +527,18 @@ type Querier interface {
 	GetBindingByID(ctx context.Context, id uint64) (RuntimeBinding, error)
 	GetCategoryByName(ctx context.Context, name string) (ApplicationCategory, error)
 	GetCategoryBySlug(ctx context.Context, slug string) (ApplicationCategory, error)
+	// ONE joined read of everything a SINGLE-application consumption decision
+	// needs (三次复审 P0-R3): the application row, its CURRENT enabled binding
+	// (the newest one wins — the same choice GetEnabledBinding and the catalog
+	// page's anti-join make) and the binding's provider status. It replaces the
+	// ApplicationByID → EnabledBinding → ProviderByKey serial walk, and it is
+	// what lets `Consumable` see the same provider fact `AuthorizeExecution`
+	// sees, so resolve / @mention can never open an application the run API
+	// would refuse because the admin switched the PROVIDER off.
+	//
+	// `b.*` / `p.status` are NULL when the application has no enabled binding /
+	// the binding has no providers row — the Go layer fails closed on both.
+	GetConsumptionBundle(ctx context.Context, id uint64) (GetConsumptionBundleRow, error)
 	GetConversationByID(ctx context.Context, id uint64) (Conversation, error)
 	// Conversation admission lock (评测 P0-2): CreateRunInTx takes this lock so
 	// the active-run count is re-read under it — two concurrent submits to the
@@ -676,10 +690,14 @@ type Querier interface {
 	// row" (a management concern), mode is "may anyone actually USE it"
 	// (consumption).
 	//   mode=consume   → additionally `enabled = 1` AND, for kind='chat', an
-	//                    enabled runtime binding (b.id IS NOT NULL). That is the
-	//                    SAME predicate AuthorizeExecution enforces, so a
-	//                    consumer surface can never list something the run API
-	//                    would then refuse. Staff is deliberately NOT exempt:
+	//                    enabled runtime binding whose PROVIDER EXISTS AND IS
+	//                    ACTIVE (三次复审 P0-R3). That is the SAME predicate
+	//                    AuthorizeExecution enforces — it joins the provider by
+	//                    provider_key and fails closed on a missing or inactive
+	//                    row — so a consumer surface can never list something
+	//                    the run API would then refuse, whether an admin
+	//                    disabled the binding OR THE PROVIDER ITSELF. Staff is
+	//                    deliberately NOT exempt:
 	//                    seeing a disabled agent in 智能体市场 is a management
 	//                    need, opening it from the switcher is not.
 	// kind: exclude_fixed → chat only; exclude_chat → non-chat ("fixed");

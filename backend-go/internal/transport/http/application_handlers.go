@@ -572,14 +572,21 @@ func dispTime(s string) *string {
 }
 
 // GetApplication implements GET /api/v2/applications/{id} — the AUTHORING
-// read (二次复审 P0-3).
+// read (二次复审 P0-3), and a MANAGEMENT-only surface since 三次复审 P0-R4.1.
 //
 // The shape it answers with carries the provider-authoring fields
-// (`external_resource_id`, `identity_mode`, `execution_mode`), so it is not a
-// public read: the caller must be authenticated AND the application must be
-// visible to them. Both "does not exist" and "not visible" answer 404 — never
-// 403 — because the id is sequential and a distinguishable 403 would turn
-// this endpoint into an existence oracle for the whole catalog.
+// (`external_resource_id`, `identity_mode`, `execution_mode`), so it is not
+// a public read. `VisibleTo` used to admit every logged-in caller for a
+// public application — which handed back exactly the authoring fields the
+// consumer DTO split had removed from every list/resolve response. The gate
+// is now `canManageCaller` (staff or the creator); consumers read through
+// /applications/resolve, /applications/page and /workspace/bootstrap.
+//
+// "Does not exist" and "exists but you may not manage it" both answer 404 —
+// never 403 — because the id is sequential and a distinguishable 403 would
+// turn this endpoint into an existence oracle for the whole catalog.
+// A database failure answers 500: disguising it as 404 would make an outage
+// look like "the application is gone" (三次复审 P1-R1).
 func (s *Server) GetApplication(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
 	caller := userFrom(r.Context())
 	if caller == nil {
@@ -588,15 +595,26 @@ func (s *Server) GetApplication(w http.ResponseWriter, r *http.Request, id genap
 	}
 	app, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
 	if err != nil {
-		writeDetail(w, http.StatusNotFound, "application not found")
+		if errors.Is(err, catalog.ErrNotFound) {
+			writeDetail(w, http.StatusNotFound, "application not found")
+			return
+		}
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if !catalog.VisibleTo(app, catalog.VisibleScopeManage, caller.ID, caller.IsStaff) {
+	if !canManageCaller(app, caller) {
 		s.denyApplicationVisibility("detail")
 		writeDetail(w, http.StatusNotFound, "application not found")
 		return
 	}
-	binding, _ := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	binding, err := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	if err != nil && !errors.Is(err, catalog.ErrNotFound) {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if errors.Is(err, catalog.ErrNotFound) {
+		binding = nil
+	}
 	writeJSON(w, http.StatusOK, s.appDetail(app, binding, caller))
 }
 
@@ -608,6 +626,30 @@ func (s *Server) denyApplicationVisibility(surface string) {
 		return
 	}
 	s.Metric.ApplicationVisibilityDeniedTotal.WithLabelValues(surface).Inc()
+}
+
+// writeApplicationAccessError collapses the two access outcomes a
+// sequential-id application surface can produce onto ONE opaque 404
+// (三次复审 P0-R4.2). Before this existed the management mutations answered
+// 403 for "exists but not yours" and fell through to 500 for a missing row,
+// so PATCHing ids 1, 2, 3… distinguished hidden rows from absent ones — the
+// by-id GET endpoints' non-disclosure was never an endpoint-level invariant.
+//
+//	route miss (catalog.ErrNotFound)   → 404 application not found
+//	no manage right (ErrNotManageable) → 404 application not found
+//	anything else (DB failure …)       → false; the caller's own mapping
+//	                                     answers 500 (never a fake 404, P1-R1)
+//
+// It returns true when a response has been written. Applied to every
+// sequential-id surface: GET detail, PATCH, DELETE, avatar up/clear,
+// default-agent set/unset.
+func (s *Server) writeApplicationAccessError(w http.ResponseWriter, err error, surface string) bool {
+	if errors.Is(err, catalog.ErrNotFound) || errors.Is(err, catalog.ErrNotManageable) {
+		s.denyApplicationVisibility(surface)
+		writeDetail(w, http.StatusNotFound, "application not found")
+		return true
+	}
+	return false
 }
 
 func (s *Server) CreateApplication(w http.ResponseWriter, r *http.Request) {
@@ -719,6 +761,11 @@ func (s *Server) UpdateApplication(w http.ResponseWriter, r *http.Request, id ge
 		body.Name, body.Description, body.Icon, body.Color, body.IsPublic, body.Enabled,
 		body.CategorySlug, body.CategoryName, runtime, body.SetDefaultAgent, body.Skills)
 	if err != nil {
+		// Sequential-id opaque 404 first (三次复审 P0-R4.2); everything else
+		// (payload validation, DB failure) keeps its own mapping.
+		if s.writeApplicationAccessError(w, err, "mutation") {
+			return
+		}
 		s.writeCatalogError(w, err)
 		return
 	}
@@ -732,6 +779,9 @@ func (s *Server) DeleteApplication(w http.ResponseWriter, r *http.Request, id ge
 		return
 	}
 	if err := s.Catalog.Delete(r.Context(), int64(id), caller.ID, caller.IsStaff); err != nil {
+		if s.writeApplicationAccessError(w, err, "mutation") {
+			return
+		}
 		s.writeCatalogError(w, err)
 		return
 	}
@@ -782,14 +832,21 @@ func (s *Server) writeCatalogError(w http.ResponseWriter, err error) {
 
 // ────────────────────────────────────────────────── favorite / default ──
 
+// Favorite / Unfavorite (三次复审 P0-R4.3): the service now applies the
+// visibility policy, so "hidden but real" and "unknown" both arrive as
+// catalog.ErrNotFound — ONE opaque 404. A database failure is a 500, never a
+// fake 404 (P1-R1): an outage must not look like "the application is gone".
 func (s *Server) FavoriteApplication(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
 	caller := userFrom(r.Context())
 	if caller == nil {
 		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
 		return
 	}
-	if err := s.Catalog.Favorite(r.Context(), int64(id), caller.ID); err != nil {
-		writeDetail(w, http.StatusNotFound, "application not found")
+	if err := s.Catalog.Favorite(r.Context(), int64(id), caller.ID, caller.IsStaff); err != nil {
+		if s.writeApplicationAccessError(w, err, "favorite") {
+			return
+		}
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"application_id": int64(id), "is_favorite": true})
@@ -801,13 +858,19 @@ func (s *Server) UnfavoriteApplication(w http.ResponseWriter, r *http.Request, i
 		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
 		return
 	}
-	if err := s.Catalog.Unfavorite(r.Context(), int64(id), caller.ID); err != nil {
-		writeDetail(w, http.StatusNotFound, "application not found")
+	if err := s.Catalog.Unfavorite(r.Context(), int64(id), caller.ID, caller.IsStaff); err != nil {
+		if s.writeApplicationAccessError(w, err, "favorite") {
+			return
+		}
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"application_id": int64(id), "is_favorite": false})
 }
 
+// SetDefaultAgent: the service rejects through promoteDefaultIfEligibleTx
+// (三次复审 P0-R1); access errors are opaque 404s like every by-id surface,
+// and the response body's re-read no longer swallows a DB failure (P1-R1).
 func (s *Server) SetDefaultAgent(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
 	caller := userFrom(r.Context())
 	if caller == nil {
@@ -815,11 +878,29 @@ func (s *Server) SetDefaultAgent(w http.ResponseWriter, r *http.Request, id gena
 		return
 	}
 	if err := s.Catalog.SetDefaultAgent(r.Context(), int64(id), caller.ID, caller.IsStaff); err != nil {
+		if s.writeApplicationAccessError(w, err, "mutation") {
+			return
+		}
 		s.writeCatalogError(w, err)
 		return
 	}
-	app, _ := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
-	binding, _ := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	app, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
+	if err != nil {
+		if errors.Is(err, catalog.ErrNotFound) {
+			writeDetail(w, http.StatusNotFound, "application not found")
+			return
+		}
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	binding, err := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	if err != nil && !errors.Is(err, catalog.ErrNotFound) {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if errors.Is(err, catalog.ErrNotFound) {
+		binding = nil
+	}
 	writeJSON(w, http.StatusOK, s.appDetail(app, binding, caller))
 }
 
@@ -830,11 +911,29 @@ func (s *Server) UnsetDefaultAgent(w http.ResponseWriter, r *http.Request, id ge
 		return
 	}
 	if err := s.Catalog.UnsetDefaultAgent(r.Context(), int64(id), caller.ID, caller.IsStaff); err != nil {
+		if s.writeApplicationAccessError(w, err, "mutation") {
+			return
+		}
 		s.writeCatalogError(w, err)
 		return
 	}
-	app, _ := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
-	binding, _ := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	app, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
+	if err != nil {
+		if errors.Is(err, catalog.ErrNotFound) {
+			writeDetail(w, http.StatusNotFound, "application not found")
+			return
+		}
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	binding, err := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	if err != nil && !errors.Is(err, catalog.ErrNotFound) {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if errors.Is(err, catalog.ErrNotFound) {
+		binding = nil
+	}
 	writeJSON(w, http.StatusOK, s.appDetail(app, binding, caller))
 }
 
@@ -866,7 +965,17 @@ func (s *Server) GetApplicationAvatar(w http.ResponseWriter, r *http.Request, id
 		return
 	}
 	app, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
-	if err != nil || app.AvatarKey == "" {
+	if err != nil {
+		// A database failure is a 500 — answering 404 would tell the caller
+		// "the application is gone" during an outage (三次复审 P1-R1).
+		if errors.Is(err, catalog.ErrNotFound) {
+			writeDetail(w, http.StatusNotFound, "avatar not set")
+			return
+		}
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if app.AvatarKey == "" {
 		writeDetail(w, http.StatusNotFound, "avatar not set")
 		return
 	}
@@ -928,11 +1037,20 @@ func (s *Server) UploadApplicationAvatar(w http.ResponseWriter, r *http.Request,
 	}
 	app, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
 	if err != nil {
-		writeDetail(w, http.StatusNotFound, "application not found")
+		// Sequential-id opaque 404 for a missing row, 500 for a DB failure
+		// (三次复审 P0-R4.2 / P1-R1). The same pair applies to the manage
+		// check below: a 403 would confirm the row exists to a caller who
+		// cannot manage it.
+		if errors.Is(err, catalog.ErrNotFound) {
+			writeDetail(w, http.StatusNotFound, "application not found")
+			return
+		}
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if !canManageCaller(app, caller) {
-		writeDetail(w, http.StatusForbidden, catalog.ErrNotManageable.Error())
+		s.denyApplicationVisibility("mutation")
+		writeDetail(w, http.StatusNotFound, "application not found")
 		return
 	}
 	file, header, err := r.FormFile("file")
@@ -968,8 +1086,26 @@ func (s *Server) UploadApplicationAvatar(w http.ResponseWriter, r *http.Request,
 	if old != "" && old != key {
 		_ = s.Storage.Delete(r.Context(), old)
 	}
-	updated, _ := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
-	binding, _ := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	updated, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
+	if err != nil {
+		// The write succeeded; only the response read failed. A missing row
+		// here means a concurrent delete, a DB failure is a 500 — never
+		// re-answer a misleading success (三次复审 P1-R1).
+		if errors.Is(err, catalog.ErrNotFound) {
+			writeDetail(w, http.StatusNotFound, "application not found")
+			return
+		}
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	binding, err := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	if err != nil && !errors.Is(err, catalog.ErrNotFound) {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if errors.Is(err, catalog.ErrNotFound) {
+		binding = nil
+	}
 	writeJSON(w, http.StatusOK, s.appDetail(updated, binding, caller))
 }
 
@@ -981,11 +1117,17 @@ func (s *Server) ClearApplicationAvatar(w http.ResponseWriter, r *http.Request, 
 	}
 	app, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
 	if err != nil {
-		writeDetail(w, http.StatusNotFound, "application not found")
+		// Same opaque pair as UploadApplicationAvatar (三次复审 P0-R4.2).
+		if errors.Is(err, catalog.ErrNotFound) {
+			writeDetail(w, http.StatusNotFound, "application not found")
+			return
+		}
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	if !canManageCaller(app, caller) {
-		writeDetail(w, http.StatusForbidden, catalog.ErrNotManageable.Error())
+		s.denyApplicationVisibility("mutation")
+		writeDetail(w, http.StatusNotFound, "application not found")
 		return
 	}
 	if app.AvatarKey != "" {
@@ -995,8 +1137,23 @@ func (s *Server) ClearApplicationAvatar(w http.ResponseWriter, r *http.Request, 
 		}
 		_ = s.Storage.Delete(r.Context(), app.AvatarKey)
 	}
-	updated, _ := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
-	binding, _ := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	updated, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
+	if err != nil {
+		if errors.Is(err, catalog.ErrNotFound) {
+			writeDetail(w, http.StatusNotFound, "application not found")
+			return
+		}
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	binding, err := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
+	if err != nil && !errors.Is(err, catalog.ErrNotFound) {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if errors.Is(err, catalog.ErrNotFound) {
+		binding = nil
+	}
 	writeJSON(w, http.StatusOK, s.appDetail(updated, binding, caller))
 }
 

@@ -206,34 +206,45 @@ func TestRankMentionCandidatesCapsAndPrependsWithoutDuplicate(t *testing.T) {
 // The CONSUME predicate is what stops a staff caller from opening an
 // application the run API would refuse (二次复审 P0-5). It is the shared
 // contract behind resolve, @mention, the bootstrap groups and
-// AuthorizeExecution, so it is pinned here too.
-func TestUsableRequiresEnabledAndABindingForChat(t *testing.T) {
+// AuthorizeExecution, so it is pinned here too. Since 三次复审 P0-R3 the
+// predicate ALSO requires the binding's provider to exist and be active —
+// the exact fact AuthorizeExecution fails closed on.
+func TestConsumableRequiresEnabledBindingAndLiveProvider(t *testing.T) {
+	active := "active"
+	inactive := "disabled"
 	chat := &catalog.Application{Kind: "chat", Enabled: true}
 	fixed := &catalog.Application{Kind: "task", Enabled: true}
 	bound := &catalog.Binding{Enabled: true}
+	on := func(f catalog.ConsumptionFacts) bool { return catalog.Consumable(f) }
 
-	if catalog.Usable(chat, bound) != true {
-		t.Fatal("an enabled + bound chat application must be usable")
+	if on(catalog.ConsumptionFacts{Application: chat, Binding: bound, ProviderStatus: &active}) != true {
+		t.Fatal("an enabled + bound chat application with an ACTIVE provider must be consumable")
 	}
-	if catalog.Usable(chat, nil) != false {
-		t.Fatal("a chat application without a binding must NOT be usable")
+	if on(catalog.ConsumptionFacts{Application: chat, Binding: bound, ProviderStatus: &inactive}) != false {
+		t.Fatal("an INACTIVE provider must NOT be consumable (P0-R3)")
 	}
-	if catalog.Usable(chat, &catalog.Binding{Enabled: false}) != false {
-		t.Fatal("a DISABLED binding must NOT be usable")
+	if on(catalog.ConsumptionFacts{Application: chat, Binding: bound}) != false {
+		t.Fatal("a binding whose provider row is MISSING must NOT be consumable (P0-R3, fail closed)")
 	}
-	if !catalog.Usable(fixed, nil) {
-		t.Fatal("a fixed application is a build-delivered page: no binding needed")
+	if on(catalog.ConsumptionFacts{Application: chat, Binding: nil, ProviderStatus: &active}) != false {
+		t.Fatal("a chat application without a binding must NOT be consumable")
+	}
+	if on(catalog.ConsumptionFacts{Application: chat, Binding: &catalog.Binding{Enabled: false}, ProviderStatus: &active}) != false {
+		t.Fatal("a DISABLED binding must NOT be consumable")
+	}
+	if !on(catalog.ConsumptionFacts{Application: fixed, Binding: nil, ProviderStatus: nil}) {
+		t.Fatal("a fixed application is a build-delivered page: no binding, no provider needed")
 	}
 	// The admin kill switch is absolute, for every kind and every caller.
 	disabled := &catalog.Application{Kind: "chat", Enabled: false}
-	if catalog.Usable(disabled, bound) != false {
-		t.Fatal("a disabled application must never be usable")
+	if on(catalog.ConsumptionFacts{Application: disabled, Binding: bound, ProviderStatus: &active}) != false {
+		t.Fatal("a disabled application must never be consumable")
 	}
 	disabledFixed := &catalog.Application{Kind: "task", Enabled: false}
-	if catalog.Usable(disabledFixed, nil) != false {
-		t.Fatal("a disabled fixed application must never be usable")
+	if on(catalog.ConsumptionFacts{Application: disabledFixed, Binding: nil}) != false {
+		t.Fatal("a disabled fixed application must never be consumable")
 	}
-	if catalog.Usable(nil, bound) != false {
-		t.Fatal("a missing application must never be usable")
+	if on(catalog.ConsumptionFacts{Application: nil, Binding: bound, ProviderStatus: &active}) != false {
+		t.Fatal("a missing application must never be consumable")
 	}
 }

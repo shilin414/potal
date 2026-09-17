@@ -37,10 +37,14 @@ LEFT JOIN runtime_bindings newer_b
   ON newer_b.application_id = b.application_id
  AND newer_b.enabled = 1
  AND newer_b.id > b.id
+LEFT JOIN providers p
+  ON p.provider_key = b.provider_key
 WHERE newer_b.id IS NULL
   AND a.enabled = 1
   AND a.kind = 'chat'
   AND b.id IS NOT NULL
+  AND p.id IS NOT NULL
+  AND p.status = 'active'
   AND (? OR a.is_public = 1)
 GROUP BY a.category_id, c.slug, c.name
 ORDER BY MIN(a.created_at), category_slug
@@ -134,6 +138,8 @@ LEFT JOIN runtime_bindings newer_b
   ON newer_b.application_id = b.application_id
  AND newer_b.enabled = 1
  AND newer_b.id > b.id
+LEFT JOIN providers p
+  ON p.provider_key = b.provider_key
 LEFT JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
            FROM runs r WHERE r.user_id = ?
            GROUP BY r.application_id) u
@@ -142,6 +148,8 @@ WHERE newer_b.id IS NULL
   AND a.enabled = 1
   AND a.kind = 'chat'
   AND b.id IS NOT NULL
+  AND p.id IS NOT NULL
+  AND p.status = 'active'
   AND (? OR a.is_public = 1)
 ORDER BY a.is_default_agent DESC, a.created_at, a.id
 LIMIT 1
@@ -179,7 +187,9 @@ type BootstrapDefaultApplicationRow struct {
 //
 //   - the visibility policy  — `show_all` (staff) OR `is_public = 1`;
 //   - the CONSUME policy     — `enabled = 1` AND, for kind='chat', an
-//     enabled runtime binding (P0-5); a bootstrap
+//     enabled runtime binding whose provider exists
+//     and is active (P0-5 + 三次复审 P0-R3); a
+//     bootstrap
 //     group is a shortcut the user will click, so
 //     it must never offer something the run API
 //     would refuse.
@@ -216,6 +226,8 @@ LEFT JOIN runtime_bindings newer_b
   ON newer_b.application_id = b.application_id
  AND newer_b.enabled = 1
  AND newer_b.id > b.id
+LEFT JOIN providers p
+  ON p.provider_key = b.provider_key
 LEFT JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
            FROM runs r WHERE r.user_id = ?
            GROUP BY r.application_id) u
@@ -225,6 +237,8 @@ WHERE f.user_id = ?
   AND a.enabled = 1
   AND a.kind = 'chat'
   AND b.id IS NOT NULL
+  AND p.id IS NOT NULL
+  AND p.status = 'active'
   AND (? OR a.is_public = 1)
 ORDER BY u.last_used_at DESC, a.name
 LIMIT ?
@@ -289,10 +303,14 @@ LEFT JOIN runtime_bindings newer_b
   ON newer_b.application_id = b.application_id
  AND newer_b.enabled = 1
  AND newer_b.id > b.id
+LEFT JOIN providers p
+  ON p.provider_key = b.provider_key
 WHERE newer_b.id IS NULL
   AND a.enabled = 1
   AND a.kind = 'chat'
   AND b.id IS NOT NULL
+  AND p.id IS NOT NULL
+  AND p.status = 'active'
   AND (? OR a.is_public = 1)
 ORDER BY u.usage_count DESC, u.last_used_at DESC, a.name
 LIMIT ?
@@ -349,10 +367,14 @@ LEFT JOIN runtime_bindings newer_b
   ON newer_b.application_id = b.application_id
  AND newer_b.enabled = 1
  AND newer_b.id > b.id
+LEFT JOIN providers p
+  ON p.provider_key = b.provider_key
 WHERE newer_b.id IS NULL
   AND a.enabled = 1
   AND a.kind = 'chat'
   AND b.id IS NOT NULL
+  AND p.id IS NOT NULL
+  AND p.status = 'active'
   AND (? OR a.is_public = 1)
 ORDER BY u.last_used_at DESC, a.created_at, a.id
 LIMIT ?
@@ -464,6 +486,8 @@ LEFT JOIN runtime_bindings newer_b
   ON newer_b.application_id = b.application_id
  AND newer_b.enabled = 1
  AND newer_b.id > b.id
+LEFT JOIN providers p
+  ON p.provider_key = b.provider_key
 LEFT JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
            FROM runs r WHERE r.user_id = ?
            GROUP BY r.application_id) u
@@ -472,6 +496,8 @@ WHERE newer_b.id IS NULL
   AND a.enabled = 1
   AND a.kind = 'chat'
   AND b.id IS NOT NULL
+  AND p.id IS NOT NULL
+  AND p.status = 'active'
   AND (? OR a.is_public = 1)
   AND NOT EXISTS (SELECT 1 FROM runs r
                   WHERE r.user_id = ? AND r.application_id = a.id)
@@ -1003,6 +1029,129 @@ func (q *Queries) GetCategoryBySlug(ctx context.Context, slug string) (Applicati
 	return i, err
 }
 
+const getConsumptionBundle = `-- name: GetConsumptionBundle :one
+SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
+       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled,
+       a.usage_count, a.tags, a.default_config, a.created_by, a.organization_id,
+       a.created_at, a.updated_at,
+       c.slug AS category_slug, c.name AS category_name,
+       b.id AS binding_id, b.provider_id AS binding_provider_id, b.provider_key AS binding_provider_key,
+       b.runtime_type AS binding_runtime_type, b.external_resource_id AS binding_external_resource_id,
+       b.identity_mode AS binding_identity_mode, b.execution_mode AS binding_execution_mode,
+       b.session_policy AS binding_session_policy, b.artifact_policy AS binding_artifact_policy,
+       b.capabilities AS binding_capabilities, b.config AS binding_config,
+       b.timeout_seconds AS binding_timeout_seconds, b.enabled AS binding_enabled,
+       p.status AS provider_status
+FROM applications a
+LEFT JOIN application_categories c ON c.id = a.category_id
+LEFT JOIN runtime_bindings b
+  ON b.application_id = a.id AND b.enabled = 1
+LEFT JOIN runtime_bindings newer_b
+  ON newer_b.application_id = b.application_id
+ AND newer_b.enabled = 1
+ AND newer_b.id > b.id
+LEFT JOIN providers p
+  ON p.provider_key = b.provider_key
+WHERE newer_b.id IS NULL
+  AND a.id = ?
+`
+
+type GetConsumptionBundleRow struct {
+	ID                        uint64
+	Slug                      string
+	Name                      string
+	Description               string
+	Icon                      string
+	AvatarKey                 string
+	Color                     string
+	Kind                      string
+	RendererKey               string
+	ExecutorKey               string
+	CategoryID                sql.NullInt64
+	IsPublic                  bool
+	IsDefaultAgent            bool
+	Enabled                   bool
+	UsageCount                uint32
+	Tags                      dbtypes.JSONText
+	DefaultConfig             dbtypes.JSONText
+	CreatedBy                 sql.NullInt64
+	OrganizationID            sql.NullInt64
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
+	CategorySlug              sql.NullString
+	CategoryName              sql.NullString
+	BindingID                 sql.NullInt64
+	BindingProviderID         sql.NullInt64
+	BindingProviderKey        sql.NullString
+	BindingRuntimeType        sql.NullString
+	BindingExternalResourceID sql.NullString
+	BindingIdentityMode       sql.NullString
+	BindingExecutionMode      sql.NullString
+	BindingSessionPolicy      sql.NullString
+	BindingArtifactPolicy     sql.NullString
+	BindingCapabilities       dbtypes.JSONText
+	BindingConfig             dbtypes.JSONText
+	BindingTimeoutSeconds     sql.NullInt32
+	BindingEnabled            sql.NullBool
+	ProviderStatus            sql.NullString
+}
+
+// ONE joined read of everything a SINGLE-application consumption decision
+// needs (三次复审 P0-R3): the application row, its CURRENT enabled binding
+// (the newest one wins — the same choice GetEnabledBinding and the catalog
+// page's anti-join make) and the binding's provider status. It replaces the
+// ApplicationByID → EnabledBinding → ProviderByKey serial walk, and it is
+// what lets `Consumable` see the same provider fact `AuthorizeExecution`
+// sees, so resolve / @mention can never open an application the run API
+// would refuse because the admin switched the PROVIDER off.
+//
+// `b.*` / `p.status` are NULL when the application has no enabled binding /
+// the binding has no providers row — the Go layer fails closed on both.
+func (q *Queries) GetConsumptionBundle(ctx context.Context, id uint64) (GetConsumptionBundleRow, error) {
+	row := q.db.QueryRowContext(ctx, getConsumptionBundle, id)
+	var i GetConsumptionBundleRow
+	err := row.Scan(
+		&i.ID,
+		&i.Slug,
+		&i.Name,
+		&i.Description,
+		&i.Icon,
+		&i.AvatarKey,
+		&i.Color,
+		&i.Kind,
+		&i.RendererKey,
+		&i.ExecutorKey,
+		&i.CategoryID,
+		&i.IsPublic,
+		&i.IsDefaultAgent,
+		&i.Enabled,
+		&i.UsageCount,
+		&i.Tags,
+		&i.DefaultConfig,
+		&i.CreatedBy,
+		&i.OrganizationID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.CategorySlug,
+		&i.CategoryName,
+		&i.BindingID,
+		&i.BindingProviderID,
+		&i.BindingProviderKey,
+		&i.BindingRuntimeType,
+		&i.BindingExternalResourceID,
+		&i.BindingIdentityMode,
+		&i.BindingExecutionMode,
+		&i.BindingSessionPolicy,
+		&i.BindingArtifactPolicy,
+		&i.BindingCapabilities,
+		&i.BindingConfig,
+		&i.BindingTimeoutSeconds,
+		&i.BindingEnabled,
+		&i.ProviderStatus,
+	)
+	return i, err
+}
+
 const getDefaultAgent = `-- name: GetDefaultAgent :one
 SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
        a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled,
@@ -1328,12 +1477,15 @@ LEFT JOIN runtime_bindings newer_b
   ON newer_b.application_id = b.application_id
  AND newer_b.enabled = 1
  AND newer_b.id > b.id
+LEFT JOIN providers p
+  ON p.provider_key = b.provider_key
 WHERE newer_b.id IS NULL
   AND (? OR (a.enabled = 1 AND (
         (? AND a.created_by = ?)
         OR (? AND a.is_public = 1))))
   AND (? = 0
-       OR (a.enabled = 1 AND (a.kind <> 'chat' OR b.id IS NOT NULL)))
+       OR (a.enabled = 1 AND (a.kind <> 'chat'
+           OR (b.id IS NOT NULL AND p.id IS NOT NULL AND p.status = 'active'))))
   AND ((? AND a.kind = 'chat')
        OR (? AND a.kind <> 'chat')
        OR ?)
@@ -1433,10 +1585,14 @@ type ListApplicationPageRow struct {
 // (consumption).
 //
 //	mode=consume   → additionally `enabled = 1` AND, for kind='chat', an
-//	                 enabled runtime binding (b.id IS NOT NULL). That is the
-//	                 SAME predicate AuthorizeExecution enforces, so a
-//	                 consumer surface can never list something the run API
-//	                 would then refuse. Staff is deliberately NOT exempt:
+//	                 enabled runtime binding whose PROVIDER EXISTS AND IS
+//	                 ACTIVE (三次复审 P0-R3). That is the SAME predicate
+//	                 AuthorizeExecution enforces — it joins the provider by
+//	                 provider_key and fails closed on a missing or inactive
+//	                 row — so a consumer surface can never list something
+//	                 the run API would then refuse, whether an admin
+//	                 disabled the binding OR THE PROVIDER ITSELF. Staff is
+//	                 deliberately NOT exempt:
 //	                 seeing a disabled agent in 智能体市场 is a management
 //	                 need, opening it from the switcher is not.
 //
@@ -1559,11 +1715,14 @@ LEFT JOIN runtime_bindings newer_b
   ON newer_b.application_id = b.application_id
  AND newer_b.enabled = 1
  AND newer_b.id > b.id
+LEFT JOIN providers p
+  ON p.provider_key = b.provider_key
 WHERE newer_b.id IS NULL
   AND a.id IN (/*SLICE:app_ids*/?)
   AND a.enabled = 1
   AND (? OR a.is_public = 1)
-  AND (a.kind <> 'chat' OR b.id IS NOT NULL)
+  AND (a.kind <> 'chat'
+       OR (b.id IS NOT NULL AND p.id IS NOT NULL AND p.status = 'active'))
 ORDER BY a.created_at, a.id
 `
 

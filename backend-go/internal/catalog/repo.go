@@ -123,6 +123,96 @@ func (r *Repo) ApplicationBySlug(ctx context.Context, slug string) (*Application
 	return a, nil
 }
 
+// ConsumptionBundle is the single-object read `Consumable` decides on: the
+// application, its current enabled binding (nil when the application has
+// none) and that binding's provider status (nil when the provider row is
+// missing — the same fail-closed shape AuthorizeExecution reads).
+type ConsumptionBundle struct {
+	Application    *Application
+	Binding        *Binding
+	ProviderStatus *string
+}
+
+// ConsumptionBundleByID loads one application's consumption facts with ONE
+// joined query (三次复审 P0-R3) — application + current enabled binding
+// (newest wins, mirroring GetEnabledBinding) + provider — instead of the
+// ApplicationByID → EnabledBinding → ProviderByKey serial walk. The join
+// keeps `resolve` / `@mention` on the same provider fact AuthorizeExecution
+// reads, and ErrNotFound maps exactly like every other single-row read.
+func (r *Repo) ConsumptionBundleByID(ctx context.Context, id int64) (*ConsumptionBundle, error) {
+	row, err := r.q(ctx).GetConsumptionBundle(ctx, uint64(id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	app := &Application{
+		ID:             int64(row.ID),
+		Slug:           row.Slug,
+		Name:           row.Name,
+		Description:    row.Description,
+		Icon:           row.Icon,
+		AvatarKey:      row.AvatarKey,
+		Color:          row.Color,
+		Kind:           row.Kind,
+		RendererKey:    row.RendererKey,
+		ExecutorKey:    row.ExecutorKey,
+		CategorySlug:   row.CategorySlug.String,
+		CategoryName:   row.CategoryName.String,
+		IsPublic:       row.IsPublic,
+		Enabled:        row.Enabled,
+		IsDefaultAgent: row.IsDefaultAgent,
+		UsageCount:     int64(row.UsageCount),
+		Skills:         ParseSkills(row.DefaultConfig),
+		CreatedAt:      row.CreatedAt,
+		UpdatedAt:      row.UpdatedAt,
+	}
+	if row.CategoryID.Valid {
+		v := int64(row.CategoryID.Int64)
+		app.CategoryID = &v
+	}
+	if row.CreatedBy.Valid {
+		v := int64(row.CreatedBy.Int64)
+		app.CreatedBy = &v
+	}
+	out := &ConsumptionBundle{Application: app}
+	if !row.BindingID.Valid {
+		return out, nil
+	}
+	b := &Binding{
+		ID:                 row.BindingID.Int64,
+		ApplicationID:      app.ID,
+		ProviderKey:        row.BindingProviderKey.String,
+		RuntimeType:        row.BindingRuntimeType.String,
+		ExternalResourceID: row.BindingExternalResourceID.String,
+		IdentityMode:       row.BindingIdentityMode.String,
+		ExecutionMode:      row.BindingExecutionMode.String,
+		SessionPolicy:      row.BindingSessionPolicy.String,
+		ArtifactPolicy:     row.BindingArtifactPolicy.String,
+		TimeoutSeconds:     int64(row.BindingTimeoutSeconds.Int32),
+		Enabled:            row.BindingEnabled.Bool,
+	}
+	if row.BindingProviderID.Valid {
+		v := int64(row.BindingProviderID.Int64)
+		b.ProviderID = &v
+	}
+	_ = json.Unmarshal(row.BindingCapabilities, &b.Capabilities)
+	_ = json.Unmarshal(row.BindingConfig, &b.Config)
+	if b.Capabilities == nil {
+		b.Capabilities = map[string]any{}
+	}
+	if b.Config == nil {
+		b.Config = map[string]any{}
+	}
+	out.Binding = b
+	if row.ProviderStatus.Valid {
+		v := row.ProviderStatus.String
+		out.ProviderStatus = &v
+	}
+	return out, nil
+}
+
 func (r *Repo) DefaultAgent(ctx context.Context) (*Application, error) {
 	row, err := r.q(ctx).GetDefaultAgent(ctx)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -396,32 +486,48 @@ func VisibleTo(app *Application, scope string, callerID int64, isStaff bool) boo
 // VisibleScopeManage is the scope the workspace surfaces resolve with.
 const VisibleScopeManage = "manage"
 
-// Usable reports whether an application can actually be CONSUMED — opened
-// and, for a chat application, run (二次复审 P0-5).
+// ConsumptionFacts carries every fact the consumption decision needs. All
+// three are single-object reads; ProviderStatus is nil when the binding's
+// provider_key has no providers row (the same "fail closed" shape
+// GetExecutionAuthBundle produces for AuthorizeExecution).
+type ConsumptionFacts struct {
+	Application    *Application
+	Binding        *Binding
+	ProviderStatus *string
+}
+
+// Consumable is THE consumption predicate (三次复审 P0-R3) — the one rule
+// every consumer surface and the execution gate share:
 //
-// Visibility answers "who may SEE the row" and is a management concern: staff
-// must see disabled, private and binding-less applications in 智能体市场 /
-// 应用中心 so they can repair them. Usability answers "may anyone actually
-// USE it", and it is the SAME predicate `AuthorizeExecution` enforces:
+//	application.enabled = 1
+//	AND (kind <> 'chat'
+//	     OR (enabled binding exists
+//	         AND provider row exists
+//	         AND provider.status = 'active'))
 //
-//	enabled = 1                        the admin kill switch is absolute
-//	kind <> 'chat' OR enabled binding  a chat app without a runtime cannot run
+// It is exactly what AuthorizeExecution enforces (评测 P0-1): enabled apps
+// only, a runtime for chat apps, and — since P0-R3 — a LIVE provider behind
+// that runtime. Before this existed `Usable` stopped at the binding, so a
+// provider an admin switched off still flowed through every consumer surface
+// (catalog page, resolve, @mention, bootstrap, default agent) and only POST
+// /v2/runs refused — the "能看到、能打开，真正发送却失败" shape P0-5 fixed
+// for bindings, back with a different trigger.
 //
-// Reusing one predicate is the point. Before this existed the two disagreed:
-// the catalog listed disabled / unbound agents for staff, `resolve` happily
-// opened them, `@` could switch to them, and then POST /v2/runs refused the
-// send — "UI 可以看到，真正发送：拒绝".
-//
-// A fixed application (kind <> 'chat') is a front-end page delivered by the
-// build, so it needs no runtime binding; only `enabled` gates it.
-func Usable(app *Application, binding *Binding) bool {
-	if app == nil || !app.Enabled {
+// Visibility answers "who may SEE the row" (visible(), a management concern)
+// and stays orthogonal: consume surfaces apply BOTH.
+func Consumable(f ConsumptionFacts) bool {
+	if f.Application == nil || !f.Application.Enabled {
 		return false
 	}
-	if app.Kind != "chat" {
+	if f.Application.Kind != "chat" {
+		// A fixed application is a page delivered by the build; no runtime
+		// and no provider behind it.
 		return true
 	}
-	return binding != nil && binding.Enabled
+	if f.Binding == nil || !f.Binding.Enabled {
+		return false
+	}
+	return f.ProviderStatus != nil && *f.ProviderStatus == "active"
 }
 
 // PageModeManage / PageModeConsume select whether a catalog page lists rows

@@ -199,7 +199,11 @@ func (s *Service) Create(ctx context.Context, in *CreateInput) (*Application, *B
 	}
 
 	if in.SetDefaultAgent {
-		if err := promoteDefaultTx(ctx, tx, id); err != nil {
+		// 三次复审 P0-R1: a create that also asks for the default flag goes
+		// through the SAME transactional eligibility gate as every other
+		// path — a chat app without a runtime, or with an inactive provider,
+		// is refused (and the whole create rolls back).
+		if err := promoteDefaultIfEligibleTx(ctx, tx, id); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -362,7 +366,12 @@ func (s *Service) Update(ctx context.Context, appID, callerID int64, isStaff boo
 
 	if setDefaultAgent != nil {
 		if *setDefaultAgent {
-			if err := promoteDefaultTx(ctx, tx, appID); err != nil {
+			// 三次复审 P0-R1: promoteDefaultIfEligibleTx re-reads the FINAL
+			// in-transaction state, so a PATCH that disabled the application
+			// above can no longer re-promote it in the same request — the
+			// `enabled=false + set_default_agent=true` combination is refused
+			// and the WHOLE patch (including the disable) rolls back.
+			if err := promoteDefaultIfEligibleTx(ctx, tx, appID); err != nil {
 				return nil, nil, err
 			}
 		} else if app.IsDefaultAgent {
@@ -456,14 +465,13 @@ func (s *Service) Delete(ctx context.Context, appID, callerID int64, isStaff boo
 	return nil
 }
 
-// SetDefaultAgent promotes an ENABLED chat app with an enabled binding; the
-// flag is globally unique and enforced transactionally (no conditional unique
-// indexes in MySQL).
-//
-// The `Enabled` check is 二次复审 P0-6. It is the same predicate
-// `catalog.Usable` applies to consumption and `AuthorizeExecution` applies to
-// runs: the three must agree, or the home composer binds to an agent whose
-// first message is refused.
+// SetDefaultAgent promotes the application through the ONE transactional
+// eligibility gate (三次复审 P0-R1): promoteDefaultIfEligibleTx re-reads the
+// final in-transaction state and enforces enabled + chat + current enabled
+// binding + live provider — the same predicate `Consumable` applies to
+// consumption and `AuthorizeExecution` to runs. The flag is globally unique
+// and enforced transactionally (no conditional unique indexes in MySQL); a
+// failed promotion rolls back before the previous default was cleared.
 func (s *Service) SetDefaultAgent(ctx context.Context, appID, callerID int64, isStaff bool) error {
 	app, err := s.ApplicationByID(ctx, appID)
 	if err != nil {
@@ -472,18 +480,12 @@ func (s *Service) SetDefaultAgent(ctx context.Context, appID, callerID int64, is
 	if !canManage(app, callerID, isStaff) {
 		return ErrNotManageable
 	}
-	if binding, err := s.EnabledBinding(ctx, appID); err != nil || !Usable(app, binding) {
-		if err != nil && !errors.Is(err, ErrNotFound) {
-			return err
-		}
-		return ErrNotDefaultable
-	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := promoteDefaultTx(ctx, tx, appID); err != nil {
+	if err := promoteDefaultIfEligibleTx(ctx, tx, appID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -502,20 +504,38 @@ func (s *Service) UnsetDefaultAgent(ctx context.Context, appID, callerID int64, 
 	return err
 }
 
-// Favorite / Unfavorite are idempotent.
-func (s *Service) Favorite(ctx context.Context, appID, userID int64) error {
-	if _, err := s.ApplicationByID(ctx, appID); err != nil {
+// Favorite / Unfavorite are idempotent — and (三次复审 P0-R4.3) no longer an
+// existence oracle. The handler used to 404 only on a missing row, so
+// `POST /applications/<hidden-real-id>/favorite` answered 200 while an
+// unknown id answered 404, enumerating hidden applications one probe at a
+// time. Both now resolve the row first and apply the SAME visibility policy
+// as every other by-id surface; anything invisible answers exactly like a
+// missing row (opaque ErrNotFound → 404), and a DB failure propagates as an
+// infrastructure error (never a fake 404, P1-R1).
+//
+// A fixed application keeps its favorite relation: the ✩ flip is a real
+// user-facing feature (P1-5), it just never enters the 收藏智能体 group.
+func (s *Service) Favorite(ctx context.Context, appID, userID int64, isStaff bool) error {
+	app, err := s.ApplicationByID(ctx, appID)
+	if err != nil {
 		return err
 	}
-	_, err := s.DB.ExecContext(ctx, `INSERT IGNORE INTO application_favorites (user_id, application_id) VALUES (?, ?)`, userID, appID)
+	if !VisibleTo(app, VisibleScopeManage, userID, isStaff) {
+		return ErrNotFound
+	}
+	_, err = s.DB.ExecContext(ctx, `INSERT IGNORE INTO application_favorites (user_id, application_id) VALUES (?, ?)`, userID, appID)
 	return err
 }
 
-func (s *Service) Unfavorite(ctx context.Context, appID, userID int64) error {
-	if _, err := s.ApplicationByID(ctx, appID); err != nil {
+func (s *Service) Unfavorite(ctx context.Context, appID, userID int64, isStaff bool) error {
+	app, err := s.ApplicationByID(ctx, appID)
+	if err != nil {
 		return err
 	}
-	_, err := s.DB.ExecContext(ctx, `DELETE FROM application_favorites WHERE user_id = ? AND application_id = ?`, userID, appID)
+	if !VisibleTo(app, VisibleScopeManage, userID, isStaff) {
+		return ErrNotFound
+	}
+	_, err = s.DB.ExecContext(ctx, `DELETE FROM application_favorites WHERE user_id = ? AND application_id = ?`, userID, appID)
 	return err
 }
 
@@ -587,11 +607,76 @@ func (s *Service) resolveCategoryTx(ctx context.Context, tx *sql.Tx, slug, name 
 	return id, &id, nil
 }
 
-func promoteDefaultTx(ctx context.Context, tx *sql.Tx, appID int64) error {
+// promoteDefaultIfEligibleTx is the ONLY way business code may promote a
+// default agent (三次复审 P0-R1). The bare two-UPDATE helper it replaces ran
+// from Create() and Update() with NO eligibility check, so
+// `POST {set_default_agent:true}` without a runtime, and
+// `PATCH {enabled:false, set_default_agent:true}` — which cleared the flag
+// first and promoted right after — both produced a default agent the
+// composer could never run, and the dedicated SetDefaultAgent endpoint's
+// checks were trivially bypassed.
+//
+// Every requirement is evaluated against the application's FINAL
+// in-transaction state (the row is read FOR UPDATE inside the caller's
+// transaction), so an enable-toggle earlier in the same PATCH is visible
+// here:
+//
+//	enabled = 1                      the kill switch is absolute
+//	kind = 'chat'                    only the composer's kind is defaultable
+//	current enabled binding          the NEWEST enabled binding wins — the
+//	                                 same choice GetEnabledBinding, the
+//	                                 catalog page anti-join and the bootstrap
+//	                                 groups make, not "some old binding"
+//	provider exists AND active       AuthorizeExecution fails closed on both
+//
+// Any miss returns ErrNotDefaultable, which ROLLS BACK the caller's whole
+// transaction — a failed promotion must never clear the previous default
+// (the clear-and-set below only runs once everything above passed).
+func promoteDefaultIfEligibleTx(ctx context.Context, tx *sql.Tx, appID int64) error {
+	var enabled bool
+	var kind string
+	err := tx.QueryRowContext(ctx,
+		`SELECT enabled, kind FROM applications WHERE id = ? FOR UPDATE`, appID,
+	).Scan(&enabled, &kind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotDefaultable
+	}
+	if err != nil {
+		return err
+	}
+	if !enabled || kind != "chat" {
+		return ErrNotDefaultable
+	}
+	var bindingID int64
+	var providerKey string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, provider_key FROM runtime_bindings
+         WHERE application_id = ? AND enabled = 1
+         ORDER BY id DESC LIMIT 1`, appID,
+	).Scan(&bindingID, &providerKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotDefaultable
+	}
+	if err != nil {
+		return err
+	}
+	var status string
+	err = tx.QueryRowContext(ctx,
+		`SELECT status FROM providers WHERE provider_key = ?`, providerKey,
+	).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotDefaultable
+	}
+	if err != nil {
+		return err
+	}
+	if status != "active" {
+		return ErrNotDefaultable
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE applications SET is_default_agent = 0 WHERE is_default_agent = 1`); err != nil {
 		return err
 	}
-	_, err := tx.ExecContext(ctx, `UPDATE applications SET is_default_agent = 1 WHERE id = ?`, appID)
+	_, err = tx.ExecContext(ctx, `UPDATE applications SET is_default_agent = 1 WHERE id = ?`, appID)
 	return err
 }
 
