@@ -31,6 +31,16 @@
 ## 本机 git
 - `core.autocrlf=true` 与仓库 LF 索引相冲：git 重写文件后工作区变 CRLF，`gofmt -l` 误报。
   本仓库已局部 `core.autocrlf=false`；再见到就用 python 把内容归一回 `\n`。
+  **⚠️ Edit/Write 工具本机写文件也会落 CRLF**（2026-09-16 两次实测：改 `Header.tsx` 删 3 行 →
+  diff 全文件 112 行；改 `MobileAppShell.tsx` 删 1 行 → 246 行。**`.md` 文件不受影响**，
+  只有 `.tsx`/代码文件命中）。识别特征：`git diff --stat` 的增删行数远大于实际改动。
+  一行修法（本机 python）：
+  ```bash
+  "C:/Users/吴志彬/.workbuddy/binaries/python/versions/3.13.12/python.exe" -c "
+  from pathlib import Path; p=Path('<file>'); b=p.read_bytes(); print('crlf',b.count(b'\r\n')); p.write_bytes(b.replace(b'\r\n',b'\n'))"
+  ```
+  归一后 diff 立刻收窄到真实改动（112→5 行、246→4 行）。
+  **提交前一定扫一眼 `git diff --stat` 的行数是否与实际改动相符。**
 - **`refs/remotes/<name>/<branch>`（两层）写入有缺陷**（PortableGit 2.55 / 系统 2.53 都复现）：
   `git fetch/push` 返回 0、reflog 也写了，但 `.git/refs/remotes/origin/` 目录不存在 → 引用丢失，
   `git status -sb` 误报 `[ahead N]` / `[gone]`。**push 本身是成功的**。
@@ -99,3 +109,27 @@
 - **EXPLAIN 断言只在真实数据形状下有意义**：空 provider 上所有候选索引都估 1 行；须先造
   「5k settled + 2 活跃」。`table` 列有别名时返回别名；索引前导列查
   `information_schema.STATISTICS`，**按 shape 断言不按 key 名**。
+
+## 操作红线（会静默出事，代价已付过）
+- **同一文件绝不可在一条消息里发两个 Edit**：工具各自基于同一旧快照写回，**后写覆盖前写 = 静默丢失**，
+  且**仍然编译通过**。本轮被吃掉过 `app.go` 的 `SSEHub` 装配（丢失后 SSE 退化成「只有 durable replay、
+  没有 live 事件」，日志不报错、指标全 0）。纪律：串行改 + 收尾 `grep` 复核关键装配行；
+  `git diff --stat` 与预期不符时优先怀疑这个。
+- **反证驱动绝不可与其它 `go test` 并发**（脚本改真实源码）。
+- **不要为对照基线 `git checkout <sha>`**（会被 SIGTERM 打断、留半成品工作区）；用 `git checkout <sha> -- <路径>`。
+- **同一工作区可能有并发会话**：开工前 `git status` + 看关键文件 mtime；提交前若混着别人的改动**先问用户**，
+  别 `git add -A`（会把别人的在制品卷进你的提交）。
+- 顺手：**改动落地后必须同步更新旧反证脚本的锚点**，锚点失配会让驱动在断言前终止（假绿）。
+
+## 启动 dev 环境时的现场检查（2026-09-16 实测）
+- 上一轮会话的进程常常**还活着**：先 `netstat -ano | grep LISTENING | grep -E ":(8080|8081|3030)\b"`，
+  再用 `tasklist /FO CSV | grep -iE "api.exe|stream.exe|worker.exe"` 认进程。
+- **Git Bash 里 `taskkill /PID x /F` 会被 MSYS 路径转换吃掉**（报「键入 TASKDILL /?」）→ 必须
+  `MSYS_NO_PATHCONV=1 taskkill /PID <pid> /F`（或改用 PowerShell 工具）。
+- 起之前**确认没漏 delivery worker**：只起 aily worker 时「对话正常但飞书群收不到」，
+  `delivery_executions` 停在 `pending`（见上「本地起环境」）。
+- **delivery worker 一起来就会 drain 历史 pending**（`dueScanLoop` 自动补发）：
+  会有 `delivery failed permanently code=send_failed` 之类的日志，属历史任务收敛，不是本次启动的回归。
+- dev 环境已起：api/stream 各自 `/healthz` 返回 **401**（= 活着且鉴权生效，不是故障），vite `:3030` 返回 200。
+  业务链自证：`POST /api/auth/login/`（demo / Creator@2026）拿 `studio_session` → `GET /api/auth/me/` → `GET /api/v2/runtimes`。
+  cookie 只在 shell 变量里传递，**不要落盘**。
