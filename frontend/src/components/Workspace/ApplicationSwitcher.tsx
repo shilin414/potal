@@ -5,12 +5,18 @@
  * back to the application center. Switching only changes the active
  * application; AppShell stays mounted and each workspace restores its own
  * conversation/draft/scroll from workspaceStore (§29).
+ *
+ * Data source (执行报告 §9.3): the switcher used to render its rows from the
+ * whole-catalog mirror, so "50 DOM rows" still meant "1800 rows downloaded".
+ * It now reads ONE server page of the paged endpoint — the same budget it
+ * renders — and resolves the active agent from the entity cache.
  */
-import { useEffect, useMemo } from 'react';
+import { useMemo } from 'react';
 import { Dropdown, Spin } from 'antd';
 import { DownOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
-import { useApplicationCatalogStore } from '@/stores/useApplicationCatalogStore';
+import { useApplicationPage } from '@/hooks/useApplicationPage';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import type { V2Application } from '@/services/runApi';
 import AgentAvatar from '@/components/Agents/AgentAvatar';
@@ -26,19 +32,27 @@ const SWITCHER_MAX_ROWS = 50;
 
 const ApplicationSwitcher: React.FC<Props> = ({ compact }) => {
   const navigate = useNavigate();
-  // The store keeps one already-derived chat list instead of every consumer
-  // re-filtering the 1800-row catalog on each render — see
-  // `chatApplicationsList` in useApplicationCatalogStore.
-  const chats = useApplicationCatalogStore((state) => state.chatApplicationsList);
-  const isLoading = useApplicationCatalogStore((state) => state.isLoading);
-  const load = useApplicationCatalogStore((state) => state.load);
+  // One server page, capped at what this dropdown can render: the browser
+  // holds 50 agent rows, not the catalog.
+  const {
+    items: chats,
+    loading,
+  } = useApplicationPage({
+    kind: 'chat',
+    scope: 'manage',
+    includeUnbound: false,
+    limit: SWITCHER_MAX_ROWS,
+  });
+  const entities = useApplicationEntityStore((state) => state.byId);
   const activeApplicationId = useWorkspaceStore((state) => state.activeApplicationId);
   const recentApplicationIds = useWorkspaceStore((state) => state.recentApplicationIds);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
 
-  useEffect(() => { void load(); }, [load]);
-
-  const active = chats.find((app) => app.id === activeApplicationId) || null;
+  // The active agent may be off this page (unbound, or beyond row 50): the
+  // entity cache still knows it because entering it is what resolved it.
+  const active = (activeApplicationId != null ? entities[activeApplicationId] : undefined)
+    || chats.find((app) => app.id === activeApplicationId)
+    || null;
 
   const open = (application: V2Application) => {
     openApplication(application.id);
@@ -75,15 +89,13 @@ const ApplicationSwitcher: React.FC<Props> = ({ compact }) => {
   });
 
   const recent = recentApplicationIds
-    .map((id) => chats.find((app) => app.id === id))
+    .map((id) => entities[id] || chats.find((app) => app.id === id))
     .filter((app): app is V2Application => Boolean(app));
 
-  // `GET /v2/applications` has no server-side cap, and integration-test rows
-  // have pushed the shared catalog past 1800 — building a Menu row per entry
-  // is what makes opening the switcher (and the shell that renders it) crawl.
   // This dropdown is a JUMP-TO menu: browsing the whole catalog is the market
-  // page behind 全部智能体 >, so the full group is bounded. The agent in play
-  // is pinned so it can never be the one that got cut.
+  // page behind 全部智能体 >, so the full group is bounded — and now the
+  // REQUEST is bounded too (one page of 50). The agent in play is pinned so it
+  // can never be the one that got cut.
   const fullList = useMemo(() => {
     const head = chats.slice(0, SWITCHER_MAX_ROWS);
     if (!active || head.some((app) => app.id === active.id)) return head;
@@ -115,14 +127,14 @@ const ApplicationSwitcher: React.FC<Props> = ({ compact }) => {
       menu={{ items: menuItems }}
       trigger={['click']}
       placement="bottomLeft"
-      disabled={isLoading && !chats.length}
+      disabled={loading && !chats.length}
     >
       <button
         type="button"
         className={`application-switcher ${compact ? 'application-switcher--compact' : ''}`}
         aria-label="切换智能体"
       >
-        {isLoading && !chats.length ? (
+        {loading && !chats.length ? (
           <Spin size="small" />
         ) : (
           <>

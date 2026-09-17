@@ -17,7 +17,7 @@ import {
   Switch,
   message,
 } from 'antd';
-import { fetchV2Applications } from '@/services/runApi';
+import { fetchApplicationPage } from '@/services/runApi';
 import { fetchFeishuTargets } from '@/services/shareApi';
 import { createSchedule, previewScheduleRuns, updateSchedule } from '@/services/scheduleApi';
 import type { V2Application } from '@/services/runApi';
@@ -90,11 +90,17 @@ export function ScheduleEditorModal({
   }, [open, editing, presetApplicationId, form]);
 
   // 可调度应用：chat + 已启用 + 有运行时绑定（后端仍会做权威校验）。
+  //
+  // Reads the PAGED endpoint instead of the legacy whole-array one (执行报告
+  // §16.2): the picker only needs the caller's own chat agents, and the
+  // server does the filtering — a schedule form must not download the whole
+  // catalog to render a dropdown.
   useEffect(() => {
     if (!open) return;
     setAppsLoading(true);
-    fetchV2Applications('chat', { scope: 'mine', includeUnbound: false })
-      .then((items) => setApps(items.filter((a) => a.enabled !== false && a.is_bound !== false)))
+    fetchApplicationPage({ kind: 'chat', scope: 'mine', limit: 100 })
+      .then((page) => setApps(page.items.filter(
+        (a) => a.enabled !== false && a.is_bound !== false)))
       .catch(() => setApps([]))
       .finally(() => setAppsLoading(false));
   }, [open]);

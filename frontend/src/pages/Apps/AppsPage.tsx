@@ -11,11 +11,12 @@
  *
  * 卡片点击 → `/app/:slug` 在 Shell 内打开（§32），返回时回到来源工作区。
  */
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Button, Empty, Input, Spin, Switch, Tag, message } from 'antd';
 import { ArrowRightOutlined, SearchOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
-import { useApplicationCatalogStore } from '@/stores/useApplicationCatalogStore';
+import { useCatalogUiStore } from '@/stores/useCatalogUiStore';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useApplicationPage } from '@/hooks/useApplicationPage';
 import { updateAgentApplication } from '@/services/runApi';
@@ -45,9 +46,9 @@ const cardDelay = (index: number): React.CSSProperties => ({
 const AppsPage: React.FC = () => {
   const navigate = useNavigate();
   const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
-  // 分类筛选是页面间的共享 UI 状态（侧栏入口），保留在 catalog store；
+  // 分类筛选是页面间的共享 UI 状态（侧栏入口），放在 useCatalogUiStore；
   // 数据本身走服务端分页。
-  const fixedCategory = useApplicationCatalogStore((state) => state.fixedCategory);
+  const fixedCategory = useCatalogUiStore((state) => state.fixedCategory);
   const [searchQuery, setSearchQuery] = useState('');
   const [togglingId, setTogglingId] = useState<number | null>(null);
 
@@ -66,6 +67,11 @@ const AppsPage: React.FC = () => {
     query: searchQuery,
     limit: 24,
   });
+
+  // Browsed rows seed the entity cache, so opening a card resolves from memory
+  // instead of issuing a resolve request (执行报告 §10-B).
+  const upsertEntities = useApplicationEntityStore((state) => state.upsertMany);
+  useEffect(() => { upsertEntities(apps); }, [apps, upsertEntities]);
 
   const handleToggle = async (
     app: V2Application,

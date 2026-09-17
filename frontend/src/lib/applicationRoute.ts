@@ -7,15 +7,19 @@
  * renderer kind would then have been wired in some of them and forgotten in
  * the rest — the kind of drift that shows up as a dead shortcut.
  *
+ * It takes the DISPLAY projection, not a full catalog item: the mobile
+ * surfaces route from bootstrap summaries (执行报告 §9–§11), and every field
+ * this decision needs (kind, renderer_key, slug) is part of it.
+ *
  * Keep this in sync with `router/index.tsx`:
  *   /chat/:applicationSlug      → ChatRenderer
  *   /app/:applicationSlug       → PageRenderer
  *   /workflow/:applicationSlug  → WorkflowRenderer
  */
-import type { V2Application } from '@/services/runApi';
+import type { ApplicationSummary } from '@/services/runApi';
 
 /** Route path for an application, matching WorkspaceHost's renderer choice. */
-export function routeForApplication(application: V2Application): string {
+export function routeForApplication(application: ApplicationSummary): string {
   // A chat application is always a chat workspace whichever `kind` a legacy
   // row carries — WorkspaceHost decides the same way, on kind OR renderer_key.
   if (application.kind === 'chat' || application.renderer_key === 'chat') {

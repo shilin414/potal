@@ -116,6 +116,21 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
 
   useEffect(() => { void fetchFirstPage(); }, [fetchFirstPage]);
 
+  // A surface that goes INACTIVE (a closed Drawer, a hidden sheet) must also
+  // abandon whatever is in flight (执行报告 §22 / P2-4): `enabled: false` used
+  // to suppress only NEW requests, so a response that was already travelling
+  // could still land and repopulate a surface nobody is looking at (and a
+  // later reopen would briefly show it). Bumping the request id invalidates
+  // them, and clearing the spinners keeps the next open from looking stuck.
+  // The items are deliberately KEPT: they are still real data, and a reopen
+  // refreshes page one anyway.
+  useEffect(() => {
+    if (enabled) return;
+    requestIdRef.current += 1;
+    setLoading(false);
+    setLoadingMore(false);
+  }, [enabled]);
+
   const loadMore = useCallback(async () => {
     if (!enabled || !cursor || loadingMore || loading) return;
     const requestId = requestIdRef.current;

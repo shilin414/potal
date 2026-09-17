@@ -239,7 +239,19 @@ LIMIT ?;
 -- kind: exclude_fixed → chat only; exclude_chat → non-chat ("fixed");
 -- neither → all. exclude_unbound drops binding-less rows (the legacy
 -- include_unbound=false semantics). Search is a case-insensitive substring
--- match on name / description, mirroring the previous client-side filter.
+-- match on name / description / category name, mirroring the previous
+-- client-side filter.
+-- ⚠️ The COLLATE is LOAD-BEARING (执行报告 §7 / P0-R2): `applications` is
+-- `DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`, so a bare `a.name LIKE ?`
+-- compares BYTE-wise and "sales" never matches "Sales Agent" — which the
+-- OpenAPI contract ("case-insensitive substring match") promises it does,
+-- and which the pre-pagination client-side filter did (JS toLowerCase).
+-- Chinese hides the defect, so only an ASCII test can catch it. Overriding
+-- the collation per comparison is cheaper and far safer than changing the
+-- column/table collation (that would also make slug uniqueness
+-- case-insensitive). The same collation is applied to the category name,
+-- because mobile's local filter always searched it (filterMobileCatalog) —
+-- leaving it out would keep the two modes disagreeing.
 -- The cursor is the (created_at, id) keyset in ascending order — the same
 -- order the legacy list used, so page one keeps the existing UI ordering.
 SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
@@ -270,8 +282,9 @@ WHERE newer_b.id IS NULL
        OR sqlc.arg('kind_all'))
   AND (sqlc.arg('allow_unbound') OR b.id IS NOT NULL)
   AND (sqlc.narg('search') IS NULL
-       OR a.name LIKE sqlc.arg('search_name_like')
-       OR COALESCE(a.description, '') LIKE sqlc.arg('search_desc_like'))
+       OR a.name COLLATE utf8mb4_unicode_ci LIKE sqlc.arg('search_name_like')
+       OR COALESCE(a.description, '') COLLATE utf8mb4_unicode_ci LIKE sqlc.arg('search_desc_like')
+       OR COALESCE(c.name, '') COLLATE utf8mb4_unicode_ci LIKE sqlc.arg('search_desc_like'))
   AND (sqlc.narg('category_slug') IS NULL
        OR (sqlc.arg('category_is_null') AND a.category_id IS NULL)
        OR c.slug = sqlc.arg('category_slug'))

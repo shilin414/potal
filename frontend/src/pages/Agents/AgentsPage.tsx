@@ -22,7 +22,8 @@ import {
 } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { useAgentStore } from '@/stores/useAgentStore';
-import { useApplicationCatalogStore } from '@/stores/useApplicationCatalogStore';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import { useApplicationPage } from '@/hooks/useApplicationPage';
@@ -109,6 +110,12 @@ const AgentsPage: React.FC = () => {
   const [runtimes, setRuntimes] = useState<AgentRuntimeDescriptor[]>([]);
   const [source, setSource] = useState<SourceFilter>('all');
 
+  // Rows the user has SEEN are entities the workspace may be asked to open, so
+  // every fetched page seeds the entity cache: clicking a card then costs no
+  // resolve request at all (执行报告 §10-B).
+  const upsertEntities = useApplicationEntityStore((state) => state.upsertMany);
+  useEffect(() => { upsertEntities(appAgents); }, [appAgents, upsertEntities]);
+
   const [selectedAgentId, setSelectedAgentId] = useState<number | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [editorOpen, setEditorOpen] = useState(false);
@@ -118,8 +125,18 @@ const AgentsPage: React.FC = () => {
   const [deletingAgentId, setDeletingAgentId] = useState<number | null>(null);
   const [busyAppId, setBusyAppId] = useState<number | null>(null);
 
-  const reloadCatalog = useApplicationCatalogStore((state) => state.load);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
+  // Local patches replace the old `reloadCatalog(true)` (执行报告 §15, P1-3):
+  // every mutation below knows exactly which objects changed — the current
+  // page row, the entity cache entry and the bootstrap groups — so none of
+  // them needs the whole catalog back. The page row is the authority for the
+  // grid; the other two keep the shell (switcher, home shortcuts, deep links)
+  // consistent with it.
+  const upsertEntity = useApplicationEntityStore((state) => state.upsert);
+  const removeEntity = useApplicationEntityStore((state) => state.remove);
+  const patchBootstrap = useWorkspaceBootstrapStore((state) => state.patch);
+  const removeFromBootstrap = useWorkspaceBootstrapStore((state) => state.remove);
+  const reloadBootstrap = useWorkspaceBootstrapStore((state) => state.load);
   // 智能体接入是管理员能力：普通用户只消费市场。
   const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
   const isFirstRun = useRef(true);
@@ -142,13 +159,17 @@ const AgentsPage: React.FC = () => {
     return () => clearTimeout(timer);
   }, [selectedCategory, searchQuery, loadAgents]);
 
+  /**
+   * A MUTATION path: refresh the two lists this page owns (the paged runtime
+   * grid and the legacy local agents) without touching the workspace
+   * bootstrap — the caller decides whether the bootstrap needs anything.
+   */
   const refreshAll = useCallback(async () => {
     await Promise.all([
       loadAgents(useAgentStore.getState().selectedCategory || undefined),
       refreshAppAgents(),
-      reloadCatalog(true),
     ]);
-  }, [loadAgents, refreshAppAgents, reloadCatalog]);
+  }, [loadAgents, refreshAppAgents]);
 
   /** Runtime label per card, read from the runtime catalog (never hard-coded). */
   const labelFor = useCallback((agent: V2Application) => {
@@ -184,9 +205,10 @@ const AgentsPage: React.FC = () => {
       message.warning('该智能体还没有可用的运行时绑定，无法对话；请先编辑补全。');
       return;
     }
-    // The workspace resolves the slug from the catalog mirror; refresh it so a
-    // just-created agent opens on the first click.
-    await reloadCatalog(true);
+    // The workspace resolves the slug from the ENTITY cache (`/applications/
+    // resolve`), so "open" seeds that cache instead of reloading the catalog
+    // — opening an agent costs no list request at all (执行报告 §15).
+    upsertEntity(agent);
     openApplication(agent.id);
     navigate(`/chat/${agent.slug}`);
   };
@@ -194,11 +216,24 @@ const AgentsPage: React.FC = () => {
   const handleSetDefault = async (agent: V2Application, next: boolean) => {
     setBusyAppId(agent.id);
     try {
-      await setDefaultAgent(agent.id, next);
+      const updated = await setDefaultAgent(agent.id, next);
       message.success(next
         ? `「${agent.name}」已设为工作台默认智能体`
         : `「${agent.name}」已取消默认智能体`);
-      await refreshAll();
+      // The response IS the new state: patch the page row, the entity cache
+      // and the bootstrap's default agent. Nothing else changed locally, so no
+      // list is refetched (执行报告 §15 "设置默认智能体").
+      const patch: Partial<V2Application> = {
+        is_default_agent: updated.is_default_agent,
+        ...(updated.avatar_url ? { avatar_url: updated.avatar_url } : {}),
+      };
+      patchAppAgent(agent.id, patch);
+      upsertEntity({ ...agent, ...patch });
+      patchBootstrap(agent.id, { is_default_agent: updated.is_default_agent });
+      // Demoting the PREVIOUS default is a server-side side effect we cannot
+      // see locally, so one bootstrap refresh (tens of rows, never the
+      // catalog) settles the flag where it also lives.
+      await reloadBootstrap(true);
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '设置默认智能体失败');
     } finally {
@@ -211,6 +246,10 @@ const AgentsPage: React.FC = () => {
     try {
       await deleteAgentApplication(agent.id);
       message.success('智能体已删除');
+      // Remove the row everywhere it is known instead of re-downloading any
+      // list: page, entity cache, bootstrap groups (执行报告 §15 "删除").
+      removeEntity(agent.id);
+      removeFromBootstrap(agent.id);
       await refreshAll();
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '删除智能体失败');
@@ -462,19 +501,30 @@ const AgentsPage: React.FC = () => {
         mode={editingMode}
         open={editorOpen}
         onClose={() => { setEditorOpen(false); setEditingAgentId(null); }}
-        onSaved={refreshAll}
+        onSaved={async () => {
+          // The editor reports no payload, so the refreshed page is the source
+          // of truth for the grid. The bootstrap is re-fetched (it is the
+          // constant-size payload) to keep the home shortcuts and the category
+          // rails consistent — a create, rename or re-category is exactly what
+          // it describes. No catalog download happens either way (执行报告 §15).
+          await refreshAll();
+          await reloadBootstrap(true);
+        }}
       />
       <AgentAvatarModal
         agent={avatarAgent}
         open={Boolean(avatarAgent)}
         onClose={() => setAvatarAgent(null)}
         onSaved={async (updated) => {
-          // Patch the card in place (执行报告 §31 — no reload), then refresh
-          // the catalog mirror so the workspace switcher shows it too.
+          // 改头像 patches the three places the avatar lives — the page row,
+          // the entity cache and the bootstrap groups — and downloads nothing
+          // (执行报告 §15 "修改头像").
           patchAppAgent(updated.id, { avatar_url: updated.avatar_url });
+          const cached = useApplicationEntityStore.getState().get(updated.id);
+          if (cached) upsertEntity({ ...cached, avatar_url: updated.avatar_url });
+          patchBootstrap(updated.id, { avatar_url: updated.avatar_url });
           setAvatarAgent((current) => (
             current && current.id === updated.id ? { ...current, ...updated } : current));
-          await reloadCatalog(true);
         }}
       />
     </div>

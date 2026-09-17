@@ -1,19 +1,26 @@
 /**
  * mobileCatalog — pure derivations the mobile catalog surfaces share.
  *
- * The mobile 智能体/应用 selectors are Bottom Sheets over the SAME catalog the
- * desktop shell uses (`GET /api/v2/applications` → `V2Application[]`). No
- * mobile-only table, endpoint or store exists: everything here is a pure
- * projection of that one payload, which is why it is unit-testable without a
- * backend and why the two shells can never disagree about what exists.
+ * The mobile 智能体/应用 selectors are Bottom Sheets over the catalog. Their
+ * rows may come from either source, and both are accepted here because the
+ * derivations only read display fields:
+ *
+ *   · the PAGED endpoint (`GET /api/v2/applications/page` → full items) in
+ *     production, one page at a time;
+ *   · the workspace bootstrap's summaries for 最近使用 and the category rails
+ *     (执行报告 §11), which is what makes those independent of the page.
+ *
+ * Everything here is a pure projection — no React, no requests — which is why
+ * it is unit-testable without a backend and why the two shells can never
+ * disagree about what exists.
  *
  * Deliberately NOT reused from the desktop home:
  *   - `RECENT_LIMIT = 8` (HomeShortcuts) — a Bottom Sheet's top area must stay
  *     short, so mobile caps 最近使用 at 3 (design report §5.2/§6.2);
- *   - `buildShortcutGroups` — desktop groups (收藏/常用/推荐) are a browsing
- *     taxonomy; mobile is a "pick one now" list (§2).
+ *   - desktop 快捷分组 (收藏/常用/推荐) are a browsing taxonomy computed by the
+ *     workspace bootstrap; mobile is a "pick one now" list (§2).
  */
-import type { V2Application } from '@/services/runApi';
+import type { ApplicationSummary } from '@/services/runApi';
 
 /** How many items each mobile selector shows under 最近使用 (§5.2). */
 export const MOBILE_RECENT_LIMIT = 3;
@@ -39,7 +46,7 @@ export const MOBILE_SHEET_PAGE_SIZE = 60;
 export const MOBILE_SHEET_MAX_ROWS = 60;
 
 /** 智能体 = chat kind; everything else is an 应用 (§16.1/§16.2). */
-export function isAgentApplication(application: V2Application): boolean {
+export function isAgentApplication(application: ApplicationSummary): boolean {
   return application.kind === 'chat';
 }
 
@@ -63,9 +70,9 @@ export function recentIdsOf(recentIds: number[]): number[] {
  * surfaces, so a 停用 app must never be pickable — the same backstop
  * HomeShortcuts applies on desktop (a staff catalog can still contain them).
  */
-export function splitMobileCatalog(applications: V2Application[]): {
-  agents: V2Application[];
-  apps: V2Application[];
+export function splitMobileCatalog(applications: ApplicationSummary[]): {
+  agents: ApplicationSummary[];
+  apps: ApplicationSummary[];
 } {
   const enabled = applications.filter((app) => app.enabled !== false);
   return {
@@ -75,8 +82,48 @@ export function splitMobileCatalog(applications: V2Application[]): {
 }
 
 /** epoch ms of an application's last use, 0 when never used. */
-function lastUsed(app: V2Application): number {
+function lastUsed(app: ApplicationSummary): number {
   return app.last_used_at ? Date.parse(app.last_used_at) || 0 : 0;
+}
+
+/**
+ * 最近使用 for ONE selector in SERVER-PAGED mode (执行报告 §4.2/§6, P0-R1).
+ *
+ * The sheet used to build this from the rows it had downloaded, which — once
+ * the list became server-paginated — meant "recency within the current page":
+ * an agent the user had just used vanished from 最近使用 as soon as it was not
+ * on page one, and picking a category filtered the section away entirely.
+ *
+ * The two sources are now both independent of the current page:
+ *
+ *   · `localRecency` — the shell's navigation log, resolved through the
+ *     entity cache (the application was resolved when the user opened it);
+ *   · `serverRecency` — the `recent` / `recent_fixed_apps` group of the
+ *     workspace bootstrap.
+ *
+ * Local first (it reflects what the user just did in THIS session, including
+ * applications the server has no usage row for yet), deduplicated, capped, and
+ * NEVER filtered by the selected category — the report is explicit that
+ * 最近使用 stays independent of the list below it.
+ */
+export function mergeRecentItems(
+  localRecency: ApplicationSummary[],
+  serverRecency: ApplicationSummary[],
+  type: 'agent' | 'app',
+  limit = MOBILE_RECENT_LIMIT,
+): ApplicationSummary[] {
+  if (limit <= 0) return [];
+  const out: ApplicationSummary[] = [];
+  const seen = new Set<number>();
+  for (const app of [...localRecency, ...serverRecency]) {
+    if (!app || seen.has(app.id) || app.enabled === false) continue;
+    const isAgent = app.kind === 'chat';
+    if (type === 'agent' ? !isAgent : isAgent) continue;
+    seen.add(app.id);
+    out.push(app);
+    if (out.length >= limit) break;
+  }
+  return out;
 }
 
 /**
@@ -92,21 +139,21 @@ function lastUsed(app: V2Application): number {
  * applications the server has not recorded a usage row for yet.
  */
 export function buildRecentItems(
-  applications: V2Application[],
+  applications: ApplicationSummary[],
   recentIds: number[],
   type: 'agent' | 'app',
   limit = MOBILE_RECENT_LIMIT,
-): V2Application[] {
+): ApplicationSummary[] {
   if (limit <= 0) return [];
   const pool = applications.filter((app) => (
     type === 'agent' ? isAgentApplication(app) : !isAgentApplication(app)));
 
-  const byId = new Map<number, V2Application>();
+  const byId = new Map<number, ApplicationSummary>();
   pool.forEach((app) => byId.set(app.id, app));
 
   const seen = new Set<number>();
-  const out: V2Application[] = [];
-  const push = (app: V2Application | undefined) => {
+  const out: ApplicationSummary[] = [];
+  const push = (app: ApplicationSummary | undefined) => {
     if (!app || seen.has(app.id) || out.length >= limit) return;
     seen.add(app.id);
     out.push(app);
@@ -138,7 +185,7 @@ export interface MobileCategory {
  * creating a meaningless tab.
  */
 export function buildMobileCategories(
-  applications: V2Application[],
+  applications: ApplicationSummary[],
 ): MobileCategory[] {
   const out: MobileCategory[] = [];
   const seen = new Set<string>();
@@ -162,10 +209,10 @@ export const UNCATEGORIZED_SLUG = '__uncategorized__';
  * within it.
  */
 export function filterMobileCatalog(
-  applications: V2Application[],
+  applications: ApplicationSummary[],
   categorySlug: string,
   query: string,
-): V2Application[] {
+): ApplicationSummary[] {
   const q = query.trim().toLowerCase();
   return applications.filter((app) => {
     if (categorySlug !== 'all') {
@@ -191,7 +238,7 @@ export function filterMobileCatalog(
  * against the raw catalog.
  */
 export function buildMobileCategoryTabs(
-  applications: V2Application[],
+  applications: ApplicationSummary[],
 ): MobileCategory[] {
   const tabs = buildMobileCategories(applications);
   const hasUncategorized = applications.some(

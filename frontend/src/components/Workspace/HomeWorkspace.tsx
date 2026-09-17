@@ -4,19 +4,25 @@
  * It is a Workspace Shell, not a "main agent page": nothing is created until
  * the user actually sends the first message or opens an application, so an
  * idle visit produces no Conversation, no Run and no provider session.
+ *
+ * Data (执行报告 §9.2/§13/§14, P1-1/P1-2): the default agent and the shortcut
+ * groups come from the constant-size workspace bootstrap, a conversation deep
+ * link resolves ONE application by id, and `@mention` routing asks the server
+ * for its candidates. None of those needs the whole catalog any more.
  */
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Spin } from 'antd';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api } from '@/services/api';
 import { RunChatPanel } from '@/components/Chat';
 import type { SendDecision } from '@/components/Chat/RunChatPanel';
-import { useApplicationCatalogStore, resolveDefaultApplication } from '@/stores/useApplicationCatalogStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
-import { routeMention } from '@/lib/mentionRouter';
+import { routeComposerText } from '@/lib/composerRouting';
 import { useIsMobile } from '@/shell/useIsMobile';
 import { MobileHomeSurface } from '@/components/Mobile';
-import type { V2Application } from '@/services/runApi';
+import type { ApplicationSummary } from '@/services/runApi';
 import HomeShortcuts from './HomeShortcuts';
 import './HomeWorkspace.css';
 
@@ -27,43 +33,43 @@ const HomeWorkspace: React.FC = () => {
   // and this component's deep-link / @mention handling are shared, so the two
   // shells can never drift on what a shortcut does — only on how it looks.
   const isMobile = useIsMobile();
-  const applications = useApplicationCatalogStore((state) => state.applications);
-  const catalogLoading = useApplicationCatalogStore((state) => state.isLoading);
-  const toggleFavorite = useApplicationCatalogStore((state) => state.toggleFavorite);
-  const load = useApplicationCatalogStore((state) => state.load);
+  const bootstrapLoading = useWorkspaceBootstrapStore((state) => state.isLoading);
+  const loadBootstrap = useWorkspaceBootstrapStore((state) => state.load);
+  const toggleFavorite = useWorkspaceBootstrapStore((state) => state.toggleFavorite);
+  const defaultApplication = useWorkspaceBootstrapStore((state) => state.defaultApplication);
+  const favorites = useWorkspaceBootstrapStore((state) => state.favorites);
+  const frequent = useWorkspaceBootstrapStore((state) => state.frequent);
+  const recent = useWorkspaceBootstrapStore((state) => state.recent);
+  const recommended = useWorkspaceBootstrapStore((state) => state.recommended);
+  const recentFixedApps = useWorkspaceBootstrapStore((state) => state.recentFixedApps);
+  const ensureApplication = useApplicationEntityStore((state) => state.ensure);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
   const rememberConversation = useWorkspaceStore((state) => state.rememberConversation);
   const queuePrompt = useWorkspaceStore((state) => state.queuePrompt);
   const [resolving, setResolving] = useState(false);
 
-  useEffect(() => { void load(); }, [load]);
-
-  // The composer needs a binding to send through; the main agent (§38) plays
-  // the configurable "default main agent" role.
-  const defaultApplication = useMemo(
-    () => resolveDefaultApplication(applications), [applications]);
+  useEffect(() => { void loadBootstrap(); }, [loadBootstrap]);
 
   const paramConversation = searchParams.get('conversation');
   const conversationParam = paramConversation
     && Number.isInteger(Number(paramConversation)) ? paramConversation : null;
 
   // `/?conversation=N` is the history-sidebar deep link. It carries no
-  // application, so resolve the owning application and hand over to the real
-  // chat workspace — the home workspace itself never renders history.
+  // application, so resolve the owning application — ONE row, by id
+  // (执行报告 §13) — and hand over to the real chat workspace. The home
+  // workspace itself never renders history.
   useEffect(() => {
     if (!conversationParam) return undefined;
-    // The catalog may still be loading on a cold deep-link: the "no
-    // application" branch must only run once the catalog is actually
-    // loaded, otherwise the ?conversation param is dropped on a race
-    // (manifested when the conversations API got faster than the catalog).
-    if (catalogLoading) return undefined;
+    // The "no application" branch must only run once the bootstrap has
+    // landed, otherwise the ?conversation param is dropped on a race.
+    if (bootstrapLoading) return undefined;
     let active = true;
     setResolving(true);
     api.get<any>(`/conversations/${conversationParam}/`)
-      .then((detail) => {
+      .then(async (detail) => {
         if (!active) return;
-        const target = applications.find(
-          (app) => app.id === detail?.application_id);
+        const target = await ensureApplication(detail?.application_id);
+        if (!active) return;
         if (target) {
           openApplication(target.id);
           rememberConversation(target.id, Number(conversationParam));
@@ -80,33 +86,26 @@ const HomeWorkspace: React.FC = () => {
       .finally(() => { if (active) setResolving(false); });
     return () => { active = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conversationParam, applications, catalogLoading]);
+  }, [conversationParam, bootstrapLoading, ensureApplication]);
 
-  const candidates = useMemo(() => applications.map((app) => ({
-    id: app.id, slug: app.slug, name: app.name, kind: app.kind,
-  })), [applications]);
-
-  const handleRouteSend = (raw: string): SendDecision => {
-    const decision = routeMention({
-      text: raw, candidates, activeApplicationId: defaultApplication?.id ?? null,
-    });
-    switch (decision.action) {
+  const handleRouteSend = async (raw: string): Promise<SendDecision> => {
+    const { route, target } = await routeComposerText(
+      raw, defaultApplication?.id ?? null);
+    switch (route.action) {
       case 'passthrough':
         return { action: 'send', content: raw };
       case 'send':
-        return { action: 'send', content: decision.content };
+        return { action: 'send', content: route.content };
       case 'ignore':
         return { action: 'ignore' };
       case 'open': {
-        const target = applications.find((app) => app.id === decision.applicationId);
         if (!target) return { action: 'send', content: raw };
         navigate(`/app/${target.slug}`);
         return { action: 'handled' };
       }
       case 'switch': {
-        const target = applications.find((app) => app.id === decision.applicationId);
         if (!target) return { action: 'send', content: raw };
-        if (decision.content) queuePrompt(target.id, decision.content);
+        if (route.content) queuePrompt(target.id, route.content);
         openApplication(target.id);
         navigate(`/chat/${target.slug}`);
         return { action: 'handled' };
@@ -116,7 +115,7 @@ const HomeWorkspace: React.FC = () => {
     }
   };
 
-  const openApplicationWorkspace = (application: V2Application) => {
+  const openApplicationWorkspace = (application: ApplicationSummary) => {
     openApplication(application.id);
     navigate(application.kind === 'chat'
       ? `/chat/${application.slug}`
@@ -133,7 +132,7 @@ const HomeWorkspace: React.FC = () => {
     <div className="workspace-host">
       <RunChatPanel
         applicationId={defaultApplication?.id}
-        application={defaultApplication}
+        application={defaultApplication ?? undefined}
         conversationId={null}
         onRouteSend={handleRouteSend}
         title="今天想做什么？"
@@ -152,7 +151,11 @@ const HomeWorkspace: React.FC = () => {
                 </p>
               </div>
               <HomeShortcuts
-                applications={applications}
+                favorites={favorites}
+                frequent={frequent}
+                recent={recent}
+                recommended={recommended}
+                recentFixedApps={recentFixedApps}
                 onOpen={openApplicationWorkspace}
                 onToggleFavorite={toggleFavorite}
               />

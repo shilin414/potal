@@ -14,14 +14,15 @@
  * explicitly warns against threading `if (compact)` through one component to
  * make it serve both a Dropdown and a Bottom Sheet (§7.3).
  */
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Spin } from 'antd';
 import { DownOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
-import { useApplicationCatalogStore } from '@/stores/useApplicationCatalogStore';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import { routeForApplication } from '@/lib/applicationRoute';
-import type { V2Application } from '@/services/runApi';
+import type { ApplicationSummary } from '@/services/runApi';
 import AgentAvatar from '@/components/Agents/AgentAvatar';
 import MobileCatalogSheet from './MobileCatalogSheet';
 import './MobileAgentSwitcher.css';
@@ -33,29 +34,38 @@ interface Props {
 
 const MobileAgentSwitcher: React.FC<Props> = ({ activeApplicationId }) => {
   const navigate = useNavigate();
-  // The catalog mirror is the lookup for the ACTIVE agent's name/avatar.
-  // (The P1 workspace-bootstrap endpoint will replace this whole-catalog
-  // load; the picker already reads the paged endpoint directly.)
-  const applicationById = useApplicationCatalogStore(
-    (state) => state.applicationById);
-  const isLoading = useApplicationCatalogStore((state) => state.isLoading);
-  const load = useApplicationCatalogStore((state) => state.load);
+  // The top bar needs the ACTIVE agent's name + face. That is one entity —
+  // looked up in the application entity cache and, on a miss, resolved by id
+  // (执行报告 §9.4/§12). It used to arrive as a side effect of the shell
+  // downloading the whole catalog.
+  const entities = useApplicationEntityStore((state) => state.byId);
+  const ensure = useApplicationEntityStore((state) => state.ensure);
+  const loadBootstrap = useWorkspaceBootstrapStore((state) => state.load);
   const storeActiveId = useWorkspaceStore((state) => state.activeApplicationId);
   const recentApplicationIds = useWorkspaceStore((state) => state.recentApplicationIds);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
   const [open, setOpen] = useState(false);
+  const [resolving, setResolving] = useState(false);
 
-  React.useEffect(() => { void load(); }, [load]);
+  useEffect(() => { void loadBootstrap(); }, [loadBootstrap]);
 
   // The route wins when it names an agent (a deep link into /chat/:slug); the
   // workspace store is the fallback for the idle home surface.
   const effectiveActiveId = activeApplicationId ?? storeActiveId;
+  const active = effectiveActiveId != null ? entities[effectiveActiveId] : undefined;
 
-  const active = applicationById(effectiveActiveId) || null;
+  useEffect(() => {
+    if (effectiveActiveId == null) return undefined;
+    if (entities[effectiveActiveId]) return undefined;
+    let live = true;
+    setResolving(true);
+    void ensure(effectiveActiveId).finally(() => { if (live) setResolving(false); });
+    return () => { live = false; };
+  }, [effectiveActiveId, entities, ensure]);
 
-  const loading = isLoading;
+  const loading = resolving && !active;
 
-  const handleSelect = (application: V2Application) => {
+  const handleSelect = (application: ApplicationSummary) => {
     openApplication(application.id);
     navigate(routeForApplication(application));
   };
@@ -96,7 +106,7 @@ const MobileAgentSwitcher: React.FC<Props> = ({ activeApplicationId }) => {
         type="agent"
         recentIds={recentApplicationIds}
         activeApplicationId={effectiveActiveId}
-        activeApplication={active}
+        activeApplication={active ?? null}
         onClose={() => setOpen(false)}
         onSelect={handleSelect}
       />

@@ -4,7 +4,7 @@ import { UserOutlined, LogoutOutlined, SettingOutlined } from '@ant-design/icons
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { userAvatarFallback, userAvatarUrl, userDisplayName } from '@/lib/chatIdentity';
-import { useApplicationCatalogStore, resolveDefaultApplication } from '@/stores/useApplicationCatalogStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { ThemeToggle } from '@/components/Theme';
 import './Header.css';
 
@@ -22,7 +22,12 @@ const Header: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const { user, logout, isAuthenticated } = useAuthStore();
-  const applications = useApplicationCatalogStore((state) => state.applications);
+  // The main agent comes from the bootstrap payload (执行报告 §9) — the
+  // header must not ask for the whole catalog just to link to "对话".
+  const defaultApplication = useWorkspaceBootstrapStore((state) => state.defaultApplication);
+  const loadBootstrap = useWorkspaceBootstrapStore((state) => state.load);
+
+  React.useEffect(() => { void loadBootstrap(); }, [loadBootstrap]);
 
   const handleLogout = async () => {
     await logout();
@@ -34,8 +39,7 @@ const Header: React.FC = () => {
     // workspace so the switcher / new-conversation header is available. Falls
     // back to the home workspace when no bound chat application exists yet.
     if (key === '/') {
-      const main = resolveDefaultApplication(applications);
-      navigate(main ? `/chat/${main.slug}` : '/');
+      navigate(defaultApplication ? `/chat/${defaultApplication.slug}` : '/');
       return;
     }
     navigate(key);

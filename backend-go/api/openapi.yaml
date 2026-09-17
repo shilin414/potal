@@ -282,6 +282,34 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/User" }
 
+  # ────────────────────────────────────────────── workspace bootstrap (P1-1) ──
+  #
+  # The one request every shell surface may use to learn the small,
+  # constant-size facts it needs at start-up: which agent is the workspace
+  # default, the home shortcut groups, and the category rails. It exists to
+  # REPLACE the whole-catalog download (执行报告 §9–§11): the response is
+  # ~30 rows no matter whether the database holds 7 or 50 000 applications.
+  #
+  # The application rows here are ApplicationSummary (display fields only) —
+  # EXCEPT default_application, which additionally carries `skills` and
+  # `capabilities` because the composer bound to it renders its 技能 chips
+  # and gates the attachment entry on the runtime capabilities.
+  /api/v2/workspace/bootstrap:
+    get:
+      operationId: getWorkspaceBootstrap
+      tags: [applications]
+      summary: Start-up catalog facts (default agent, shortcut groups, categories)
+      description: |
+        Replaces the whole-catalog `GET /api/v2/applications` download the
+        shell used to perform on mount. Frontends MUST prefer this endpoint:
+        its size is independent of the catalog size.
+      responses:
+        "200":
+          description: Bootstrap payload
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkspaceBootstrap" }
+
   # ─────────────────────────────────────────────────────── applications ──
   /api/v2/applications:
     get:
@@ -386,6 +414,77 @@ paths:
               schema: { $ref: "#/components/schemas/ApplicationPage" }
         "400":
           description: invalid cursor
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/applications/resolve:
+    get:
+      operationId: resolveApplication
+      tags: [applications]
+      summary: Resolve ONE application by slug or id (执行报告 §12)
+      description: >
+        Exact single-row resolution for deep links (/chat/:slug, /app/:slug) and
+        for the application entity cache. Applies EXACTLY the catalog list's
+        access policy (enabled + is_public for regular callers, everything for
+        staff) and answers 404 when the application does not exist OR is not
+        visible — existence is never leaked. This is what makes
+        "open /chat/sales" cost one small request instead of a catalog
+        download plus Array.find().
+      parameters:
+        - name: slug
+          in: query
+          schema: { type: string }
+          description: Exact slug. Provide this or `id`.
+        - name: id
+          in: query
+          schema: { type: integer }
+          description: Exact application id. Provide this or `slug`.
+      responses:
+        "200":
+          description: The application, in the same shape the catalog page uses
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApplicationListItem" }
+        "400":
+          description: neither slug nor id was provided
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "404":
+          description: unknown or not visible to this caller
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/applications/resolve-mention:
+    get:
+      operationId: resolveApplicationMention
+      tags: [applications]
+      summary: Resolve the `@` token of a composer instruction to candidates (§14)
+      description: >
+        Server-side replacement for the client-side @mention candidate array
+        (which was built by downloading every application). Matching is
+        case-insensitive on the application name and slug; the response is
+        ranked (exact name/slug first, then name prefixes, then name
+        substrings) and capped, so the composer never needs the whole catalog
+        to route `@销售助手 帮我查一下`.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+          description: The text after `@`, e.g. `销售助手`.
+      responses:
+        "200":
+          description: Ranked candidates (at most 10)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/MentionCandidate" }
+        "400":
+          description: q is required
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
@@ -1887,6 +1986,150 @@ components:
           items: { $ref: "#/components/schemas/ApplicationListItem" }
         next_cursor: { type: string }
         has_more: { type: boolean }
+
+    ApplicationSummary:
+      type: object
+      description: >
+        Display projection of one application (执行报告 §11, P2-1): what a card,
+        a switcher row, a shortcut or a bottom-sheet row needs to render, and
+        nothing else. Deliberately excludes `skills`, `external_resource_id`,
+        `identity_mode`, `execution_mode`, `capabilities` and `can_manage` —
+        a consumer that needs those resolves the single application it is bound
+        to through /applications/resolve or /applications/{id}.
+      required:
+        - id
+        - slug
+        - name
+        - description
+        - icon
+        - avatar_url
+        - color
+        - kind
+        - renderer_key
+        - category_slug
+        - category_name
+        - provider_key
+        - runtime_type
+        - enabled
+        - is_bound
+        - is_favorite
+        - is_default_agent
+        - usage_count
+        - last_used_at
+        - global_usage_count
+      properties:
+        id: { type: integer }
+        slug: { type: string }
+        name: { type: string }
+        description: { type: string }
+        icon: { type: string }
+        avatar_url: { type: string }
+        color: { type: string }
+        kind: { type: string, enum: [chat, task, custom] }
+        renderer_key: { type: string }
+        category_slug: { type: string }
+        category_name: { type: string }
+        provider_key: { type: string }
+        runtime_type: { type: string }
+        enabled: { type: boolean }
+        is_bound: { type: boolean }
+        is_favorite: { type: boolean }
+        is_default_agent: { type: boolean }
+        usage_count: { type: integer, description: this caller's own runs }
+        last_used_at:
+          type: string
+          nullable: true
+          format: date-time
+        global_usage_count: { type: integer }
+        skills:
+          type: array
+          description: >
+            Only present on `default_application` in WorkspaceBootstrap (the
+            home composer renders this agent's 技能 chips).
+          items: { $ref: "#/components/schemas/ApplicationSkill" }
+        capabilities:
+          type: object
+          additionalProperties: { type: boolean }
+          description: only present on `default_application` (same reason)
+
+    ApplicationCategory:
+      type: object
+      description: >
+        One category rail entry. `slug` is what `category_slug` accepts on the
+        paged endpoint; the sentinel `__uncategorized__` is the 其他 tab
+        (rows with no category) and is only emitted when such rows exist.
+      required: [slug, name, count]
+      properties:
+        slug: { type: string }
+        name: { type: string }
+        count:
+          type: integer
+          description: visible applications in this category (both kinds' rails are separate)
+
+    WorkspaceBootstrap:
+      type: object
+      description: >
+        Start-up catalog facts (GET /api/v2/workspace/bootstrap). Constant size
+        by design — the shell renders home shortcuts, the category rails, the
+        default agent and the mobile pickers from this payload and NEVER needs
+        the whole catalog.
+      required:
+        - default_application
+        - favorites
+        - frequent
+        - recent
+        - recommended
+        - recent_fixed_apps
+        - agent_categories
+        - app_categories
+      properties:
+        default_application:
+          description: >
+            The workspace's main agent (explicit `is_default_agent`, else the
+            first bound chat application). null when the caller can see no
+            bound chat application at all.
+          nullable: true
+          allOf: [{ $ref: "#/components/schemas/ApplicationSummary" }]
+        favorites:
+          type: array
+          description: 收藏 (chat applications this caller starred)
+          items: { $ref: "#/components/schemas/ApplicationSummary" }
+        frequent:
+          type: array
+          description: 常用智能体 (most-run by this caller)
+          items: { $ref: "#/components/schemas/ApplicationSummary" }
+        recent:
+          type: array
+          description: 最近使用 (chat, most recently run by this caller)
+          items: { $ref: "#/components/schemas/ApplicationSummary" }
+        recommended:
+          type: array
+          description: 推荐 (chat, not yet used by this caller, most used globally)
+          items: { $ref: "#/components/schemas/ApplicationSummary" }
+        recent_fixed_apps:
+          type: array
+          description: 常用应用 (non-chat applications this caller recently opened)
+          items: { $ref: "#/components/schemas/ApplicationSummary" }
+        agent_categories:
+          type: array
+          description: category rail for the 智能体 selectors (chat applications)
+          items: { $ref: "#/components/schemas/ApplicationCategory" }
+        app_categories:
+          type: array
+          description: category rail for 应用中心 / the 应用 selectors (non-chat)
+          items: { $ref: "#/components/schemas/ApplicationCategory" }
+
+    MentionCandidate:
+      type: object
+      description: >
+        One `@` candidate for the composer's routing decision. `kind` matters:
+        a chat application receives the instruction, anything else is opened.
+      required: [id, slug, name, kind]
+      properties:
+        id: { type: integer }
+        slug: { type: string }
+        name: { type: string }
+        kind: { type: string, enum: [chat, task, custom] }
 
     ApplicationSkill:
       type: object

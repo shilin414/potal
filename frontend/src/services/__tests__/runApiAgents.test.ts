@@ -28,8 +28,9 @@ import {
   createAgentApplication,
   deleteAgentApplication,
   fetchAgentRuntimes,
-  fetchManageableAgents,
-  fetchV2Applications,
+  fetchWorkspaceBootstrap,
+  resolveApplication,
+  resolveApplicationMention,
   setDefaultAgent,
   updateAgentApplication,
   uploadAgentAvatar,
@@ -43,45 +44,58 @@ beforeEach(() => {
   mocks.delete.mockReset().mockResolvedValue({});
 });
 
-describe('fetchV2Applications (workspace catalog)', () => {
-  it('keeps the legacy chat listing shape by default', async () => {
-    await fetchV2Applications();
+// 执行报告 §9–§14 (P1-1/P1-2). The shell's start-up data and its single-row
+// lookups are what replaced the whole-catalog download, so the CONTRACT of
+// those three calls is worth pinning: a wrong URL or a dropped parameter shows
+// up as "the shell is empty" rather than as an obvious error.
+describe('workspace bootstrap + single-application resolution', () => {
+  it('reads the constant-size start-up payload', async () => {
+    await fetchWorkspaceBootstrap();
 
-    expect(mocks.get).toHaveBeenCalledWith('/v2/applications', undefined);
+    expect(mocks.get).toHaveBeenCalledWith('/workspace/bootstrap');
   });
 
-  it('passes kind, scope and include_unbound through', async () => {
-    await fetchV2Applications('all', { scope: 'manage' });
-    expect(mocks.get).toHaveBeenLastCalledWith(
-      '/v2/applications', { kind: 'all', scope: 'manage' });
-
-    await fetchV2Applications('chat', { scope: 'manage', includeUnbound: true });
-    expect(mocks.get).toHaveBeenLastCalledWith(
-      '/v2/applications', { scope: 'manage', include_unbound: 'true' });
+  it('never asks for the legacy whole-catalog array any more', async () => {
+    // A regression here is invisible in a small dev DB and fatal in a large
+    // one, so it is asserted rather than trusted: the module must not even
+    // export the legacy helpers.
+    const runApi = await import('@/services/runApi');
+    expect('fetchV2Applications' in runApi).toBe(false);
+    expect('fetchManageableAgents' in runApi).toBe(false);
   });
 
-  it('degrades to an empty catalog instead of throwing', async () => {
+  it('resolves one application by slug or id', async () => {
+    await resolveApplication({ slug: 'sales' });
+    expect(mocks.get).toHaveBeenCalledWith(
+      '/v2/applications/resolve', { slug: 'sales' });
+
+    await resolveApplication({ id: 7 });
+    expect(mocks.get).toHaveBeenLastCalledWith(
+      '/v2/applications/resolve', { id: '7' });
+  });
+
+  it('resolves @mention candidates server-side', async () => {
+    await resolveApplicationMention('  销售助手 ');
+
+    expect(mocks.get).toHaveBeenCalledWith(
+      '/v2/applications/resolve-mention', { q: '销售助手' });
+  });
+
+  it('treats an unreachable mention resolver as "no candidates"', async () => {
     mocks.get.mockRejectedValueOnce(new Error('offline'));
 
-    await expect(fetchV2Applications()).resolves.toEqual([]);
+    // Routing is a convenience: an unreachable resolver must degrade to
+    // "unknown mention → send as typed", never to a blocked composer (§38).
+    await expect(resolveApplicationMention('销售助手')).resolves.toEqual([]);
+  });
+
+  it('does not call the API for an empty mention token', async () => {
+    await expect(resolveApplicationMention('   ')).resolves.toEqual([]);
+    expect(mocks.get).not.toHaveBeenCalled();
   });
 });
 
 describe('智能体市场 authoring', () => {
-  it('lists manageable agents including unbound ones', async () => {
-    await fetchManageableAgents();
-
-    expect(mocks.get).toHaveBeenCalledWith('/v2/applications', {
-      kind: 'chat', scope: 'manage', include_unbound: 'true',
-    });
-  });
-
-  it('returns an empty list when the marketplace listing fails', async () => {
-    mocks.get.mockRejectedValueOnce(new Error('boom'));
-
-    await expect(fetchManageableAgents()).resolves.toEqual([]);
-  });
-
   it('reads the runtime catalog for the create form', async () => {
     await fetchAgentRuntimes();
 

@@ -287,6 +287,74 @@ func TestApplicationPagePerUsageAggregation(t *testing.T) {
 	}
 }
 
+// TestApplicationPageSearchIsCaseInsensitive pins 执行报告 §7 / P0-R2: the
+// OpenAPI contract promises a case-insensitive substring match, but
+// `applications` is `utf8mb4_bin`, so a bare LIKE compares bytes — "Agent"
+// simply never matched "agent". Chinese hides the defect completely, so an
+// ASCII fixture is the only thing that can catch it. The same test proves the
+// category NAME is searchable, which is what the mobile sheet's local filter
+// always did (filterMobileCatalog) and the server must now match.
+func TestApplicationPageSearchIsCaseInsensitive(t *testing.T) {
+	svc, repo := pageFixtureEnv(t)
+
+	staff := int64(777006)
+	app, _, err := svc.Create(context.Background(), &catalog.CreateInput{
+		Name: "itestPageSales Agent", Kind: "chat", IsPublic: true,
+		CategorySlug: "itest-page-sales-cat", CategoryName: "ItestPageSalesCategory",
+		CreatorID: staff, IsStaff: true,
+	})
+	if err != nil {
+		t.Fatalf("seed app: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Delete(context.Background(), app.ID, staff, true) })
+
+	// A distinctive, underscore-free needle: `_` used to widen the LIKE to any
+	// single character before likePattern escaped it.
+	search := func(q string) []catalog.ApplicationWithBinding {
+		t.Helper()
+		got, err := repo.ListApplicationPage(context.Background(), catalog.ApplicationPageQuery{
+			Scope: "manage", Kind: catalog.PageQueryKindChat, IncludeUnbound: true,
+			Search: q, Limit: 100, CallerID: staff, IsStaff: true,
+		})
+		if err != nil {
+			t.Fatalf("search %q: %v", q, err)
+		}
+		out := make([]catalog.ApplicationWithBinding, 0, len(got))
+		for _, item := range got {
+			if item.App.ID == app.ID {
+				out = append(out, item)
+			}
+		}
+		return out
+	}
+
+	for _, q := range []string{
+		"itestPageSales", // exact case
+		"itestpagesales", // all lower: the BYTE comparison used to miss this
+		"ITESTPAGESALES", // all upper
+		"itestPageSA",    // mixed
+	} {
+		if len(search(q)) != 1 {
+			t.Fatalf("q=%q must match the seeded application case-insensitively", q)
+		}
+	}
+
+	// Category NAME is searched too (mobile's local mode always did).
+	if len(search("itestpagesalescategory")) != 1 {
+		t.Fatalf("q must match the CATEGORY NAME case-insensitively")
+	}
+
+	// The existing LIKE escaping is not undone: `_` stays a literal.
+	// The stored name is "itestPageSales Agent" — note the space, so the
+	// literal pattern must include it.
+	if len(search("itestPageSales Age")) != 1 {
+		t.Fatalf("the literal name must still match")
+	}
+	if got := search("itestPageSales Ag_nt"); len(got) != 0 {
+		t.Fatalf("`_` must stay a literal, not a single-character wildcard (got %v)", namesOf(got))
+	}
+}
+
 func namesOf(items []catalog.ApplicationWithBinding) []string {
 	out := make([]string, 0, len(items))
 	for _, item := range items {

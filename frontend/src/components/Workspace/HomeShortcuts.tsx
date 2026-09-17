@@ -1,13 +1,27 @@
 import React, { useMemo } from 'react';
 import { StarFilled, StarOutlined } from '@ant-design/icons';
-import { buildShortcutGroups } from '@/stores/useApplicationCatalogStore';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
-import type { V2Application } from '@/services/runApi';
+import type { ApplicationSummary } from '@/services/runApi';
 import AgentAvatar from '@/components/Agents/AgentAvatar';
 
 interface Props {
-  applications: V2Application[];
-  onOpen: (application: V2Application) => void;
+  /**
+   * The groups, computed SERVER-side (执行报告 §11, P1-1).
+   *
+   * This component used to derive them from the whole catalog
+   * (`buildShortcutGroups(applications)`), which is precisely why the shell
+   * downloaded every application on mount. The server applies the same rules
+   * (收藏 / 常用 / 最近使用 / 推荐 / 常用应用) to the same fields, so the
+   * rendering below is unchanged — only the source of truth moved.
+   */
+  favorites: ApplicationSummary[];
+  frequent: ApplicationSummary[];
+  recent: ApplicationSummary[];
+  recommended: ApplicationSummary[];
+  /** 常用应用: non-chat applications, recently opened first. */
+  recentFixedApps: ApplicationSummary[];
+  onOpen: (application: ApplicationSummary) => void;
   onToggleFavorite: (applicationId: number) => void;
 }
 
@@ -17,48 +31,50 @@ const RECENT_LIMIT = 8;
  * HomeShortcuts — 常用智能体 / 常用应用 / 最近使用 / 收藏 (§35).
  *
  * Everything here is an Application; there is no "agent shortcut" vs
- * "app shortcut" distinction (§35). Data comes from the catalog endpoint,
- * merged with the local recency the shell keeps while navigating.
+ * "app shortcut" distinction (§35).
  */
 const HomeShortcuts: React.FC<Props> = ({
-  applications, onOpen, onToggleFavorite,
+  favorites, frequent, recent: serverRecent, recommended, recentFixedApps,
+  onOpen, onToggleFavorite,
 }) => {
   const recentApplicationIds = useWorkspaceStore((state) => state.recentApplicationIds);
-  // 停用的应用（应用中心开关）对普通用户已被服务端过滤；这里兜底过滤掉
-  // 管理员视角下混入目录的停用应用，保持首页快捷入口干净。
-  const enabledApplications = useMemo(
-    () => applications.filter((app) => app.enabled !== false),
-    [applications]);
-  const groups = useMemo(() => buildShortcutGroups(enabledApplications), [enabledApplications]);
+  // Local recency (the shell's own navigation log) still leads: it reflects
+  // what the user did in THIS session, including applications the server has
+  // no usage row for yet. The rows it points at are the ones the entity cache
+  // resolved while navigating — one lookup, no catalog.
+  const entities = useApplicationEntityStore((state) => state.byId);
 
   const recent = useMemo(() => {
     const local = recentApplicationIds
-      .map((id) => enabledApplications.find((app) => app.id === id))
-      .filter((app): app is V2Application => app != null && app.kind === 'chat');
-    const merged: V2Application[] = [];
+      .map((id) => entities[id])
+      .filter((app) => app != null && app.kind === 'chat');
+    const merged: ApplicationSummary[] = [];
     const seen = new Set<number>();
-    for (const app of [...local, ...groups.recent]) {
+    for (const app of [...local, ...serverRecent]) {
       if (seen.has(app.id)) continue;
       seen.add(app.id);
       merged.push(app);
     }
     return merged.slice(0, RECENT_LIMIT);
-  }, [recentApplicationIds, enabledApplications, groups.recent]);
+  }, [recentApplicationIds, entities, serverRecent]);
 
   const fixedApplications = useMemo(
-    () => enabledApplications.filter((app) => app.kind !== 'chat').slice(0, RECENT_LIMIT),
-    [enabledApplications]);
+    () => recentFixedApps.slice(0, RECENT_LIMIT),
+    [recentFixedApps]);
 
   const sections = useMemo(() => [
-    { key: 'favorites', label: '收藏', items: groups.favorites },
-    { key: 'frequent', label: '常用智能体', items: groups.frequent },
+    { key: 'favorites', label: '收藏', items: favorites },
+    { key: 'frequent', label: '常用智能体', items: frequent },
     { key: 'applications', label: '常用应用', items: fixedApplications },
     { key: 'recent', label: '最近使用', items: recent },
-    { key: 'recommended', label: '推荐', items: groups.recommended },
+    { key: 'recommended', label: '推荐', items: recommended },
   ].filter((section) => section.items.length > 0),
-  [fixedApplications, groups.favorites, groups.frequent, groups.recommended, recent]);
+  [favorites, fixedApplications, frequent, recommended, recent]);
 
-  if (!enabledApplications.length) {
+  const hasAnything = favorites.length > 0 || frequent.length > 0
+    || recent.length > 0 || recommended.length > 0 || fixedApplications.length > 0;
+
+  if (!hasAnything) {
     return (
       <div className="home-shortcuts home-shortcuts--empty">
         <p>暂无可用的智能体与应用，请联系管理员在智能体市场或应用中心配置。</p>

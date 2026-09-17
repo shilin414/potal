@@ -9,7 +9,7 @@
  * to a provider.
  */
 import React, {
-  useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState,
+  useCallback, useEffect, useLayoutEffect, useRef, useState,
 } from 'react';
 import { Button, Tooltip } from 'antd';
 import { PlusOutlined, StarFilled, StarOutlined } from '@ant-design/icons';
@@ -17,9 +17,9 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { RunChatPanel } from '@/components/Chat';
 import type { SendDecision } from '@/components/Chat/RunChatPanel';
 import { useRunChatStore } from '@/stores/useRunChatStore';
-import { useApplicationCatalogStore } from '@/stores/useApplicationCatalogStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { useWorkspaceStore, workspaceStateOf } from '@/stores/useWorkspaceStore';
-import { routeMention } from '@/lib/mentionRouter';
+import { routeComposerText } from '@/lib/composerRouting';
 import type { V2Application } from '@/services/runApi';
 import ApplicationSwitcher from './ApplicationSwitcher';
 
@@ -30,8 +30,7 @@ interface Props {
 const ChatRenderer: React.FC<Props> = ({ application }) => {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const applications = useApplicationCatalogStore((state) => state.applications);
-  const toggleFavorite = useApplicationCatalogStore((state) => state.toggleFavorite);
+  const toggleFavorite = useWorkspaceBootstrapStore((state) => state.toggleFavorite);
   const workspace = useWorkspaceStore(
     (state) => workspaceStateOf(state.workspaces, application.id));
   const openApplication = useWorkspaceStore((state) => state.openApplication);
@@ -65,35 +64,30 @@ const ChatRenderer: React.FC<Props> = ({ application }) => {
     if (pending) setAutoSend({ id: Date.now(), text: pending });
   }, [application.id, takePrompt]);
 
-  const candidates = useMemo(() => applications.map((app) => ({
-    id: app.id, slug: app.slug, name: app.name, kind: app.kind,
-  })), [applications]);
-
-  const handleRouteSend = useCallback((raw: string): SendDecision => {
-    const decision = routeMention({
-      text: raw, candidates, activeApplicationId: application.id,
-    });
-    switch (decision.action) {
+  // `@application` routing (执行报告 §14): the candidate list is resolved by
+  // the SERVER from the token the user typed, so an agent that is not on any
+  // loaded page can still be mentioned without downloading the catalog.
+  const handleRouteSend = useCallback(async (raw: string): Promise<SendDecision> => {
+    const { route, target } = await routeComposerText(raw, application.id);
+    switch (route.action) {
       case 'passthrough':
         return { action: 'send', content: raw };
       case 'send':
-        return { action: 'send', content: decision.content };
+        return { action: 'send', content: route.content };
       case 'ignore':
         return { action: 'ignore' };
       case 'open': {
-        const target = applications.find((app) => app.id === decision.applicationId);
         if (!target) return { action: 'send', content: raw };
         rememberConversation(application.id, conversationId);
         navigate(`/app/${target.slug}`);
         return { action: 'handled' };
       }
       case 'switch': {
-        const target = applications.find((app) => app.id === decision.applicationId);
         if (!target) return { action: 'send', content: raw };
         // Persist this workspace before leaving so switching back restores
         // the conversation/draft/scroll (§29).
         rememberConversation(application.id, conversationId);
-        if (decision.content) queuePrompt(target.id, decision.content);
+        if (route.content) queuePrompt(target.id, route.content);
         openApplication(target.id);
         navigate(`/chat/${target.slug}`);
         return { action: 'handled' };
@@ -101,7 +95,7 @@ const ChatRenderer: React.FC<Props> = ({ application }) => {
       default:
         return { action: 'send', content: raw };
     }
-  }, [applications, application.id, candidates, conversationId, navigate,
+  }, [application.id, conversationId, navigate,
     openApplication, queuePrompt, rememberConversation]);
 
   // Scroll persistence is throttled: the store is persisted, and a write per
@@ -160,7 +154,7 @@ const ChatRenderer: React.FC<Props> = ({ application }) => {
             type="text"
             aria-label={application.is_favorite ? '取消收藏' : '收藏'}
             icon={application.is_favorite ? <StarFilled /> : <StarOutlined />}
-            onClick={() => void toggleFavorite(application.id)}
+            onClick={() => void toggleFavorite(application.id, application)}
           />
         </Tooltip>
         <Button type="text" icon={<PlusOutlined />} onClick={handleNewConversation}>

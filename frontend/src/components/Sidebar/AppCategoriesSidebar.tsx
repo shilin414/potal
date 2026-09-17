@@ -1,37 +1,44 @@
-import React, { useMemo } from 'react';
+import React from 'react';
 import { Menu } from 'antd';
-import { useApplicationCatalogStore } from '@/stores/useApplicationCatalogStore';
+import { useCatalogUiStore } from '@/stores/useCatalogUiStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 
 /**
  * AppCategoriesSidebar — 应用中心的分类栏（与智能体市场的分类栏同构）。
  *
- * 分类直接从 v2 应用目录的固定应用里聚合，无需单独接口；选择状态放在
- * useApplicationCatalogStore 里，由侧栏与卡片网格共享。
+ * The rail comes from the workspace bootstrap (执行报告 §11): the server
+ * returns the non-chat category list WITH counts, so this component no longer
+ * aggregates the whole catalog (which used to mean every visit to 应用中心
+ * downloaded every application before the rail could render).
+ *
+ * The selected category is shared with the card grid through
+ * `useCatalogUiStore` — UI state, deliberately not a data store.
  */
 const AppCategoriesSidebar: React.FC = () => {
-  const applications = useApplicationCatalogStore((state) => state.applications);
-  const fixedCategory = useApplicationCatalogStore((state) => state.fixedCategory);
-  const setFixedCategory = useApplicationCatalogStore((state) => state.setFixedCategory);
+  const categories = useWorkspaceBootstrapStore((state) => state.appCategories);
+  const loadBootstrap = useWorkspaceBootstrapStore((state) => state.load);
+  const fixedCategory = useCatalogUiStore((state) => state.fixedCategory);
+  const setFixedCategory = useCatalogUiStore((state) => state.setFixedCategory);
 
-  const categories = useMemo(() => {
-    const counts = new Map<string, { name: string; count: number }>();
-    applications
-      .filter((app) => app.kind !== 'chat')
-      .forEach((app) => {
-        const slug = app.category_slug || '';
-        if (!slug) return;
-        const entry = counts.get(slug) || { name: app.category_name || slug, count: 0 };
-        entry.count += 1;
-        counts.set(slug, entry);
-      });
-    return [...counts.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  }, [applications]);
+  React.useEffect(() => { void loadBootstrap(); }, [loadBootstrap]);
+
+  // The server returns first-appearance (created_at) order; the rail keeps the
+  // alphabetical order it always had. 其他 (the __uncategorized__ sentinel) is
+  // pinned last, where the paged endpoint expects it.
+  const sorted = React.useMemo(() => {
+    const named = categories.filter((item) => item.slug !== '__uncategorized__');
+    const rest = categories.filter((item) => item.slug === '__uncategorized__');
+    return [
+      ...[...named].sort((a, b) => a.slug.localeCompare(b.slug)),
+      ...rest,
+    ];
+  }, [categories]);
 
   const menuItems = [
     { key: 'all', label: '全部应用' },
-    ...categories.map(([slug, entry]) => ({
-      key: slug,
-      label: `${entry.name} (${entry.count})`,
+    ...sorted.map((item) => ({
+      key: item.slug,
+      label: `${item.name} (${item.count})`,
     })),
   ];
 

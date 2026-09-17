@@ -4,7 +4,8 @@ import { MenuOutlined, PlusOutlined } from '@ant-design/icons';
 import ConversationHistory from '@/components/ConversationHistory/ConversationHistory';
 import MobileAgentSwitcher from '@/components/Mobile/MobileAgentSwitcher';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
-import { useApplicationCatalogStore, resolveDefaultApplication } from '@/stores/useApplicationCatalogStore';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { useRunChatStore } from '@/stores/useRunChatStore';
 import type { ShellChrome } from './useShellChrome';
 import './shell.css';
@@ -40,17 +41,18 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
   };
 
   // Same semantics as the desktop sidebar's 新建 (see Sidebar.tsx): a new
-  // conversation of the active/main chat agent, never a silent no-op.
+  // conversation of the active/main chat agent, never a silent no-op. The
+  // lookup stays inside the entity cache + the bootstrap payload, so tapping
+  // 新建 costs no catalog request (执行报告 §9.4).
   const handleNewConversation = () => {
-    const applications = useApplicationCatalogStore.getState().applications;
+    const entities = useApplicationEntityStore.getState();
     const activeApplicationId = useWorkspaceStore.getState().activeApplicationId;
     const slug = path.startsWith('/chat/')
       ? decodeURIComponent(path.slice('/chat/'.length))
       : null;
-    const application = (slug
-      && applications.find((app) => app.slug === slug))
-      || applications.find((app) => app.id === activeApplicationId)
-      || resolveDefaultApplication(applications);
+    const application = (slug ? entities.getBySlug(slug) : undefined)
+      || entities.get(activeApplicationId)
+      || useWorkspaceBootstrapStore.getState().defaultApplication;
     setMobileNavOpen(false);
     if (!application) {
       navigate('/');

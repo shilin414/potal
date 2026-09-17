@@ -25,10 +25,15 @@ const sent: ScheduleUpsertPayload[] = [];
 
 const lastPayload = (): ScheduleUpsertPayload => sent[sent.length - 1];
 
+// The picker reads the PAGED endpoint (执行报告 §16.2) — the legacy
+// whole-array client no longer exists, so the mock has to answer the paged
+// shape the component actually consumes.
 vi.mock('@/services/runApi', () => ({
-  fetchV2Applications: vi.fn(async () => [
-    { id: 7, name: '日报智能体', enabled: true, is_bound: true },
-  ]),
+  fetchApplicationPage: vi.fn(async () => ({
+    items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }],
+    next_cursor: '',
+    has_more: false,
+  })),
 }));
 
 vi.mock('@/services/shareApi', () => ({

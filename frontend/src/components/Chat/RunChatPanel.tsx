@@ -36,10 +36,8 @@ import {
   buildShareUrl,
   createConversationShare,
 } from '@/services/shareApi';
-import {
-  resolveDefaultApplication,
-  useApplicationCatalogStore,
-} from '@/stores/useApplicationCatalogStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 import { useRunChatStore } from '@/stores/useRunChatStore';
 import type { ChatMessage } from '@/stores/useRunChatStore';
 import { useAuthStore } from '@/stores/useAuthStore';
@@ -57,7 +55,7 @@ import {
   resolveSelectedSkills,
   skillButtonLabel,
 } from '@/lib/agentSkills';
-import type { AgentSkill, V2Application } from '@/services/runApi';
+import type { AgentSkill, ComposerApplication } from '@/services/runApi';
 import { useIsMobile } from '@/shell/useIsMobile';
 import AgentAvatar from '@/components/Agents/AgentAvatar';
 import {
@@ -85,6 +83,10 @@ const ATTACHMENT_ACCEPT = '.png,.jpg,.jpeg,.pdf,image/png,image/jpeg,application
 /**
  * Send interception result. The workspace uses it to route `@application`
  * instructions (§36): the panel stays provider- and routing-agnostic.
+ *
+ * `onRouteSend` may answer ASYNCHRONOUSLY (执行报告 §14): the `@` candidate
+ * list is resolved on the server now, so the panel awaits the decision instead
+ * of demanding a synchronously pre-loaded catalog.
  */
 export type SendDecision =
   /** Send this content in the application the panel is bound to. */
@@ -100,8 +102,8 @@ export interface RunChatPanelProps {
   applicationId?: number;
   /** The resolved application, when the caller already holds it. Drives the
    *  agent's display name/avatar in the message list; without it the panel
-   *  falls back to the shared catalog (see `effectiveApplication`). */
-  application?: V2Application;
+   *  falls back to the entity cache and then to the bootstrap's main agent. */
+  application?: ComposerApplication;
   /** Existing conversation to continue; null = lazy create on first send. */
   conversationId?: number | null;
   onConversationCreated?: (conversationId: number) => void;
@@ -113,7 +115,7 @@ export interface RunChatPanelProps {
   /** Report every composer edit so the workspace can persist the draft. */
   onDraftChange?: (text: string) => void;
   /** Intercept the submitted text before the Run is created. */
-  onRouteSend?: (raw: string) => SendDecision;
+  onRouteSend?: (raw: string) => SendDecision | Promise<SendDecision>;
   /** Send once, then hand control back (used by @mention routing). */
   autoSend?: { id: number; text: string } | null;
   /** Restore the message list scroll offset of this workspace (§29). */
@@ -150,11 +152,15 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
   } = useRunChatStore();
   const [inputValue, setInputValue] = useState(draftText || '');
   const [sending, setSending] = useState(false);
-  // Shared catalog: the same main-agent resolution the home workspace uses,
-  // so the composer and the shortcut list can never disagree (§38).
-  const applications = useApplicationCatalogStore((state) => state.applications);
-  const loadApplications = useApplicationCatalogStore((state) => state.load);
-  const catalogLoading = useApplicationCatalogStore((state) => state.isLoading);
+  // The composer's agent identity no longer comes from a catalog mirror
+  // (执行报告 §9): the caller passes the resolved application, and the two
+  // fallbacks are the entity cache (an application this session already
+  // resolved) and the bootstrap's default main agent (§38). Both are
+  // constant-size sources, so the panel never triggers a catalog load.
+  const defaultApplication = useWorkspaceBootstrapStore((state) => state.defaultApplication);
+  const bootstrapLoading = useWorkspaceBootstrapStore((state) => state.isLoading);
+  const loadBootstrap = useWorkspaceBootstrapStore((state) => state.load);
+  const entities = useApplicationEntityStore((state) => state.byId);
   const [pendingUploads, setPendingUploads] = useState<PendingUpload[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -184,10 +190,11 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
   };
 
   useEffect(() => {
-    // Only the Home Workspace path has no bound application; the shared
-    // catalog is loaded (and cached) by the workspace shell.
-    if (!applicationId) void loadApplications();
-  }, [applicationId, loadApplications]);
+    // Only the Home Workspace path has no bound application, and its agent
+    // comes from the bootstrap payload — a constant-size request, never the
+    // old whole-catalog load.
+    if (!applicationId) void loadBootstrap();
+  }, [applicationId, loadBootstrap]);
 
   useEffect(() => {
     // History restore: only for a conversation the store does not already
@@ -358,20 +365,17 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Fallback application for the Home Workspace composer: the explicit main
-  // agent, else the first bound chat application (§38).
-  const fallbackApplication = useMemo(
-    () => (applicationId ? null : resolveDefaultApplication(applications)),
-    [applicationId, applications]);
+  // Fallback application for the Home Workspace composer: the bootstrap's
+  // main agent — the same row the shortcut list uses, so the composer and the
+  // 收藏/常用 groups can never disagree (§38).
+  const fallbackApplication = applicationId ? null : defaultApplication;
   // The agent that answers here. Its name and avatar label every assistant
   // message — the chat must never show a generic 助手 (§46 Unified User).
   const effectiveApplication = useMemo(
     () => applicationProp
-      || (applicationId
-        ? applications.find((app) => app.id === applicationId)
-        : undefined)
+      || (applicationId ? entities[applicationId] : undefined)
       || fallbackApplication,
-    [applicationProp, applicationId, applications, fallbackApplication]);
+    [applicationProp, applicationId, entities, fallbackApplication]);
   const capabilities = effectiveApplication?.capabilities || null;
   const supportsAttachment = capabilities
     ? Boolean(capabilities.attachment)
@@ -437,9 +441,11 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
     if (!raw || sending || streaming) return;
 
     // `@application` routing is decided by the caller (§36): it may strip the
-    // mention, switch workspace, or open a fixed page instead of sending.
+    // mention, switch workspace, or open a fixed page instead of sending. The
+    // decision may involve a server round trip (resolving the mention), which
+    // is why it is awaited — the composer stays disabled (`sending`) meanwhile.
     const decision: SendDecision = onRouteSend
-      ? onRouteSend(raw)
+      ? await onRouteSend(raw)
       : { action: 'send', content: raw };
     if (decision.action === 'ignore') return;
     if (decision.action === 'handled') {
@@ -453,7 +459,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
     if (!effectiveApplicationId) {
       // Home composer before the catalog arrives: stay quiet instead of
       // warning, and never swallow the text (it stays in the composer).
-      if (!catalogLoading) antdMessage.warning('暂无可用的聊天应用');
+      if (!bootstrapLoading) antdMessage.warning('暂无可用的聊天应用');
       return;
     }
     const attachments = pendingUploads
@@ -782,7 +788,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
               <button
                 className="run-chat-send"
                 disabled={!inputValue.trim() || sending || streaming
-                  || (!effectiveApplicationId && catalogLoading)}
+                  || (!effectiveApplicationId && bootstrapLoading)}
                 onClick={() => void handleSend()}
               >
                 <SendOutlined />
@@ -793,7 +799,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
                 ? '回复生成中…'
                 : readyCount > 0
                   ? `已选 ${readyCount} 个附件 · Enter 发送`
-                  : (!effectiveApplicationId && catalogLoading)
+                  : (!effectiveApplicationId && bootstrapLoading)
                     ? '正在加载智能体…'
                     : 'Enter 发送 · Shift+Enter 换行'}
             </div>

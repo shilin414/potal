@@ -217,3 +217,66 @@
   不会自动级联，顺序写错只会留孤儿 → 必须"子表排空到 0 再动父表"。
 - `applications` 曾被历次 authz/gate 集成测试灌入 **1818 条 `itest-*` 残留**（2026-09-17 已清理，
   清理后仅剩 7 条真实应用）。**根治办法是让集成测试自带 `t.Cleanup`**，否则会持续复发。
+
+## 🔴🔴 本机 git 的两条「删库」红线（2026-09-17 一天内连撞两次）
+
+### 1) 绝不在同一条命令里「git 写操作 + 长任务」，也不要让命令撞 120s 超时
+
+实测两次事故，受害者都是**工作区 + `.git` 引用目录**：
+
+- **事故 A（丢 176 个工作区文件）**：在 `frontend/` 下执行
+  `git rm -q src/stores/useApplicationCatalogStore.ts src/stores/__tests__/useApplicationCatalogStore.test.ts && npx tsc --noEmit`
+  —— 被 Bash 工具 120s 超时 **SIGTERM** 打断（杀整个进程组），随后 `frontend/src` 下
+  **176 个已跟踪文件从磁盘消失**，`git status` 全是 ` D`。
+  删除形态是「被中断的递归遍历」：字母序靠前的 `components/Agents|Applications|Chat` 还在，
+  `components/ConversationHistory` 起（含 `*.tsx`、`*.css`）全没了，**同目录里 `.css` 有时活下来**
+  （readdir 顺序，不是按扩展名）。残留 **`.git/index.lock`（0 字节）**，此后 `git status` 把
+  **124 个内容完全一致的文件**报成 ` M`（stat 缓存烂掉）。
+- **事故 B（丢 `.git/refs` + 对象库回退一代）**：同一轮稍后，我用 Bash 跑一段
+  **双引号包裹的 `python -c "…"`**，源码里含 Markdown 反引号（记录事故 A 的正文）。
+  **bash 在双引号内会做反引号命令替换** → 正文里的 `git rm … && npx tsc --noEmit`
+  **被真的执行了一遍**（同样撞超时 SIGTERM），另一个裸 `git rm` 报
+  `fatal: No pathspec was given. Which files should I remove?`。
+  结果：`.git/refs` **整个目录消失**（`git` 直接报 `not a git repository`），
+  `packed-refs` 里 `refs/heads/dev` 停在**陈旧的 07a3b27**，
+  pack 被换成**上一代**（`80d772a` / `4c8a4e2` 报 `Not a valid object name`，
+  只有更早的 `9d00f1a` 还在），且 `.idx`(17:20) 与 `.pack`(22:09) **代际不一致**。
+
+### 判定（先做这个，别急着修）
+
+- 数删除：`git status --short | grep -c '^ D'`；
+  **索引是否等于 HEAD**：`git diff --cached --stat`（空 = 历史没丢，只是工作区没了）；
+  **内容级判据**：`git diff --numstat -- <路径>`（比 `git status` 可信）；
+  `git cat-file -t <sha>` 判断对象在不在；`git count-objects -v` 看 `in-pack/packs`。
+
+### 恢复（两次都实测成功）
+
+1. 先备份幸存文件到仓库外（`cp -r frontend/src <外部目录>/survivors`）；
+2. **`git archive` 取 HEAD 快照**（只读，比 `checkout` 安全）：
+   `git archive --format=tar -o <外部>/head.tar HEAD <路径>`
+   —— ⚠️ `-o` **必须用 Windows 原生路径**（`C:/Users/...`），MSYS 的 `/c/...` 会报
+   `could not open ... for writing`；
+3. Python 解包后 **只补缺失文件**（`dst.exists()` 就跳过，内容不同的保留工作区版），
+   这样**不会覆盖任何未提交的编辑**；
+4. `rm -f .git/index.lock` → `git add -- <路径>` 刷新 stat 缓存 → 幽灵 ` M` 消失；
+5. **`.git/refs` 没了就手工重建**（`mkdir -p .git/refs/{heads,tags,remotes/origin}` +
+   写 loose ref + 双写 `packed-refs`，**一律 LF / 无 BOM**）；`refs/heads/dev` 用真实 tip
+   （可从 `.git/logs/HEAD` 的最后一条或 `git ls-remote origin` 取）；
+6. **对象库缺 commit 就 `git fetch origin --tags` 取回**（本机很慢 ≈4 分钟且会被 SIGTERM
+   打断 → **必须 `run_in_background`**）；fetch 自己**不会**修好 `.idx`/`.pack` 代际，
+   由 git 在读取时用新 pack 兜住即可。恢复后 `git cat-file -t <tip>` 必须返回 `commit`。
+
+### 纪律
+
+- **不要用 `git rm`**：删单个文件用普通 `rm`，最后 `git add <path>` 让索引跟上；
+- **不要把 git 写操作和长任务（`npx tsc` / `go test`）串在一条命令里**，长任务一律
+  `run_in_background`，别让它撞 120s；
+- **改文件内容永远不要用「双引号里的 `python -c`」**（反引号/`$()` 会被 bash 先执行）。
+  写内容用 Write/Edit 工具，或 **单引号 heredoc**；
+- 任何 git 写操作后**立刻** `git status --short | wc -l` 对账，数字与预期不符**先停下**；
+- 动手前把要改的子树**快照到仓库外**——两次事故都是靠「幸存副本 + HEAD 归档」救回来的，
+  但**未提交的编辑内容无法从 git 恢复，只能重做**（事故 A 我重做了 20 处前端编辑）。
+- 同类历史：`## 本机 git：绝对禁止 git stash`（丢对象库）与更上面的两层 ref 缺陷，
+  **同一个根因家族**：git 事务失败后的回滚清理会删掉「因此变空的目录」，
+  删到 `refs/heads` 丢分支、删到 `objects/pack` 丢全部历史。
+

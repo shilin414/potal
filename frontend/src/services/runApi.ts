@@ -38,7 +38,20 @@ export interface RunArtifactRecord {
   created_at: string;
 }
 
-export interface V2Application {
+/**
+ * The DISPLAY projection of one application (执行报告 §11, P2-1).
+ *
+ * What a card / switcher row / shortcut / bottom-sheet row needs, and nothing
+ * else. `V2Application` is a structural SUPERTYPE of this, so a component that
+ * only renders a row can accept `ApplicationSummary` and be handed either a
+ * summary (workspace bootstrap) or a full catalog item (paged endpoint) —
+ * which is exactly what the mobile sheet and the switcher do.
+ *
+ * `skills` / `capabilities` are deliberately absent: they exist on
+ * `V2Application` and on the bootstrap's `default_application` (the one
+ * application a composer is bound to).
+ */
+export interface ApplicationSummary {
   id: number;
   slug: string;
   name: string;
@@ -50,9 +63,37 @@ export interface V2Application {
   /** Application kind: 'chat' | 'task' | 'custom'. */
   kind: string;
   renderer_key?: string;
-  executor_key?: string;
   category_slug?: string;
   category_name?: string;
+  provider_key?: string;
+  runtime_type?: string;
+  /** 应用中心开关：停用的应用对普通用户完全隐藏（管理员仍可管理）。 */
+  enabled?: boolean;
+  /** False for fixed pages that have no runtime binding. */
+  is_bound?: boolean;
+  is_favorite?: boolean;
+  /** Marked as the workspace's default main agent (§38). */
+  is_default_agent?: boolean;
+  /** Personal usage — drives 常用 / 最近使用 ordering in the home workspace. */
+  usage_count?: number;
+  last_used_at?: string | null;
+  /** Global counter (Application.usage_count) — drives 推荐 only. */
+  global_usage_count?: number;
+}
+
+/**
+ * An application a COMPOSER can be bound to: the display projection plus the
+ * two runtime facts the chat panel reads (技能 chips + the attachment
+ * capability). This is exactly what the bootstrap's `default_application`
+ * carries, and what `/applications/resolve` returns in full.
+ */
+export type ComposerApplication = ApplicationSummary & {
+  skills?: AgentSkill[];
+  capabilities?: Record<string, boolean>;
+};
+
+export interface V2Application extends ApplicationSummary {
+  executor_key?: string;
   runtime_type: string;
   provider_key: string;
   /** Aily agent_id (or the provider's equivalent resource id). */
@@ -60,22 +101,10 @@ export interface V2Application {
   identity_mode: string;
   execution_mode: string;
   capabilities: Record<string, boolean>;
-  /** False for fixed pages that have no runtime binding. */
-  is_bound?: boolean;
-  is_favorite?: boolean;
   /** 是否公开到市场：私有（仅自己可见）只有管理员能看到。 */
   is_public?: boolean;
-  /** 应用中心开关：停用的应用对普通用户完全隐藏（管理员仍可管理）。 */
-  enabled?: boolean;
-  /** Marked as the workspace's default main agent (§38). */
-  is_default_agent?: boolean;
   /** True when the caller may edit / delete / re-avatar this application. */
   can_manage?: boolean;
-  /** Personal usage — drives 常用 / 最近使用 ordering in the home workspace. */
-  usage_count?: number;
-  last_used_at?: string | null;
-  /** Global counter (Application.usage_count) — drives 推荐 only. */
-  global_usage_count?: number;
   /**
    * 技能配置 — the agent's own skills, configured in 智能体市场.
    *
@@ -153,33 +182,97 @@ export function validateAttachment(file: File): AttachmentViolation | null {
   return null;
 }
 
-/** Openable applications (default: chat apps, i.e. the default-app resolver).
+// ---------------------------------------------------------------------------
+// 工作台启动数据 (执行报告 §9–§14, P1-1/P1-2, 2026-09-17)
+//
+// The shell used to boot by downloading the WHOLE catalog
+// (`GET /v2/applications`, once 1800+ rows) and projecting it in the browser:
+// default agent, home shortcut groups, category rails, `@mention` candidates,
+// slug lookups. Every one of those is now a server responsibility:
+//
+//   · GET /workspace/bootstrap   → default agent + groups + category rails
+//   · GET /applications/resolve  → ONE application by slug or id
+//   · GET /applications/resolve-mention → the few `@` candidates
+//   · GET /applications/page     → the paged lists (see below)
+//
+// No studio surface may call the legacy whole-array endpoint again: a
+// regression there is invisible in a small dev database and fatal in a large
+// one. The backend keeps it (and meters it,
+// studio_legacy_application_list_requests_total) only for non-studio clients.
+// ---------------------------------------------------------------------------
+
+/** One category rail entry (bootstrap). */
+export interface ApplicationCategory {
+  /** What `category_slug` accepts; `__uncategorized__` is the 其他 tab. */
+  slug: string;
+  name: string;
+  count: number;
+}
+
+/**
+ * The start-up payload: constant size, independent of the catalog size.
  *
- * `kind` widens the listing for the workspace home shortcuts: 'all' returns
- * chat apps (bound) plus fixed pages / tasks, so the shell can render every
- * shortcut from one request (architecture doc §35).
- *
- * `scope` widens *whose* applications come back: 'public' (default) keeps the
- * original semantics, 'manage' adds the caller's own (private included) so a
- * user's own agents appear in the switcher and in 智能体市场.
- * `includeUnbound` also returns chat apps whose binding is missing/disabled —
- * the marketplace needs them to stay visible and repairable.
+ * `default_application` is the ONE application that carries `skills` and
+ * `capabilities` (the home composer bound to it renders 技能 chips and gates
+ * the attachment entry on the runtime capabilities); every other row is an
+ * `ApplicationSummary`.
  */
-export async function fetchV2Applications(
-  kind: 'chat' | 'task' | 'custom' | 'all' = 'chat',
-  options: {
-    scope?: 'public' | 'manage' | 'mine';
-    includeUnbound?: boolean;
-  } = {},
-): Promise<V2Application[]> {
+export interface WorkspaceBootstrap {
+  default_application: ComposerApplication | null;
+  favorites: ApplicationSummary[];
+  frequent: ApplicationSummary[];
+  recent: ApplicationSummary[];
+  recommended: ApplicationSummary[];
+  recent_fixed_apps: ApplicationSummary[];
+  agent_categories: ApplicationCategory[];
+  app_categories: ApplicationCategory[];
+}
+
+export function fetchWorkspaceBootstrap(): Promise<WorkspaceBootstrap> {
+  return api.get<WorkspaceBootstrap>('/workspace/bootstrap');
+}
+
+/**
+ * Resolve exactly ONE application (执行报告 §12).
+ *
+ * The visibility policy is the catalog list's own, and an invisible or
+ * unknown application answers 404 — so the caller treats "not found" and "not
+ * allowed" the same way, which is what a deep link needs.
+ */
+export function resolveApplication(
+  lookup: { slug?: string; id?: number },
+): Promise<V2Application> {
   const params: Record<string, string> = {};
-  if (kind !== 'chat') params.kind = kind;
-  if (options.scope && options.scope !== 'public') params.scope = options.scope;
-  if (options.includeUnbound) params.include_unbound = 'true';
+  if (lookup.slug) params.slug = lookup.slug;
+  if (lookup.id != null) params.id = String(lookup.id);
+  return api.get<V2Application>('/v2/applications/resolve', params);
+}
+
+/** One `@` candidate: `kind` decides open vs send (§14). */
+export interface MentionCandidate {
+  id: number;
+  slug: string;
+  name: string;
+  kind: string;
+}
+
+/**
+ * Server-side `@mention` resolution (执行报告 §14).
+ *
+ * Replaces the candidate array the shell used to build from the whole
+ * catalog: the composer sends the token the user typed and gets back the few
+ * applications whose name/slug could match, ranked.
+ */
+export async function resolveApplicationMention(
+  q: string,
+): Promise<MentionCandidate[]> {
+  const needle = q.trim();
+  if (!needle) return [];
   try {
-    return await api.get<V2Application[]>(
-      '/v2/applications', Object.keys(params).length ? params : undefined);
+    return await api.get<MentionCandidate[]>('/v2/applications/resolve-mention', { q: needle });
   } catch {
+    // Routing is a convenience: an unreachable resolver must degrade to
+    // "unknown mention → send as typed", never to a blocked composer (§38).
     return [];
   }
 }
@@ -277,24 +370,14 @@ export interface RuntimeValidationResult {
   detail: string;
 }
 
-/** Agents the caller can manage: public ones + their own, bound or not. */
-export async function fetchManageableAgents(): Promise<ManagedAgent[]> {
-  try {
-    return await api.get<ManagedAgent[]>('/v2/applications', {
-      kind: 'chat', scope: 'manage', include_unbound: 'true',
-    });
-  } catch {
-    return [];
-  }
-}
-
 // ---------------------------------------------------------------------------
 // 服务端游标分页 (执行报告 §14–§24, 2026-09-17)
 //
 // GET /v2/applications/page evaluates LIMIT + the cursor condition inside
 // SQL and aggregates personal usage / favourites for the returned page ids
-// only. The legacy /v2/applications whole-array endpoint stays for callers
-// not yet migrated (catalog store, mention router — see the P1 bootstrap).
+// only. Since P1 it is the ONLY list endpoint any studio surface uses: the
+// catalog mirror, the mention candidate array and the slug lookups all moved
+// to /workspace/bootstrap + /applications/resolve (see above).
 // ---------------------------------------------------------------------------
 
 /** One keyset page of the application catalog. */

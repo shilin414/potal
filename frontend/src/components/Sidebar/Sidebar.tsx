@@ -1,5 +1,6 @@
 import { useLocation, useNavigate } from 'react-router-dom';
-import { useApplicationCatalogStore, resolveDefaultApplication } from '@/stores/useApplicationCatalogStore';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { useRunChatStore } from '@/stores/useRunChatStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import AgentCategoriesSidebar from './AgentCategoriesSidebar';
@@ -57,16 +58,19 @@ const Sidebar = () => {
   // workspace it starts a NEW conversation of THAT agent (same as the header
   // 新建对话 button); from the home workspace it opens the main agent's chat
   // surface instead of a no-op navigate('/').
+  //
+  // The agent is looked up in the entity cache (populated by whatever route
+  // the user is on) and then in the bootstrap payload — never by loading the
+  // catalog (执行报告 §9).
   const handleNewConversation = () => {
-    const applications = useApplicationCatalogStore.getState().applications;
+    const entities = useApplicationEntityStore.getState();
     const activeApplicationId = useWorkspaceStore.getState().activeApplicationId;
     const slug = path.startsWith('/chat/')
       ? decodeURIComponent(path.slice('/chat/'.length))
       : null;
-    const application = (slug
-      && applications.find((app) => app.slug === slug))
-      || applications.find((app) => app.id === activeApplicationId)
-      || resolveDefaultApplication(applications);
+    const application = (slug ? entities.getBySlug(slug) : undefined)
+      || entities.get(activeApplicationId)
+      || useWorkspaceBootstrapStore.getState().defaultApplication;
     if (!application) {
       navigate('/');
       return;

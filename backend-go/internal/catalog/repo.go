@@ -382,6 +382,20 @@ func visible(app *Application, scope string, callerID int64, isStaff bool) bool 
 	return app.IsPublic
 }
 
+// VisibleTo exposes the access policy above as a single-row predicate.
+//
+// Single-application resolution (GET /v2/applications/resolve, 执行报告 §12,
+// and the bootstrap groups) must apply EXACTLY the same rule as the catalog
+// list; re-implementing it at a call site is how "the deep link opens an
+// application the market hides" bugs are born. `scope` uses the same values
+// as the list endpoints: public | mine | manage.
+func VisibleTo(app *Application, scope string, callerID int64, isStaff bool) bool {
+	return visible(app, scope, callerID, isStaff)
+}
+
+// VisibleScopeManage is the scope the workspace surfaces resolve with.
+const VisibleScopeManage = "manage"
+
 // ─────────────────────────────────────────── keyset-paginated catalog page ──
 
 // PageCursor is the opaque keyset cursor: base64url(JSON) of the
@@ -398,8 +412,19 @@ func EncodePageCursor(t time.Time, id int64) string {
 	return base64.RawURLEncoding.EncodeToString(payload)
 }
 
+// ErrInvalidCursor is returned for a cursor that decodes but carries no
+// usable position (执行报告 §21 / P2-3).
+var ErrInvalidCursor = errors.New("invalid cursor")
+
 // DecodePageCursor parses a next_cursor round-trip. Any malformed input is
 // an error — the handler answers 400 instead of silently restarting the walk.
+//
+// A payload that decodes cleanly but carries a zero anchor (`{}`, or
+// `{"c":"0001-01-01T00:00:00Z","i":0}`) is REJECTED too: the zero value is
+// exactly what "first page" means internally, so accepting it would let a
+// hand-crafted cursor silently restart the walk at page one instead of
+// failing loudly. The fields are not signed — a cursor is a pagination
+// position, not a capability (§21), so an HMAC would buy nothing.
 func DecodePageCursor(raw string) (time.Time, int64, error) {
 	payload, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(raw))
 	if err != nil {
@@ -408,6 +433,9 @@ func DecodePageCursor(raw string) (time.Time, int64, error) {
 	var c PageCursor
 	if err := json.Unmarshal(payload, &c); err != nil {
 		return time.Time{}, 0, err
+	}
+	if c.ID <= 0 || c.CreatedAt.IsZero() {
+		return time.Time{}, 0, ErrInvalidCursor
 	}
 	return c.CreatedAt, c.ID, nil
 }
@@ -489,7 +517,9 @@ func (r *Repo) ListApplicationPage(ctx context.Context, q ApplicationPageQuery) 
 		AllowUnbound:   boolArg(q.IncludeUnbound),
 		Search:         searchArg,
 		SearchNameLike: likePattern(search),
-		SearchDescLike: sql.NullString{String: likePattern(search), Valid: true},
+		// The same needle feeds the description AND the category-name branch
+		// (see the query's comment): one placeholder, two comparisons.
+		SearchDescLike: likePattern(search),
 		CategorySlug:   sql.NullString{String: q.CategorySlug, Valid: q.CategorySlug != ""},
 		CategoryIsNull: boolArg(uncategorized),
 		// First page: anchor far in the past, so `created_at > ?` is a no-op.

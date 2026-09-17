@@ -9,11 +9,16 @@
  *
  * `Chat` is only one of them. Everything here is provider-agnostic: the
  * backend already reduced a binding to capabilities + a renderer key.
+ *
+ * Slug resolution (执行报告 §12, P1-2) is EXACT and one row wide: the route's
+ * slug is looked up in the application entity cache and, on a miss, resolved
+ * with `GET /applications/resolve?slug=`. Opening `/chat/sales` used to
+ * download the entire catalog and run `Array.find()` over it.
  */
-import React, { useEffect, useMemo } from 'react';
+import React, { useEffect, useState } from 'react';
 import { Button, Empty, Spin } from 'antd';
 import { useNavigate, useParams } from 'react-router-dom';
-import { useApplicationCatalogStore } from '@/stores/useApplicationCatalogStore';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import ChatRenderer from './ChatRenderer';
 import HomeWorkspace from './HomeWorkspace';
@@ -29,31 +34,43 @@ interface Props {
 const WorkspaceHost: React.FC<Props> = ({ kind = 'home' }) => {
   const navigate = useNavigate();
   const { applicationSlug } = useParams<{ applicationSlug?: string }>();
-  const applications = useApplicationCatalogStore((state) => state.applications);
-  const isLoading = useApplicationCatalogStore((state) => state.isLoading);
-  const load = useApplicationCatalogStore((state) => state.load);
+  const bySlug = useApplicationEntityStore((state) => state.bySlug);
+  const ensureBySlug = useApplicationEntityStore((state) => state.ensureBySlug);
   const setActiveApplication = useWorkspaceStore((state) => state.setActiveApplication);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
+  const [resolving, setResolving] = useState(false);
 
-  useEffect(() => { void load(); }, [load]);
+  const application = applicationSlug ? bySlug[applicationSlug] : undefined;
 
-  const application = useMemo(
-    () => (applicationSlug
-      ? applications.find((app) => app.slug === applicationSlug)
-      : undefined),
-    [applications, applicationSlug]);
+  useEffect(() => {
+    if (!applicationSlug) {
+      setResolving(false);
+      setActiveApplication(null);
+      return undefined;
+    }
+    let active = true;
+    setResolving(true);
+    // Cache-first: a slug already visited resolves synchronously, so the
+    // workspace does not flash a spinner on a route change inside the shell.
+    void ensureBySlug(applicationSlug).finally(() => {
+      if (active) setResolving(false);
+    });
+    return () => { active = false; };
+  }, [applicationSlug, ensureBySlug, setActiveApplication]);
 
   useEffect(() => {
     if (application) openApplication(application.id);
-    else if (!applicationSlug) setActiveApplication(null);
-  }, [application, applicationSlug, openApplication, setActiveApplication]);
+  }, [application, openApplication]);
 
   if (!applicationSlug) return <HomeWorkspace />;
 
   if (!application) {
-    if (isLoading) {
+    if (resolving) {
       return <div className="workspace-host__loading"><Spin size="large" /></div>;
     }
+    // A missing application and a FORBIDDEN one look the same here, which is
+    // the point: /applications/resolve answers 404 for both, so the shell
+    // cannot be used to probe which slugs exist.
     return (
       <div className="workspace-host__missing">
         <Empty

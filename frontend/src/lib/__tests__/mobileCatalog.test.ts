@@ -7,15 +7,64 @@ import {
   buildMobileCategoryTabs,
   buildRecentItems,
   filterMobileCatalog,
+  mergeRecentItems,
   splitMobileCatalog,
 } from '../mobileCatalog';
-import type { V2Application } from '@/services/runApi';
+import type { ApplicationSummary, V2Application } from '@/services/runApi';
 
 const app = (over: Partial<V2Application>): V2Application => ({
   id: 1, slug: 's', name: 'A', description: '', icon: '', kind: 'chat',
   runtime_type: 'agent', provider_key: 'feishu_aily', identity_mode: 'user',
   execution_mode: 'interactive', capabilities: {},
   ...over,
+});
+
+const summary = (over: Partial<ApplicationSummary> & { id: number }): ApplicationSummary => ({
+  slug: `s-${over.id}`, name: `A${over.id}`, description: '', icon: '',
+  kind: 'chat', enabled: true,
+  ...over,
+});
+
+// 执行报告 §4.2/§6 (P0-R1): in server-paged mode 最近使用 is merged from the
+// shell's local recency and the server's recency group — NOT from the fetched
+// page — so the section survives both paging and a category switch.
+describe('mergeRecentItems (server-paged mode)', () => {
+  it('leads with local recency, then the server group', () => {
+    const local = [summary({ id: 1 }), summary({ id: 2 })];
+    const server = [summary({ id: 2 }), summary({ id: 3 })];
+
+    const merged = mergeRecentItems(local, server, 'agent');
+
+    expect(merged.map((item) => item.id)).toEqual([1, 2, 3]);
+  });
+
+  it('keeps agents and applications apart', () => {
+    const local = [summary({ id: 1 }), summary({ id: 2, kind: 'custom' })];
+
+    expect(mergeRecentItems(local, [], 'agent').map((i) => i.id)).toEqual([1]);
+    expect(mergeRecentItems(local, [], 'app').map((i) => i.id)).toEqual([2]);
+  });
+
+  it('never offers a disabled application, and caps the list', () => {
+    const rows = [
+      ...Array.from({ length: MOBILE_RECENT_LIMIT + 3 }, (_, i) => summary({ id: i + 1 })),
+      summary({ id: 99, enabled: false }),
+    ];
+
+    const merged = mergeRecentItems(rows, [], 'agent');
+
+    expect(merged).toHaveLength(MOBILE_RECENT_LIMIT);
+    expect(merged.some((item) => item.id === 99)).toBe(false);
+  });
+
+  it('is independent of any category filter', () => {
+    // Nothing here knows about categories: an HR-filtered list must still be
+    // able to show an IT agent in 最近使用 (§4.2).
+    const it = summary({ id: 7, category_slug: 'it', category_name: 'IT运维' });
+    const hr = summary({ id: 8, category_slug: 'hr', category_name: 'HR' });
+
+    expect(mergeRecentItems([it], [hr], 'agent').map((i) => i.id)).toEqual([7, 8]);
+  });
 });
 
 describe('large catalogs (the shared DB carries 1800+ rows)', () => {

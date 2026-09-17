@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"bytes"
+	"context"
 	"database/sql"
 
 	"github.com/creation-agent-studio/backend-go/internal/catalog"
@@ -25,6 +26,58 @@ import (
 )
 
 // ───────────────────────────────────────────── application payloads ──
+
+// applicationSummary is the DISPLAY shape (执行报告 §11, P2-1): the fields a
+// consumer surface needs to render a row — no `skills`, no
+// `external_resource_id`, no runtime config, no `capabilities`, unless the
+// caller explicitly asks for the one application a composer is bound to
+// (see workspaceBootstrap.DefaultApplication).
+//
+// It is a strict projection of applicationListItem so the two shapes can
+// never drift: every summary is built by summaryOf(item).
+type applicationSummary struct {
+	ID               int64   `json:"id"`
+	Slug             string  `json:"slug"`
+	Name             string  `json:"name"`
+	Description      string  `json:"description"`
+	Icon             string  `json:"icon"`
+	AvatarURL        string  `json:"avatar_url"`
+	Color            string  `json:"color"`
+	Kind             string  `json:"kind"`
+	RendererKey      string  `json:"renderer_key"`
+	CategorySlug     string  `json:"category_slug"`
+	CategoryName     string  `json:"category_name"`
+	ProviderKey      string  `json:"provider_key"`
+	RuntimeType      string  `json:"runtime_type"`
+	Enabled          bool    `json:"enabled"`
+	IsBound          bool    `json:"is_bound"`
+	IsFavorite       bool    `json:"is_favorite"`
+	IsDefaultAgent   bool    `json:"is_default_agent"`
+	UsageCount       int64   `json:"usage_count"`
+	LastUsedAt       *string `json:"last_used_at"`
+	GlobalUsageCount int64   `json:"global_usage_count"`
+
+	// Only on default_application: the home composer renders this agent's
+	// 技能 chips and gates the attachment entry on its runtime
+	// capabilities, so those two fields ARE needed by the page that
+	// consumes it (§11 "除非当前页面确实需要").
+	Skills       []catalog.Skill `json:"skills,omitempty"`
+	Capabilities map[string]any  `json:"capabilities,omitempty"`
+}
+
+func summaryOf(item applicationListItem) applicationSummary {
+	return applicationSummary{
+		ID: item.ID, Slug: item.Slug, Name: item.Name, Description: item.Description,
+		Icon: item.Icon, AvatarURL: item.AvatarURL, Color: item.Color,
+		Kind: item.Kind, RendererKey: item.RendererKey,
+		CategorySlug: item.CategorySlug, CategoryName: item.CategoryName,
+		ProviderKey: item.ProviderKey, RuntimeType: item.RuntimeType,
+		Enabled: item.Enabled, IsBound: item.IsBound,
+		IsFavorite: item.IsFavorite, IsDefaultAgent: item.IsDefaultAgent,
+		UsageCount: item.UsageCount, LastUsedAt: item.LastUsedAt,
+		GlobalUsageCount: item.GlobalUsageCount,
+	}
+}
 
 // applicationListItem mirrors GET /api/v2/applications (24 keys, exact).
 type applicationListItem struct {
@@ -184,47 +237,19 @@ func (s *Server) ListApplications(w http.ResponseWriter, r *http.Request, params
 	includeUnbound := params.IncludeUnbound != nil &&
 		isTruthy(*params.IncludeUnbound)
 
-	providers := map[int64]*catalog.Provider{}
-	if provs, err := s.CatalogRepo.ListActiveProviders(ctx); err == nil {
-		for i := range provs {
-			providers[provs[i].ID] = &provs[i]
-		}
+	// Deprecation meter (执行报告 §16): studio surfaces use
+	// /applications/page and /workspace/bootstrap now, so this series has to
+	// decay to zero before the endpoint can be deleted.
+	if s.Metric != nil {
+		s.Metric.LegacyApplicationListRequestsTotal.Inc()
 	}
 
-	// personal usage per application (own runs only) — the legacy whole-list
-	// endpoint keeps its user-wide aggregation until callers migrate to the
-	// paged endpoint (which aggregates only the page ids, §20).
-	usage := map[int64]pageUsage{}
-	rows, err := s.DB.QueryContext(ctx,
-		`SELECT application_id, COUNT(*) AS n, MAX(created_at) AS last_used FROM runs WHERE user_id = ? AND application_id IS NOT NULL GROUP BY application_id`,
-		caller.ID)
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var appID, n int64
-			var last sql.NullTime
-			if err := rows.Scan(&appID, &n, &last); err == nil {
-				entry := pageUsage{Count: n}
-				if last.Valid {
-					t := last.Time.UTC().Format(time.RFC3339)
-					entry.Last = &t
-				}
-				usage[appID] = entry
-			}
-		}
-	}
-
-	favorites := map[int64]bool{}
-	if favRows, err := s.DB.QueryContext(ctx,
-		`SELECT application_id FROM application_favorites WHERE user_id = ?`, caller.ID); err == nil {
-		defer favRows.Close()
-		for favRows.Next() {
-			var appID int64
-			if favRows.Scan(&appID) == nil {
-				favorites[appID] = true
-			}
-		}
-	}
+	providers := s.activeProviders(ctx)
+	// The legacy whole-list endpoint keeps its user-wide aggregation until
+	// callers migrate to the paged endpoint (which aggregates only the page
+	// ids, §20).
+	usage := s.personalUsage(ctx, caller.ID)
+	favorites := s.personalFavorites(ctx, caller.ID)
 
 	out := []applicationListItem{}
 	seenBound := map[int64]bool{}
@@ -379,12 +404,7 @@ func (s *Server) ListApplicationPage(w http.ResponseWriter, r *http.Request, par
 		return
 	}
 
-	providers := map[int64]*catalog.Provider{}
-	if provs, err := s.CatalogRepo.ListActiveProviders(ctx); err == nil {
-		for i := range provs {
-			providers[provs[i].ID] = &provs[i]
-		}
-	}
+	providers := s.activeProviders(ctx)
 
 	favMap := map[int64]bool{}
 	for id, fav := range favorites {
@@ -411,6 +431,71 @@ func (s *Server) ListApplicationPage(w http.ResponseWriter, r *http.Request, par
 		NextCursor string                `json:"next_cursor"`
 		HasMore    bool                  `json:"has_more"`
 	}{Items: items, NextCursor: nextCursor, HasMore: hasMore})
+}
+
+// ────────────────────────────────────────────── shared list ingredients ──
+
+// activeProviders indexes the active providers by id — the capability lookup
+// `buildListItem` needs. Best-effort: an empty map simply means no
+// capabilities are reported.
+func (s *Server) activeProviders(ctx context.Context) map[int64]*catalog.Provider {
+	providers := map[int64]*catalog.Provider{}
+	if provs, err := s.CatalogRepo.ListActiveProviders(ctx); err == nil {
+		for i := range provs {
+			providers[provs[i].ID] = &provs[i]
+		}
+	}
+	return providers
+}
+
+// personalUsage aggregates the CALLER's own runs per application.
+//
+// User-wide rather than per-page/per-pool on purpose: the row count is
+// bounded by what this caller actually ran, and it is ONE query instead of an
+// `IN (...)` over a whole page (the paged endpoint's variant) or millions of
+// rows (a whole catalog). Best-effort by design: losing it degrades the
+// 使用次数 / 最近使用 hints, it must never fail a list request.
+func (s *Server) personalUsage(ctx context.Context, userID int64) map[int64]pageUsage {
+	usage := map[int64]pageUsage{}
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT application_id, COUNT(*) AS n, MAX(created_at) AS last_used FROM runs WHERE user_id = ? AND application_id IS NOT NULL GROUP BY application_id`,
+		userID)
+	if err != nil {
+		return usage
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var appID, n int64
+		var last sql.NullTime
+		if err := rows.Scan(&appID, &n, &last); err == nil {
+			entry := pageUsage{Count: n}
+			if last.Valid {
+				t := last.Time.UTC().Format(time.RFC3339)
+				entry.Last = &t
+			}
+			usage[appID] = entry
+		}
+	}
+	return usage
+}
+
+// personalFavorites is the set of applications this caller starred
+// (best-effort, same rationale as personalUsage).
+func (s *Server) personalFavorites(ctx context.Context, userID int64) map[int64]bool {
+	favorites := map[int64]bool{}
+	rows, err := s.DB.QueryContext(ctx,
+		`SELECT application_id FROM application_favorites WHERE user_id = ?`, userID)
+	if err != nil {
+		return favorites
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var appID int64
+		if rows.Scan(&appID) == nil {
+			favorites[appID] = true
+		}
+	}
+	return favorites
 }
 
 func (s *Server) buildListItem(item catalog.ApplicationWithBinding, providers map[int64]*catalog.Provider,

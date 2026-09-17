@@ -19,28 +19,30 @@
  * the composer is a sibling of this surface inside the workspace column, so
  * this component only ever fills the space above it.
  */
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { resolveDefaultApplication, useApplicationCatalogStore } from '@/stores/useApplicationCatalogStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import { routeForApplication } from '@/lib/applicationRoute';
-import type { V2Application } from '@/services/runApi';
+import type { ApplicationSummary } from '@/services/runApi';
 import AgentAvatar from '@/components/Agents/AgentAvatar';
 import MobileCatalogSheet from './MobileCatalogSheet';
 import './MobileHomeSurface.css';
 
 const MobileHomeSurface: React.FC = () => {
   const navigate = useNavigate();
-  const applications = useApplicationCatalogStore((state) => state.applications);
+  // The hero's agent is the bootstrap's main agent (执行报告 §9.5): one small
+  // payload, not the whole catalog this component used to project.
+  const defaultApplication = useWorkspaceBootstrapStore((state) => state.defaultApplication);
+  const loadBootstrap = useWorkspaceBootstrapStore((state) => state.load);
   const recentApplicationIds = useWorkspaceStore((state) => state.recentApplicationIds);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
 
   const [sheet, setSheet] = useState<'agent' | 'app' | null>(null);
 
-  const defaultApplication = useMemo(
-    () => resolveDefaultApplication(applications), [applications]);
+  useEffect(() => { void loadBootstrap(); }, [loadBootstrap]);
 
-  const open = (application: V2Application) => {
+  const open = (application: ApplicationSummary) => {
     // Same contract as the desktop shortcuts: mark it active (which also
     // records local recency) and let the route pick the right renderer.
     openApplication(application.id);

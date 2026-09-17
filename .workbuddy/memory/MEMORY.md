@@ -9,9 +9,14 @@
 - 仓库 `shilin414/potal`，分支 `dev`。执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot/Lease/Heartbeat/Gate）与第九轮 **FROZEN**，不得顺手改。
 - 第十轮 Batch 4 / 4.1 / 4.1.1 / 4.1.2 → **SSE Hub 永久 FROZEN**（4.1.2 为 test-only）；Batch 5 + 5.1 → **Worker Dispatcher FINAL FROZEN**。
 - **第十一轮 Aily 附件链路已修复并推送**（`9d00f1a`）：Worker 侧附件上传桥接 + studio/provider id 分离 + P0-6 多图 artifact。**未动 `waiting_external` 机制**。
-- **下一步：Batch 6 — 优先 Aily Workflow Runtime**（验证同 provider、不同 `runtime_type` 走不同 Executor）。
-- migration 基线 = **24**（0021 run_requests / 0022 provider_submissions / 0023 next_event_sequence / 0024 容量索引）。Batch 4/5 系列与第十一轮**均无 migration**。
-- P1 待办（本轮未做）：**xlsx/csv 需 potal 本地解析成结构化文本再进 `user_message.content`**，不能伪装成 `type=file`（Aily 直接文件仅支持 png/jpg/pdf）。
+- **第十二轮 P0-R + P1 已完成**（复审报告 `potal 最新代码复审暨下一轮修改执行报告.md`）：目录架构闭环
+  —— 头像指纹缓存 + keyset 分页（`4c8a4e2`/`80d772a`）+ **bootstrap/resolve/mention 三端点 +
+  删除整目录镜像**（本轮）。**下一步仍是 Batch 6 — 优先 Aily Workflow Runtime**。
+- migration 基线 = **24**（0021 run_requests / 0022 provider_submissions / 0023 next_event_sequence / 0024 容量索引）。Batch 4/5 系列与第十/十一/十二轮**均无 migration**。
+- P1 待办（仍未做）：**xlsx/csv 需 potal 本地解析成结构化文本再进 `user_message.content`**，不能伪装成 `type=file`（Aily 直接文件仅支持 png/jpg/pdf）。
+- P2 待办（复审报告点名，本轮未做）：`/applications/page` 的 0025 索引 **EXPLAIN 实测**（`kind=all`/`kind<>'chat'` 未必吃得到索引）、
+  legacy `/agents/` 的分页（若长期保留）、用户自身头像是否走代理层（先看 DevTools 是否命中 memory/disk cache）、
+  DTO 进一步拆 Summary/Detail/AuthoringDetail、CI 静态检查禁止前端出现 `/v2/applications`。
 
 ## 改冻结子系统前先读
 | 子系统 | 文档 |
@@ -51,22 +56,52 @@
 - **前端 store**：异步写用 functional setState；`activeRunId` compare-and-clear；拉取失败 `null` = 未知、不清空；`run.cancelled` 独立终态不得映射 done；`run.deferred` 靠 `run.started` 清除。
 - **antd 表单取值（P0 事故）**：拼 payload 一律 `form.getFieldsValue(true)`；**绝不用 `validateFields()` / `getFieldsValue()` 的返回值**（只含已注册 Form.Item 的路径，其他字段被**静默丢弃**）。回归测试 `frontend/src/components/Schedules/__tests__/scheduleEditorPayload.test.tsx`。
 
-## 前端列表/选择器：目录是「全量下发」的，渲染必须自己设界（2026-09-17 事故）
-`GET /api/v2/applications` **没有服务端分页**，一次返回整张目录（dev 库被集成测试残留灌到 1800+ 行）。
-违反下面任一条都会复发成「进页面很卡 / 列表一闪而过然后空了」：
+## 前端数据层：**单行解析 + 分页 + bootstrap**，禁止整目录下载（第十二轮 2026-09-17 收口）
+`useApplicationCatalogStore`（把整张目录镜像到浏览器）**已删除**；`fetchV2Applications` /
+`fetchManageableAgents` 也从前端移除。现在的三个数据层与**唯一允许的四个入口**：
+- 列表 → `GET /v2/applications/page`（keyset，`useApplicationPage`；q/category 传后端）；
+- 起屏事实 → `GET /v2/workspace/bootstrap`（`useWorkspaceBootstrapStore`：默认主智能体 +
+  收藏/常用/最近/推荐/常用应用 + 智能体与应用分类导航；**响应体与目录规模无关**）；
+- 单行 → `GET /v2/applications/resolve?slug=|id=`（`useApplicationEntityStore`，同一套
+  `catalog.VisibleTo`，不可见与不存在都 404）；
+- `@` 路由 → `GET /v2/applications/resolve-mention?q=`（`lib/composerRouting`，
+  `onRouteSend` 可以返回 Promise）。
+- **绝不再让前端碰 `GET /v2/applications`（全量数组）**：小库看不出、大库是事故。
+  后端保留该端点只为非 studio 客户端，并用 `studio_legacy_application_list_requests_total` 计量。
+- 变更后的本地 patch 三处一起：**page item + entity cache + bootstrap**（AgentsPage 是范例）；
+  只有「前一个默认智能体被服务端降级」这种看不见的副作用才需要重新拉一次 bootstrap（几十行）。
+- 组件若要只渲染不解析，参数类型用 `ApplicationSummary`（`V2Application` 是它的结构化子类型），
+  **不要把 summary 塞进 entity store**（那里只放完整 item）。
+
+## 移动端列表/选择器：分类与「最近使用」绝不从当前页推导（P0-R1，2026-09-17）
+`MobileCatalogSheet` 有**两种数据模式**，测试必须分清（旧的 256 个用例全走 local 模式，
+所以生产路径的语义错误一个都没抓到）：
+- `applications` 传了 → legacy 本地池（**只用于单测**）：`buildMobileCategoryTabs(pool)` +
+  `buildRecentItems(pool, recentIds, type)` + `MOBILE_SHEET_MAX_ROWS` 渲染预算；
+- `applications` 未传 → **生产** server-paged：分类 tabs = `bootstrap.{agent,app}_categories`
+  （服务端算好，含 `__uncategorized__`→「其他」哨兵），最近使用 =
+  `mergeRecentItems(本地 recentIds 经实体缓存解析, bootstrap.recent/recent_fixed_apps)`，
+  **不受当前分类/搜索影响**；`activeApplication` 只在「`category==='all'` 且无搜索」时注入
+  （注入到分类或搜索结果里 = 让 IT 分类出现销售智能体）。
+- 空态要分两类：目录真空 → 「暂无可用智能体/请联系管理员配置」；**分类或搜索无结果 → 保留 tab 导航**
+  （否则用户被困在那个分类里出不来）。
+
+## 前端列表/选择器：渲染预算仍必须有上界（2026-09-17 事故，遗留约束）
+进入某个页面/选择器以后看到的仍是「分页/上限」结果，所以下面这些仍然成立：
 - **首屏动画延迟绝不可与下标线性相关**：`animationDelay: index * 50ms` 配
   `animation: fadeIn … both` 时，`both` 会在**整个延迟期间保持 opacity:0**，
   1800 行 → 最后一张要等 ~90 秒，用户看到的就是「空列表」。必须**封顶**（`cardDelay`）。
 - **列表必须设渲染上限 + 加载更多**：市场页 `PAGE_SIZE=24`，移动端 sheet
   `MOBILE_SHEET_MAX_ROWS=60`，切换器跳跃菜单 `SWITCHER_MAX_ROWS=50`（并**钉住当前项**，别把它截掉）。
-- **上限只能是「渲染预算」，绝不能加到过滤之前**：`filtered` 必须在**完整池**上算，
+- **上限只能是「渲染预算」，绝不能加到过滤之前**（legacy 本地池模式）：`filtered` 必须在**完整池**上算，
   只有 `rendered` 才切片 —— 否则搜索会静默搜不到第一页之外的项（管理员看不见自己的智能体）。
-  这条有专门的反证测试钉住。
+  **server-paged 模式下搜索/分类由后端做**，`filtered` 就是服务端返回的那一页，不存在这个坑。
 - **同一批数据出现在两个 Menu 分组时，key 必须按分组加前缀**（`recent-1` / `all-1`）：
   共用 `String(app.id)` 会触发 React `Duplicated key` 且 antd 的 active-key 追踪会把两行当一行。
-- **派生结果放 store，不要在每个消费组件的渲染体里重算**：`useApplicationCatalogStore.chatApplicationsList`
-  在下发时算一次；组件内 `applications.filter(kind==='chat')` 是每次渲染重分配 1800 项。
-  改这类派生字段时，**所有写 `applications` 的地方都要同步维护它**（`toggleFavorite` / `clear` 都算）。
+- **派生结果放 store，不要在每个消费组件的渲染体里重算**：整目录镜像没了以后，剩下的
+  派生点（`ApplicationSummary` 分组、分类导航）都在 `useWorkspaceBootstrapStore` 里由**服务端**
+  算好一次；组件里再 `list.filter(...)` 就是每次渲染重分配。改派生字段时**所有写它的方法都要同步维护**
+  （`patch` / `remove` / `toggleFavorite` 都算 —— bootstrap store 里这三处是并列的）。
 - `applications.default_config` 是「归属智能体的配置」的落点，但**写它必须 FOR UPDATE
   读-改-写**（`MergeSkills`）：该 JSON 列还被 legacy 的 `guided_entry_prompt_key` 共用，
   直接覆盖会把它一起抹掉。
@@ -76,6 +111,10 @@
 - **反证驱动绝不可与其它 `go test` 并发**（脚本改真实源码）。
 - **不要为对照基线 `git checkout <sha>`**（本机会被 SIGTERM 打断）；用 `git checkout <sha> -- <路径>`。
 - **同一工作区可能有并发会话**：开工前 `git status` + 看关键文件 mtime；提交前若混着别人的改动**先问用户**，别 `git add -A`。
+- **🔴 不要用 `git rm`；不要把 git 写操作和长任务串在一条命令里；不要用双引号包 `python -c "…"` 写含反引号的内容**
+  —— 2026-09-17 一天撞了两次「删工作区 176 文件 + 删 `.git/refs` + 对象库回退一代」，
+  起因分别是 `git rm … && npx tsc` 撞 120s 超时、以及 bash 把正文里的反引号当命令执行。
+  恢复流程（`git archive` 补文件 / 重建 refs / `git fetch --tags` 取回对象库）见 `PITFALLS.md`。
 
 ## 历轮索引
 十轮 **4**（单 upstream / 有界 cache / 协议隔离 / register-before-replay / 慢客户端隔离 / terminal 硬边界）→ **4.1**（live gap 修复 / cache 字节硬上界 / 指标代际围栏 / 锁序）→ **4.1.1**（constructor inert / 初始 idle timer 竞态 / canonical 连续性 fail-closed）→ **4.1.2**（test-only）→ **5 / 5.1**（Worker Dispatcher，FROZEN）。

@@ -156,6 +156,14 @@ type Metrics struct {
 	ProviderSubmissionDedupTotal   prometheus.Counter
 	SSEReplayEventsTotal           prometheus.Counter
 
+	// LegacyApplicationListRequestsTotal counts callers still hitting
+	// GET /api/v2/applications — the whole-catalog array endpoint (执行报告
+	// §16). It is a DEPRECATION meter, not a health signal: every studio
+	// surface migrated to /applications/page + /workspace/bootstrap, so this
+	// series must decay to zero before the endpoint can be deleted. No label:
+	// per-caller cardinality is not worth it for a counter nobody alerts on.
+	LegacyApplicationListRequestsTotal prometheus.Counter
+
 	// Batch 4 — SSE Hub. These are the series that prove the fan-out change
 	// happened, and they are read as RATIOS, never in isolation:
 	//
@@ -417,6 +425,12 @@ func NewMetrics(service string) *Metrics {
 			Help: "Durable run events fetched from the MySQL SSE replay path (cache replays are counted by " +
 				"studio_sse_hub_cache_replay_total instead).",
 		}),
+		LegacyApplicationListRequestsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_legacy_application_list_requests_total",
+			Help: "Requests to the legacy whole-catalog endpoint GET /api/v2/applications. Deprecation " +
+				"meter: studio surfaces use /applications/page and /workspace/bootstrap, so a non-zero " +
+				"and non-decaying rate means some client still downloads the entire catalog.",
+		}),
 		SSEHubActive: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "studio_sse_hubs_active",
 			Help: "Process-local SSE run hubs (one per run being streamed by this instance).",
@@ -487,6 +501,7 @@ func NewMetrics(service string) *Metrics {
 		m.RunIdempotencyReplayTotal, m.RunIdempotencyConflictTotal,
 		m.ProviderSubmissionUnknownTotal, m.ProviderSubmissionDedupTotal,
 		m.SSEReplayEventsTotal,
+		m.LegacyApplicationListRequestsTotal,
 		m.SSEHubActive, m.SSEHubSubscribersActive, m.SSEHubUpstreamsActive,
 		m.SSEHubCreatedTotal, m.SSEHubCacheReplayTotal, m.SSEHubCacheMissTotal,
 		m.SSEHubSubscriberDroppedTotal, m.SSEHubUpstreamFailureTotal,

@@ -26,13 +26,16 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Drawer, Input, Skeleton } from 'antd';
 import { CheckOutlined, SearchOutlined } from '@ant-design/icons';
-import type { V2Application } from '@/services/runApi';
+import type { ApplicationSummary, V2Application } from '@/services/runApi';
 import { useApplicationPage } from '@/hooks/useApplicationPage';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import AgentAvatar from '@/components/Agents/AgentAvatar';
 import {
   buildMobileCategoryTabs,
   buildRecentItems,
   filterMobileCatalog,
+  mergeRecentItems,
   MOBILE_SHEET_MAX_ROWS,
   MOBILE_SHEET_PAGE_SIZE,
   splitMobileCatalog,
@@ -54,12 +57,12 @@ export interface MobileCatalogSheetProps {
    * by the caller so the tick renders even when the active row is not on a
    * fetched page (e.g. an unbound agent the list legitimately omits).
    */
-  activeApplication?: V2Application | null;
+  activeApplication?: ApplicationSummary | null;
   recentIds: number[];
   /** Show row skeletons instead of an 空列表 while loading (§15.1). */
   loading?: boolean;
   onClose: () => void;
-  onSelect: (application: V2Application) => void;
+  onSelect: (application: ApplicationSummary) => void;
 }
 
 const TITLE: Record<'agent' | 'app', string> = {
@@ -80,9 +83,9 @@ const EMPTY_TITLE: Record<'agent' | 'app', string> = {
 function CatalogRow({
   application, active, onSelect,
 }: {
-  application: V2Application;
+  application: ApplicationSummary;
   active: boolean;
-  onSelect: (application: V2Application) => void;
+  onSelect: (application: ApplicationSummary) => void;
 }) {
   return (
     <button type="button" className="mobile-sheet__row" onClick={() => onSelect(application)}>
@@ -150,17 +153,44 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
     enabled: open,
   });
 
+  // Category rails and server-side recency come from the workspace bootstrap
+  // (执行报告 §6/§11, P0-R1): they describe the CATALOG, not the pages this
+  // sheet happens to have fetched. Deriving them from `paged.items` is what
+  // made a category tab disappear the moment it was tapped, and made
+  // 最近使用 vanish for anything off page one.
+  const bootstrapRecent = useWorkspaceBootstrapStore((state) => state.recent);
+  const bootstrapRecentFixed = useWorkspaceBootstrapStore((state) => state.recentFixedApps);
+  const agentCategories = useWorkspaceBootstrapStore((state) => state.agentCategories);
+  const appCategories = useWorkspaceBootstrapStore((state) => state.appCategories);
+  const loadBootstrap = useWorkspaceBootstrapStore((state) => state.load);
+  const summaryById = useWorkspaceBootstrapStore((state) => state.summaryById);
+  // Local recency resolves through the entity cache: opening an application is
+  // what put it there, so a just-used agent is never "unknown" here.
+  const entities = useApplicationEntityStore((state) => state.byId);
+
+  // The drawer keeps this component mounted while closed, so the bootstrap
+  // fetch is gated on `open` — a closed sheet issues no traffic.
+  useEffect(() => {
+    if (open) void loadBootstrap();
+  }, [open, loadBootstrap]);
+
+  const serverMode = applications === undefined;
+
   // The active row is injected so the ✓ renders even when the active
-  // application is not on a fetched page (e.g. an unbound agent the list
-  // legitimately omits).
+  // application is not on a fetched page. Restrained to the unfiltered view
+  // (执行报告 §4.3): inside a search or a category the injected row would be
+  // an application that does not belong to the result set at all.
+  const canPinActive = serverMode
+    && category === 'all'
+    && query.trim().length === 0;
   const serverPool = useMemo(() => {
-    if (!activeApplication
+    if (!canPinActive || !activeApplication
       || paged.items.some((app) => app.id === activeApplication.id)) {
       return paged.items;
     }
     return [activeApplication, ...paged.items];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [paged.items, activeApplication]);
+  }, [paged.items, activeApplication, canPinActive]);
   const serverLoading = paged.loading || paged.loadingMore;
 
   // A reopened sheet must never be stuck on the previous search or tab — that
@@ -186,18 +216,39 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [applications, type, serverPool]);
 
-  const recent = useMemo(
-    () => buildRecentItems(pool, recentIds, type),
-    [pool, recentIds, type],
-  );
+  const recent = useMemo<ApplicationSummary[]>(() => {
+    if (!serverMode) return buildRecentItems(pool, recentIds, type);
+    // Server-paged mode: the shell's own recency log, resolved against the
+    // entity cache and the bootstrap rows, merged with the server's recency
+    // group — so the section is independent of the current page AND of the
+    // selected category (执行报告 §4.2).
+    const localRecency: ApplicationSummary[] = [];
+    for (const id of recentIds) {
+      const hit: ApplicationSummary | undefined = entities[id] ?? summaryById(id);
+      if (hit) localRecency.push(hit);
+    }
+    return mergeRecentItems(
+      localRecency,
+      type === 'agent' ? bootstrapRecent : bootstrapRecentFixed,
+      type,
+    );
+  }, [serverMode, pool, recentIds, type, entities, summaryById,
+    bootstrapRecent, bootstrapRecentFixed]);
 
-  const tabs = useMemo(() => buildMobileCategoryTabs(pool), [pool]);
+  // Tabs: the local-pool mode derives them from the injected rows (tests pin
+  // that behaviour); production reads the server's rails, which include the
+  // 其他 sentinel only when uncategorized rows exist. Either way the rail does
+  // NOT depend on the fetched page, so tapping a category cannot delete the
+  // other tabs.
+  const tabs = useMemo(() => (
+    serverMode
+      ? (type === 'agent' ? agentCategories : appCategories)
+      : buildMobileCategoryTabs(pool)
+  ), [serverMode, type, agentCategories, appCategories, pool]);
 
   const filtered = useMemo(
-    () => (applications !== undefined
-      ? filterMobileCatalog(pool, category, query)
-      : pool),
-    [applications, pool, category, query],
+    () => (serverMode ? pool : filterMobileCatalog(pool, category, query)),
+    [serverMode, pool, category, query],
   );
 
   // LEGACY local-pool mode only: a render budget over the injected pool (the
@@ -209,28 +260,33 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
     setVisibleCount(MOBILE_SHEET_MAX_ROWS);
   }, [category, query, type]);
   const rendered = useMemo(
-    () => (applications !== undefined
-      ? filtered.slice(0, visibleCount)
-      : filtered),
-    [applications, filtered, visibleCount],
+    () => (serverMode ? filtered : filtered.slice(0, visibleCount)),
+    [serverMode, filtered, visibleCount],
   );
   const localHasMore = filtered.length > rendered.length;
-  const hasMore = applications !== undefined ? localHasMore : paged.hasMore;
-  const loading = applications !== undefined ? localLoading : serverLoading;
+  const hasMore = serverMode ? paged.hasMore : localHasMore;
+  const loading = serverMode ? serverLoading : localLoading;
 
   const searching = searchMode && query.trim().length > 0;
   // 最近使用 is hidden while searching so the results own the whole list (§5.4).
   const showRecent = !searching && recent.length > 0;
 
-  const handleSelect = (application: V2Application) => {
+  const handleSelect = (application: ApplicationSummary) => {
     onSelect(application);
     onClose();
   };
 
   const renderBody = () => {
+    const narrowed = searching || category !== 'all';
     if (loading && !pool.length) return <RowSkeletons />;
 
-    if (!pool.length) {
+    // "No applications at all" is a CATALOG state; a search or a category that
+    // returned nothing is not (执行报告 §15.2/§15.3). Distinguishing them
+    // matters most in server-paged mode, where a narrowed request legitimately
+    // comes back empty: telling the user "暂无可用智能体 / 请联系管理员配置"
+    // there is both wrong and a dead end, because it also used to hide the tab
+    // rail they would need to get back.
+    if (!pool.length && !narrowed) {
       return (
         <div className="mobile-sheet__empty">
           <strong>{EMPTY_TITLE[type]}</strong>
@@ -278,7 +334,7 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
           </div>
         )}
 
-        {!searching && !showRecent && tabs.length === 0 && (
+        {!searching && !showRecent && tabs.length === 0 && pool.length > 0 && (
           <div className="mobile-sheet__section-label">
             {type === 'agent' ? '全部智能体' : '全部应用'}
           </div>
@@ -303,9 +359,9 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
               <button
                 type="button"
                 className="mobile-sheet__more-btn"
-                onClick={() => (applications !== undefined
-                  ? setVisibleCount((current: number) => current + MOBILE_SHEET_MAX_ROWS)
-                  : void paged.loadMore())}
+                onClick={() => (serverMode
+                  ? void paged.loadMore()
+                  : setVisibleCount((current: number) => current + MOBILE_SHEET_MAX_ROWS))}
               >
                 加载更多
               </button>

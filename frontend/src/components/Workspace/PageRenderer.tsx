@@ -15,7 +15,8 @@ import React, { useEffect } from 'react';
 import { Button, Empty } from 'antd';
 import { ArrowLeftOutlined, StarFilled, StarOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
-import { useApplicationCatalogStore } from '@/stores/useApplicationCatalogStore';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import type { V2Application } from '@/services/runApi';
@@ -46,7 +47,10 @@ const FIXED_RENDERERS: Record<string, FixedAppRenderer> = {
 const PageRenderer: React.FC<Props> = ({ application, kindLabel = '应用' }) => {
   const navigate = useNavigate();
   const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
-  const toggleFavorite = useApplicationCatalogStore((state) => state.toggleFavorite);
+  // The favourite flag is patched into the bootstrap groups and the entity
+  // cache; `application` is handed over as the fallback so an application
+  // that is in no group can still be starred (执行报告 §15).
+  const toggleFavorite = useWorkspaceBootstrapStore((state) => state.toggleFavorite);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
   const previousApplicationId = useWorkspaceStore((state) => state.previousApplicationId);
 
@@ -54,9 +58,10 @@ const PageRenderer: React.FC<Props> = ({ application, kindLabel = '应用' }) =>
 
   /** §80: back goes to the workspace the user came from, never a reload. */
   const goBack = () => {
-    const previous = previousApplicationId != null
-      ? useApplicationCatalogStore.getState().applicationById(previousApplicationId)
-      : undefined;
+    // The previous application is in the entity cache because entering it is
+    // what resolved it — a cache miss falls back to the home workspace rather
+    // than triggering a catalog download (执行报告 §9).
+    const previous = useApplicationEntityStore.getState().get(previousApplicationId);
     if (previous) {
       navigate(previous.kind === 'chat'
         ? `/chat/${previous.slug}`
@@ -93,7 +98,7 @@ const PageRenderer: React.FC<Props> = ({ application, kindLabel = '应用' }) =>
           type="text"
           aria-label={application.is_favorite ? '取消收藏' : '收藏'}
           icon={application.is_favorite ? <StarFilled /> : <StarOutlined />}
-          onClick={() => void toggleFavorite(application.id)}
+          onClick={() => void toggleFavorite(application.id, application)}
         />
       </header>
       <div className="chat-renderer__body">
