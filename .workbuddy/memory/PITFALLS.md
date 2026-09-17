@@ -52,26 +52,52 @@
   `.git/index.lock` 残留 + 分支没切过去」。恢复：备份未提交改动到仓库外 → `rm .git/index.lock` →
   `git reset --hard HEAD` → 从备份恢复。对照基线用 `git checkout <sha> -- <路径>`。
 - 无 `gh`；查 CI 用匿名 GitHub API。
+- **写 loose ref 用 `Set-Content -Encoding ascii -NoNewline` 时 git 会报
+  `ignoring ref with broken name refs/remotes/origin/dev?`**（`?` 是 BOM）→ 必须显式
+  `-Encoding ascii`（或 `utf8NoBOM`）；PowerShell 默认的 `utf8` 会带 BOM。
+  修复后核对：`git for-each-ref refs/remotes/` 无 warning + `git status -sb` 无 `[ahead]`。
+- **2 层 ref 缺陷第 13 次命中（2026-09-17）**：`push` 打印 `b63cdd2..9d00f1a  dev -> dev`，
+  本地 ref 仍 `b63cdd2`。顺序照做即可（push → mkdir → loose ref → packed-refs 双写）。
+  本条**每次 push 后都要复查**，不要相信 git 打印的成功信息。
 
 ## Git Bash / shell
-- 常丢 coreutils：命令前加 `export PATH="/usr/bin:/bin:/c/software/Git/cmd:$PATH"`，
-  否则 `dirname` / `sleep` / `head` / `grep -A` 会 `command not found`
-  （表现为 `shell-runtime-bash-env.sh: line 3: dirname: command not found`，可忽略但要加 PATH）。
-- `grep -A/-B` 在本机 shell 里可能不可靠 → 优先用 Grep 工具。
-- Python：`~/.workbuddy/binaries/python/versions/3.13.12/python`。
-- 临时 Go 程序放 `backend-go/tmp-xxx/`（跑完删）。
-- 断言时间戳未变用 `CAST(col AS CHAR)` 比较，别比 `DATETIME` 对象。
+- **2026-09-17：Bash 工具整会话不可用**——`ls/cat/head/cp/dirname` 全部
+  `command not found`（PortableGit 的 `bash.exe` 起不来 coreutils），
+  加 PATH 也无效。**直接改用 PowerShell 工具**；脚本/测试文件用 **Write 工具**写，
+  **别用 heredoc**（`cat > f <<EOF` 本会话必失败）。
+## PowerShell 工具专项
+- **`$LASTEXITCODE` 在管道或赋值后会被清掉**：`cmd 2>&1 | Out-File ...` 之后再读
+  `$LASTEXITCODE` 拿到的是**空**（本会话为此空跑 3 次）。可靠写法：
+  ```powershell
+  $out = & some.cmd args 2>&1 | Out-String
+  Set-Content -Path out.txt -Value "EXIT=$LASTEXITCODE`n$out" -Encoding utf8
+  ```
+  或把命令与 `"EXITCODE=$LASTEXITCODE"` 一起写进**同一条** `Set-Content`。
+- 看到 `...+ ... is not recognized`／`NativeCommandError` 时，先确认命令本身是否存在
+  （`go`/`sqlc`/`git`），PowerShell 会把 stderr 也包装成错误记录，**exit code 才是判据**。
+- 本机 **`sqlc` 未安装**（`~/go/bin/sqlc.exe` 也不存在）→ 改 `db/queries/*.sql` 后
+  `internal/gen/db/*.go` 只能**手工按生成风格同步**；有 sqlc 时再 `sqlc generate` 核对漂移。
 
 ## 数据库 / Redis
 - MySQL 5.7 `192.168.211.26:20336/xiaoan`、Redis `192.168.211.239:6380`，
   凭据在 `backend-go/.env.local`；DSN 保持 UTC 不动。
+- **⚠️ 这是共享库，跑集成测试前先查有没有别人卡住的长事务**：
+  ```sql
+  SELECT id, time, state, LEFT(info,120) FROM information_schema.processlist
+  WHERE command='Query' AND time > 60;
+  ```
+  2026-09-17 实测：一个**别的会话遗留的** `tmp_clean_itest.py` 长事务里
+  `DELETE FROM outbox_events ... IN (SELECT ... 'itest-%')` **卡了 1703s**，持着 `runs` 行锁，
+  导致我的集成测试全部报 `Error 1205 Lock wait timeout exceeded`，
+  **看起来完全像自己的代码 bug**（还会让人误改冻结的 reaper）。
+  处置：确认是遗留清理语句后 `KILL <id>`（**只杀 `info LIKE '%itest-%'` 且 `time>60` 的**）。
 - 开关：`STUDIO_TEST_DB=1` / `STUDIO_TEST_REDIS=1`（不设则集成用例静默 skip）。
 - 集成门禁顺序（本机 ≈2.5 分钟）：
   `go run ./cmd/migrate` ×2（**第二次必须干净 no-op**）→
   `go test ./internal/execution/... ./internal/delivery/... ./internal/platform/...` →
   `go test ./tests/integration/...`。
 - 全库 COUNT=0 会被 fixture 假红；清理圈定 `provider LIKE 'itest%'`。
-- 改 `db/queries/*.sql` 后跑 `~/go/bin/sqlc.exe generate`。
+- 改 `db/queries/*.sql` 后跑 `~/go/bin/sqlc.exe generate`（本机未装，见上）。
 - **本机集成 flake**：`TestRetryRunAndOutboxShareRetryAt` /
   `TestReaperRequeueIsImmediatelyClaimableAndInSync` 要求两次独立写的 `available_at` 差 ≤50ms，
   实测 60–110ms（A/B 交替已证基线同样失败）；`TestTickAndRunNowConcurrent` 全量跑因库污染失败、

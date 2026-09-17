@@ -8,8 +8,10 @@
 ## 当前状态
 - 仓库 `shilin414/potal`，分支 `dev`。执行内核（Ownership/Claim/Reaper/Finalize/ProviderSlot/Lease/Heartbeat/Gate）与第九轮 **FROZEN**，不得顺手改。
 - 第十轮 Batch 4 / 4.1 / 4.1.1 / 4.1.2 → **SSE Hub 永久 FROZEN**（4.1.2 为 test-only）；Batch 5 + 5.1 → **Worker Dispatcher FINAL FROZEN**。
+- **第十一轮 Aily 附件链路已修复并推送**（`9d00f1a`）：Worker 侧附件上传桥接 + studio/provider id 分离 + P0-6 多图 artifact。**未动 `waiting_external` 机制**。
 - **下一步：Batch 6 — 优先 Aily Workflow Runtime**（验证同 provider、不同 `runtime_type` 走不同 Executor）。
-- migration 基线 = **24**（0021 run_requests / 0022 provider_submissions / 0023 next_event_sequence / 0024 容量索引）。Batch 4/5 系列**无 migration**。
+- migration 基线 = **24**（0021 run_requests / 0022 provider_submissions / 0023 next_event_sequence / 0024 容量索引）。Batch 4/5 系列与第十一轮**均无 migration**。
+- P1 待办（本轮未做）：**xlsx/csv 需 potal 本地解析成结构化文本再进 `user_message.content`**，不能伪装成 `type=file`（Aily 直接文件仅支持 png/jpg/pdf）。
 
 ## 改冻结子系统前先读
 | 子系统 | 文档 |
@@ -19,6 +21,21 @@
 | 历轮 | `docs/` 按主题命名（含 TiDB→MySQL 5.7 切换报告） |
 
 ## 核心硬性约定（违反会复发 P0/事故）
+- **第十一轮 Aily 附件链路**（提交 `9d00f1a`）：**Studio ID 与 Provider ID 是两个不可互换的名字空间**
+  —— `runtime_attachments.id` 只存在于 potal 内部，`runs.input.studio_attachment_ids` 存前者，
+  Aily `agent_attachment_id` 只能由 `POST /agents/:id/attachments` 产出、存在
+  `runtime_attachments.external_attachment_id`，**只有它允许进 `user_message.agent_attachment_ids`**
+  （系统级 invariant，测试 `TestChatNeverReceivesAStudioAttachmentID` 双模式钉住）。
+- **附件上传必须排在 `beginSubmit` 之前**：`beginSubmit` = 「上游可能已产生 chat」的边界，上传是
+  Provider IO 且**与 `/chats` 是两个外部动作**，**绝不写 `provider_submissions`**。上传失败 →
+  `run.failed(aily_attachment_upload_failed)`，**绝不 `waiting_external`**（那里的「转圈」不是根因）。
+  上传可有限重试（5xx/timeout/429，最坏多个孤立附件），chat 提交仍严格 at-most-once。
+- **附件写入必须 fenced + set-once**：`MarkAttachmentUploadedFenced` 谓词含 `id AND run_id AND
+  external_attachment_id=''`；`ErrAttachmentNotClaimed` ≠ `ErrLostOwnership`（前者可继续、后者必须停）。
+- **`JSON_ARRAY_APPEND` 写不存在的路径是静默 no-op**（MySQL 5.7/TiDB 实测原样返回，非 NULL）
+  → 往 JSON 列追加前必须先 `JSON_SET` 补 `JSON_ARRAY()`；否则写入无声失败。
+- **集成测试造 fixture 要走真实 query，不要用裸 SQL 手工 UPDATE**：本轮就是因为改走真实
+  `AppendUserAttachmentToRunInput` 才暴露上面那条静默 no-op（手工 UPDATE 会把它一起屏蔽）。
 - **幂等**：`client_request_id` 解析早于授权/限流/附件校验；身份表 `run_requests`，`request_hash = SHA-256(归一化 payload)`；同 key 不同 hash → 409；resolver infra error → 5xx。
 - **Provider 提交状态机**：`sending|accepted|rejected|unknown`；**只有 `rejected` 可重发**；`sending`/`unknown` → park `waiting_external`，**绝不 blind retry**；5xx/timeout = 未知，4xx = 明确拒绝。**提交边界 = POST 成功且拿到 external id**；200 无 id → `ErrServer`（Aily → unknown → waiting_external），绝不 failRun；park 后必须 return。
 - **accepted identity 持久化是 canonical correctness**：`MarkSubmissionAccepted` 失败必须**停链**（不 poll/reconcile/finalize/重发），只做本地 DB 短重试（50/100/200ms）；sentinel `ErrProviderAcceptancePersistence`。
