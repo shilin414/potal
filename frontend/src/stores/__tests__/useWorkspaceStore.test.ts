@@ -102,3 +102,85 @@ describe('useWorkspaceStore (UI state only)', () => {
     expect(workspaceStateOf(state.workspaces, 2).draft).toBe('y');
   });
 });
+
+describe('useWorkspaceStore 技能配置 (§9.4)', () => {
+  beforeEach(() => {
+    useWorkspaceStore.getState().clearAll();
+  });
+
+  it('defaults to no selection', () => {
+    expect(workspaceStateOf(useWorkspaceStore.getState().workspaces, 1).selectedSkillIds)
+      .toEqual([]);
+  });
+
+  it('keeps the selection per application, like the draft', () => {
+    const store = useWorkspaceStore.getState();
+    store.setSelectedSkillIds(1, ['income']);
+    store.setSelectedSkillIds(2, ['chart', 'doc']);
+
+    const state = useWorkspaceStore.getState();
+    expect(workspaceStateOf(state.workspaces, 1).selectedSkillIds).toEqual(['income']);
+    expect(workspaceStateOf(state.workspaces, 2).selectedSkillIds)
+      .toEqual(['chart', 'doc']);
+  });
+
+  it('does NOT clear the selection on a send (only 新任务 clears it)', () => {
+    const store = useWorkspaceStore.getState();
+    store.setSelectedSkillIds(1, ['income']);
+    // A send touches the draft and the conversation, never the skills.
+    store.setDraft(1, '');
+    store.rememberConversation(1, 42);
+
+    expect(workspaceStateOf(useWorkspaceStore.getState().workspaces, 1).selectedSkillIds)
+      .toEqual(['income']);
+  });
+
+  it('clears the selection on 新任务', () => {
+    const store = useWorkspaceStore.getState();
+    store.setSelectedSkillIds(1, ['income', 'chart']);
+
+    useWorkspaceStore.getState().startNewConversation(1);
+
+    expect(workspaceStateOf(useWorkspaceStore.getState().workspaces, 1).selectedSkillIds)
+      .toEqual([]);
+  });
+
+  it('does not leak the selection into another application on 新任务', () => {
+    const store = useWorkspaceStore.getState();
+    store.setSelectedSkillIds(2, ['chart']);
+
+    useWorkspaceStore.getState().startNewConversation(1);
+
+    expect(workspaceStateOf(useWorkspaceStore.getState().workspaces, 2).selectedSkillIds)
+      .toEqual(['chart']);
+  });
+
+  it('owns its own array — mutating the argument cannot corrupt the store', () => {
+    const ids = ['income'];
+    useWorkspaceStore.getState().setSelectedSkillIds(1, ids);
+    ids.push('chart');
+
+    expect(workspaceStateOf(useWorkspaceStore.getState().workspaces, 1).selectedSkillIds)
+      .toEqual(['income']);
+  });
+
+  // workspaceStateOf hands back a shared constant for unknown applications so
+  // Zustand selectors keep a stable identity. That makes the nested array
+  // shared too, so it must be frozen or one stray push would silently edit
+  // the default for every application.
+  it('exposes a frozen default selection', () => {
+    const fallback = workspaceStateOf(useWorkspaceStore.getState().workspaces, 999);
+    expect(Object.isFrozen(fallback.selectedSkillIds)).toBe(true);
+    expect(() => (fallback.selectedSkillIds as string[]).push('x'))
+      .toThrow();
+  });
+
+  it('clearAll drops every selection', () => {
+    useWorkspaceStore.getState().setSelectedSkillIds(1, ['income']);
+    useWorkspaceStore.getState().clearAll();
+
+    const state = useWorkspaceStore.getState();
+    expect(state.workspaces).toEqual({});
+    expect(workspaceStateOf(state.workspaces, 1).selectedSkillIds).toEqual([]);
+  });
+});

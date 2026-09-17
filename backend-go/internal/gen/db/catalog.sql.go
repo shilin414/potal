@@ -362,6 +362,22 @@ func (q *Queries) GetApplicationBySlug(ctx context.Context, slug string) (GetApp
 	return i, err
 }
 
+const getApplicationDefaultConfigForUpdate = `-- name: GetApplicationDefaultConfigForUpdate :one
+SELECT default_config FROM applications WHERE id = ? FOR UPDATE
+`
+
+// Read-modify-write guard for default_config (the only JSON column the Go
+// backend WRITES). FOR UPDATE, not a bare read: 技能配置 replaces just the
+// `skills` key and must not clobber the other keys a legacy editor stored
+// there (guided_entry_prompt_key), so the merge needs the row pinned for the
+// duration of the transaction.
+func (q *Queries) GetApplicationDefaultConfigForUpdate(ctx context.Context, id uint64) (dbtypes.JSONText, error) {
+	row := q.db.QueryRowContext(ctx, getApplicationDefaultConfigForUpdate, id)
+	var default_config dbtypes.JSONText
+	err := row.Scan(&default_config)
+	return default_config, err
+}
+
 const getBindingByID = `-- name: GetBindingByID :one
 SELECT id, application_id, provider_id, provider_key, runtime_type, external_resource_id,
        endpoint_key, identity_mode, execution_mode, session_policy, artifact_policy,
@@ -1040,6 +1056,20 @@ type UpdateApplicationAvatarParams struct {
 
 func (q *Queries) UpdateApplicationAvatar(ctx context.Context, arg UpdateApplicationAvatarParams) error {
 	_, err := q.db.ExecContext(ctx, updateApplicationAvatar, arg.AvatarKey, arg.ID)
+	return err
+}
+
+const updateApplicationDefaultConfig = `-- name: UpdateApplicationDefaultConfig :exec
+UPDATE applications SET default_config = ? WHERE id = ?
+`
+
+type UpdateApplicationDefaultConfigParams struct {
+	DefaultConfig dbtypes.JSONText
+	ID            uint64
+}
+
+func (q *Queries) UpdateApplicationDefaultConfig(ctx context.Context, arg UpdateApplicationDefaultConfigParams) error {
+	_, err := q.db.ExecContext(ctx, updateApplicationDefaultConfig, arg.DefaultConfig, arg.ID)
 	return err
 }
 

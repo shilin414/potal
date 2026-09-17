@@ -80,8 +80,11 @@ func appFromDetail(row db.GetApplicationByIDRow) *Application {
 		Enabled:        row.Enabled,
 		IsDefaultAgent: row.IsDefaultAgent,
 		UsageCount:     int64(row.UsageCount),
-		CreatedAt:      row.CreatedAt,
-		UpdatedAt:      row.UpdatedAt,
+		// 技能配置 lives inside default_config; project it once here so every
+		// caller (mobile sheet, market form) reads the same parsed shape.
+		Skills:    ParseSkills(row.DefaultConfig),
+		CreatedAt: row.CreatedAt,
+		UpdatedAt: row.UpdatedAt,
 	}
 	if row.CategoryID.Valid {
 		v := int64(row.CategoryID.Int64)

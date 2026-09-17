@@ -73,6 +73,8 @@ type CreateInput struct {
 	Kind            string
 	RendererKey     string
 	Runtime         *BindingInput
+	// Skills is the agent-scoped 技能配置 stored in default_config.
+	Skills          []Skill
 	SetDefaultAgent bool
 	CreatorID       int64
 	IsStaff         bool
@@ -110,6 +112,13 @@ func (s *Service) Create(ctx context.Context, in *CreateInput) (*Application, *B
 	renderer := "chat"
 	if in.RendererKey != "" {
 		renderer = in.RendererKey
+	}
+
+	// 技能配置 is validated up front, like the runtime below: an invalid skill
+	// must fail before any row is written.
+	skills, err := NormalizeSkills(in.Skills)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	// Validate runtime up front (provider active + adapter registered + id format).
@@ -159,6 +168,14 @@ func (s *Service) Create(ctx context.Context, in *CreateInput) (*Application, *B
 		return nil, nil, err
 	}
 
+	// 技能配置 lands in default_config. Skipped when empty so a newly created
+	// agent keeps a NULL column instead of an empty JSON document.
+	if len(skills) > 0 {
+		if err := s.applySkillsTx(ctx, tx, id, skills); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	if in.Runtime != nil {
 		b := bindingFromInput(id, in.Runtime)
 		// Record the provider FK (评测 P1): without it the join-based
@@ -201,7 +218,12 @@ func (s *Service) Create(ctx context.Context, in *CreateInput) (*Application, *B
 }
 
 // Update applies partial edits; runtime rebinding upserts the binding.
-func (s *Service) Update(ctx context.Context, appID, callerID int64, isStaff bool, name, description, icon, color *string, isPublic, enabled *bool, categorySlug, categoryName *string, runtime *BindingInput, setDefaultAgent *bool) (*Application, *Binding, error) {
+//
+// `skills` is a POINTER so "not mentioned" and "clear it" stay distinguishable:
+// nil leaves the stored 技能配置 alone (a rename must not wipe it), while a
+// pointer to an empty slice clears it. Encoding that as `[]Skill` alone would
+// silently erase skills on every unrelated PATCH.
+func (s *Service) Update(ctx context.Context, appID, callerID int64, isStaff bool, name, description, icon, color *string, isPublic, enabled *bool, categorySlug, categoryName *string, runtime *BindingInput, setDefaultAgent *bool, skills *[]Skill) (*Application, *Binding, error) {
 	app, err := s.ApplicationByID(ctx, appID)
 	if err != nil {
 		return nil, nil, err
@@ -218,6 +240,17 @@ func (s *Service) Update(ctx context.Context, appID, callerID int64, isStaff boo
 			return nil, nil, err
 		}
 		adapter, provider = a, p
+	}
+
+	// Validate the submitted skills BEFORE opening the transaction, so a bad
+	// payload cannot leave a half-applied edit behind.
+	var normalizedSkills []Skill
+	if skills != nil {
+		normalized, err := NormalizeSkills(*skills)
+		if err != nil {
+			return nil, nil, err
+		}
+		normalizedSkills = normalized
 	}
 
 	tx, err := s.DB.BeginTx(ctx, nil)
@@ -281,6 +314,12 @@ func (s *Service) Update(ctx context.Context, appID, callerID int64, isStaff boo
 		return nil, nil, err
 	}
 
+	if skills != nil {
+		if err := s.applySkillsTx(ctx, tx, appID, normalizedSkills); err != nil {
+			return nil, nil, err
+		}
+	}
+
 	var updatedBinding *Binding
 	if runtime != nil {
 		b := bindingFromInput(appID, runtime)
@@ -330,9 +369,32 @@ func (s *Service) Update(ctx context.Context, appID, callerID int64, isStaff boo
 	return app, updatedBinding, nil
 }
 
+// applySkillsTx merges the 技能配置 into `default_config` inside the caller's
+// transaction.
+//
+// The read is a FOR UPDATE, so it is a real read-modify-write rather than a
+// blind overwrite: this column is shared with a legacy editor that parked
+// `guided_entry_prompt_key` there, and saving skills must not take it with
+// them. Doing the whole thing in the caller's transaction is what makes the
+// read meaningful — outside one, FOR UPDATE would not hold the row.
+func (s *Service) applySkillsTx(ctx context.Context, tx *sql.Tx, appID int64, skills []Skill) error {
+	q := s.q(tx)
+	raw, err := q.GetApplicationDefaultConfigForUpdate(ctx, uint64(appID))
+	if err != nil {
+		return err
+	}
+	merged, err := MergeSkills(raw, skills)
+	if err != nil {
+		return err
+	}
+	return q.UpdateApplicationDefaultConfig(ctx, db.UpdateApplicationDefaultConfigParams{
+		DefaultConfig: merged,
+		ID:            uint64(appID),
+	})
+}
+
 // Delete removes an application unless conversations/runs reference it.
-func (s *Service) Delete(ctx context.Context, appID, callerID int64, isStaff bool) error {
-	app, err := s.ApplicationByID(ctx, appID)
+func (s *Service) Delete(ctx context.Context, appID, callerID int64, isStaff bool) error {	app, err := s.ApplicationByID(ctx, appID)
 	if err != nil {
 		return err
 	}

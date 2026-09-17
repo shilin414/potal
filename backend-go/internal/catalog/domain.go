@@ -34,9 +34,12 @@ type Application struct {
 	Enabled        bool
 	IsDefaultAgent bool
 	UsageCount     int64
-	CreatedBy      *int64
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// Skills is the agent-scoped 技能配置, projected out of default_config
+	// (see skills.go). Read-only here: writes go through MergeSkills.
+	Skills    []Skill
+	CreatedBy *int64
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // Binding couples an application to a provider runtime.

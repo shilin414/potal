@@ -26,6 +26,19 @@ export interface ApplicationWorkspaceState {
    * watches this tick to reset to a fresh conversation (sidebar 新建).
    */
   newConversationTick: number;
+  /**
+   * 技能配置 selection for this application's composer (design report §9.4).
+   *
+   * Kept PER APPLICATION, like the draft: switching agent A → B → A must
+   * restore A's own skill combination rather than leaking B's. It survives
+   * sends (a multi-turn task keeps its skills) and is cleared only by 新任务,
+   * which is the opposite of the draft's lifecycle.
+   *
+   * Ids, not names, so renaming a skill in 智能体市场 does not invalidate an
+   * existing selection; stale ids are dropped at read time by
+   * `resolveSelectedSkills`.
+   */
+  selectedSkillIds: string[];
 }
 
 export interface PendingPrompt {
@@ -33,12 +46,22 @@ export interface PendingPrompt {
   text: string;
 }
 
+/**
+ * The inert state unknown applications read back.
+ *
+ * Frozen on purpose: `workspaceStateOf` returns THIS object (not a copy) so a
+ * Zustand selector keeps a stable identity and does not re-render forever.
+ * That makes it shared across every application, so the nested array must not
+ * be mutable — otherwise one stray `push` would edit the default for all of
+ * them at once, silently.
+ */
 export const EMPTY_WORKSPACE_STATE: ApplicationWorkspaceState = {
   conversationId: null,
   draft: '',
   scrollTop: 0,
   updatedAt: 0,
   newConversationTick: 0,
+  selectedSkillIds: Object.freeze([]) as unknown as string[],
 };
 
 /** How many applications the local 最近使用 list keeps. */
@@ -64,6 +87,8 @@ interface WorkspaceStore {
   rememberConversation: (applicationId: number, conversationId: number | null) => void;
   setDraft: (applicationId: number, draft: string) => void;
   setScrollTop: (applicationId: number, scrollTop: number) => void;
+  /** Replace this application's 技能配置 selection (already catalog-ordered). */
+  setSelectedSkillIds: (applicationId: number, skillIds: string[]) => void;
   touchRecent: (applicationId: number) => void;
   queuePrompt: (applicationId: number, text: string) => void;
   takePrompt: (applicationId: number) => string | null;
@@ -145,6 +170,14 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
         workspaces: patch(state.workspaces, applicationId, { scrollTop }),
       })),
 
+      setSelectedSkillIds: (applicationId, skillIds) => set((state) => ({
+        // Copy defensively: the caller may hand us a frozen or reused array,
+        // and the persisted store must own its own value.
+        workspaces: patch(state.workspaces, applicationId, {
+          selectedSkillIds: [...skillIds],
+        }),
+      })),
+
       touchRecent: (applicationId) => set((state) => ({
         recentApplicationIds: withRecent(state.recentApplicationIds, applicationId),
       })),
@@ -166,6 +199,10 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
         activeApplicationId: applicationId,
         workspaces: patch(state.workspaces, applicationId, {
           conversationId: null, draft: '', scrollTop: 0,
+          // 新任务 means a NEW task context, so the previous task's skill
+          // combination must not be inherited (design report §9.4). This is
+          // the ONLY place skills are cleared — a send deliberately keeps them.
+          selectedSkillIds: [],
           newConversationTick:
             (state.workspaces[applicationId]?.newConversationTick || 0) + 1,
         }),

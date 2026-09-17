@@ -1,0 +1,64 @@
+/* MobileSkillSheet — checkbox rows + the 完成 footer (§9.3). */
+
+.mobile-skill-row {
+  align-items: flex-start;
+  padding-top: 12px;
+  padding-bottom: 12px;
+}
+
+.mobile-skill-row__box {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  margin-top: 1px;
+  border: 1.5px solid var(--color-border-lit);
+  border-radius: 6px;
+  background: transparent;
+  color: #fff;
+  font-size: 12px;
+}
+
+.mobile-skill-row__box--on {
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+}
+
+/* 每项最多两行 (§9.3): the label and the description each get ONE line and
+   ellipsize, so a long description cannot push a row past two lines. */
+.mobile-skill-row__name {
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 15px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-skill-row__desc {
+  overflow: hidden;
+  color: var(--color-text-dim);
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-skill-sheet__footer {
+  flex: none;
+  padding: 8px 16px calc(12px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--color-border);
+}
+
+.mobile-skill-sheet__done {
+  width: 100%;
+  min-height: 44px;
+  border: none;
+  border-radius: 999px;
+  background: var(--color-primary);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}

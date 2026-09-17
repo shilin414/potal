@@ -94,6 +94,17 @@ SET name = ?, description = ?, icon = ?, color = ?, is_public = ?,
     category_id = ?, renderer_key = ?
 WHERE id = ?;
 
+-- name: GetApplicationDefaultConfigForUpdate :one
+-- Read-modify-write guard for default_config (the only JSON column the Go
+-- backend WRITES). FOR UPDATE, not a bare read: 技能配置 replaces just the
+-- `skills` key and must not clobber the other keys a legacy editor stored
+-- there (guided_entry_prompt_key), so the merge needs the row pinned for the
+-- duration of the transaction.
+SELECT default_config FROM applications WHERE id = ? FOR UPDATE;
+
+-- name: UpdateApplicationDefaultConfig :exec
+UPDATE applications SET default_config = ? WHERE id = ?;
+
 -- name: UpdateApplicationAvatar :exec
 UPDATE applications SET avatar_key = ? WHERE id = ?;
 

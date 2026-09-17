@@ -14,6 +14,8 @@ import type { SendDecision } from '@/components/Chat/RunChatPanel';
 import { useApplicationCatalogStore, resolveDefaultApplication } from '@/stores/useApplicationCatalogStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import { routeMention } from '@/lib/mentionRouter';
+import { useIsMobile } from '@/shell/useIsMobile';
+import { MobileHomeSurface } from '@/components/Mobile';
 import type { V2Application } from '@/services/runApi';
 import HomeShortcuts from './HomeShortcuts';
 import './HomeWorkspace.css';
@@ -21,6 +23,10 @@ import './HomeWorkspace.css';
 const HomeWorkspace: React.FC = () => {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
+  // Mobile swaps ONLY the empty state (§6.1): the WorkspaceHost, the Run API
+  // and this component's deep-link / @mention handling are shared, so the two
+  // shells can never drift on what a shortcut does — only on how it looks.
+  const isMobile = useIsMobile();
   const applications = useApplicationCatalogStore((state) => state.applications);
   const catalogLoading = useApplicationCatalogStore((state) => state.isLoading);
   const toggleFavorite = useApplicationCatalogStore((state) => state.toggleFavorite);
@@ -133,19 +139,25 @@ const HomeWorkspace: React.FC = () => {
         title="今天想做什么？"
         description="选择一个智能体，或直接输入你的需求开始。"
         emptyState={(
-          <div className="home-workspace">
-            <div className="home-workspace__hero">
-              <h2 className="home-workspace__title">今天想做什么？</h2>
-              <p className="home-workspace__subtitle">
-                选择一个智能体继续，或直接在下方输入你的需求。
-              </p>
+          isMobile ? (
+            // §27: the desktop 多分组 HomeShortcuts is NOT rendered on mobile —
+            // it is kept intact for PC, and mobile gets an Agent-first surface.
+            <MobileHomeSurface />
+          ) : (
+            <div className="home-workspace">
+              <div className="home-workspace__hero">
+                <h2 className="home-workspace__title">今天想做什么？</h2>
+                <p className="home-workspace__subtitle">
+                  选择一个智能体继续，或直接在下方输入你的需求。
+                </p>
+              </div>
+              <HomeShortcuts
+                applications={applications}
+                onOpen={openApplicationWorkspace}
+                onToggleFavorite={toggleFavorite}
+              />
             </div>
-            <HomeShortcuts
-              applications={applications}
-              onOpen={openApplicationWorkspace}
-              onToggleFavorite={toggleFavorite}
-            />
-          </div>
+          )
         )}
         onConversationCreated={(id) => {
           if (!defaultApplication) return;

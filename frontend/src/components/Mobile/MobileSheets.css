@@ -1,0 +1,262 @@
+/* ============================================
+   Mobile Sheets — the ONE visual language for every mobile Bottom Sheet
+   (智能体 / 应用 / 技能 / 附件). Design report §12.
+
+   Rules that are already decided here and must not be re-invented per sheet:
+     · top-rounded, sliding from the bottom, 82dvh;
+     · a grab handle that is a VISUAL cue only (drag-to-dismiss is not part of
+       the first release, §12.1/§12.2);
+     · every tappable row >= 44px and every icon button >= 40px (§12.3);
+     · `env(safe-area-inset-bottom)` on the scroll tail, so the last row is not
+       under the iPhone home indicator;
+     · `min-height: 0` on the scroll region — without it a flex child refuses to
+       shrink and the PAGE scrolls behind the sheet instead of the list (§25).
+   ============================================ */
+
+.mobile-sheet {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  background: var(--color-bg-card);
+}
+
+/* ── handle + header ─────────────────────────────────────────────────── */
+
+.mobile-sheet__handle {
+  flex: none;
+  width: 40px;
+  height: 4px;
+  margin: 8px auto 2px;
+  border-radius: 999px;
+  background: var(--color-border-lit);
+}
+
+.mobile-sheet__header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  min-height: 52px;
+  padding: 4px 12px 4px 16px;
+}
+
+.mobile-sheet__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 17px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-sheet__icon-btn {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-sec);
+  font-size: 16px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-sheet__icon-btn:hover {
+  background: var(--color-bg-elevated);
+  color: var(--color-text);
+}
+
+.mobile-sheet__cancel {
+  flex: none;
+  padding: 0 8px;
+  height: 40px;
+  border: none;
+  background: transparent;
+  color: var(--color-primary);
+  font-size: 15px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* The search field takes over the title row so the list keeps its height. */
+.mobile-sheet__search {
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── scroll region ───────────────────────────────────────────────────── */
+
+.mobile-sheet__body {
+  flex: 1;
+  /* Load-bearing: lets this shrink inside the flex column. */
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: calc(8px + env(safe-area-inset-bottom));
+}
+
+.mobile-sheet__section-label {
+  padding: 10px 16px 4px;
+  color: var(--color-text-dim);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.mobile-sheet__divider {
+  height: 1px;
+  margin: 8px 16px;
+  background: var(--color-border);
+}
+
+/* ── category tabs ───────────────────────────────────────────────────── */
+
+.mobile-sheet__tabs {
+  display: flex;
+  gap: 8px;
+  padding: 8px 16px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.mobile-sheet__tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.mobile-sheet__tab {
+  flex: none;
+  padding: 7px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-sec);
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-sheet__tab--active {
+  border-color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 12%, transparent);
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+/* ── rows ────────────────────────────────────────────────────────────── */
+
+.mobile-sheet__row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 60px;
+  padding: 8px 16px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-sheet__row:hover,
+.mobile-sheet__row:active {
+  background: var(--color-bg-elevated);
+}
+
+.mobile-sheet__row-body {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mobile-sheet__row-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--color-text);
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.mobile-sheet__row-name > span:first-child {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-sheet__row-desc {
+  overflow: hidden;
+  color: var(--color-text-dim);
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 主 marker: 工作台默认主智能体 (§5.5). Compact so it never competes with
+   the name for width. */
+.mobile-sheet__badge {
+  flex: none;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--color-primary) 14%, transparent);
+  color: var(--color-primary);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 15px;
+}
+
+.mobile-sheet__tick {
+  flex: none;
+  color: var(--color-primary);
+  font-size: 16px;
+}
+
+/* ── states ──────────────────────────────────────────────────────────── */
+
+.mobile-sheet__empty {
+  padding: 40px 24px;
+  color: var(--color-text-sec);
+  font-size: 14px;
+  text-align: center;
+}
+
+.mobile-sheet__empty strong {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--color-text);
+  font-weight: 500;
+}
+
+/* 加载更多 — spans the sheet, so it is visibly NOT one of the rows above it. */
+.mobile-sheet__more-btn {
+  display: block;
+  width: calc(100% - 32px);
+  margin: 8px 16px 16px;
+  padding: 10px 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius-sm);
+  background: var(--color-bg-elevated);
+  color: var(--color-text-sec);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.mobile-sheet__more-btn:active {
+  background: var(--color-bg-card);
+}
+
+.mobile-sheet__skeleton {
+  padding: 12px 16px;
+}

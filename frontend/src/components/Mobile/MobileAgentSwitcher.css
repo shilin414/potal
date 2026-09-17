@@ -1,0 +1,56 @@
+/* MobileAgentSwitcher — top bar agent entry that opens a Bottom Sheet (§7.2).
+   Mirrors ApplicationSwitcher's look so the two shells share a visual language,
+   while the interaction is mobile-native (sheet, not Dropdown). */
+
+.mobile-agent-switcher {
+  display: inline-flex;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 40px;
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--border-radius-md);
+  background: transparent;
+  color: var(--color-text);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-agent-switcher:hover:not(:disabled),
+.mobile-agent-switcher:active:not(:disabled) {
+  background: var(--color-bg-elevated);
+  border-color: var(--color-border);
+}
+
+.mobile-agent-switcher:disabled {
+  cursor: default;
+}
+
+.mobile-agent-switcher__icon {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.mobile-agent-switcher__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-align: left;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-agent-switcher__caret {
+  flex: none;
+  color: var(--color-text-sec);
+  font-size: 10px;
+}

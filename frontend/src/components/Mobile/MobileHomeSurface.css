@@ -1,0 +1,96 @@
+/* MobileHomeSurface — Agent-first idle home (§3). Light, low-chrome, generous
+   whitespace: no card-on-card, no multi-layer dividers (§13). */
+
+/* `.chat-empty` centres its child and pads 32/24px. The mobile home surface
+   owns its own layout and gutter, so those are zeroed here — otherwise the
+   hero is inset twice and the 首屏 no-scroll budget is spent on padding.
+   Compound selector for the same reason as the composer's. */
+.chat-container .chat-empty--mobile {
+  padding: 0;
+}
+
+.mobile-home {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  align-items: center;
+  /* Pushed above centre so the eye lands on the hero while the composer
+     stays anchored at the bottom of the workspace. */
+  justify-content: center;
+  gap: 20px;
+  padding: 16px 20px 24px;
+  text-align: center;
+}
+
+.mobile-home__hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+}
+
+.mobile-home__avatar {
+  box-shadow: var(--shadow-sm);
+}
+
+/* 24–26px (§13.1). */
+.mobile-home__title {
+  margin: 0;
+  color: var(--color-text);
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+/* ── 智能体 / 应用 双入口 ─────────────────────────────────────────────── */
+
+.mobile-home__entries {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: var(--color-bg-card);
+}
+
+.mobile-home__entry {
+  min-width: 96px;
+  min-height: 40px;
+  padding: 0 20px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-sec);
+  font-size: 15px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.18s ease, color 0.18s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-home__entry:active,
+.mobile-home__entry:hover {
+  background: color-mix(in srgb, var(--color-primary) 12%, transparent);
+  color: var(--color-primary);
+}
+
+.mobile-home__entries-sep {
+  width: 1px;
+  height: 20px;
+  background: var(--color-border);
+}
+
+@media (max-height: 640px) {
+  /* Small phones: keep the first screen scroll-free (§21) by tightening the
+     hero instead of hiding any of the three required elements. */
+  .mobile-home {
+    gap: 14px;
+    padding-top: 8px;
+  }
+
+  .mobile-home__title {
+    font-size: 21px;
+  }
+}

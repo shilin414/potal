@@ -43,6 +43,7 @@ import {
 import { useRunChatStore } from '@/stores/useRunChatStore';
 import type { ChatMessage } from '@/stores/useRunChatStore';
 import { useAuthStore } from '@/stores/useAuthStore';
+import { useWorkspaceStore, workspaceStateOf } from '@/stores/useWorkspaceStore';
 import {
   agentAvatarFallback,
   agentAvatarUrl,
@@ -51,20 +52,35 @@ import {
   userAvatarFallback,
   userAvatarUrl,
 } from '@/lib/chatIdentity';
-import type { V2Application } from '@/services/runApi';
+import {
+  buildSkillAugmentedContent,
+  resolveSelectedSkills,
+  skillButtonLabel,
+} from '@/lib/agentSkills';
+import type { AgentSkill, V2Application } from '@/services/runApi';
+import { useIsMobile } from '@/shell/useIsMobile';
 import AgentAvatar from '@/components/Agents/AgentAvatar';
+import {
+  MobileAttachmentSheet,
+  MobileComposer,
+  MobileSkillSheet,
+} from '@/components/Mobile';
+import type { PendingUpload } from '@/components/Mobile';
 import ArtifactCard from './ArtifactCard';
 import { MarkdownWithArtifacts } from './ArtifactMarkdown';
 import FeishuForwardModal from './FeishuForwardModal';
 import './chatSurface.css';
 import './RunChatPanel.css';
 
-interface PendingUpload {
-  key: string;
-  name: string;
-  state: 'uploading' | 'ready' | 'failed';
-  attachmentId?: string;
-}
+/** Stable empty list: `?? []` in render would churn every memo depending on it. */
+const NO_SKILLS: AgentSkill[] = [];
+
+/**
+ * What the ONE hidden file input accepts. Extensions AND mime types, because
+ * some Android/飞书 pickers match on one and some on the other; the real
+ * enforcement is `validateAttachment`, which also knows the size limits (§9.3).
+ */
+const ATTACHMENT_ACCEPT = '.png,.jpg,.jpeg,.pdf,image/png,image/jpeg,application/pdf';
 
 /**
  * Send interception result. The workspace uses it to route `@application`
@@ -143,6 +159,11 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
+  // Mobile-only sheets (§8/§10): the composer's 技能 and ＋ entries.
+  const [skillSheetOpen, setSkillSheetOpen] = useState(false);
+  const [attachmentSheetOpen, setAttachmentSheetOpen] = useState(false);
+  const isMobile = useIsMobile();
+  const setSelectedSkillIds = useWorkspaceStore((state) => state.setSelectedSkillIds);
   // Scroll restore applies once, and only to a list that already has content
   // (restoring into an empty list would be overwritten by the auto-scroll).
   const pendingScrollRestore = useRef<number | null>(
@@ -357,6 +378,26 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
     : true;
   const effectiveApplicationId = effectiveApplication?.id;
 
+  // ── 技能配置 (design report §9) ──────────────────────────────────────
+  // Skills belong to the AGENT, so the list comes straight off the resolved
+  // application rather than from a standalone skill catalog. The selection
+  // lives in the workspace store, keyed by application, so switching agents
+  // restores each one's own combination (§9.4).
+  const availableSkills = effectiveApplication?.skills ?? NO_SKILLS;
+  const storedSkillIds = useWorkspaceStore((state) => (
+    workspaceStateOf(state.workspaces, effectiveApplicationId).selectedSkillIds));
+  // resolveSelectedSkills drops ids the agent no longer offers AND re-sorts
+  // into catalog order, which is what keeps the composed content — and hence
+  // the idempotency hash — stable regardless of the order chips were tapped.
+  const selectedSkills = useMemo(
+    () => resolveSelectedSkills(availableSkills, storedSkillIds),
+    [availableSkills, storedSkillIds]);
+
+  const handleSkillChange = (skillIds: string[]) => {
+    if (effectiveApplicationId == null) return;
+    setSelectedSkillIds(effectiveApplicationId, skillIds);
+  };
+
   const handleFiles = async (files: FileList | null) => {
     if (!files?.length || !effectiveApplicationId) return;
     const next: PendingUpload[] = [];
@@ -418,6 +459,12 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
     const attachments = pendingUploads
       .filter((u) => u.state === 'ready' && u.attachmentId)
       .map((u) => ({ id: u.attachmentId!, name: u.name }));
+    // 技能 are applied AFTER routing, never before: `routeMention` only
+    // recognises a LEADING `@mention`, so prepending the skill prompts first
+    // would push `@销售助手 ...` off the front and silently stop routing it
+    // (§36). The provider then sees the composed text — the fragment changes
+    // `content`, so the idempotency hash already covers the selection.
+    const outgoingContent = buildSkillAugmentedContent(selectedSkills, content);
     // Clear the composer synchronously BEFORE the async send: the await
     // below lets React re-render with the previous controlled value, which
     // would refill the textarea after our later setInputValue('').
@@ -428,7 +475,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
       const cid = await sendMessage({
         applicationId: effectiveApplicationId,
         conversationId: conversationId || null,
-        content,
+        content: outgoingContent,
         attachments,
       });
       if (cid != null) {
@@ -601,7 +648,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
         // height, composer pinned below); callers only supply the content via
         // `emptyState`. Rendering `emptyState` bare here loses that layout —
         // a max-width block would hug the left edge instead of centering.
-        <div className="chat-empty">
+        <div className={`chat-empty${isMobile ? ' chat-empty--mobile' : ''}`}>
           {emptyState ?? (
             <>
               {/* The empty state is this agent's front door: its face, not ✦. */}
@@ -642,8 +689,22 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
         </div>
       )}
 
-      <div className="chat-input-area">
+      <div className={`chat-input-area${isMobile ? ' chat-input-area--mobile' : ''}`}>
         <div className="chat-input-wrapper">
+          {/* ONE hidden picker for both shells: the desktop paperclip and the
+              mobile `+` sheet both open THIS input, so validateAttachment →
+              uploadAttachment → pendingUploads stays single-sourced. */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            hidden
+            accept={ATTACHMENT_ACCEPT}
+            onChange={(e) => {
+              void handleFiles(e.target.files);
+              e.target.value = '';
+            }}
+          />
           {selectMode ? (
             <div className="run-chat-select-bar">
               <button className="run-chat-select-btn" onClick={exitSelect}>取消</button>
@@ -668,6 +729,20 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
                 生成分享链接
               </Button>
             </div>
+          ) : isMobile ? (
+            <MobileComposer
+              value={inputValue}
+              sending={sending || streaming}
+              uploads={pendingUploads}
+              supportsAttachment={supportsAttachment}
+              skillLabel={skillButtonLabel(selectedSkills)}
+              hasSkills={availableSkills.length > 0}
+              onChange={updateInput}
+              onSend={() => void handleSend()}
+              onOpenAttachments={() => setAttachmentSheetOpen(true)}
+              onOpenSkills={() => setSkillSheetOpen(true)}
+              onRemoveUpload={removeUpload}
+            />
           ) : (
           <div className="run-chat-composer">
             {pendingUploads.length > 0 && (
@@ -685,17 +760,6 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
               </div>
             )}
             <div className="run-chat-input-row">
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                hidden
-                accept=".png,.jpg,.jpeg,.pdf"
-                onChange={(e) => {
-                  void handleFiles(e.target.files);
-                  e.target.value = '';
-                }}
-              />
               <button
                 className="run-chat-clip"
                 disabled={!supportsAttachment || sending || streaming}
@@ -785,6 +849,25 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
         shareToken={shareResult?.token ?? null}
         onClose={() => setForwardOpen(false)}
       />
+
+      {/* Mobile-only sheets. Rendered unconditionally (their `open` flag gates
+          them) so the composer's buttons never have to mount/unmount trees. */}
+      {isMobile && (
+        <>
+          <MobileSkillSheet
+            open={skillSheetOpen}
+            skills={availableSkills}
+            selectedIds={selectedSkills.map((skill) => skill.id)}
+            onChange={handleSkillChange}
+            onClose={() => setSkillSheetOpen(false)}
+          />
+          <MobileAttachmentSheet
+            open={attachmentSheetOpen}
+            onPickFiles={() => fileInputRef.current?.click()}
+            onClose={() => setAttachmentSheetOpen(false)}
+          />
+        </>
+      )}
     </div>
   );
 };

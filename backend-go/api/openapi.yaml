@@ -1779,6 +1779,7 @@ components:
         - usage_count
         - last_used_at
         - global_usage_count
+        - skills
       properties:
         id: { type: integer }
         slug: { type: string }
@@ -1812,6 +1813,35 @@ components:
           nullable: true
           format: date-time
         global_usage_count: { type: integer }
+        skills:
+          type: array
+          description: >-
+            Agent-scoped 技能配置. Always present; `[]` when the agent has none.
+          items: { $ref: "#/components/schemas/ApplicationSkill" }
+
+    ApplicationSkill:
+      type: object
+      description: >-
+        An agent-scoped skill: a NAMED prompt fragment the composer prepends to
+        the user's message. It is not a provider capability — the provider only
+        ever sees ordinary message content, and interpreting the fragment is the
+        custom agent's own concern. Because the fragment changes `content`, the
+        existing idempotency request hash already covers it.
+      required: [id, name, prompt]
+      properties:
+        id:
+          type: string
+          maxLength: 64
+          pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          description: >-
+            Stable across renames so a saved composer selection survives an
+            admin rewording the skill. Derived from `name` when omitted.
+        name: { type: string, maxLength: 24, description: composer chip label }
+        description: { type: string, maxLength: 60, description: one-line subtitle }
+        prompt:
+          type: string
+          maxLength: 200
+          description: prepended verbatim to the user's message
 
     ApplicationDetail:
       type: object
@@ -1860,6 +1890,10 @@ components:
         execution_mode: { type: string }
         can_manage: { type: boolean }
         updated_at: { type: string, format: date-time }
+        skills:
+          type: array
+          description: Agent-scoped 技能配置; always present, `[]` when none.
+          items: { $ref: "#/components/schemas/ApplicationSkill" }
 
     RuntimeBindingInput:
       type: object
@@ -1902,6 +1936,11 @@ components:
         renderer_key: { type: string, default: chat }
         runtime: { $ref: "#/components/schemas/RuntimeBindingInput" }
         set_default_agent: { type: boolean, default: false }
+        skills:
+          type: array
+          maxItems: 20
+          description: Agent-scoped 技能配置; omit or send `[]` for none.
+          items: { $ref: "#/components/schemas/ApplicationSkill" }
 
     ApplicationUpdateRequest:
       type: object
@@ -1916,6 +1955,13 @@ components:
         category_name: { type: string }
         runtime: { $ref: "#/components/schemas/RuntimeBindingInput" }
         set_default_agent: { type: boolean }
+        skills:
+          type: array
+          maxItems: 20
+          description: >-
+            Replaces the stored 技能配置. OMIT the field to leave it untouched —
+            a rename must not clear an agent's skills; send `[]` to clear them.
+          items: { $ref: "#/components/schemas/ApplicationSkill" }
 
     FavoriteResult:
       type: object

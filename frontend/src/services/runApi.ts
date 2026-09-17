@@ -76,7 +76,46 @@ export interface V2Application {
   last_used_at?: string | null;
   /** Global counter (Application.usage_count) — drives 推荐 only. */
   global_usage_count?: number;
+  /**
+   * 技能配置 — the agent's own skills, configured in 智能体市场.
+   *
+   * The backend always sends this (`[]` when the agent has none), so a
+   * selector can tell "none configured" apart from "not loaded". Optional in
+   * the type only so older cached payloads and test fixtures stay valid.
+   */
+  skills?: AgentSkill[];
 }
+
+/**
+ * An agent-scoped skill.
+ *
+ * A skill is a NAMED PROMPT FRAGMENT the composer prepends to the user's
+ * message — NOT a provider capability. The provider (Aily or otherwise) only
+ * ever receives ordinary message content; interpreting the fragment is the
+ * custom agent's own business. That is why selecting a skill needs no new Run
+ * field: it changes `content`, which the existing idempotency hash already
+ * covers.
+ */
+export interface AgentSkill {
+  /** Stable across renames, so a saved selection survives a reworded skill. */
+  id: string;
+  /** Composer chip label (「查询收入数据」). */
+  name: string;
+  /** One-line subtitle in the skill sheet. */
+  description: string;
+  /** Prepended verbatim to the user's message (「/查询收入查询」). */
+  prompt: string;
+}
+
+/**
+ * A skill as SUBMITTED by the authoring form.
+ *
+ * `id` may be omitted: the backend derives a stable one from the name, which is
+ * what lets a newly added skill work without the form inventing identifiers.
+ * An existing skill's id is sent back unchanged so its reworded text does not
+ * invalidate anyone's saved composer selection.
+ */
+export type AgentSkillInput = Omit<AgentSkill, 'id'> & { id?: string };
 
 export interface UploadPendingAttachment {
   id: string;
@@ -181,6 +220,8 @@ export interface ManagedAgent {
   last_used_at?: string | null;
   is_favorite?: boolean;
   capabilities?: Record<string, boolean>;
+  /** 技能配置, as configured in 智能体市场 (see AgentSkill). */
+  skills?: AgentSkill[];
 }
 
 /** A runtime an agent can be built on (one Provider × registered adapter). */
@@ -221,6 +262,12 @@ export interface AgentApplicationPayload {
   is_public?: boolean;
   runtime?: AgentRuntimePayload;
   set_default_agent?: boolean;
+  /**
+   * 技能配置. The whole list is replaced on save, matching the backend
+   * contract; OMITTING the field leaves the stored skills untouched (which is
+   * what a rename-only PATCH must do), while `[]` clears them.
+   */
+  skills?: AgentSkillInput[];
 }
 
 export interface RuntimeValidationResult {

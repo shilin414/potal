@@ -2,7 +2,7 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { Button, Drawer } from 'antd';
 import { MenuOutlined, PlusOutlined } from '@ant-design/icons';
 import ConversationHistory from '@/components/ConversationHistory/ConversationHistory';
-import ApplicationSwitcher from '@/components/Workspace/ApplicationSwitcher';
+import MobileAgentSwitcher from '@/components/Mobile/MobileAgentSwitcher';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import { useApplicationCatalogStore, resolveDefaultApplication } from '@/stores/useApplicationCatalogStore';
 import { useRunChatStore } from '@/stores/useRunChatStore';
@@ -73,7 +73,9 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
           >
             <MenuOutlined />
           </button>
-          <ApplicationSwitcher compact />
+          {/* 移动端智能体切换走 Bottom Sheet，与首页选择器同一组件 (§7.2)；
+              桌面端继续用 ApplicationSwitcher 的 Dropdown，互不影响。 */}
+          <MobileAgentSwitcher />
           {/* 右侧主操作：回到首页。这里原本是账号头像（纯展示、无下拉，
               账号菜单本来就在移动端不可达），换成一个更常用的动作。 */}
           <Button

@@ -15,6 +15,7 @@
  */
 import { useEffect, useMemo, useState } from 'react';
 import { Alert, Button, Form, Input, Modal, Segmented, Select, Switch, message } from 'antd';
+import { MinusCircleOutlined, PlusOutlined } from '@ant-design/icons';
 import { api } from '@/services/api';
 import {
   createAgentApplication,
@@ -22,6 +23,8 @@ import {
   updateAgentApplication,
   validateAgentRuntime,
   type AgentRuntimeDescriptor,
+  type AgentSkill,
+  type AgentSkillInput,
 } from '@/services/runApi';
 
 export type AgentEditorMode = 'runtime' | 'local';
@@ -74,6 +77,8 @@ interface RuntimeAgentDetail {
   external_resource_id?: string;
   identity_mode?: string;
   execution_mode?: string;
+  /** 技能配置, maintained by this form (§9). */
+  skills?: AgentSkill[];
 }
 
 interface AgentFormValues {
@@ -85,12 +90,18 @@ interface AgentFormValues {
   category_slug?: string;
   system_prompt?: string;
   skill_ids?: string[];
+  /** Legacy: the local agent's Skill bindings (a different concept entirely). */
   is_public: boolean;
   runtime_key?: string;
   external_resource_id?: string;
   identity_mode?: string;
   execution_mode?: string;
   set_default_agent?: boolean;
+  /**
+   * 技能配置 rows. Kept as a Form.List so each row is a real Form.Item —
+   * see the payload note in handleSave.
+   */
+  agent_skills?: AgentSkillInput[];
 }
 
 const unwrap = <T,>(response: T[] | { results?: T[] }): T[] => (
@@ -162,6 +173,7 @@ const AgentEditorModal = ({
             icon: '🤖',
             skill_ids: [],
             is_public: false,
+            agent_skills: [],
             runtime_key: runtimeList[0]?.key,
             identity_mode: runtimeList[0]?.identity_modes[0] || 'user',
             execution_mode: runtimeList[0]?.execution_modes[0] || 'interactive',
@@ -199,6 +211,7 @@ const AgentEditorModal = ({
           identity_mode: application.identity_mode || 'user',
           execution_mode: application.execution_mode || 'interactive',
           set_default_agent: Boolean(application.is_default_agent),
+          agent_skills: application.skills || [],
         });
       })
       .catch(() => message.error('加载智能体配置失败'))
@@ -234,6 +247,28 @@ const AgentEditorModal = ({
     }
   };
 
+  /**
+   * Normalize the 技能配置 rows for the wire.
+   *
+   * Blank rows are DROPPED rather than sent: the form keeps an empty row so the
+   * user can start typing, and that placeholder is not a skill. `id` is sent
+   * only when it exists — the backend derives one from the name otherwise, so
+   * the form never has to invent identifiers.
+   */
+  const collectSkills = (values: AgentFormValues): AgentSkillInput[] => (
+    (values.agent_skills || [])
+      .filter((row) => row && (row.name || '').trim() && (row.prompt || '').trim())
+      .map((row) => {
+        const id = (row.id || '').trim();
+        return {
+          ...(id ? { id } : {}),
+          name: row.name.trim(),
+          description: (row.description || '').trim(),
+          prompt: row.prompt.trim(),
+        };
+      })
+  );
+
   const saveRuntimeAgent = async (values: AgentFormValues) => {
     const descriptor = runtimes.find((item) => item.key === values.runtime_key);
     if (!descriptor) {
@@ -249,6 +284,7 @@ const AgentEditorModal = ({
       execution_mode: values.execution_mode
         || descriptor.execution_modes[0] || 'interactive',
     };
+    const skills = collectSkills(values);
     if (isEdit && agentId) {
       await updateAgentApplication(agentId, {
         name: values.name,
@@ -259,6 +295,7 @@ const AgentEditorModal = ({
         category_name: category?.name || '',
         runtime,
         set_default_agent: Boolean(values.set_default_agent),
+        skills,
       });
       message.success('智能体已更新');
       return;
@@ -273,6 +310,7 @@ const AgentEditorModal = ({
       category_name: category?.name || DEFAULT_CATEGORY.name,
       runtime,
       set_default_agent: Boolean(values.set_default_agent),
+      skills,
     });
     message.success('智能体已创建');
   };
@@ -306,7 +344,12 @@ const AgentEditorModal = ({
 
   const handleSave = async () => {
     try {
-      const values = await form.validateFields();
+      // `validateFields()` is the GATE only — its return value is deliberately
+      // discarded. It contains just the registered Form.Item paths, so building
+      // the payload from it can silently drop fields the form did not register
+      // (this project has already shipped that bug once).
+      await form.validateFields();
+      const values = form.getFieldsValue(true) as AgentFormValues;
       setSaving(true);
       if (agentType === 'runtime') {
         await saveRuntimeAgent(values);
@@ -558,6 +601,67 @@ const AgentEditorModal = ({
             </Form.Item>
           ) : null}
         </div>
+
+        {agentType === 'runtime' && (
+          <Form.Item
+            label="技能配置"
+            extra="技能归属该智能体。用户在对话页选中后，会把「提示词」拼在提问前面一起发给智能体（例如 /查询收入查询），具体如何识别由智能体自身逻辑处理。"
+          >
+            {/* Form.List carries its own value binding, so the wrapping
+                Form.Item must NOT declare a `name`. */}
+            <Form.List name="agent_skills">
+              {(fields, { add, remove }) => (
+                <div className="agent-skills-editor">
+                  {fields.map((field) => (
+                    <div className="agent-skills-editor__row" key={field.key}>
+                      {/* Preserves an existing skill's id across edits so a
+                          reworded skill keeps working for anyone who already
+                          selected it in their composer. */}
+                      <Form.Item name={[field.name, 'id']} hidden>
+                        <Input />
+                      </Form.Item>
+                      <Form.Item
+                        name={[field.name, 'name']}
+                        className="agent-skills-editor__name"
+                        rules={[{ required: true, whitespace: true, message: '请输入技能名称' }]}
+                      >
+                        <Input placeholder="技能名称，如：查询收入数据" maxLength={24} />
+                      </Form.Item>
+                      <Form.Item
+                        name={[field.name, 'prompt']}
+                        className="agent-skills-editor__prompt"
+                        rules={[{ required: true, whitespace: true, message: '请输入提示词' }]}
+                      >
+                        <Input placeholder="提示词前缀，如：/查询收入查询" maxLength={200} />
+                      </Form.Item>
+                      <Form.Item
+                        name={[field.name, 'description']}
+                        className="agent-skills-editor__desc"
+                      >
+                        <Input placeholder="一行说明（可选）" maxLength={60} />
+                      </Form.Item>
+                      <Button
+                        type="text"
+                        danger
+                        aria-label="删除该技能"
+                        icon={<MinusCircleOutlined />}
+                        onClick={() => remove(field.name)}
+                      />
+                    </div>
+                  ))}
+                  <Button
+                    type="dashed"
+                    block
+                    icon={<PlusOutlined />}
+                    onClick={() => add({ name: '', prompt: '', description: '' })}
+                  >
+                    添加技能
+                  </Button>
+                </div>
+              )}
+            </Form.List>
+          </Form.Item>
+        )}
 
         {agentType === 'runtime' && (
           <div className="agent-editor-hint">

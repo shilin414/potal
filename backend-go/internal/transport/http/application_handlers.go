@@ -6,6 +6,7 @@ import (
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -52,6 +53,10 @@ type applicationListItem struct {
 	UsageCount         int64          `json:"usage_count"`
 	LastUsedAt         *string        `json:"last_used_at"`
 	GlobalUsageCount   int64          `json:"global_usage_count"`
+	// 技能配置 (agent-scoped prompt prefixes). Always present — an agent with
+	// no skills sends `[]`, never `null`, so the mobile skill sheet needs no
+	// null-guard and can distinguish "not loaded" from "none configured".
+	Skills []catalog.Skill `json:"skills"`
 }
 
 // applicationDetail mirrors the compact authoring shape (18 keys).
@@ -77,6 +82,8 @@ type applicationDetail struct {
 	ExecutionMode      string `json:"execution_mode"`
 	CanManage          bool   `json:"can_manage"`
 	UpdatedAt          string `json:"updated_at"`
+	// 技能配置 — see applicationListItem.Skills.
+	Skills []catalog.Skill `json:"skills"`
 }
 
 func avatarURL(app *catalog.Application) string {
@@ -104,6 +111,7 @@ func (s *Server) appDetail(app *catalog.Application, binding *catalog.Binding, c
 		IsDefaultAgent: app.IsDefaultAgent,
 		CanManage:      manage,
 		UpdatedAt:      app.UpdatedAt.UTC().Format(time.RFC3339),
+		Skills:         app.Skills,
 	}
 	if binding != nil && binding.Enabled {
 		d.IsBound = true
@@ -299,6 +307,7 @@ func (s *Server) buildListItem(item catalog.ApplicationWithBinding, providers ma
 		CanManage:      canManageCaller(app, caller),
 		UsageCount:     entry.Count, LastUsedAt: dispTime(disp),
 		GlobalUsageCount: app.UsageCount,
+		Skills:           app.Skills,
 	}
 }
 
@@ -331,18 +340,19 @@ func (s *Server) CreateApplication(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Name            string        `json:"name"`
-		Slug            string        `json:"slug"`
-		Description     string        `json:"description"`
-		Icon            string        `json:"icon"`
-		Color           string        `json:"color"`
-		CategorySlug    string        `json:"category_slug"`
-		CategoryName    string        `json:"category_name"`
-		IsPublic        *bool         `json:"is_public"`
-		Kind            string        `json:"kind"`
-		RendererKey     string        `json:"renderer_key"`
-		Runtime         *runtimeInput `json:"runtime"`
-		SetDefaultAgent bool          `json:"set_default_agent"`
+		Name            string          `json:"name"`
+		Slug            string          `json:"slug"`
+		Description     string          `json:"description"`
+		Icon            string          `json:"icon"`
+		Color           string          `json:"color"`
+		CategorySlug    string          `json:"category_slug"`
+		CategoryName    string          `json:"category_name"`
+		IsPublic        *bool           `json:"is_public"`
+		Kind            string          `json:"kind"`
+		RendererKey     string          `json:"renderer_key"`
+		Runtime         *runtimeInput   `json:"runtime"`
+		SetDefaultAgent bool            `json:"set_default_agent"`
+		Skills          []catalog.Skill `json:"skills"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeFieldErrors(w, map[string][]string{"body": {"invalid json"}})
@@ -355,6 +365,7 @@ func (s *Server) CreateApplication(w http.ResponseWriter, r *http.Request) {
 		IsPublic: body.IsPublic == nil || *body.IsPublic,
 		Kind:     body.Kind, RendererKey: body.RendererKey,
 		SetDefaultAgent: body.SetDefaultAgent,
+		Skills:          body.Skills,
 		CreatorID:       caller.ID,
 		IsStaff:         caller.IsStaff,
 	}
@@ -402,16 +413,17 @@ func (s *Server) UpdateApplication(w http.ResponseWriter, r *http.Request, id ge
 		return
 	}
 	var body struct {
-		Name            *string       `json:"name"`
-		Description     *string       `json:"description"`
-		Icon            *string       `json:"icon"`
-		Color           *string       `json:"color"`
-		IsPublic        *bool         `json:"is_public"`
-		Enabled         *bool         `json:"enabled"`
-		CategorySlug    *string       `json:"category_slug"`
-		CategoryName    *string       `json:"category_name"`
-		Runtime         *runtimeInput `json:"runtime"`
-		SetDefaultAgent *bool         `json:"set_default_agent"`
+		Name            *string          `json:"name"`
+		Description     *string          `json:"description"`
+		Icon            *string          `json:"icon"`
+		Color           *string          `json:"color"`
+		IsPublic        *bool            `json:"is_public"`
+		Enabled         *bool            `json:"enabled"`
+		CategorySlug    *string          `json:"category_slug"`
+		CategoryName    *string          `json:"category_name"`
+		Runtime         *runtimeInput    `json:"runtime"`
+		SetDefaultAgent *bool            `json:"set_default_agent"`
+		Skills          *[]catalog.Skill `json:"skills"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeFieldErrors(w, map[string][]string{"body": {"invalid json"}})
@@ -423,7 +435,7 @@ func (s *Server) UpdateApplication(w http.ResponseWriter, r *http.Request, id ge
 	}
 	app, binding, err := s.Catalog.Update(r.Context(), int64(id), caller.ID, caller.IsStaff,
 		body.Name, body.Description, body.Icon, body.Color, body.IsPublic, body.Enabled,
-		body.CategorySlug, body.CategoryName, runtime, body.SetDefaultAgent)
+		body.CategorySlug, body.CategoryName, runtime, body.SetDefaultAgent, body.Skills)
 	if err != nil {
 		s.writeCatalogError(w, err)
 		return
@@ -460,6 +472,11 @@ func (s *Server) writeCatalogError(w http.ResponseWriter, err error) {
 		writeFieldErrors(w, map[string][]string{"detail": {err.Error()}})
 	case err == catalog.ErrDeleteReferenced:
 		writeDetail(w, http.StatusConflict, err.Error())
+	case errors.Is(err, catalog.ErrInvalidSkill):
+		// A malformed 技能配置 is the caller's payload, not a server fault:
+		// surface it on the skills field (the message names the offending
+		// entry) instead of a generic 500.
+		writeFieldErrors(w, map[string][]string{"skills": {err.Error()}})
 	case err == catalog.ErrNoBinding:
 		writeBare(w, http.StatusBadRequest, err.Error())
 	default:

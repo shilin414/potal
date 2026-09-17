@@ -92,6 +92,16 @@ export function resolveDefaultApplication(
 
 interface CatalogState {
   applications: V2Application[];
+  /**
+   * Chat applications, derived ONCE per catalog load.
+   *
+   * Not a convenience: the catalog is served whole (1800+ rows on the shared
+   * dev DB), and `applications.filter(kind === 'chat')` inside a component
+   * body re-allocates that array on every render — measured as a real input
+   * delay on the mobile shell, where the switcher re-renders per keystroke.
+   * A stored projection is computed when the payload lands, never per render.
+   */
+  chatApplicationsList: V2Application[];
   isLoading: boolean;
   error: string | null;
   loadedAt: number;
@@ -110,10 +120,14 @@ interface CatalogState {
   clear: () => void;
 }
 
+const chatOf = (applications: V2Application[]): V2Application[] =>
+  applications.filter((app) => app.kind === 'chat');
+
 let inflight: Promise<V2Application[]> | null = null;
 
 export const useApplicationCatalogStore = create<CatalogState>()((set, get) => ({
   applications: [],
+  chatApplicationsList: [],
   isLoading: false,
   error: null,
   loadedAt: 0,
@@ -128,7 +142,12 @@ export const useApplicationCatalogStore = create<CatalogState>()((set, get) => (
     // because unbound chat apps are excluded unless include_unbound is set.
     inflight = fetchV2Applications('all', { scope: 'manage' })
       .then((applications) => {
-        set({ applications, isLoading: false, loadedAt: Date.now() });
+        set({
+          applications,
+          chatApplicationsList: chatOf(applications),
+          isLoading: false,
+          loadedAt: Date.now(),
+        });
         return applications;
       })
       .catch((error: any) => {
@@ -147,24 +166,23 @@ export const useApplicationCatalogStore = create<CatalogState>()((set, get) => (
     if (!current) return;
     const next = !current.is_favorite;
     // Optimistic: the shell must react instantly; revert on failure.
-    set({
-      applications: get().applications.map((app) => (
-        app.id === applicationId ? { ...app, is_favorite: next } : app)),
-    });
+    // `is_favorite` lives only on the visible groups, so the chat projection
+    // (same object references) is refreshed alongside to keep them identical.
+    const withFavorite = (value: boolean) => get().applications.map((app) => (
+      app.id === applicationId ? { ...app, is_favorite: value } : app));
+    const applyFavorite = (value: boolean) => {
+      const applications = withFavorite(value);
+      set({ applications, chatApplicationsList: chatOf(applications) });
+    };
+    applyFavorite(next);
     try {
       const result = await setApplicationFavorite(applicationId, next);
-      set({
-        applications: get().applications.map((app) => (
-          app.id === applicationId
-            ? { ...app, is_favorite: result.is_favorite } : app)),
-      });
+      applyFavorite(result.is_favorite);
     } catch {
-      set({
-        applications: get().applications.map((app) => (
-          app.id === applicationId
-            ? { ...app, is_favorite: current.is_favorite } : app)),
-        error: '收藏操作失败',
-      });
+      set({ error: '收藏操作失败' });
+      // `?? false` matches the pre-existing semantics: an absent flag is "not
+      // favourited", and the revert must restore exactly that.
+      applyFavorite(current.is_favorite ?? false);
     }
   },
 
@@ -186,8 +204,13 @@ export const useApplicationCatalogStore = create<CatalogState>()((set, get) => (
       || (!Number.isNaN(numeric) && app.id === numeric)));
   },
 
-  chatApplications: () => get().applications.filter((app) => app.kind === 'chat'),
+  chatApplications: () => get().chatApplicationsList,
   fixedApplications: () => get().applications.filter((app) => app.kind !== 'chat'),
 
-  clear: () => set({ applications: [], loadedAt: 0, error: null }),
+  clear: () => set({
+    applications: [],
+    chatApplicationsList: [],
+    loadedAt: 0,
+    error: null,
+  }),
 }));

@@ -1,0 +1,44 @@
+/* MobileAttachmentSheet — the single-entry `+` menu (§10.1). */
+
+.mobile-attachment-sheet__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 4px 16px calc(20px + env(safe-area-inset-bottom));
+}
+
+.mobile-attachment-sheet__item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 56px;
+  padding: 0 16px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--border-radius-lg);
+  background: var(--color-bg-card);
+  color: var(--color-text);
+  font-size: 15px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-attachment-sheet__item:hover,
+.mobile-attachment-sheet__item:active {
+  border-color: var(--color-primary);
+  background: var(--color-bg-elevated);
+}
+
+.mobile-attachment-sheet__icon {
+  color: var(--color-primary);
+  font-size: 18px;
+}
+
+.mobile-attachment-sheet__hint {
+  margin: 0;
+  color: var(--color-text-dim);
+  font-size: 12px;
+  line-height: 1.6;
+}

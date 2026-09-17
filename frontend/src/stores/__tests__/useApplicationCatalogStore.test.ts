@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   buildShortcutGroups,
   resolveDefaultApplication,
@@ -132,5 +132,52 @@ describe('resolveDefaultApplication (§38 main agent)', () => {
     expect(resolveDefaultApplication([
       app({ id: 1, name: '修改OA密码', kind: 'custom' }),
     ])).toBeUndefined();
+  });
+});
+
+describe('chatApplicationsList (the cached chat projection)', () => {
+  // The switchers read this instead of re-filtering the 1800-row catalog on
+  // every render, which is only correct while it stays derived from
+  // `applications`. Favourites are the one write that touches both fields, so
+  // a mis-set field there would leave the two disagreeing silently.
+  it('keeps the projection in step through a favorite toggle', async () => {
+    const runApi = await import('@/services/runApi');
+    const { useApplicationCatalogStore } = await import('../useApplicationCatalogStore');
+
+    const favorite = vi.spyOn(runApi, 'setApplicationFavorite')
+      .mockResolvedValue({ application_id: 1, is_favorite: true });
+
+    const chat = app({ id: 1, name: '创作助手', is_favorite: false });
+    const fixed = app({ id: 2, name: '修改OA密码', kind: 'custom' });
+    useApplicationCatalogStore.setState({
+      applications: [chat, fixed],
+      chatApplicationsList: [chat],
+    });
+
+    await useApplicationCatalogStore.getState().toggleFavorite(1);
+
+    const { applications, chatApplicationsList } = useApplicationCatalogStore.getState();
+    expect(chatApplicationsList.map((a) => a.id)).toEqual([1]);
+    // System under test: the projection must be the SAME application objects
+    // re-filtered, so the star the shell renders cannot disagree with the list.
+    expect(chatApplicationsList[0].is_favorite).toBe(true);
+    expect(applications.find((a) => a.id === 1)?.is_favorite).toBe(true);
+    expect(chatApplicationsList).toEqual(applications.filter((a) => a.kind === 'chat'));
+
+    favorite.mockRestore();
+  });
+
+  it('clears the projection together with the catalog', async () => {
+    const { useApplicationCatalogStore } = await import('../useApplicationCatalogStore');
+    useApplicationCatalogStore.setState({
+      applications: [app({ id: 1 })], chatApplicationsList: [app({ id: 1 })],
+    });
+
+    useApplicationCatalogStore.getState().clear();
+
+    // A half-cleared store would let the switcher keep rendering agents for a
+    // catalog the shell has already forgotten (e.g. after logout).
+    expect(useApplicationCatalogStore.getState().applications).toEqual([]);
+    expect(useApplicationCatalogStore.getState().chatApplicationsList).toEqual([]);
   });
 });
