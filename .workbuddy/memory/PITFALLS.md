@@ -154,6 +154,14 @@
   `MSYS_NO_PATHCONV=1 taskkill /PID <pid> /F`（或改用 PowerShell 工具）。
 - 起之前**确认没漏 delivery worker**：只起 aily worker 时「对话正常但飞书群收不到」，
   `delivery_executions` 停在 `pending`（见上「本地起环境」）。
+- **⚠️ 端口要在「启动那一秒」查，查早一分钟都可能撞车**（2026-09-17 实测）：
+  17:39 查 `8080/8081/3030` 全空 → 17:39:58 编译完 → 17:40:07 `api.exe` 报
+  `listen tcp :8080: bind: Only one usage of each socket address ...` 2 秒即退出 ——
+  **期间另一个会话（或用户本人）把整套环境起起来了**。
+  **判据**：`api.exe` 在 1–2 秒内退出且日志里只有一条 `studio-api listening` + 一条
+  `http server ... bind: Only one usage of each socket address` → **不是崩溃、不是被杀，
+  是端口已被别人占**。先 `netstat -ano | grep LISTENING | grep :8080` 看 PID，
+  用 `tasklist` 认一下是不是自己的再决定动不动手，**别重复起一套**。
 - **delivery worker 一起来就会 drain 历史 pending**（`dueScanLoop` 自动补发）：
   会有 `delivery failed permanently code=send_failed` 之类的日志，属历史任务收敛，不是本次启动的回归。
 - dev 环境已起：api/stream 各自 `/healthz` 返回 **401**（= 活着且鉴权生效，不是故障），vite `:3030` 返回 200。
