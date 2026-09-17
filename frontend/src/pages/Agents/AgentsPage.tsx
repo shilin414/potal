@@ -43,6 +43,33 @@ const { Search } = Input;
 
 const AGENT_ICONS = ['🎬', '✍️', '🎙️', '✂️', '🎨', '🎵', '💡', '🔧'];
 
+/**
+ * How many cards the grid renders before 加载更多.
+ *
+ * The catalog is served whole by `GET /v2/applications` (no pagination), so
+ * rendering it in one pass means one DOM node per application — on a catalog
+ * polluted by integration-test rows (1800+) that is a multi-second freeze on
+ * entry, which is what "进去非常卡" is. The filters stay client-side and are
+ * applied to the FULL list first, so 加载更多 can never disagree with them.
+ */
+const PAGE_SIZE = 24;
+
+/**
+ * Cards fade in with a small stagger — but only for the first few.
+ *
+ * `.agent-card` is `animation: fadeIn .4s ... both`, and `both` holds the
+ * FIRST keyframe (opacity: 0) for the whole `animation-delay`. An uncapped
+ * `index * delay` therefore makes a large catalog look EMPTY: card #1300
+ * would stay invisible for over a minute. Capping the stagger keeps the
+ * entrance animation while making "how long until the grid is readable"
+ * independent of how many agents exist.
+ */
+const STAGGER_MS = 40;
+const STAGGER_MAX_STEPS = 8;
+const cardDelay = (index: number): React.CSSProperties => ({
+  animationDelay: `${Math.min(index, STAGGER_MAX_STEPS) * STAGGER_MS}ms`,
+});
+
 type SourceFilter = 'all' | 'runtime' | 'local';
 
 const AgentsPage: React.FC = () => {
@@ -72,6 +99,8 @@ const AgentsPage: React.FC = () => {
   const [avatarAgent, setAvatarAgent] = useState<ManagedAgent | null>(null);
   const [deletingAgentId, setDeletingAgentId] = useState<number | null>(null);
   const [busyAppId, setBusyAppId] = useState<number | null>(null);
+  /** How many cards of the filtered result the grid currently renders. */
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
 
   const reloadCatalog = useApplicationCatalogStore((state) => state.load);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
@@ -108,6 +137,13 @@ const AgentsPage: React.FC = () => {
     return () => clearTimeout(timer);
   }, [selectedCategory, searchQuery, loadAgents]);
 
+  // A new result set always starts at page one: keeping a grown visibleCount
+  // across a search would skip straight past the matches the user is looking
+  // at, and shrinking the result (typing more) would leave a stale tail.
+  useEffect(() => {
+    setVisibleCount(PAGE_SIZE);
+  }, [selectedCategory, searchQuery, source]);
+
   const refreshAll = useCallback(async () => {
     await Promise.all([
       loadAgents(useAgentStore.getState().selectedCategory || undefined),
@@ -136,6 +172,17 @@ const AgentsPage: React.FC = () => {
 
   const showRuntime = source !== 'local';
   const showLocal = source !== 'runtime';
+  // Filter FIRST, page SECOND: `visibleCount` is a budget shared by the two
+  // sections (as they are in one grid), so 加载更多 reveals the next slice of
+  // the same filtered result instead of a different one.
+  const pagedRuntime = showRuntime ? visibleAppAgents.slice(0, visibleCount) : [];
+  const pagedLocal = showLocal
+    ? agents.slice(0, Math.max(0, visibleCount - pagedRuntime.length))
+    : [];
+  const totalMatched = (showRuntime ? visibleAppAgents.length : 0)
+    + (showLocal ? agents.length : 0);
+  const hasMore = totalMatched > pagedRuntime.length + pagedLocal.length;
+
   const isBusy = isLoading || loadingApps;
   const isEmpty = (!showRuntime || visibleAppAgents.length === 0)
     && (!showLocal || agents.length === 0);
@@ -203,7 +250,7 @@ const AgentsPage: React.FC = () => {
     <div
       key={`app-${agent.id}`}
       className="agent-card"
-      style={{ animationDelay: `${index * 50}ms` }}
+      style={cardDelay(index)}
       onClick={() => void openRuntimeAgent(agent)}
     >
       {agent.can_manage && (
@@ -291,7 +338,7 @@ const AgentsPage: React.FC = () => {
     <div
       key={`agent-${agent.id}`}
       className="agent-card"
-      style={{ animationDelay: `${index * 50}ms` }}
+      style={cardDelay(index)}
       onClick={() => { setSelectedAgentId(agent.id); setModalOpen(true); }}
     >
       {(agent.can_edit || agent.can_delete) && (
@@ -397,8 +444,24 @@ const AgentsPage: React.FC = () => {
         </div>
       ) : (
         <div className="agent-grid">
-          {showRuntime && visibleAppAgents.map(runtimeCard)}
-          {showLocal && agents.map(localCard)}
+          {pagedRuntime.map(runtimeCard)}
+          {pagedLocal.map(localCard)}
+        </div>
+      )}
+
+      {!isEmpty && (
+        <div className="agents-page__more">
+          {hasMore ? (
+            <Button
+              onClick={() => setVisibleCount((current) => current + PAGE_SIZE)}
+            >
+              加载更多（还有 {totalMatched - pagedRuntime.length - pagedLocal.length} 个）
+            </Button>
+          ) : (
+            totalMatched > PAGE_SIZE && (
+              <span className="agents-page__count">已显示全部 {totalMatched} 个</span>
+            )
+          )}
         </div>
       )}
 

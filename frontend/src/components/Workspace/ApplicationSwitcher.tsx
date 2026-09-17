@@ -21,9 +21,15 @@ interface Props {
   compact?: boolean;
 }
 
+/** How many rows the 全部智能体 group builds (see fullList below). */
+const SWITCHER_MAX_ROWS = 50;
+
 const ApplicationSwitcher: React.FC<Props> = ({ compact }) => {
   const navigate = useNavigate();
-  const applications = useApplicationCatalogStore((state) => state.applications);
+  // The store keeps one already-derived chat list instead of every consumer
+  // re-filtering the 1800-row catalog on each render — see
+  // `chatApplicationsList` in useApplicationCatalogStore.
+  const chats = useApplicationCatalogStore((state) => state.chatApplicationsList);
   const isLoading = useApplicationCatalogStore((state) => state.isLoading);
   const load = useApplicationCatalogStore((state) => state.load);
   const activeApplicationId = useWorkspaceStore((state) => state.activeApplicationId);
@@ -32,9 +38,6 @@ const ApplicationSwitcher: React.FC<Props> = ({ compact }) => {
 
   useEffect(() => { void load(); }, [load]);
 
-  const chats = useMemo(
-    () => applications.filter((app) => app.kind === 'chat'),
-    [applications]);
   const active = chats.find((app) => app.id === activeApplicationId) || null;
 
   const open = (application: V2Application) => {
@@ -42,8 +45,13 @@ const ApplicationSwitcher: React.FC<Props> = ({ compact }) => {
     navigate(`/chat/${application.slug}`);
   };
 
-  const itemFor = (application: V2Application) => ({
-    key: String(application.id),
+  // 最近使用 and 全部智能体 render the SAME applications, so one shared key
+  // would appear twice in a single Menu — React warns, and antd would treat
+  // the two rows as one entry for active-key tracking. The fix is to scope
+  // the key by section, NOT to drop the repeat: 全部智能体 must stay complete,
+  // that is the whole point of the group.
+  const itemFor = (application: V2Application, section: string) => ({
+    key: `${section}-${application.id}`,
     label: (
       <span className="application-switcher__item">
         <AgentAvatar
@@ -70,18 +78,30 @@ const ApplicationSwitcher: React.FC<Props> = ({ compact }) => {
     .map((id) => chats.find((app) => app.id === id))
     .filter((app): app is V2Application => Boolean(app));
 
+  // `GET /v2/applications` has no server-side cap, and integration-test rows
+  // have pushed the shared catalog past 1800 — building a Menu row per entry
+  // is what makes opening the switcher (and the shell that renders it) crawl.
+  // This dropdown is a JUMP-TO menu: browsing the whole catalog is the market
+  // page behind 全部智能体 >, so the full group is bounded. The agent in play
+  // is pinned so it can never be the one that got cut.
+  const fullList = useMemo(() => {
+    const head = chats.slice(0, SWITCHER_MAX_ROWS);
+    if (!active || head.some((app) => app.id === active.id)) return head;
+    return [active, ...head];
+  }, [chats, active]);
+
   const menuItems: any[] = [];
   if (recent.length) {
     menuItems.push({
       type: 'group' as const,
       label: '最近使用',
-      children: recent.map(itemFor),
+      children: recent.map((app) => itemFor(app, 'recent')),
     });
   }
   menuItems.push({
     type: 'group' as const,
     label: recent.length ? '全部智能体' : '智能体',
-    children: chats.map(itemFor),
+    children: fullList.map((app) => itemFor(app, 'all')),
   });
   menuItems.push({ type: 'divider' as const });
   menuItems.push({

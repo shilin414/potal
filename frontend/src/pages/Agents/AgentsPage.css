@@ -4,6 +4,22 @@
   overflow-y: auto;
 }
 
+/* 加载更多 — centered under the grid, never inside it (it is not a card and
+   must not take a `auto-fill` track). */
+.agents-page__more {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 12px;
+  margin-top: 20px;
+  padding-bottom: 8px;
+}
+
+.agents-page__count {
+  font-size: 12px;
+  color: var(--color-text-dim);
+}
+
 .page-header {
   margin-bottom: 4px;
 }
@@ -86,6 +102,39 @@
 
 .agent-system-prompt-input {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* ── 技能配置 rows (AgentEditorModal) ─────────────────────────────────────
+   name | prompt | description | 删除. The description column is the one that
+   collapses first on a narrow modal, so the two required fields keep their
+   width and stay readable. */
+.agent-skills-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-skills-editor__row {
+  display: grid;
+  grid-template-columns: 1.1fr 1.4fr 1fr auto;
+  gap: 8px;
+  align-items: start;
+}
+
+/* Rows carry a visible grid, but antd's Form.Item still adds its default
+   bottom margin, which would misalign the delete button against the inputs. */
+.agent-skills-editor__row > .ant-form-item {
+  margin-bottom: 0;
+}
+
+@media (max-width: 720px) {
+  .agent-skills-editor__row {
+    grid-template-columns: 1fr auto;
+  }
+
+  .agent-skills-editor__row > .ant-form-item {
+    grid-column: 1;
+  }
 }
 
 .modal-skill-list {
