@@ -97,6 +97,87 @@ describe('load', () => {
     expect(state.isLoading).toBe(false);
     expect(state.loadedAt).toBe(0); // a failure must not look like a load
   });
+
+  // ── bootstrap races (三次复审 P1-R2) — deterministic promise control ──
+
+  it('keeps dirty when a response that started BEFORE invalidate() lands', async () => {
+    let release: (value: WorkspaceBootstrap) => void = () => {};
+    mocks.fetchWorkspaceBootstrap.mockReturnValueOnce(
+      new Promise((done) => { release = done; }));
+
+    const inflight = useWorkspaceBootstrapStore.getState().load();
+    // A mutation fires while the request is travelling.
+    useWorkspaceBootstrapStore.getState().invalidate();
+    release(payload());
+    await inflight;
+
+    // The OLD code reset dirty:false here — branding a pre-mutation
+    // snapshot as fresh forever.
+    const state = useWorkspaceBootstrapStore.getState();
+    expect(state.dirty).toBe(true);
+    expect(state.loadedAt).toBeGreaterThan(0);
+  });
+
+  it('does not let a previous session\u2019s settled request break the new session\u2019s dedup', async () => {
+    let releaseA: (value: WorkspaceBootstrap) => void = () => {};
+    mocks.fetchWorkspaceBootstrap
+      .mockReturnValueOnce(new Promise<WorkspaceBootstrap>((done) => { releaseA = done; }))
+      .mockReturnValueOnce(new Promise<WorkspaceBootstrap>(() => {})); // B stays pending
+
+    const inflightA = useWorkspaceBootstrapStore.getState().load();
+    // A → B switch while A is still travelling.
+    useWorkspaceBootstrapStore.getState().clear();
+    void useWorkspaceBootstrapStore.getState().load(); // B's request starts here
+
+    releaseA(payload());
+    await inflightA.catch(() => undefined);
+
+    // A's `.finally` must not null B's in-flight pointer: a concurrent
+    // load() must still SHARE B's request — no third fetch may start
+    // (load() is async, so promises are wrapped per call; the observable
+    // identity is the request count).
+    void useWorkspaceBootstrapStore.getState().load();
+    expect(mocks.fetchWorkspaceBootstrap).toHaveBeenCalledTimes(2);
+
+    useWorkspaceBootstrapStore.getState().clear();
+  });
+
+  it('force reload drains an in-flight request and returns post-mutation data', async () => {
+    let releaseFirst: (value: WorkspaceBootstrap) => void = () => {};
+    mocks.fetchWorkspaceBootstrap
+      .mockReturnValueOnce(new Promise<WorkspaceBootstrap>((done) => { releaseFirst = done; }))
+      .mockResolvedValueOnce(payload({ frequent: [summary({ id: 9, name: '变更后的常用', usage_count: 9 })] }));
+
+    const first = useWorkspaceBootstrapStore.getState().load();
+    // force=true arrives while the first request is still travelling: it
+    // must NOT return that stale promise.
+    const forced = useWorkspaceBootstrapStore.getState().load(true);
+    releaseFirst(payload());
+    await first;
+    await forced;
+
+    expect(mocks.fetchWorkspaceBootstrap).toHaveBeenCalledTimes(2);
+    const state = useWorkspaceBootstrapStore.getState();
+    expect(state.frequent.map((a) => a.name)).toEqual(['变更后的常用']);
+    // And the forced (post-mutation) answer is fresh, not branded stale.
+    expect(state.dirty).toBe(false);
+    expect(state.error).toBeNull();
+  });
+
+  it('force reload still resolves with fresh data when the drained request fails', async () => {
+    mocks.fetchWorkspaceBootstrap
+      .mockRejectedValueOnce({ response: { data: { detail: 'first boom' } } })
+      .mockResolvedValueOnce(payload({ frequent: [summary({ id: 9, name: '重试后的常用' })] }));
+
+    const first = useWorkspaceBootstrapStore.getState().load().catch(() => undefined);
+    const forced = useWorkspaceBootstrapStore.getState().load(true);
+    await first;
+    await forced;
+
+    expect(mocks.fetchWorkspaceBootstrap).toHaveBeenCalledTimes(2);
+    expect(useWorkspaceBootstrapStore.getState().frequent.map((a) => a.name)).toEqual(['重试后的常用']);
+    expect(useWorkspaceBootstrapStore.getState().error).toBeNull();
+  });
 });
 
 describe('lookups', () => {
@@ -159,8 +240,43 @@ describe('toggleFavorite', () => {
 
     const state = useWorkspaceBootstrapStore.getState();
     expect(state.favorites).toEqual([]);
-    expect(state.frequent.find((a) => a.id === 2)?.is_favorite).toBeUndefined();
+    // The rollback patches THIS row's flag only (三次复审 P1-R3) — an
+    // explicit `false`, not a resurrection of the whole previous snapshot.
+    expect(state.frequent.find((a) => a.id === 2)?.is_favorite).toBe(false);
     expect(state.error).toBe('收藏操作失败');
+    // The failure marks the groups stale so the server recomputes membership.
+    expect(state.dirty).toBe(true);
+  });
+
+  it('keeps a successful toggle intact when a slower toggle for another app fails', async () => {
+    await useWorkspaceBootstrapStore.getState().load();
+    const state = useWorkspaceBootstrapStore.getState();
+    useApplicationEntityStore.getState().upsert({
+      ...(state.frequent[0] as any),
+      runtime_type: 'agent', provider_key: 'feishu_aily',
+      identity_mode: 'user', execution_mode: 'interactive', capabilities: {},
+    });
+
+    // 收藏 2 慢且最终失败，收藏 3 快且成功 — 2 的回滚绝不能抹掉 3.
+    let rejectFirst: (e: unknown) => void = () => {};
+    mocks.setApplicationFavorite
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectFirst = reject; }))
+      .mockResolvedValueOnce({ application_id: 3, is_favorite: true });
+
+    const slow = useWorkspaceBootstrapStore.getState().toggleFavorite(2);
+    await useWorkspaceBootstrapStore.getState().toggleFavorite(3);
+
+    rejectFirst(new Error('nope'));
+    await slow.catch(() => undefined);
+
+    const after = useWorkspaceBootstrapStore.getState();
+    // B survived: the failed rollback of A must not restore the snapshot
+    // from before B (三次复审 P1-R3). App 3 lives in 最近使用; it joined the
+    // 收藏 group, and its flag stays flipped everywhere.
+    expect(after.recent.find((a) => a.id === 3)?.is_favorite).toBe(true);
+    expect(after.favorites.map((a) => a.id)).toEqual([3]);
+    expect(after.frequent.find((a) => a.id === 2)?.is_favorite).toBe(false);
+    expect(after.error).toBe('收藏操作失败');
   });
 });
 

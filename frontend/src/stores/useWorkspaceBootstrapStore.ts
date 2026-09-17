@@ -128,6 +128,24 @@ let inflight: Promise<void> | null = null;
  * instead of being written.
  */
 let generation = 0;
+/**
+ * Bumped by `invalidate()` and by a `force` reload that has to drain an
+ * in-flight request (三次复审 P1-R2). A response records the revision its
+ * request started with; if the CURRENT revision has moved on, the response
+ * is older than a mutation that happened while it was travelling and must
+ * NOT clear the dirty mark — the old code let a pre-mutation response land
+ * AFTER `invalidate()` and reset `dirty:false`, permanently branding a
+ * stale snapshot as fresh.
+ */
+let invalidationRevision = 0;
+
+/**
+ * Per-application operation counter for the favourite toggle (三次复审
+ * P1-R3). A late server answer (or failure) may only touch the state when
+ * it is still the LATEST operation for that application — otherwise a slow
+ * failed toggle A would roll back the user's already-successful toggle B.
+ */
+const favoriteVersions = new Map<number, number>();
 
 const patchList = (
   list: ApplicationSummary[],
@@ -176,12 +194,31 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
   ...initialBootstrapState,
 
   load: async (force = false) => {
-    // Fresh = loaded AND not marked stale (P1-4).
-    if (!force && get().loadedAt && !get().dirty) return;
+    if (force) {
+      // 三次复审 P1-R2: a request already in flight may have STARTED before
+      // the mutation this reload must observe. Bump the revision so its
+      // (older) answer lands as dirty instead of silently restoring the
+      // pre-mutation mark, drain it, and only then issue the real reload —
+      // `reloadBootstrap(true)` must never resolve with pre-mutation data.
+      while (inflight) {
+        invalidationRevision += 1;
+        set({ dirty: true });
+        const pending = inflight;
+        try {
+          await pending;
+        } catch {
+          // The fresh request below reports the failure itself.
+        }
+      }
+    } else if (get().loadedAt && !get().dirty) {
+      // Fresh = loaded AND not marked stale (P1-4).
+      return;
+    }
     if (inflight) return inflight;
     const myGeneration = generation;
+    const myRevision = invalidationRevision;
     set({ isLoading: true, error: null });
-    inflight = fetchWorkspaceBootstrap()
+    const request = fetchWorkspaceBootstrap()
       .then((payload) => {
         // The identity underneath this request is gone: drop the answer
         // rather than writing another user's shortcuts (P0-2).
@@ -197,7 +234,9 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
           appCategories: payload.app_categories ?? [],
           isLoading: false,
           loadedAt: Date.now(),
-          dirty: false,
+          // A mutation that landed while this request was travelling keeps
+          // the stale mark — the response is ALREADY older than it (P1-R2).
+          dirty: invalidationRevision !== myRevision,
         });
       })
       .catch((error: any) => {
@@ -207,11 +246,21 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
           isLoading: false,
         });
       })
-      .finally(() => { inflight = null; });
-    return inflight;
+      .finally(() => {
+        // Clear by IDENTITY: a settled request must never null the pointer
+        // to a DIFFERENT (newer) request — after a user switch the old
+        // session's `.finally` still runs, and without this check it would
+        // break the new session's deduplication (三次复审 P1-R2).
+        if (inflight === request) inflight = null;
+      });
+    inflight = request;
+    return request;
   },
 
-  invalidate: () => set({ dirty: true }),
+  invalidate: () => {
+    invalidationRevision += 1;
+    set({ dirty: true });
+  },
 
   patch: (id, patch) => set((state) => ({
     defaultApplication: state.defaultApplication?.id === id
@@ -244,14 +293,13 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
     // 收藏 is a CHAT group; a fixed application only flips its own ✩ and is
     // never injected into the agent group (P1-5).
     const belongsToAgentFavorites = known.kind === 'chat';
-    const before = {
-      favorites: state.favorites,
-      defaultApplication: state.defaultApplication,
-      frequent: state.frequent,
-      recent: state.recent,
-      recommended: state.recommended,
-      recentFixedApps: state.recentFixedApps,
-    };
+    // 三次复审 P1-R3: each toggle gets a per-application operation number.
+    // Only the LATEST operation for this application may reconcile or roll
+    // back its flag — the old whole-snapshot rollback could resurrect state
+    // from BEFORE an unrelated (already successful) toggle.
+    const version = (favoriteVersions.get(applicationId) ?? 0) + 1;
+    favoriteVersions.set(applicationId, version);
+    const isLatestOperation = () => favoriteVersions.get(applicationId) === version;
     const write = (favorite: boolean) => {
       set((s) => ({
         favorites: belongsToAgentFavorites
@@ -272,20 +320,21 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
     write(next);
     try {
       const result = await setApplicationFavorite(applicationId, next);
-      // The server is authoritative about the flag it actually stored.
-      if (result.is_favorite !== next) write(result.is_favorite);
-      // Membership in 常用 / 最近 / 推荐 is a server-side Top-8 decision the
-      // client cannot recompute, so mark stale and let the next home visit
-      // settle it (P1-4).
-      get().invalidate();
+      // The server is authoritative about the flag it actually stored — but
+      // only while no newer toggle for this application has taken over.
+      if (result.is_favorite !== next && isLatestOperation()) write(result.is_favorite);
     } catch {
-      // Revert to the exact previous collections (an absent flag means "not
-      // favourited", which is what `?? false` restores).
-      set({ ...before, error: '收藏操作失败' });
-      useApplicationEntityStore.getState().patch(applicationId, {
-        is_favorite: known.is_favorite ?? false,
-      });
+      if (isLatestOperation()) {
+        // Restore ONLY this application's own flag (三次复审 P1-R3): group
+        // membership (Top-8, server-computed) is NOT rolled back locally.
+        write(known.is_favorite ?? false);
+        set({ error: '收藏操作失败' });
+      }
     }
+    // Membership in 常用 / 最近 / 推荐 / 收藏 is a server-side Top-8 decision
+    // the client cannot recompute, so mark stale and let the next home visit
+    // settle it from the server (P1-4, 三次复审 P1-R3).
+    get().invalidate();
   },
 
   summaryById: (id) => {
@@ -318,6 +367,10 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
     // Bump FIRST: any request already in flight must see a stale generation
     // the moment it settles, not after the next statement.
     generation += 1;
+    // Drop the pointer WITHOUT waiting for the old promise's `.finally` —
+    // that finally still runs later, and the identity check inside it (`if
+    // (inflight === request)`) is what keeps it from nulling the NEXT
+    // session's in-flight request (三次复审 P1-R2).
     inflight = null;
     set({ ...initialBootstrapState });
   },

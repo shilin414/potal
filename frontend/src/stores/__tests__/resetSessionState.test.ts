@@ -16,8 +16,11 @@
  *   · a re-login as the SAME user does NOT wipe (it would discard the
  *     user's own draft and open conversation);
  *   · the id comparison is string-based, because the id arrives as a number
- *     from the local-admin login and as a string from the Feishu exchange.
+ *     from the local-admin login and as a string from the Feishu exchange;
+ *   · the persisted organization/workspace storage keys are wiped too, and
+ *     real cross-user preferences (theme) survive (三次复审 P0-R2).
  */
+// @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -43,6 +46,7 @@ import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore'
 import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import { useRunChatStore } from '@/stores/useRunChatStore';
+import { useOrganizationStore } from '@/stores/useOrganizationStore';
 import type { ApplicationSummary, V2Application } from '@/services/runApi';
 
 const summary = (id: number, name: string): ApplicationSummary => ({
@@ -165,6 +169,69 @@ describe('resetSessionScopedState', () => {
 
     expect(useAuthStore.getState().user).toBeNull();
     expect(useWorkspaceStore.getState().workspaces[1]).toBeUndefined();
+  });
+});
+
+describe('organization session isolation (三次复审 P0-R2)', () => {
+  const persistedOrganizations = (raw: string | null): string | null => {
+    const parsed = raw == null ? null : JSON.parse(raw);
+    return parsed?.state?.currentOrganizationId ?? null;
+  };
+
+  it('forgets the previous user\u2019s organizations and their persisted selection', () => {
+    useOrganizationStore.setState({
+      organizations: [
+        { id: 'org-a1', name: 'A 的组织一', slug: 'a1', role: 'owner' },
+        { id: 'org-a2', name: 'A 的组织二', slug: 'a2', role: 'member' },
+      ],
+      currentOrganizationId: 'org-a2',
+    });
+    // The axios interceptor reads the PERSISTED key on every request and
+    // sends it as X-Organization-ID — so the persisted copy is part of the
+    // leak surface, not just the in-memory store.
+    localStorage.setItem(
+      'organization-storage',
+      JSON.stringify({
+        state: { organizations: [{ id: 'org-a2' }], currentOrganizationId: 'org-a2' },
+        version: 0,
+      }),
+    );
+
+    resetSessionScopedState();
+
+    const org = useOrganizationStore.getState();
+    expect(org.organizations).toEqual([]);
+    expect(org.currentOrganizationId).toBeNull();
+    // No stale X-Organization-ID can be read by the interceptor afterwards.
+    expect(persistedOrganizations(localStorage.getItem('organization-storage'))).toBeNull();
+    expect(localStorage.getItem('organization-storage')).toBeNull();
+  });
+
+  it('wipes the persisted organization/workspace keys even when the store module never loaded', () => {
+    // Simulates the lazy-chunk scenario (三次复审 P0-R2): user A's session
+    // wrote the key, but the resetter for this store was never registered in
+    // the running bundle. The key removal must not depend on module loading.
+    localStorage.setItem(
+      'organization-storage',
+      JSON.stringify({ state: { currentOrganizationId: 'org-a9' }, version: 0 }),
+    );
+    localStorage.setItem(
+      'workspace-storage',
+      JSON.stringify({ state: { workspaces: { 7: { draft: 'A 的草稿' } } }, version: 0 }),
+    );
+
+    resetSessionScopedState();
+
+    expect(localStorage.getItem('organization-storage')).toBeNull();
+    expect(localStorage.getItem('workspace-storage')).toBeNull();
+  });
+
+  it('不清除真正跨用户的客户端偏好（主题）', () => {
+    localStorage.setItem('theme-storage', JSON.stringify({ state: { theme: 'dark' }, version: 0 }));
+
+    resetSessionScopedState();
+
+    expect(localStorage.getItem('theme-storage')).not.toBeNull();
   });
 });
 

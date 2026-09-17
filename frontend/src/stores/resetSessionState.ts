@@ -53,11 +53,23 @@ export function registerSessionReset(fn: ResetFn): void {
 }
 
 /**
- * Wipe every store whose contents belong to ONE identity.
+ * Persisted storage keys that belong to ONE identity (三次复审 P0-R2).
  *
- * Deliberately NOT cleared: `useThemeStore` (a device preference, not user
- * data) and `useOrganizationStore` (its own lifecycle — it is keyed by the
- * organization, and the backend re-authorizes it per request).
+ * The registry above only reaches stores whose module was actually IMPORTED.
+ * A lazily-loaded store that never mounted during user A's session still has
+ * A's rows in localStorage — and zustand's `persist` would hydrate them back
+ * the first time user B's session loads that module. Wiping the KEYS here
+ * closes that gap for every session-scoped persisted store, whether or not
+ * its resetter is registered yet.
+ *
+ * Deliberately NOT in this list: `theme-storage` and any other real
+ * cross-user client preference.
+ */
+const SESSION_SCOPED_STORAGE_KEYS = ['workspace-storage', 'organization-storage'] as const;
+
+/**
+ * Wipe every store whose contents belong to ONE identity — and the
+ * localStorage keys that would hydrate them back.
  *
  * A failing resetter must not abort the others: a half-reset session is
  * strictly better than an exception thrown from inside a logout.
@@ -68,6 +80,14 @@ export function resetSessionScopedState(): void {
       reset();
     } catch {
       // Best-effort by design; see the note above.
+    }
+  }
+  for (const key of SESSION_SCOPED_STORAGE_KEYS) {
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // Storage can be unavailable (private mode); the in-memory reset above
+      // still ran.
     }
   }
 }

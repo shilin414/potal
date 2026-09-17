@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { api } from '@/services/api';
+import { registerSessionReset } from '@/stores/resetSessionState';
 
 export interface Organization {
   id: string;
@@ -41,3 +42,16 @@ export const useOrganizationStore = create<OrganizationState>()(
     { name: 'organization-storage' }
   )
 );
+
+// Organizations and the selected organization id belong to ONE identity
+// (三次复审 P0-R2): the axios interceptor reads the PERSISTED
+// `organization-storage` key on every request and sends it as
+// X-Organization-ID, so user A's selection must not survive into user B's
+// session — B's first requests would otherwise carry A's organization id
+// until B's own organization list finished loading.
+//
+// The persisted key itself is also wiped by resetSessionScopedState
+// (SESSION_SCOPED_STORAGE_KEYS): this module can sit in a lazy chunk that a
+// logout never imports, and the key removal is what stops zustand from
+// hydrating A's organizations back into B's session on first load.
+registerSessionReset(() => useOrganizationStore.getState().reset());
