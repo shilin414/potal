@@ -159,3 +159,53 @@
 - dev 环境已起：api/stream 各自 `/healthz` 返回 **401**（= 活着且鉴权生效，不是故障），vite `:3030` 返回 200。
   业务链自证：`POST /api/auth/login/`（demo / Creator@2026）拿 `studio_session` → `GET /api/auth/me/` → `GET /api/v2/runtimes`。
   cookie 只在 shell 变量里传递，**不要落盘**。
+
+## 本机 git：**绝对禁止 `git stash`**（2026-09-17 实测丢对象库）
+
+**症状**：`git stash push -- <文件>` 会报 `<sha> is not a valid object`，随后
+`.git/refs/heads` 与 `.git/refs/remotes` **整个目录消失**、`.git/objects/pack/*.pack` **被删只剩 `.idx`**
+（`git count-objects -v` → `in-pack: 0 packs: 0`），`git log` 报"分支没有任何提交"。
+根因同「本机 git 引用写入缺陷」：**git 事务失败后的回滚清理会删掉"因此变空的目录"**，
+删到 `refs/heads` 丢分支，删到 `objects/pack` 丢**全部历史**。
+
+**纪律**：
+- 不做 `git stash`。要"临时移开某些改动看基线"时，**不要动工作区的已跟踪文件**——
+  改用 `git show <sha>:<path>` 取内容、或把改动文件**复制到仓库外**再临时还原，
+  或干脆只靠"当前整树 `tsc`/`vitest` 全绿 + 论证依赖方向"来确认可构建性。
+- 一切会触发 git 事务回滚的写操作都要警惕；`git add`/`commit` 正常可用（本轮多次成功）。
+
+**恢复流程（已实测成功）**：
+1. 先确认工作区文件完好（`node` 读文件 grep 关键标识）——**内容才是资产，历史可从远程再取**。
+2. 把失效的孤儿 `.idx` / `multi-pack-index` 移出 `.git/objects/pack/`（缺 `.pack` 会让 git 报错）。
+3. `git fetch origin --tags` 取回对象库（会被本机 SIGTERM 打断 → 用 `run_in_background`）。
+   完成后 `git cat-file -t <远程tip>` 应返回 `commit`。
+4. 手工重建引用：`mkdir -p` + 写 loose ref + 双写 `packed-refs`，**一律 LF**（见下条）。
+5. `git fsck --no-progress` 应无输出（只有 `dangling …` 是正常的）；
+   残留的 `invalid reflog entry <sha>`（指向已消失的提交）可把该行从 `.git/logs/**` 过滤掉。
+6. 索引里引用的 blob 可能一起丢 → `git commit` 报 `invalid object … for <path>`，
+   **重新 `git add` 该文件**即可（基于工作区重建 blob，内容无损）。
+
+**`packed-refs` 必须是 LF**：CRLF 会让 git 把引用名解析成 `…dev\r`，报
+`warning: ignoring ref with broken name refs/remotes/origin/dev?`（`\r` 显示成 `?`），
+于是 `for-each-ref` 一条都不列、`git log` 也可能异常。写完用 `node -e "…includes(13)"` 断言无 `\r`。
+（另一种同症状的成因是**写 loose ref 时带了 BOM** —— 用 `Set-Content -Encoding ascii` 可避免。）
+
+## 共享 dev 库（`192.168.211.26:20336/xiaoan`）的写操作纪律（2026-09-17 实测，代价 28 分钟）
+
+- 服务器默认 **`innodb_lock_wait_timeout = 5`**（且 `innodb_rollback_on_timeout=0`），
+  长事务/宽扫描必然撞 `1205`。
+- **共享库上禁止长事务**：一次 `DELETE ... WHERE run_id IN (SELECT id FROM runs WHERE ...)`
+  的跨 991 个 run 宽子查询卡了 28 分钟、持 `runs` 行锁，
+  **把并发会话的集成测试全部打成 `1205 Lock wait timeout`**，对方当成自己的代码 bug 查了半天。
+  → 正确配方：**id 先取到客户端（Python/Go 侧）→ 显式 `IN (...)` 分块 → `autocommit=True` 短事务
+  → `1205` 退避重试**。改完 5 秒跑完全部 1800+ 行的级联。
+- 批量删数据前**先采样确认数据停止增长**：并发会话在跑集成测试时，`itest-*` 会边删边涨
+  （实测 1818 → 1844 → 1852），"清空"这个目标不成立。40 秒内 3 次采样一致再动手。
+- 删前用**指纹守卫**：把要保留的真实行（计数/关键字段）前后对比，不一致就回滚并中止。
+- 级联面**必须用 `information_schema.columns` 枚举**，不能凭记忆：
+  `runs` 挂 9 张表、`conversations` 挂 4 张；`outbox_events` 是**多态**
+  （`aggregate` + `aggregate_id`，聚合值实测只有 `run` / `delivery`），没有 `run_id` 列。
+- 这张库**没有任何外键约束**（`information_schema.referential_constraints` 为空）：
+  不会自动级联，顺序写错只会留孤儿 → 必须"子表排空到 0 再动父表"。
+- `applications` 曾被历次 authz/gate 集成测试灌入 **1818 条 `itest-*` 残留**（2026-09-17 已清理，
+  清理后仅剩 7 条真实应用）。**根治办法是让集成测试自带 `t.Cleanup`**，否则会持续复发。

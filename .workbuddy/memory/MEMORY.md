@@ -51,6 +51,26 @@
 - **前端 store**：异步写用 functional setState；`activeRunId` compare-and-clear；拉取失败 `null` = 未知、不清空；`run.cancelled` 独立终态不得映射 done；`run.deferred` 靠 `run.started` 清除。
 - **antd 表单取值（P0 事故）**：拼 payload 一律 `form.getFieldsValue(true)`；**绝不用 `validateFields()` / `getFieldsValue()` 的返回值**（只含已注册 Form.Item 的路径，其他字段被**静默丢弃**）。回归测试 `frontend/src/components/Schedules/__tests__/scheduleEditorPayload.test.tsx`。
 
+## 前端列表/选择器：目录是「全量下发」的，渲染必须自己设界（2026-09-17 事故）
+`GET /api/v2/applications` **没有服务端分页**，一次返回整张目录（dev 库被集成测试残留灌到 1800+ 行）。
+违反下面任一条都会复发成「进页面很卡 / 列表一闪而过然后空了」：
+- **首屏动画延迟绝不可与下标线性相关**：`animationDelay: index * 50ms` 配
+  `animation: fadeIn … both` 时，`both` 会在**整个延迟期间保持 opacity:0**，
+  1800 行 → 最后一张要等 ~90 秒，用户看到的就是「空列表」。必须**封顶**（`cardDelay`）。
+- **列表必须设渲染上限 + 加载更多**：市场页 `PAGE_SIZE=24`，移动端 sheet
+  `MOBILE_SHEET_MAX_ROWS=60`，切换器跳跃菜单 `SWITCHER_MAX_ROWS=50`（并**钉住当前项**，别把它截掉）。
+- **上限只能是「渲染预算」，绝不能加到过滤之前**：`filtered` 必须在**完整池**上算，
+  只有 `rendered` 才切片 —— 否则搜索会静默搜不到第一页之外的项（管理员看不见自己的智能体）。
+  这条有专门的反证测试钉住。
+- **同一批数据出现在两个 Menu 分组时，key 必须按分组加前缀**（`recent-1` / `all-1`）：
+  共用 `String(app.id)` 会触发 React `Duplicated key` 且 antd 的 active-key 追踪会把两行当一行。
+- **派生结果放 store，不要在每个消费组件的渲染体里重算**：`useApplicationCatalogStore.chatApplicationsList`
+  在下发时算一次；组件内 `applications.filter(kind==='chat')` 是每次渲染重分配 1800 项。
+  改这类派生字段时，**所有写 `applications` 的地方都要同步维护它**（`toggleFavorite` / `clear` 都算）。
+- `applications.default_config` 是「归属智能体的配置」的落点，但**写它必须 FOR UPDATE
+  读-改-写**（`MergeSkills`）：该 JSON 列还被 legacy 的 `guided_entry_prompt_key` 共用，
+  直接覆盖会把它一起抹掉。
+
 ## 本机操作红线（完整版 + 命令见 `PITFALLS.md`）
 - **同一文件绝不可在一条消息里发两个 Edit**：并行写同文件 = 后写覆盖前写、静默丢失，且**仍能编译通过**。串行改 + grep 复核那一行。
 - **反证驱动绝不可与其它 `go test` 并发**（脚本改真实源码）。
