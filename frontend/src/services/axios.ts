@@ -64,6 +64,10 @@ let redirectingToLogin = false;
 const redirectToLogin = () => {
   if (redirectingToLogin) return;
   redirectingToLogin = true;
+  // clearAuth() also wipes the session-scoped stores (二次复审 P0-2): an
+  // expired session is an identity boundary, and leaving the previous
+  // user's drafts / transcripts / shortcuts in memory until a new login
+  // replaces them is the leak this fixes.
   useAuthStore.getState().clearAuth();
   window.location.href = '/auth/login';
 };

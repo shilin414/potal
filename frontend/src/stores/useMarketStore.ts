@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { registerSessionReset } from '@/stores/resetSessionState';
 import { api } from '@/services/api';
 
 interface MarketState {
@@ -12,6 +13,8 @@ interface MarketState {
   addFavorite: (templateId: number) => Promise<void>;
   removeFavorite: (favoriteId: number) => Promise<void>;
   addReview: (templateId: number, rating: number, comment: string) => Promise<void>;
+  /** Back to the inert state — called by resetSessionScopedState (P0-2). */
+  reset: () => void;
 }
 
 export const useMarketStore = create<MarketState>((set, get) => ({
@@ -40,6 +43,13 @@ export const useMarketStore = create<MarketState>((set, get) => ({
       console.error('Failed to load recommended:', error);
     }
   },
+
+  reset: () => set({
+    trending: [],
+    recommended: [],
+    favorites: [],
+    isLoading: false,
+  }),
 
   loadFavorites: async () => {
     try {
@@ -79,3 +89,6 @@ export const useMarketStore = create<MarketState>((set, get) => ({
     }
   },
 }));
+
+// Market favourites are per-user (P0-2).
+registerSessionReset(() => useMarketStore.getState().reset());

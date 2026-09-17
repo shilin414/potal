@@ -52,7 +52,11 @@ var (
 	ErrNotManageable    = errors.New("只有应用创建者或管理员可以修改该智能体。")
 	ErrOnlyChatRenderer = errors.New("智能体市场目前只创建 chat renderer 的应用")
 	ErrNoBinding        = errors.New("application has no runtime binding")
-	ErrNotDefaultable   = errors.New("只有「有可用运行时绑定的聊天应用」才能设为主智能体")
+	// ErrNotDefaultable (二次复审 P0-6) now also covers a DISABLED
+	// application: the default agent is the one the home composer binds to,
+	// and a disabled application can never execute, so promoting it would
+	// bind the workspace to an agent that refuses every send.
+	ErrNotDefaultable   = errors.New("只有「已启用且有可用运行时绑定的聊天应用」才能设为主智能体")
 	ErrDeleteReferenced = errors.New("该智能体已有会话或运行记录，无法删除；可先将其改为「不公开」。")
 	ErrUnknownProvider  = errors.New("未知的运行时提供方")
 	ErrProviderDisabled = errors.New("运行时提供方已停用")
@@ -342,6 +346,18 @@ func (s *Service) Update(ctx context.Context, appID, callerID int64, isStaff boo
 		}); err != nil {
 			return nil, nil, err
 		}
+		// 停用解除主智能体 (二次复审 P0-6). Switching an application off
+		// must not leave it as the default: the home composer would stay
+		// bound to an agent that can never execute, and the flag would
+		// become invisible-immovable (the market shows 已停用 but the
+		// workspace still opens it). The bootstrap then falls back to the
+		// first enabled + bound chat application by itself.
+		if !*enabled {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE applications SET is_default_agent = 0 WHERE id = ?`, appID); err != nil {
+				return nil, nil, err
+			}
+		}
 	}
 
 	if setDefaultAgent != nil {
@@ -440,9 +456,14 @@ func (s *Service) Delete(ctx context.Context, appID, callerID int64, isStaff boo
 	return nil
 }
 
-// SetDefaultAgent promotes a chat app with an enabled binding; the flag is
-// globally unique and enforced transactionally (no conditional unique
+// SetDefaultAgent promotes an ENABLED chat app with an enabled binding; the
+// flag is globally unique and enforced transactionally (no conditional unique
 // indexes in MySQL).
+//
+// The `Enabled` check is 二次复审 P0-6. It is the same predicate
+// `catalog.Usable` applies to consumption and `AuthorizeExecution` applies to
+// runs: the three must agree, or the home composer binds to an agent whose
+// first message is refused.
 func (s *Service) SetDefaultAgent(ctx context.Context, appID, callerID int64, isStaff bool) error {
 	app, err := s.ApplicationByID(ctx, appID)
 	if err != nil {
@@ -451,14 +472,11 @@ func (s *Service) SetDefaultAgent(ctx context.Context, appID, callerID int64, is
 	if !canManage(app, callerID, isStaff) {
 		return ErrNotManageable
 	}
-	if app.Kind != "chat" {
-		return ErrNotDefaultable
-	}
-	if _, err := s.EnabledBinding(ctx, appID); err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return ErrNotDefaultable
+	if binding, err := s.EnabledBinding(ctx, appID); err != nil || !Usable(app, binding) {
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return err
 		}
-		return err
+		return ErrNotDefaultable
 	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {

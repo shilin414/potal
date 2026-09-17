@@ -1,6 +1,10 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import axiosInstance from '@/services/axios';
+import {
+  isSameUser,
+  resetSessionScopedState,
+} from '@/stores/resetSessionState';
 
 interface User {
   id: string;
@@ -31,6 +35,16 @@ interface AuthState {
   completeSso: (exchange: string) => Promise<void>;
   logout: () => Promise<void>;
   clearAuth: () => void;
+  /**
+   * The ONLY way an authenticated identity is installed (二次复审 P0-2).
+   *
+   * Every login path (password, admin, SSO, Feishu) ends here instead of
+   * calling `set({ user })` directly, so the session-scoped stores are wiped
+   * exactly once, in exactly one place — before the new identity is
+   * installed. A page that sets `user` by hand is a page that leaks the
+   * previous user's drafts, transcripts and shortcuts to the next one.
+   */
+  acceptAuthenticatedUser: (user: User) => void;
   updateUser: (data: Partial<User>) => void;
 }
 
@@ -52,42 +66,51 @@ export const useAuthStore = create<AuthState>()(
         // Cookie session: the HttpOnly `studio_session` cookie is set by the
         // backend (Set-Cookie); no token is stored client-side.
         const response = await axiosInstance.post('/auth/login/', { username, password }) as any;
-        set({ user: response.user, isAuthenticated: true });
+        get().acceptAuthenticatedUser(response.user);
       },
 
       adminLogin: async (username: string, password: string) => {
         // 管理员本地登录：与飞书登录共享同一套 HttpOnly Studio Session。
         const response = await axiosInstance.post('/identity/admin/login', { username, password }) as any;
-        set({
-          user: {
-            id: String(response.id ?? ''),
-            username: response.username ?? username,
-            email: '',
-            role: response.is_staff ? 'admin' : 'user',
-            is_staff: Boolean(response.is_staff),
-            auth_source: response.auth_source ?? 'local_admin',
-            display_name: response.display_name ?? response.username,
-            display_id: response.display_id ?? '',
-            created_at: new Date().toISOString(),
-          },
-          isAuthenticated: true,
+        get().acceptAuthenticatedUser({
+          id: String(response.id ?? ''),
+          username: response.username ?? username,
+          email: '',
+          role: response.is_staff ? 'admin' : 'user',
+          is_staff: Boolean(response.is_staff),
+          auth_source: response.auth_source ?? 'local_admin',
+          display_name: response.display_name ?? response.username,
+          display_id: response.display_id ?? '',
+          created_at: new Date().toISOString(),
         });
       },
 
       register: async (data: RegisterData) => {
         const response = await axiosInstance.post('/auth/register/', data) as any;
-        set({ user: response.user, isAuthenticated: true });
+        get().acceptAuthenticatedUser(response.user);
       },
 
       completeSso: async (exchange: string) => {
         const response = await axiosInstance.post('/enterprise/sso/exchange', { exchange }) as any;
-        set({ user: response.user, isAuthenticated: true });
+        get().acceptAuthenticatedUser(response.user);
       },
 
       clearAuth: () => {
-        // Synchronously wipe local auth state. Used right before a full-page
-        // redirect to login.
+        // Synchronously wipe local auth state AND every session-scoped store.
+        // Used right before a full-page redirect to login.
+        resetSessionScopedState();
         set({ user: null, isAuthenticated: false });
+      },
+
+      acceptAuthenticatedUser: (user) => {
+        // A DIFFERENT identity ends the previous session's state first
+        // (二次复审 P0-2). Same identity (a re-login, a token refresh that
+        // re-installs the snapshot) must NOT: that would throw away the
+        // user's own composer draft and open conversation.
+        if (!isSameUser(get().user, user)) {
+          resetSessionScopedState();
+        }
+        set({ user, isAuthenticated: true });
       },
 
       logout: async () => {

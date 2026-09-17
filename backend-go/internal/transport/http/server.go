@@ -81,16 +81,22 @@ type Server struct {
 // publicRoutes are served without authentication (path+method table; the
 // generated mux registers every route, auth is enforced by middleware).
 var publicRoutes = map[string]bool{
-	"GET /api/identity/oauth/start":     true,
-	"GET /api/identity/oauth/exchange":  true,
-	"POST /api/identity/admin/login":    true,
-	"POST /api/auth/login/":             true,
-	"POST /api/auth/logout/":            true,
-	"POST /api/auth/token/refresh/":     true,
-	"GET /api/v2/applications/*/avatar": true,
-	"GET /api/v2/artifacts/*/open":      true,
-	"GET /api/v2/runs/*/stream":         true,
-	"GET /api/v2/public/shares/*":       true,
+	"GET /api/identity/oauth/start":    true,
+	"GET /api/identity/oauth/exchange": true,
+	"POST /api/identity/admin/login":   true,
+	"POST /api/auth/login/":            true,
+	"POST /api/auth/logout/":           true,
+	"POST /api/auth/token/refresh/":    true,
+	// ⚠️ `GET /api/v2/applications/*/avatar` is deliberately ABSENT (二次复审
+	// P0-4). It used to be public, which made every avatar readable by
+	// sequential application id without a session — an enumeration oracle
+	// for the catalog. An <img> on a studio page is a same-origin request
+	// and already carries the Studio Session cookie, so requiring auth
+	// costs nothing. A public share must expose an avatar through
+	// /api/v2/public/shares/{token}/... (share-token-gated), never here.
+	"GET /api/v2/artifacts/*/open": true,
+	"GET /api/v2/runs/*/stream":    true,
+	"GET /api/v2/public/shares/*":  true,
 }
 
 // isInfraPath allows health/metrics probes without authentication.
@@ -116,8 +122,7 @@ func isPublicRoute(method, path string) bool {
 		prefix = path[:i+1]
 	}
 	switch method + " " + prefix + "*" {
-	case "GET /api/v2/applications/*/avatar":
-		return strings.HasPrefix(path, "/api/v2/applications/") && strings.HasSuffix(path, "/avatar")
+	// No /applications/*/avatar case — see publicRoutes (P0-4).
 	case "GET /api/v2/artifacts/*/open":
 		return strings.HasPrefix(path, "/api/v2/artifacts/") && strings.HasSuffix(path, "/open")
 	case "GET /api/v2/runs/*/stream":

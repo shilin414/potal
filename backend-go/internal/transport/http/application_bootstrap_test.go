@@ -1,188 +1,155 @@
 package http
 
-// Review 12 (2026-09-17, 执行报告 §9–§14, P1-1/P1-2): the workspace bootstrap
-// replaces the whole-catalog download. Its derivation is PURE, so these tests
-// need no database — which is exactly why it was written as a pure function
-// rather than as SQL glued into the handler.
+// Review 12 (2026-09-17, 执行报告 §9–§14, P1-1/P1-2) + 二次复审 (P1-1/P0-5).
 //
-// What they pin (each one is a rule the client-side code these functions
-// replace already had, so a regression here is a silent UX regression):
-//   · 收藏/常用/最近使用/推荐/常用应用 are derived by kind, never mixed;
-//   · 停用 applications never enter a SHORTCUT group, but the category rails
-//     still count them (staff see the real market);
-//   · the default agent prefers an explicit `is_default_agent` AND requires a
-//     binding, falling back to the first bound chat app;
-//   · 推荐 means "this caller has never used it" (usage, recency, favourite);
-//   · the 其他 sentinel appears only when uncategorized rows exist, and uses
-//     the same slug the paged endpoint understands;
-//   · `@` candidates match name/slug only (never the description the SQL
-//     pre-filter also matched), ranked exact → prefix → substring.
+// The workspace bootstrap replaces the whole-catalog download. Its grouping
+// now happens IN SQL (one bounded query per group), so what is left to test
+// without a database is the SQL→response glue, which is still PURE:
+//
+//   · bootstrapGroupIDs  — every selected id, deduplicated, so the single
+//     row fetch is exactly as wide as the groups are;
+//   · bootstrapUsage     — the personal usage the ranking query already
+//     returned for one row, in the shape buildListItem reads;
+//   · bootstrapSummaries — group ORDER is the SQL's, never the row fetch's
+//     (`IN (...)` has no order), and an unresolvable id is skipped rather
+//     than rendered as an empty card;
+//   · bootstrapCategoryRail — the empty slug (rows with no category) becomes
+//     the `__uncategorized__` sentinel the paged endpoint understands.
+//
+// The mention router stays pure on purpose and keeps its own tests.
 
 import (
 	"testing"
+	"time"
+
+	"github.com/creation-agent-studio/backend-go/internal/catalog"
 )
 
-func bsItem(id int64, name, kind string, tweak func(*applicationListItem)) applicationListItem {
-	item := applicationListItem{ID: id, Slug: name, Name: name, Kind: kind, Enabled: true}
-	item.Slug = "slug-" + name
-	if tweak != nil {
-		tweak(&item)
-	}
-	return item
+func strPtr(v string) *string { return &v }
+
+func bsRow(id int64) catalog.BootstrapGroupRow {
+	return catalog.BootstrapGroupRow{ApplicationID: id}
 }
 
-func idsOf(items []applicationListItem) []int64 {
-	out := make([]int64, 0, len(items))
-	for _, item := range items {
-		out = append(out, item.ID)
+func idsOfRows(rows []catalog.BootstrapGroupRow) []int64 {
+	out := make([]int64, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, row.ApplicationID)
 	}
 	return out
 }
 
-func sameIDs(got []applicationListItem, want ...int64) bool {
+func TestBootstrapGroupIDsDeduplicatesAcrossGroups(t *testing.T) {
+	// One application legitimately appears in SEVERAL groups (used + recent
+	// + favourite), and the row fetch must ask for it once.
+	def := bsRow(1)
+	groups := catalog.BootstrapGroups{
+		Default:         &def,
+		Favorites:       []catalog.BootstrapGroupRow{bsRow(1), bsRow(2)},
+		Frequent:        []catalog.BootstrapGroupRow{bsRow(1), bsRow(3)},
+		Recent:          []catalog.BootstrapGroupRow{bsRow(3)},
+		Recommended:     []catalog.BootstrapGroupRow{bsRow(4)},
+		RecentFixedApps: []catalog.BootstrapGroupRow{bsRow(5)},
+	}
+	got := bootstrapGroupIDs(groups)
+	want := []int64{1, 2, 3, 4, 5}
 	if len(got) != len(want) {
-		return false
+		t.Fatalf("ids must be deduplicated, got %v want %v", got, want)
 	}
 	for i := range want {
-		if got[i].ID != want[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func TestBootstrapGroupsSplitKindsAndRankPerGroup(t *testing.T) {
-	pool := []applicationListItem{
-		// 1: chat, used 3 times, most recently — belongs to 常用/最近使用
-		bsItem(1, "alpha", "chat", func(i *applicationListItem) {
-			i.UsageCount = 3
-			i.LastUsedAt = strPtr("2026-09-17T10:00:00Z")
-		}),
-		// 2: chat, used 9 times but older — 常用 first, 最近使用 second
-		bsItem(2, "beta", "chat", func(i *applicationListItem) {
-			i.UsageCount = 9
-			i.LastUsedAt = strPtr("2026-09-16T10:00:00Z")
-		}),
-		// 3: chat, starred and never used — 收藏 only
-		bsItem(3, "gamma", "chat", func(i *applicationListItem) { i.IsFavorite = true }),
-		// 4: chat, never used, high global usage — 推荐
-		bsItem(4, "delta", "chat", func(i *applicationListItem) { i.GlobalUsageCount = 100 }),
-		// 5: chat, never used, low global usage — 推荐 second
-		bsItem(5, "epsilon", "chat", func(i *applicationListItem) { i.GlobalUsageCount = 1 }),
-		// 6: fixed app this caller ran — 常用应用 first
-		bsItem(6, "oa", "task", func(i *applicationListItem) {
-			i.LastUsedAt = strPtr("2026-09-17T09:00:00Z")
-		}),
-		// 7: fixed app never used — still offered (catalog order, after 6)
-		bsItem(7, "report", "task", nil),
-	}
-	g := buildBootstrapGroups(pool)
-
-	if !sameIDs(g.Frequent, 2, 1) {
-		t.Fatalf("常用 must rank by run count desc, got %v", idsOf(g.Frequent))
-	}
-	if !sameIDs(g.Recent, 1, 2) {
-		t.Fatalf("最近使用 must rank by recency desc, got %v", idsOf(g.Recent))
-	}
-	if !sameIDs(g.Favorites, 3) {
-		t.Fatalf("收藏 must be the starred chat apps, got %v", idsOf(g.Favorites))
-	}
-	if !sameIDs(g.Recommended, 4, 5) {
-		t.Fatalf("推荐 must exclude every used/starred app and rank by global usage, got %v", idsOf(g.Recommended))
-	}
-	if !sameIDs(g.RecentFixedApps, 6, 7) {
-		t.Fatalf("常用应用 must hold non-chat apps, recently used first, got %v", idsOf(g.RecentFixedApps))
-	}
-	for _, item := range g.Favorites {
-		if item.Kind != "chat" {
-			t.Fatalf("收藏 leaked a non-chat application: %s", item.Kind)
+		if got[i] != want[i] {
+			t.Fatalf("ids must keep first-appearance order, got %v want %v", got, want)
 		}
 	}
 }
 
-func TestBootstrapGroupsDefaultAgentNeedsExplicitFlagAndBinding(t *testing.T) {
-	pool := []applicationListItem{
-		bsItem(1, "first-bound", "chat", func(i *applicationListItem) { i.IsBound = true }),
-		bsItem(2, "explicit-default", "chat", func(i *applicationListItem) {
-			i.IsBound = true
-			i.IsDefaultAgent = true
-		}),
-		bsItem(3, "unbound-default", "chat", func(i *applicationListItem) { i.IsDefaultAgent = true }),
-	}
-	g := buildBootstrapGroups(pool)
-	if g.DefaultApplication == nil || g.DefaultApplication.ID != 2 {
-		t.Fatalf("the explicit default agent must win, got %+v", g.DefaultApplication)
-	}
-
-	// Nothing marked: the FIRST bound chat app is the fallback (the
-	// resolveDefaultApplication rule) — the unbound row is skipped even when
-	// it is flagged, because a binding-less agent cannot be sent to.
-	g = buildBootstrapGroups(pool[:1])
-	if g.DefaultApplication == nil || g.DefaultApplication.ID != 1 {
-		t.Fatalf("fallback must be the first bound chat app, got %+v", g.DefaultApplication)
-	}
-	g = buildBootstrapGroups([]applicationListItem{pool[2]})
-	if g.DefaultApplication != nil {
-		t.Fatalf("an unbound agent must not become the default, got %+v", g.DefaultApplication)
+func TestBootstrapGroupIDsHandlesAnEmptyWorkspace(t *testing.T) {
+	// A fresh install has no default and no groups: the row fetch must be
+	// skipped entirely (an `IN ()` is not valid SQL).
+	if got := bootstrapGroupIDs(catalog.BootstrapGroups{}); len(got) != 0 {
+		t.Fatalf("no groups must mean no row fetch, got %v", got)
 	}
 }
 
-func TestBootstrapGroupsDropDisabledFromGroupsButKeepRails(t *testing.T) {
-	pool := []applicationListItem{
-		bsItem(1, "live", "chat", func(i *applicationListItem) {
-			i.CategorySlug = "it"
-			i.CategoryName = "IT运维"
-		}),
-		bsItem(2, "disabled", "chat", func(i *applicationListItem) {
-			i.Enabled = false
-			i.CategorySlug = "it"
-			i.CategoryName = "IT运维"
-			i.UsageCount = 50
-			i.LastUsedAt = strPtr("2026-09-17T10:00:00Z")
-		}),
+func TestBootstrapUsageReadsTheRankingQueryResult(t *testing.T) {
+	used := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
+	row := catalog.BootstrapGroupRow{ApplicationID: 7, UsageCount: 4, LastUsedAt: &used}
+	groups := catalog.BootstrapGroups{
+		Frequent: []catalog.BootstrapGroupRow{row},
+		Recent:   []catalog.BootstrapGroupRow{bsRow(9)},
 	}
-	g := buildBootstrapGroups(pool)
-	for _, group := range [][]applicationListItem{g.Frequent, g.Recent} {
-		for _, item := range group {
-			if !item.Enabled {
-				t.Fatalf("a 停用 application must never enter a shortcut group: %v", idsOf(group))
-			}
-		}
+
+	got := bootstrapUsage(groups, 7)
+	entry, ok := got[7]
+	if !ok {
+		t.Fatalf("usage for the resolved row must be available, got %v", got)
 	}
-	if len(g.AgentCategories) != 1 || g.AgentCategories[0].Count != 2 {
-		t.Fatalf("the category rail must still count disabled rows, got %+v", g.AgentCategories)
+	if entry.Count != 4 {
+		t.Fatalf("usage count must come from the ranking query, got %d", entry.Count)
+	}
+	if entry.Last == nil || *entry.Last != used.UTC().Format(time.RFC3339) {
+		t.Fatalf("last_used_at must be the RFC3339 projection buildListItem renders, got %v", entry.Last)
+	}
+
+	// A row the caller never used has no timestamp at all — not a zero time
+	// rendered as 0001-01-01.
+	if got := bootstrapUsage(groups, 9); got[9].Count != 0 || got[9].Last != nil {
+		t.Fatalf("never-used must be count 0 + nil, got %+v", got[9])
+	}
+	// Recommended rows carry no personal usage by definition.
+	if got := bootstrapUsage(catalog.BootstrapGroups{
+		Recommended: []catalog.BootstrapGroupRow{bsRow(11)},
+	}, 11); len(got) != 0 {
+		t.Fatalf("推荐 must not invent usage, got %+v", got)
 	}
 }
 
-func TestBootstrapCategoryRailsOnlyAddOtherWhenNeeded(t *testing.T) {
-	g := buildBootstrapGroups([]applicationListItem{
-		bsItem(1, "a", "chat", func(i *applicationListItem) {
-			i.CategorySlug = "hr"
-			i.CategoryName = "人力"
-		}),
-		bsItem(2, "b", "chat", func(i *applicationListItem) {
-			i.CategorySlug = "hr"
-			i.CategoryName = "人力"
-		}),
-		bsItem(3, "c", "chat", nil), // no category
-		bsItem(4, "d", "task", func(i *applicationListItem) {
-			i.CategorySlug = "oa"
-			i.CategoryName = "OA"
-		}),
+func TestBootstrapSummariesKeepSQLOrderAndSkipUnresolvedIDs(t *testing.T) {
+	items := map[int64]applicationListItem{
+		2: {ID: 2, Name: "second"},
+		1: {ID: 1, Name: "first"},
+	}
+	// The group order is the SQL's; the map iteration order is not.
+	group := []catalog.BootstrapGroupRow{bsRow(2), bsRow(1), bsRow(99)}
+
+	got := bootstrapSummaries(group, items)
+	if len(got) != 2 {
+		t.Fatalf("an id the row fetch could not resolve must be dropped, got %d", len(got))
+	}
+	if got[0].ID != 2 || got[1].ID != 1 {
+		t.Fatalf("group order must survive the row fetch, got %+v", got)
+	}
+}
+
+func TestBootstrapCategoryRailRendersTheUncategorizedSentinelLast(t *testing.T) {
+	rail := bootstrapCategoryRail([]catalog.BootstrapCategory{
+		{Slug: "hr", Name: "人力", Count: 2},
+		{Slug: "", Name: "", Count: 3},
+		{Slug: "it", Name: "", Count: 1},
 	})
-	if len(g.AgentCategories) != 2 {
-		t.Fatalf("agent rail = 人力 + 其他, got %+v", g.AgentCategories)
+	if len(rail) != 3 {
+		t.Fatalf("rail = 人力 + IT + 其他, got %+v", rail)
 	}
-	if g.AgentCategories[0].Slug != "hr" || g.AgentCategories[0].Count != 2 {
-		t.Fatalf("first-appearance order + counts are wrong: %+v", g.AgentCategories)
+	if rail[0].Slug != "hr" || rail[0].Count != 2 {
+		t.Fatalf("first-appearance order + counts are wrong: %+v", rail)
 	}
-	other := g.AgentCategories[1]
-	if other.Slug != "__uncategorized__" || other.Name != "其他" || other.Count != 1 {
-		t.Fatalf("其他 sentinel is wrong: %+v", other)
+	// A category with no name falls back to its slug rather than rendering
+	// an empty tab.
+	if rail[1].Slug != "it" || rail[1].Name != "it" {
+		t.Fatalf("a nameless category must fall back to its slug: %+v", rail[1])
 	}
-	// The fixed rail has no uncategorized row, so it must NOT offer 其他.
-	if len(g.AppCategories) != 1 || g.AppCategories[0].Slug != "oa" {
-		t.Fatalf("app rail must be OA only, got %+v", g.AppCategories)
+	other := rail[2]
+	if other.Slug != catalog.PageUncategorizedSlug || other.Name != "其他" || other.Count != 3 {
+		t.Fatalf("其他 sentinel must be last and use the paged endpoint's slug: %+v", other)
+	}
+}
+
+func TestBootstrapCategoryRailOmitsOtherWhenEverythingIsCategorized(t *testing.T) {
+	rail := bootstrapCategoryRail([]catalog.BootstrapCategory{
+		{Slug: "oa", Name: "OA", Count: 4},
+	})
+	if len(rail) != 1 || rail[0].Slug != "oa" {
+		t.Fatalf("no uncategorized rows must mean no 其他 tab, got %+v", rail)
 	}
 }
 
@@ -236,4 +203,37 @@ func TestRankMentionCandidatesCapsAndPrependsWithoutDuplicate(t *testing.T) {
 	}
 }
 
-func strPtr(v string) *string { return &v }
+// The CONSUME predicate is what stops a staff caller from opening an
+// application the run API would refuse (二次复审 P0-5). It is the shared
+// contract behind resolve, @mention, the bootstrap groups and
+// AuthorizeExecution, so it is pinned here too.
+func TestUsableRequiresEnabledAndABindingForChat(t *testing.T) {
+	chat := &catalog.Application{Kind: "chat", Enabled: true}
+	fixed := &catalog.Application{Kind: "task", Enabled: true}
+	bound := &catalog.Binding{Enabled: true}
+
+	if catalog.Usable(chat, bound) != true {
+		t.Fatal("an enabled + bound chat application must be usable")
+	}
+	if catalog.Usable(chat, nil) != false {
+		t.Fatal("a chat application without a binding must NOT be usable")
+	}
+	if catalog.Usable(chat, &catalog.Binding{Enabled: false}) != false {
+		t.Fatal("a DISABLED binding must NOT be usable")
+	}
+	if !catalog.Usable(fixed, nil) {
+		t.Fatal("a fixed application is a build-delivered page: no binding needed")
+	}
+	// The admin kill switch is absolute, for every kind and every caller.
+	disabled := &catalog.Application{Kind: "chat", Enabled: false}
+	if catalog.Usable(disabled, bound) != false {
+		t.Fatal("a disabled application must never be usable")
+	}
+	disabledFixed := &catalog.Application{Kind: "task", Enabled: false}
+	if catalog.Usable(disabledFixed, nil) != false {
+		t.Fatal("a disabled fixed application must never be usable")
+	}
+	if catalog.Usable(nil, bound) != false {
+		t.Fatal("a missing application must never be usable")
+	}
+}

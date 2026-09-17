@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api } from '@/services/api';
+import { registerSessionReset } from '@/stores/resetSessionState';
 
 interface AgentCategory {
   id: number;
@@ -45,6 +46,8 @@ interface AgentState {
   setSearchQuery: (query: string) => void;
   executeAgent: (agentId: number, inputData: any) => Promise<AgentExecution>;
   loadMyExecutions: () => Promise<void>;
+  /** Back to the inert state — called by resetSessionScopedState (P0-2). */
+  reset: () => void;
 }
 
 export const useAgentStore = create<AgentState>((set, get) => ({
@@ -54,6 +57,15 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   searchQuery: '',
   executions: [],
   isLoading: false,
+
+  reset: () => set({
+    categories: [],
+    agents: [],
+    selectedCategory: null,
+    searchQuery: '',
+    executions: [],
+    isLoading: false,
+  }),
 
   loadCategories: async () => {
     try {
@@ -109,3 +121,6 @@ export const useAgentStore = create<AgentState>((set, get) => ({
     }
   },
 }));
+
+// Legacy Django-side agent list + executions (P0-2).
+registerSessionReset(() => useAgentStore.getState().reset());

@@ -11,6 +11,8 @@
  * this store only mirrors them for rendering.
  */
 import { create } from 'zustand';
+import { registerSessionReset } from '@/stores/resetSessionState';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import axiosInstance from '@/services/axios';
 import {
   createRun,
@@ -111,6 +113,12 @@ export interface RunChatState {
     clientRequestId?: string;
   }) => Promise<number | null>;
   clearError: () => void;
+  /**
+   * Forget every transcript (二次复审 P0-2). Chat history is the most
+   * sensitive thing this app holds in memory, and it is per-user: it must
+   * not survive a logout / user switch.
+   */
+  clearAll: () => void;
 }
 
 /**
@@ -276,6 +284,20 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
 
   clearError: () => set({ error: null }),
 
+  clearAll: () => {
+    // The pending-send identity belongs to the PREVIOUS user's last failed
+    // action (第九轮 P0-1): reusing it after a switch would attach B's
+    // message to A's idempotency key.
+    pendingSend = null;
+    set({
+      conversations: {},
+      activeConversationId: null,
+      isLoading: false,
+      error: null,
+      lastConversationId: null,
+    });
+  },
+
   sendMessage: async ({
     applicationId, conversationId, content, attachments, clientRequestId,
   }) => {
@@ -296,6 +318,11 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
         clientRequestId: requestId,
       });
       pendingSend = null;
+      // A new run moves `usage_count` / `last_used_at`, which is exactly what
+      // 常用 / 最近使用 / 推荐 are ranked by (二次复审 P1-4). Mark the
+      // bootstrap stale instead of refetching it per message: the next home
+      // visit re-reads it once.
+      useWorkspaceBootstrapStore.getState().invalidate();
     } catch (error: any) {
       // Remember the identity so the retry replays instead of duplicating.
       pendingSend = { fingerprint, clientRequestId: requestId };
@@ -693,3 +720,7 @@ export async function finalizeRun(runId: string, eventText?: string) {
 
   refreshSidebarDebounced();
 }
+
+// Live transcripts plus the pending-send idempotency identity, which belongs
+// to the previous user's last failed action (P0-2).
+registerSessionReset(() => useRunChatStore.getState().clearAll());

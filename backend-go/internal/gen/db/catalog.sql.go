@@ -25,6 +25,507 @@ func (q *Queries) ApplicationSlugExists(ctx context.Context, slug string) (int64
 	return n, err
 }
 
+const bootstrapAgentCategories = `-- name: BootstrapAgentCategories :many
+SELECT COALESCE(c.slug, '') AS category_slug,
+       COALESCE(c.name, '') AS category_name,
+       COUNT(*) AS category_count
+FROM applications a
+LEFT JOIN application_categories c ON c.id = a.category_id
+LEFT JOIN runtime_bindings b
+  ON b.application_id = a.id AND b.enabled = 1
+LEFT JOIN runtime_bindings newer_b
+  ON newer_b.application_id = b.application_id
+ AND newer_b.enabled = 1
+ AND newer_b.id > b.id
+WHERE newer_b.id IS NULL
+  AND a.enabled = 1
+  AND a.kind = 'chat'
+  AND b.id IS NOT NULL
+  AND (? OR a.is_public = 1)
+GROUP BY a.category_id, c.slug, c.name
+ORDER BY MIN(a.created_at), category_slug
+`
+
+type BootstrapAgentCategoriesRow struct {
+	CategorySlug  string
+	CategoryName  string
+	CategoryCount int64
+}
+
+// 智能体分类 rail. Grouped in SQL (never in Go over a pool) and ordered by
+// first appearance (MIN(created_at)) — the order the market itself lists
+// applications in. Rows with no category come back with an EMPTY slug and
+// are rendered as the `__uncategorized__` sentinel by the caller.
+func (q *Queries) BootstrapAgentCategories(ctx context.Context, showAll interface{}) ([]BootstrapAgentCategoriesRow, error) {
+	rows, err := q.db.QueryContext(ctx, bootstrapAgentCategories, showAll)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BootstrapAgentCategoriesRow{}
+	for rows.Next() {
+		var i BootstrapAgentCategoriesRow
+		if err := rows.Scan(&i.CategorySlug, &i.CategoryName, &i.CategoryCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const bootstrapAppCategories = `-- name: BootstrapAppCategories :many
+SELECT COALESCE(c.slug, '') AS category_slug,
+       COALESCE(c.name, '') AS category_name,
+       COUNT(*) AS category_count
+FROM applications a
+LEFT JOIN application_categories c ON c.id = a.category_id
+WHERE a.enabled = 1
+  AND a.kind <> 'chat'
+  AND (? OR a.is_public = 1)
+GROUP BY a.category_id, c.slug, c.name
+ORDER BY MIN(a.created_at), category_slug
+`
+
+type BootstrapAppCategoriesRow struct {
+	CategorySlug  string
+	CategoryName  string
+	CategoryCount int64
+}
+
+// Same rail for 应用中心 (kind <> 'chat'), which needs no runtime binding.
+func (q *Queries) BootstrapAppCategories(ctx context.Context, showAll interface{}) ([]BootstrapAppCategoriesRow, error) {
+	rows, err := q.db.QueryContext(ctx, bootstrapAppCategories, showAll)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BootstrapAppCategoriesRow{}
+	for rows.Next() {
+		var i BootstrapAppCategoriesRow
+		if err := rows.Scan(&i.CategorySlug, &i.CategoryName, &i.CategoryCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const bootstrapDefaultApplication = `-- name: BootstrapDefaultApplication :one
+
+SELECT a.id,
+       COALESCE(u.usage_count, 0) AS personal_usage_count,
+       u.last_used_at
+FROM applications a
+LEFT JOIN runtime_bindings b
+  ON b.application_id = a.id AND b.enabled = 1
+LEFT JOIN runtime_bindings newer_b
+  ON newer_b.application_id = b.application_id
+ AND newer_b.enabled = 1
+ AND newer_b.id > b.id
+LEFT JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
+           FROM runs r WHERE r.user_id = ?
+           GROUP BY r.application_id) u
+  ON u.application_id = a.id
+WHERE newer_b.id IS NULL
+  AND a.enabled = 1
+  AND a.kind = 'chat'
+  AND b.id IS NOT NULL
+  AND (? OR a.is_public = 1)
+ORDER BY a.is_default_agent DESC, a.created_at, a.id
+LIMIT 1
+`
+
+type BootstrapDefaultApplicationParams struct {
+	CallerID sql.NullInt64
+	ShowAll  interface{}
+}
+
+type BootstrapDefaultApplicationRow struct {
+	ID                 uint64
+	PersonalUsageCount int64
+	LastUsedAt         interface{}
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Workspace bootstrap groups (二次复审 P1-1)
+//
+// The first version of the bootstrap ran ONE `ListApplicationPage` with
+// `Limit = 5000` and derived the groups in Go. That made the HTTP RESPONSE
+// constant-size but not the COST: rows examined, Go memory and CPU all grew
+// with the catalog, and past row 5000 the result was silently WRONG (a
+// category, the top 推荐 agent or the only valid default fallback that sorts
+// after row 5000 simply disappeared).
+//
+// These queries ask the database for the business answer directly, so the
+// cost is bounded by the groups themselves (≤ 8 rows each):
+//
+//	query count      fixed (one per group + one row fetch)
+//	rows examined    bounded by the indexes, not the catalog
+//	Go objects       ≤ ~40 applications, regardless of catalog size
+//
+// Every one of them applies, IN SQL:
+//
+//   - the visibility policy  — `show_all` (staff) OR `is_public = 1`;
+//   - the CONSUME policy     — `enabled = 1` AND, for kind='chat', an
+//     enabled runtime binding (P0-5); a bootstrap
+//     group is a shortcut the user will click, so
+//     it must never offer something the run API
+//     would refuse.
+//
+// `ONLY_FULL_GROUP_BY` (MySQL 5.7 default) is why the usage aggregate is a
+// DERIVED TABLE joined on application_id instead of a `GROUP BY a.id` over
+// the selected application columns: grouping by the primary key alone is not
+// enough for the server to accept the other selected columns.
+// ─────────────────────────────────────────────────────────────────────────
+// 默认智能体: the explicit main agent wins; otherwise the first enabled +
+// bound chat application in catalog order (created_at, id) — the same
+// fallback the old Go-side `buildBootstrapGroups` implemented, so a fresh
+// install with nothing configured still gets a working composer.
+//
+// `enabled = 1` is NEW (二次复审 P0-6): a disabled application used to stay
+// the default if it was promoted before being switched off, which bound the
+// home composer to an agent that cannot execute.
+func (q *Queries) BootstrapDefaultApplication(ctx context.Context, arg BootstrapDefaultApplicationParams) (BootstrapDefaultApplicationRow, error) {
+	row := q.db.QueryRowContext(ctx, bootstrapDefaultApplication, arg.CallerID, arg.ShowAll)
+	var i BootstrapDefaultApplicationRow
+	err := row.Scan(&i.ID, &i.PersonalUsageCount, &i.LastUsedAt)
+	return i, err
+}
+
+const bootstrapFavoriteApplications = `-- name: BootstrapFavoriteApplications :many
+SELECT a.id,
+       COALESCE(u.usage_count, 0) AS personal_usage_count,
+       u.last_used_at
+FROM application_favorites f
+JOIN applications a ON a.id = f.application_id
+LEFT JOIN runtime_bindings b
+  ON b.application_id = a.id AND b.enabled = 1
+LEFT JOIN runtime_bindings newer_b
+  ON newer_b.application_id = b.application_id
+ AND newer_b.enabled = 1
+ AND newer_b.id > b.id
+LEFT JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
+           FROM runs r WHERE r.user_id = ?
+           GROUP BY r.application_id) u
+  ON u.application_id = a.id
+WHERE f.user_id = ?
+  AND newer_b.id IS NULL
+  AND a.enabled = 1
+  AND a.kind = 'chat'
+  AND b.id IS NOT NULL
+  AND (? OR a.is_public = 1)
+ORDER BY u.last_used_at DESC, a.name
+LIMIT ?
+`
+
+type BootstrapFavoriteApplicationsParams struct {
+	CallerID  sql.NullInt64
+	FavUserID uint64
+	ShowAll   interface{}
+	Limit     int32
+}
+
+type BootstrapFavoriteApplicationsRow struct {
+	ID                 uint64
+	PersonalUsageCount int64
+	LastUsedAt         interface{}
+}
+
+// 收藏: chat applications this caller starred, most recently used first.
+// NULL `last_used_at` sorts LAST under DESC, matching the old Go `usedAt()`
+// (a missing timestamp meant "never used", i.e. the oldest possible).
+func (q *Queries) BootstrapFavoriteApplications(ctx context.Context, arg BootstrapFavoriteApplicationsParams) ([]BootstrapFavoriteApplicationsRow, error) {
+	rows, err := q.db.QueryContext(ctx, bootstrapFavoriteApplications,
+		arg.CallerID,
+		arg.FavUserID,
+		arg.ShowAll,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BootstrapFavoriteApplicationsRow{}
+	for rows.Next() {
+		var i BootstrapFavoriteApplicationsRow
+		if err := rows.Scan(&i.ID, &i.PersonalUsageCount, &i.LastUsedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const bootstrapFrequentApplications = `-- name: BootstrapFrequentApplications :many
+SELECT a.id,
+       u.usage_count AS personal_usage_count,
+       u.last_used_at
+FROM applications a
+JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
+      FROM runs r WHERE r.user_id = ?
+      GROUP BY r.application_id) u
+  ON u.application_id = a.id
+LEFT JOIN runtime_bindings b
+  ON b.application_id = a.id AND b.enabled = 1
+LEFT JOIN runtime_bindings newer_b
+  ON newer_b.application_id = b.application_id
+ AND newer_b.enabled = 1
+ AND newer_b.id > b.id
+WHERE newer_b.id IS NULL
+  AND a.enabled = 1
+  AND a.kind = 'chat'
+  AND b.id IS NOT NULL
+  AND (? OR a.is_public = 1)
+ORDER BY u.usage_count DESC, u.last_used_at DESC, a.name
+LIMIT ?
+`
+
+type BootstrapFrequentApplicationsParams struct {
+	CallerID sql.NullInt64
+	ShowAll  interface{}
+	Limit    int32
+}
+
+type BootstrapFrequentApplicationsRow struct {
+	ID                 uint64
+	PersonalUsageCount int64
+	LastUsedAt         interface{}
+}
+
+// 常用智能体: chat applications this caller has actually run, most runs first.
+func (q *Queries) BootstrapFrequentApplications(ctx context.Context, arg BootstrapFrequentApplicationsParams) ([]BootstrapFrequentApplicationsRow, error) {
+	rows, err := q.db.QueryContext(ctx, bootstrapFrequentApplications, arg.CallerID, arg.ShowAll, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BootstrapFrequentApplicationsRow{}
+	for rows.Next() {
+		var i BootstrapFrequentApplicationsRow
+		if err := rows.Scan(&i.ID, &i.PersonalUsageCount, &i.LastUsedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const bootstrapRecentApplications = `-- name: BootstrapRecentApplications :many
+SELECT a.id,
+       u.usage_count AS personal_usage_count,
+       u.last_used_at
+FROM applications a
+JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
+      FROM runs r WHERE r.user_id = ?
+      GROUP BY r.application_id) u
+  ON u.application_id = a.id
+LEFT JOIN runtime_bindings b
+  ON b.application_id = a.id AND b.enabled = 1
+LEFT JOIN runtime_bindings newer_b
+  ON newer_b.application_id = b.application_id
+ AND newer_b.enabled = 1
+ AND newer_b.id > b.id
+WHERE newer_b.id IS NULL
+  AND a.enabled = 1
+  AND a.kind = 'chat'
+  AND b.id IS NOT NULL
+  AND (? OR a.is_public = 1)
+ORDER BY u.last_used_at DESC, a.created_at, a.id
+LIMIT ?
+`
+
+type BootstrapRecentApplicationsParams struct {
+	CallerID sql.NullInt64
+	ShowAll  interface{}
+	Limit    int32
+}
+
+type BootstrapRecentApplicationsRow struct {
+	ID                 uint64
+	PersonalUsageCount int64
+	LastUsedAt         interface{}
+}
+
+// 最近使用: chat applications this caller ran, most recent first (the pool's
+// created_at order breaks ties, reproducing the old stable Go sort).
+func (q *Queries) BootstrapRecentApplications(ctx context.Context, arg BootstrapRecentApplicationsParams) ([]BootstrapRecentApplicationsRow, error) {
+	rows, err := q.db.QueryContext(ctx, bootstrapRecentApplications, arg.CallerID, arg.ShowAll, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BootstrapRecentApplicationsRow{}
+	for rows.Next() {
+		var i BootstrapRecentApplicationsRow
+		if err := rows.Scan(&i.ID, &i.PersonalUsageCount, &i.LastUsedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const bootstrapRecentFixedApplications = `-- name: BootstrapRecentFixedApplications :many
+SELECT a.id,
+       COALESCE(u.usage_count, 0) AS personal_usage_count,
+       u.last_used_at
+FROM applications a
+LEFT JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
+           FROM runs r WHERE r.user_id = ?
+           GROUP BY r.application_id) u
+  ON u.application_id = a.id
+WHERE a.enabled = 1
+  AND a.kind <> 'chat'
+  AND (? OR a.is_public = 1)
+ORDER BY u.last_used_at DESC, a.created_at, a.id
+LIMIT ?
+`
+
+type BootstrapRecentFixedApplicationsParams struct {
+	CallerID sql.NullInt64
+	ShowAll  interface{}
+	Limit    int32
+}
+
+type BootstrapRecentFixedApplicationsRow struct {
+	ID                 uint64
+	PersonalUsageCount int64
+	LastUsedAt         interface{}
+}
+
+// 常用应用 (应用中心 entries on the home page): enabled non-chat
+// applications, the recently opened ones first, then catalog order. No
+// runtime binding is required — a fixed application is a page delivered by
+// the build, not a provider runtime.
+//
+// The group must still SHOW the fixed apps on a workspace nobody has used
+// yet, so `used` is an ORDERING key only, never a filter.
+func (q *Queries) BootstrapRecentFixedApplications(ctx context.Context, arg BootstrapRecentFixedApplicationsParams) ([]BootstrapRecentFixedApplicationsRow, error) {
+	rows, err := q.db.QueryContext(ctx, bootstrapRecentFixedApplications, arg.CallerID, arg.ShowAll, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BootstrapRecentFixedApplicationsRow{}
+	for rows.Next() {
+		var i BootstrapRecentFixedApplicationsRow
+		if err := rows.Scan(&i.ID, &i.PersonalUsageCount, &i.LastUsedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const bootstrapRecommendedApplications = `-- name: BootstrapRecommendedApplications :many
+SELECT a.id,
+       COALESCE(u.usage_count, 0) AS personal_usage_count,
+       u.last_used_at
+FROM applications a
+LEFT JOIN runtime_bindings b
+  ON b.application_id = a.id AND b.enabled = 1
+LEFT JOIN runtime_bindings newer_b
+  ON newer_b.application_id = b.application_id
+ AND newer_b.enabled = 1
+ AND newer_b.id > b.id
+LEFT JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
+           FROM runs r WHERE r.user_id = ?
+           GROUP BY r.application_id) u
+  ON u.application_id = a.id
+WHERE newer_b.id IS NULL
+  AND a.enabled = 1
+  AND a.kind = 'chat'
+  AND b.id IS NOT NULL
+  AND (? OR a.is_public = 1)
+  AND NOT EXISTS (SELECT 1 FROM runs r
+                  WHERE r.user_id = ? AND r.application_id = a.id)
+  AND NOT EXISTS (SELECT 1 FROM application_favorites f
+                  WHERE f.user_id = ? AND f.application_id = a.id)
+ORDER BY a.usage_count DESC, a.name
+LIMIT ?
+`
+
+type BootstrapRecommendedApplicationsParams struct {
+	CallerID  sql.NullInt64
+	ShowAll   interface{}
+	FavUserID uint64
+	Limit     int32
+}
+
+type BootstrapRecommendedApplicationsRow struct {
+	ID                 uint64
+	PersonalUsageCount int64
+	LastUsedAt         interface{}
+}
+
+// 推荐: chat applications this caller has NEVER used and never starred, most
+// used GLOBALLY first. "Never used" is the definition, so both exclusions
+// are NOT EXISTS — not a left join whose result is then filtered in Go.
+func (q *Queries) BootstrapRecommendedApplications(ctx context.Context, arg BootstrapRecommendedApplicationsParams) ([]BootstrapRecommendedApplicationsRow, error) {
+	rows, err := q.db.QueryContext(ctx, bootstrapRecommendedApplications,
+		arg.CallerID,
+		arg.ShowAll,
+		arg.CallerID,
+		arg.FavUserID,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []BootstrapRecommendedApplicationsRow{}
+	for rows.Next() {
+		var i BootstrapRecommendedApplicationsRow
+		if err := rows.Scan(&i.ID, &i.PersonalUsageCount, &i.LastUsedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const clearDefaultAgent = `-- name: ClearDefaultAgent :exec
 UPDATE applications SET is_default_agent = 0 WHERE is_default_agent = 1
 `
@@ -831,6 +1332,8 @@ WHERE newer_b.id IS NULL
   AND (? OR (a.enabled = 1 AND (
         (? AND a.created_by = ?)
         OR (? AND a.is_public = 1))))
+  AND (? = 0
+       OR (a.enabled = 1 AND (a.kind <> 'chat' OR b.id IS NOT NULL)))
   AND ((? AND a.kind = 'chat')
        OR (? AND a.kind <> 'chat')
        OR ?)
@@ -853,6 +1356,7 @@ type ListApplicationPageParams struct {
 	MineOnly        interface{}
 	PageCallerID    sql.NullInt64
 	PublicOnly      interface{}
+	ConsumeOnly     interface{}
 	KindChatOnly    interface{}
 	KindFixedOnly   interface{}
 	KindAll         interface{}
@@ -924,6 +1428,18 @@ type ListApplicationPageRow struct {
 //	  scope=mine     → own rows (private included),
 //	  scope=public/manage → is_public = 1.
 //
+// `mode` (二次复审 P0-5) is ORTHOGONAL to scope: scope is "who may SEE the
+// row" (a management concern), mode is "may anyone actually USE it"
+// (consumption).
+//
+//	mode=consume   → additionally `enabled = 1` AND, for kind='chat', an
+//	                 enabled runtime binding (b.id IS NOT NULL). That is the
+//	                 SAME predicate AuthorizeExecution enforces, so a
+//	                 consumer surface can never list something the run API
+//	                 would then refuse. Staff is deliberately NOT exempt:
+//	                 seeing a disabled agent in 智能体市场 is a management
+//	                 need, opening it from the switcher is not.
+//
 // kind: exclude_fixed → chat only; exclude_chat → non-chat ("fixed");
 // neither → all. exclude_unbound drops binding-less rows (the legacy
 // include_unbound=false semantics). Search is a case-insensitive substring
@@ -948,6 +1464,7 @@ func (q *Queries) ListApplicationPage(ctx context.Context, arg ListApplicationPa
 		arg.MineOnly,
 		arg.PageCallerID,
 		arg.PublicOnly,
+		arg.ConsumeOnly,
 		arg.KindChatOnly,
 		arg.KindFixedOnly,
 		arg.KindAll,
@@ -971,6 +1488,155 @@ func (q *Queries) ListApplicationPage(ctx context.Context, arg ListApplicationPa
 	items := []ListApplicationPageRow{}
 	for rows.Next() {
 		var i ListApplicationPageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.Description,
+			&i.Icon,
+			&i.AvatarKey,
+			&i.Color,
+			&i.Kind,
+			&i.RendererKey,
+			&i.ExecutorKey,
+			&i.CategoryID,
+			&i.IsPublic,
+			&i.IsDefaultAgent,
+			&i.Enabled,
+			&i.UsageCount,
+			&i.Tags,
+			&i.DefaultConfig,
+			&i.CreatedBy,
+			&i.OrganizationID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.CategorySlug,
+			&i.CategoryName,
+			&i.BindingID,
+			&i.BindingProviderID,
+			&i.BindingProviderKey,
+			&i.BindingRuntimeType,
+			&i.BindingExternalResourceID,
+			&i.BindingIdentityMode,
+			&i.BindingExecutionMode,
+			&i.BindingSessionPolicy,
+			&i.BindingArtifactPolicy,
+			&i.BindingCapabilities,
+			&i.BindingConfig,
+			&i.BindingTimeoutSeconds,
+			&i.BindingEnabled,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listApplicationRowsByIDs = `-- name: ListApplicationRowsByIDs :many
+SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
+       a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled,
+       a.usage_count, a.tags, a.default_config, a.created_by, a.organization_id,
+       a.created_at, a.updated_at,
+       c.slug AS category_slug, c.name AS category_name,
+       b.id AS binding_id, b.provider_id AS binding_provider_id, b.provider_key AS binding_provider_key,
+       b.runtime_type AS binding_runtime_type, b.external_resource_id AS binding_external_resource_id,
+       b.identity_mode AS binding_identity_mode, b.execution_mode AS binding_execution_mode,
+       b.session_policy AS binding_session_policy, b.artifact_policy AS binding_artifact_policy,
+       b.capabilities AS binding_capabilities, b.config AS binding_config,
+       b.timeout_seconds AS binding_timeout_seconds, b.enabled AS binding_enabled
+FROM applications a
+LEFT JOIN application_categories c ON c.id = a.category_id
+LEFT JOIN runtime_bindings b
+  ON b.application_id = a.id AND b.enabled = 1
+LEFT JOIN runtime_bindings newer_b
+  ON newer_b.application_id = b.application_id
+ AND newer_b.enabled = 1
+ AND newer_b.id > b.id
+WHERE newer_b.id IS NULL
+  AND a.id IN (/*SLICE:app_ids*/?)
+  AND a.enabled = 1
+  AND (? OR a.is_public = 1)
+  AND (a.kind <> 'chat' OR b.id IS NOT NULL)
+ORDER BY a.created_at, a.id
+`
+
+type ListApplicationRowsByIDsParams struct {
+	AppIds  []uint64
+	ShowAll interface{}
+}
+
+type ListApplicationRowsByIDsRow struct {
+	ID                        uint64
+	Slug                      string
+	Name                      string
+	Description               string
+	Icon                      string
+	AvatarKey                 string
+	Color                     string
+	Kind                      string
+	RendererKey               string
+	ExecutorKey               string
+	CategoryID                sql.NullInt64
+	IsPublic                  bool
+	IsDefaultAgent            bool
+	Enabled                   bool
+	UsageCount                uint32
+	Tags                      dbtypes.JSONText
+	DefaultConfig             dbtypes.JSONText
+	CreatedBy                 sql.NullInt64
+	OrganizationID            sql.NullInt64
+	CreatedAt                 time.Time
+	UpdatedAt                 time.Time
+	CategorySlug              sql.NullString
+	CategoryName              sql.NullString
+	BindingID                 sql.NullInt64
+	BindingProviderID         sql.NullInt64
+	BindingProviderKey        sql.NullString
+	BindingRuntimeType        sql.NullString
+	BindingExternalResourceID sql.NullString
+	BindingIdentityMode       sql.NullString
+	BindingExecutionMode      sql.NullString
+	BindingSessionPolicy      sql.NullString
+	BindingArtifactPolicy     sql.NullString
+	BindingCapabilities       dbtypes.JSONText
+	BindingConfig             dbtypes.JSONText
+	BindingTimeoutSeconds     sql.NullInt32
+	BindingEnabled            sql.NullBool
+}
+
+// Full catalog rows for EXACTLY the ids the bootstrap groups selected — the
+// single row-fetch that replaces materialising a 5000-row pool.
+//
+// The visibility + consume predicates are repeated here deliberately: the
+// ids came from queries that already applied them, but re-applying makes
+// the row fetch safe on its own (and keeps the two from drifting).
+func (q *Queries) ListApplicationRowsByIDs(ctx context.Context, arg ListApplicationRowsByIDsParams) ([]ListApplicationRowsByIDsRow, error) {
+	query := listApplicationRowsByIDs
+	var queryParams []interface{}
+	if len(arg.AppIds) > 0 {
+		for _, v := range arg.AppIds {
+			queryParams = append(queryParams, v)
+		}
+		query = strings.Replace(query, "/*SLICE:app_ids*/?", strings.Repeat(",?", len(arg.AppIds))[1:], 1)
+	} else {
+		query = strings.Replace(query, "/*SLICE:app_ids*/?", "NULL", 1)
+	}
+	queryParams = append(queryParams, arg.ShowAll)
+	rows, err := q.db.QueryContext(ctx, query, queryParams...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListApplicationRowsByIDsRow{}
+	for rows.Next() {
+		var i ListApplicationRowsByIDsRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.Slug,

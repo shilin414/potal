@@ -92,14 +92,21 @@ export type ComposerApplication = ApplicationSummary & {
   capabilities?: Record<string, boolean>;
 };
 
+/**
+ * `V2Application` — the CONSUMER shape (二次复审 P2-1).
+ *
+ * It deliberately does NOT carry the provider-authoring fields
+ * (`external_resource_id`, `identity_mode`, `execution_mode`). Those are the
+ * provider's own resource identity and belong to the authoring surface only
+ * (`ManagedAgent` / `RuntimeAgentDetail`, returned by
+ * GET /v2/applications/{id} and by create/update) — leaking them into every
+ * paged list and every deep-link resolve gave every logged-in caller the
+ * internal Aily agent ids.
+ */
 export interface V2Application extends ApplicationSummary {
   executor_key?: string;
   runtime_type: string;
   provider_key: string;
-  /** Aily agent_id (or the provider's equivalent resource id). */
-  external_resource_id?: string;
-  identity_mode: string;
-  execution_mode: string;
   capabilities: Record<string, boolean>;
   /** 是否公开到市场：私有（仅自己可见）只有管理员能看到。 */
   is_public?: boolean;
@@ -190,10 +197,10 @@ export function validateAttachment(file: File): AttachmentViolation | null {
 // default agent, home shortcut groups, category rails, `@mention` candidates,
 // slug lookups. Every one of those is now a server responsibility:
 //
-//   · GET /workspace/bootstrap   → default agent + groups + category rails
-//   · GET /applications/resolve  → ONE application by slug or id
-//   · GET /applications/resolve-mention → the few `@` candidates
-//   · GET /applications/page     → the paged lists (see below)
+//   · GET /v2/workspace/bootstrap   → default agent + groups + category rails
+//   · GET /v2/applications/resolve  → ONE application by slug or id
+//   · GET /v2/applications/resolve-mention → the few `@` candidates
+//   · GET /v2/applications/page     → the paged lists (see below)
 //
 // No studio surface may call the legacy whole-array endpoint again: a
 // regression there is invisible in a small dev database and fatal in a large
@@ -229,7 +236,16 @@ export interface WorkspaceBootstrap {
 }
 
 export function fetchWorkspaceBootstrap(): Promise<WorkspaceBootstrap> {
-  return api.get<WorkspaceBootstrap>('/workspace/bootstrap');
+  // ⚠️ The `/v2` prefix is LOAD-BEARING (二次复审 P0-1).
+  //
+  // The OpenAPI (SSOT) registers `GET /api/v2/workspace/bootstrap` and the
+  // server mounts ONLY the generated routes (`genapi.HandlerFromMux`), so
+  // there is no `/api/workspace/bootstrap` alias. Since `api` is an axios
+  // instance with `baseURL = '/api'`, a path without `/v2` becomes
+  // `/api/workspace/bootstrap` → 404. The store unit tests mock this
+  // function away, which is exactly why the wrong path survived review —
+  // see `runApi.contract.test.ts`, which asserts the real URL.
+  return api.get<WorkspaceBootstrap>('/v2/workspace/bootstrap');
 }
 
 /**
@@ -392,6 +408,20 @@ export interface ApplicationPageQuery {
   /** 'chat' (market) | 'fixed' (应用中心, kind <> 'chat') | 'all'. */
   kind?: 'chat' | 'fixed' | 'all';
   scope?: 'public' | 'manage' | 'mine';
+  /**
+   * `mode` answers a DIFFERENT question from `scope` (二次复审 P0-5).
+   *
+   *   scope = who may SEE the row   (management)
+   *   mode  = may anyone actually USE it (consumption)
+   *
+   * `manage` (the backend default, omitted here) is the authoring surface:
+   * staff also sees disabled / private / binding-less rows so they can
+   * repair them. `consume` is every surface that OPENS or RUNS something
+   * (切换器, 移动端目录, bootstrap 分组): it requires `enabled` and, for a
+   * chat application, a runtime binding — the same gate the run API applies,
+   * so the UI can no longer offer something the send will refuse.
+   */
+  mode?: 'manage' | 'consume';
   /** Keep binding-less rows (the marketplace needs them repairable). */
   includeUnbound?: boolean;
   /** Case-insensitive name/description substring, evaluated in SQL. */
@@ -411,6 +441,9 @@ export async function fetchApplicationPage(
   const kind = options.kind ?? 'chat';
   if (kind !== 'chat') params.kind = kind;
   if (options.scope && options.scope !== 'public') params.scope = options.scope;
+  // `manage` is the backend default and is omitted so a management page's URL
+  // stays identical to before; only a consumer surface asks for `consume`.
+  if (options.mode && options.mode !== 'manage') params.mode = options.mode;
   if (options.includeUnbound) params.include_unbound = 'true';
   if (options.q && options.q.trim()) params.q = options.q.trim();
   if (options.categorySlug) params.category_slug = options.categorySlug;

@@ -8,14 +8,22 @@
  * not be smuggled into a data store just to keep a component compiling.
  */
 import { create } from 'zustand';
+import { registerSessionReset } from '@/stores/resetSessionState';
 
 interface CatalogUiState {
   /** Selected category slug for 应用中心; null = 全部应用. */
   fixedCategory: string | null;
   setFixedCategory: (category: string | null) => void;
+  /** Back to the inert state — called by resetSessionScopedState (P0-2). */
+  reset: () => void;
 }
 
 export const useCatalogUiStore = create<CatalogUiState>()((set) => ({
   fixedCategory: null,
   setFixedCategory: (fixedCategory) => set({ fixedCategory }),
+  reset: () => set({ fixedCategory: null }),
 }));
+
+// A category selection is not user data, but it is stale across identities in
+// exactly the same way, and resetting it is free (P0-2).
+registerSessionReset(() => useCatalogUiStore.getState().reset());

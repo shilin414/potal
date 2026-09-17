@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { registerSessionReset } from '@/stores/resetSessionState';
 import type { AppItem, AppCategory } from '@/types';
 import { api } from '@/services/api';
 
@@ -16,6 +17,8 @@ interface AppState {
   loadApp: (slug: string) => Promise<AppItem | null>;
   selectCategory: (slug: string | null) => void;
   setSearchQuery: (query: string) => void;
+  /** Back to the inert state — called by resetSessionScopedState (P0-2). */
+  reset: () => void;
 }
 
 /** Unwrap a DRF response that may be a plain array or a paginated { results } object. */
@@ -54,6 +57,14 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedCategory: null,
   searchQuery: '',
   isLoading: false,
+
+  reset: () => set({
+    apps: [],
+    categories: [],
+    selectedCategory: null,
+    searchQuery: '',
+    isLoading: false,
+  }),
 
   loadCategories: async () => {
     try {
@@ -103,3 +114,6 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   setSearchQuery: (query) => set({ searchQuery: query }),
 }));
+
+// The legacy app list is per-user (P0-2).
+registerSessionReset(() => useAppStore.getState().reset());

@@ -58,6 +58,17 @@ const AGENT_ICONS = ['🎬', '✍️', '🎙️', '✂️', '🎨', '🎵', '�
 const PAGE_SIZE = 24;
 
 /**
+ * The legacy (GraphFlow) section's render budget (二次复审 P2-2).
+ *
+ * `GET /agents/` has no server-side pagination, so the whole set arrives at
+ * once. This is NOT a filter — search still runs over the complete set — it
+ * is how many rows are MOUNTED, which is what keeps a large legacy list from
+ * blanking the page through the entrance animation (`animation-delay` × index
+ * holds the first keyframe, 执行报告 §22).
+ */
+const LOCAL_AGENT_PAGE = 24;
+
+/**
  * Cards fade in with a small stagger — but only for the first few.
  *
  * `.agent-card` is `animation: fadeIn .4s ... both`, and `both` holds the
@@ -109,6 +120,8 @@ const AgentsPage: React.FC = () => {
 
   const [runtimes, setRuntimes] = useState<AgentRuntimeDescriptor[]>([]);
   const [source, setSource] = useState<SourceFilter>('all');
+  // How many legacy rows are MOUNTED (二次复审 P2-2). Grown by 显示更多.
+  const [localRenderLimit, setLocalRenderLimit] = useState(LOCAL_AGENT_PAGE);
 
   // Rows the user has SEEN are entities the workspace may be asked to open, so
   // every fetched page seeds the entity cache: clicking a card then costs no
@@ -137,6 +150,11 @@ const AgentsPage: React.FC = () => {
   const patchBootstrap = useWorkspaceBootstrapStore((state) => state.patch);
   const removeFromBootstrap = useWorkspaceBootstrapStore((state) => state.remove);
   const reloadBootstrap = useWorkspaceBootstrapStore((state) => state.load);
+  // 二次复审 P1-4: a create / edit / delete / rename / category change can
+  // move ANY bootstrap group's membership, and the client cannot recompute a
+  // server-side Top-8. Mark the payload stale and let the next home visit
+  // (or sheet open) re-read it once — instead of refetching it here.
+  const invalidateBootstrap = useWorkspaceBootstrapStore((state) => state.invalidate);
   // 智能体接入是管理员能力：普通用户只消费市场。
   const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
   const isFirstRun = useRef(true);
@@ -153,6 +171,9 @@ const AgentsPage: React.FC = () => {
       loadAgents(selectedCategory || undefined);
       return;
     }
+    // A new filter is a new result set: the legacy render budget restarts
+    // with it, so 显示更多 cannot leave a stale expanded list behind.
+    setLocalRenderLimit(LOCAL_AGENT_PAGE);
     const timer = setTimeout(() => {
       loadAgents(selectedCategory || undefined);
     }, 300);
@@ -183,10 +204,17 @@ const AgentsPage: React.FC = () => {
   const showLocal = source !== 'runtime';
   // The runtime section is server-paged: `appAgents` is exactly what the API
   // returned for the current filters. The LOCAL (legacy GraphFlow) section is
-  // the Django `/agents` listing — a small, separately server-searched set —
-  // so it renders whole; only the runtime side carries 加载更多.
+  // the Django `/agents` listing, which is still fetched WHOLE (二次复审
+  // P2-2) — so it gets a RENDER BUDGET instead: `agents` is the full set for
+  // filtering, and only the first LOCAL_AGENT_RENDER_LIMIT rows are mounted.
+  //
+  // The budget is a render cap, never a filter (执行报告 §22): applying it
+  // before the filter would make search silently miss everything past the
+  // cap. The real fix is migrating Legacy Agent → Application, after which
+  // this section disappears and the one server-paged list is the only one.
   const pagedRuntime = showRuntime ? appAgents : [];
-  const pagedLocal = showLocal ? agents : [];
+  const localMatches = showLocal ? agents : [];
+  const pagedLocal = localMatches.slice(0, localRenderLimit);
   const totalLoaded = (showRuntime ? appAgents.length : 0)
     + (showLocal ? agents.length : 0);
 
@@ -250,6 +278,7 @@ const AgentsPage: React.FC = () => {
       // list: page, entity cache, bootstrap groups (执行报告 §15 "删除").
       removeEntity(agent.id);
       removeFromBootstrap(agent.id);
+      invalidateBootstrap();
       await refreshAll();
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '删除智能体失败');
@@ -263,6 +292,7 @@ const AgentsPage: React.FC = () => {
     try {
       await api.delete(`/agents/${agentId}/`);
       message.success('智能体已删除');
+      invalidateBootstrap();
       await refreshAll();
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '删除智能体失败');
@@ -483,6 +513,12 @@ const AgentsPage: React.FC = () => {
             >
               加载更多智能体
             </Button>
+          ) : localMatches.length > pagedLocal.length ? (
+            // The legacy set is already fully downloaded, so this only lifts
+            // the RENDER budget — no request (二次复审 P2-2).
+            <Button onClick={() => setLocalRenderLimit((n) => n + LOCAL_AGENT_PAGE)}>
+              显示更多本地智能体（还有 {localMatches.length - pagedLocal.length} 个）
+            </Button>
           ) : (
             totalLoaded > PAGE_SIZE && (
               <span className="agents-page__count">已显示全部 {totalLoaded} 个</span>
@@ -507,7 +543,8 @@ const AgentsPage: React.FC = () => {
           // constant-size payload) to keep the home shortcuts and the category
           // rails consistent — a create, rename or re-category is exactly what
           // it describes. No catalog download happens either way (执行报告 §15).
-          await refreshAll();
+          invalidateBootstrap();
+      await refreshAll();
           await reloadBootstrap(true);
         }}
       />

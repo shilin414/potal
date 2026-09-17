@@ -21,8 +21,10 @@ export async function completeFeishuLogin(code: string, state: string): Promise<
   }
 
   // Cookie session: studio_session is set by the backend; no client token.
-  useAuthStore.setState({
-    user,
-    isAuthenticated: true,
-  });
+  //
+  // Through `acceptAuthenticatedUser`, never `setState` (二次复审 P0-2): a
+  // Feishu login is exactly the user switch whose session-scoped state used
+  // to survive — the bootstrap, the entity cache, the drafts, the
+  // transcripts — because this path only ever replaced the user object.
+  useAuthStore.getState().acceptAuthenticatedUser(user);
 }

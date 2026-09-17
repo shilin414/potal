@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { registerSessionReset } from '@/stores/resetSessionState';
 import { api } from '@/services/api';
 
 export interface Project {
@@ -26,12 +27,16 @@ interface ProjectState {
   createProject: (data: any) => Promise<Project>;
   updateProject: (id: number, data: any) => Promise<void>;
   deleteProject: (id: number) => Promise<void>;
+  /** Back to the inert state — called by resetSessionScopedState (P0-2). */
+  reset: () => void;
 }
 
 export const useProjectStore = create<ProjectState>((set, get) => ({
   projects: [],
   currentProject: null,
   isLoading: false,
+
+  reset: () => set({ projects: [], currentProject: null, isLoading: false }),
 
   loadProjects: async () => {
     try {
@@ -93,3 +98,6 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     }
   },
 }));
+
+// Projects are per-user (P0-2).
+registerSessionReset(() => useProjectStore.getState().reset());

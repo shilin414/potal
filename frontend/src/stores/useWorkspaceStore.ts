@@ -10,6 +10,7 @@
  */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { registerSessionReset } from '@/stores/resetSessionState';
 
 export interface ApplicationWorkspaceState {
   /** Conversation the workspace should restore when reopened (null = new). */
@@ -234,3 +235,9 @@ export const useWorkspaceStore = create<WorkspaceStore>()(
     },
   ),
 );
+
+// Drafts, conversation ids, scroll offsets, skill selections and 最近使用 —
+// the most obviously personal state in the app, and the one that is
+// `persist`ed (so it survives even a real reload). Forget it on a user
+// switch (P0-2).
+registerSessionReset(() => useWorkspaceStore.getState().clearAll());

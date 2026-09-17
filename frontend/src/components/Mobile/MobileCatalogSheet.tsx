@@ -146,6 +146,11 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
   const paged = useApplicationPage({
     kind: type === 'agent' ? 'chat' : 'fixed',
     scope: 'manage',
+    // consume (二次复审 P0-5): tapping a row OPENS the application, so the
+    // sheet must not list 停用 or binding-less ones. The old server mode
+    // used `scope=manage` alone, which let a staff user open an agent that
+    // then refused every send.
+    mode: 'consume',
     includeUnbound: type === 'app',
     category: category === 'all' ? null : category,
     query,

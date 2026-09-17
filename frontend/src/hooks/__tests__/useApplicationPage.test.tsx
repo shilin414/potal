@@ -26,8 +26,7 @@ const mockPage = vi.mocked(fetchApplicationPage);
 
 const app = (id: number, name = `agent-${id}`): V2Application => ({
   id, slug: `slug-${id}`, name, description: '', icon: '🤖', kind: 'chat',
-  runtime_type: '', provider_key: '', identity_mode: '', execution_mode: '',
-  capabilities: {},
+  runtime_type: '', provider_key: '',  capabilities: {},
 });
 
 const page = (ids: number[], next: string, hasMore: boolean): ApplicationPage => ({

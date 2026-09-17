@@ -11,7 +11,7 @@
  * for its candidates. None of those needs the whole catalog any more.
  */
 import React, { useEffect, useState } from 'react';
-import { Spin } from 'antd';
+import { Button, Empty, Spin } from 'antd';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api } from '@/services/api';
 import { RunChatPanel } from '@/components/Chat';
@@ -47,6 +47,8 @@ const HomeWorkspace: React.FC = () => {
   const rememberConversation = useWorkspaceStore((state) => state.rememberConversation);
   const queuePrompt = useWorkspaceStore((state) => state.queuePrompt);
   const [resolving, setResolving] = useState(false);
+  /** Distinguishes "no such conversation/application" from "offline" (P1-6). */
+  const [resolveFailed, setResolveFailed] = useState(false);
 
   useEffect(() => { void loadBootstrap(); }, [loadBootstrap]);
 
@@ -65,10 +67,22 @@ const HomeWorkspace: React.FC = () => {
     if (bootstrapLoading) return undefined;
     let active = true;
     setResolving(true);
+    setResolveFailed(false);
     api.get<any>(`/conversations/${conversationParam}/`)
       .then(async (detail) => {
         if (!active) return;
-        const target = await ensureApplication(detail?.application_id);
+        let target: Awaited<ReturnType<typeof ensureApplication>>;
+        try {
+          target = await ensureApplication(detail?.application_id);
+        } catch {
+          // A 500 / timeout / offline backend (二次复审 P1-6). The old code
+          // swallowed this together with a 404 and then DELETED the user's
+          // `?conversation=` deep link, so a transient network error
+          // silently destroyed real navigation state. Keep the URL, show a
+          // retry.
+          if (active) setResolveFailed(true);
+          return;
+        }
         if (!active) return;
         if (target) {
           openApplication(target.id);
@@ -81,7 +95,9 @@ const HomeWorkspace: React.FC = () => {
         setSearchParams({}, { replace: true });
       })
       .catch(() => {
-        if (active) setSearchParams({}, { replace: true });
+        // The conversation detail itself failed. Also not a 404: keep the
+        // deep link and offer a retry.
+        if (active) setResolveFailed(true);
       })
       .finally(() => { if (active) setResolving(false); });
     return () => { active = false; };
@@ -125,6 +141,24 @@ const HomeWorkspace: React.FC = () => {
   if (resolving) {
     return (
       <div className="workspace-host__loading"><Spin size="large" /></div>
+    );
+  }
+
+  // A FAILED deep-link lookup keeps the `?conversation=` param and offers a
+  // reload (二次复审 P1-6) — the URL is the user's navigation state, so a
+  // transport error must not be "handled" by deleting it.
+  if (resolveFailed) {
+    return (
+      <div className="workspace-host__missing">
+        <Empty
+          image={Empty.PRESENTED_IMAGE_SIMPLE}
+          description="对话加载失败，请检查网络后重试"
+        >
+          <Button type="primary" onClick={() => window.location.reload()}>
+            重新加载
+          </Button>
+        </Empty>
+      </div>
     );
   }
 

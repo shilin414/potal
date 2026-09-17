@@ -163,6 +163,11 @@ type Metrics struct {
 	// series must decay to zero before the endpoint can be deleted. No label:
 	// per-caller cardinality is not worth it for a counter nobody alerts on.
 	LegacyApplicationListRequestsTotal prometheus.Counter
+	// ApplicationVisibilityDeniedTotal is labelled by surface:
+	// "detail" (GET /applications/{id}) and "avatar"
+	// (GET /applications/{id}/avatar) — see the constructor.
+	ApplicationVisibilityDeniedTotal *prometheus.CounterVec
+	WorkspaceBootstrapRequestsTotal  prometheus.Counter
 
 	// Batch 4 — SSE Hub. These are the series that prove the fan-out change
 	// happened, and they are read as RATIOS, never in isolation:
@@ -431,6 +436,29 @@ func NewMetrics(service string) *Metrics {
 				"meter: studio surfaces use /applications/page and /workspace/bootstrap, so a non-zero " +
 				"and non-decaying rate means some client still downloads the entire catalog.",
 		}),
+		// 二次复审 P0-3 / P0-4: `GET /applications/{id}` and
+		// `GET /applications/{id}/avatar` used to answer ANY authenticated
+		// caller (and the avatar, any anonymous one), which turned the
+		// sequential application id into an enumeration oracle. They now
+		// apply catalog.VisibleTo and answer 404.
+		//
+		// This meter exists because closing a hole can break a caller: a
+		// share page or an embedded client that leaned on the public avatar
+		// URL shows up here as a steady `surface="avatar"` rate instead of
+		// as "some images are broken" with no trace.
+		ApplicationVisibilityDeniedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "studio_application_visibility_denied_total",
+			Help: "Application reads refused by the visibility check, by surface. 404 is returned for " +
+				"both 'unknown' and 'not visible' on purpose, so this is the only signal that " +
+				"distinguishes them. A steady non-zero rate means a caller is probing ids or has " +
+				"lost access to something it still renders.",
+		}, []string{"surface"}),
+		WorkspaceBootstrapRequestsTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_workspace_bootstrap_requests_total",
+			Help: "Workspace bootstrap requests (二次复审 P1-1). The endpoint's cost is now independent " +
+				"of the catalog size, so this is a plain request counter — it is here to correlate " +
+				"with the paged-catalog rate, not to alert on.",
+		}),
 		SSEHubActive: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "studio_sse_hubs_active",
 			Help: "Process-local SSE run hubs (one per run being streamed by this instance).",
@@ -502,6 +530,7 @@ func NewMetrics(service string) *Metrics {
 		m.ProviderSubmissionUnknownTotal, m.ProviderSubmissionDedupTotal,
 		m.SSEReplayEventsTotal,
 		m.LegacyApplicationListRequestsTotal,
+		m.ApplicationVisibilityDeniedTotal, m.WorkspaceBootstrapRequestsTotal,
 		m.SSEHubActive, m.SSEHubSubscribersActive, m.SSEHubUpstreamsActive,
 		m.SSEHubCreatedTotal, m.SSEHubCacheReplayTotal, m.SSEHubCacheMissTotal,
 		m.SSEHubSubscriberDroppedTotal, m.SSEHubUpstreamFailureTotal,

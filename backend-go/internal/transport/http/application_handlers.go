@@ -79,35 +79,44 @@ func summaryOf(item applicationListItem) applicationSummary {
 	}
 }
 
-// applicationListItem mirrors GET /api/v2/applications (24 keys, exact).
+// applicationListItem is the CONSUMER shape of an application (二次复审
+// P2-1): everything a card / switcher row / shortcut / sheet row needs, plus
+// the two runtime facts a composer needs (`capabilities`, `skills`).
+//
+// It deliberately does NOT carry the provider-authoring fields
+// (`external_resource_id`, `identity_mode`, `execution_mode`). Those are the
+// provider's own resource identity — the Aily agent id — and they belong to
+// the authoring surface only: `GET /v2/applications/{id}` and the create /
+// update responses (ApplicationDetail). Before this split every paged list
+// and every single-row resolve leaked them to every logged-in caller.
+//
+// `RuntimeType` / `ProviderKey` stay because a card legitimately renders
+// “飞书 Aily 自定义智能体” and because they are not secrets.
 type applicationListItem struct {
-	ID                 int64          `json:"id"`
-	Slug               string         `json:"slug"`
-	Name               string         `json:"name"`
-	Description        string         `json:"description"`
-	Icon               string         `json:"icon"`
-	AvatarURL          string         `json:"avatar_url"`
-	Color              string         `json:"color"`
-	Kind               string         `json:"kind"`
-	RendererKey        string         `json:"renderer_key"`
-	ExecutorKey        string         `json:"executor_key"`
-	CategorySlug       string         `json:"category_slug"`
-	CategoryName       string         `json:"category_name"`
-	IsPublic           bool           `json:"is_public"`
-	Enabled            bool           `json:"enabled"`
-	RuntimeType        string         `json:"runtime_type"`
-	ProviderKey        string         `json:"provider_key"`
-	ExternalResourceID string         `json:"external_resource_id"`
-	IdentityMode       string         `json:"identity_mode"`
-	ExecutionMode      string         `json:"execution_mode"`
-	Capabilities       map[string]any `json:"capabilities"`
-	IsBound            bool           `json:"is_bound"`
-	IsFavorite         bool           `json:"is_favorite"`
-	IsDefaultAgent     bool           `json:"is_default_agent"`
-	CanManage          bool           `json:"can_manage"`
-	UsageCount         int64          `json:"usage_count"`
-	LastUsedAt         *string        `json:"last_used_at"`
-	GlobalUsageCount   int64          `json:"global_usage_count"`
+	ID               int64          `json:"id"`
+	Slug             string         `json:"slug"`
+	Name             string         `json:"name"`
+	Description      string         `json:"description"`
+	Icon             string         `json:"icon"`
+	AvatarURL        string         `json:"avatar_url"`
+	Color            string         `json:"color"`
+	Kind             string         `json:"kind"`
+	RendererKey      string         `json:"renderer_key"`
+	ExecutorKey      string         `json:"executor_key"`
+	CategorySlug     string         `json:"category_slug"`
+	CategoryName     string         `json:"category_name"`
+	IsPublic         bool           `json:"is_public"`
+	Enabled          bool           `json:"enabled"`
+	RuntimeType      string         `json:"runtime_type"`
+	ProviderKey      string         `json:"provider_key"`
+	Capabilities     map[string]any `json:"capabilities"`
+	IsBound          bool           `json:"is_bound"`
+	IsFavorite       bool           `json:"is_favorite"`
+	IsDefaultAgent   bool           `json:"is_default_agent"`
+	CanManage        bool           `json:"can_manage"`
+	UsageCount       int64          `json:"usage_count"`
+	LastUsedAt       *string        `json:"last_used_at"`
+	GlobalUsageCount int64          `json:"global_usage_count"`
 	// 技能配置 (agent-scoped prompt prefixes). Always present — an agent with
 	// no skills sends `[]`, never `null`, so the mobile skill sheet needs no
 	// null-guard and can distinguish "not loaded" from "none configured".
@@ -312,6 +321,22 @@ type pageUsage struct {
 	Last  *string
 }
 
+// usageMapOf converts a repository usage aggregate into the display map
+// `buildListItem` reads. Shared by the paged endpoint and the single-row
+// resolve so both render `last_used_at` from the same RFC3339 projection.
+func usageMapOf(usage map[int64]catalog.PersonalUsage) map[int64]pageUsage {
+	out := make(map[int64]pageUsage, len(usage))
+	for id, u := range usage {
+		entry := pageUsage{Count: u.Count}
+		if u.Last != nil {
+			t := u.Last.UTC().Format(time.RFC3339)
+			entry.Last = &t
+		}
+		out[id] = entry
+	}
+	return out
+}
+
 func (s *Server) ListApplicationPage(w http.ResponseWriter, r *http.Request, params genapi.ListApplicationPageParams) {
 	caller := userFrom(r.Context())
 	if caller == nil {
@@ -332,6 +357,17 @@ func (s *Server) ListApplicationPage(w http.ResponseWriter, r *http.Request, par
 		switch sc := string(*params.Scope); sc {
 		case "public", "mine", "manage":
 			scope = sc
+		}
+	}
+	// mode answers a DIFFERENT question from scope (二次复审 P0-5): scope is
+	// "who may see the row" (management), mode is "may anyone actually use
+	// it" (consumption). Defaulting to manage keeps the authoring pages
+	// (智能体市场 / 应用中心) seeing disabled / private / unbound rows.
+	mode := catalog.PageModeManage
+	if params.Mode != nil {
+		switch m := string(*params.Mode); m {
+		case catalog.PageModeManage, catalog.PageModeConsume:
+			mode = m
 		}
 	}
 	includeUnbound := params.IncludeUnbound != nil && isTruthy(*params.IncludeUnbound)
@@ -365,6 +401,7 @@ func (s *Server) ListApplicationPage(w http.ResponseWriter, r *http.Request, par
 	// limit+1 probe: has_more without a COUNT(*) (§15).
 	page, err := s.CatalogRepo.ListApplicationPage(ctx, catalog.ApplicationPageQuery{
 		Scope:           scope,
+		Mode:            mode,
 		Kind:            kind,
 		IncludeUnbound:  includeUnbound,
 		Search:          search,
@@ -406,23 +443,9 @@ func (s *Server) ListApplicationPage(w http.ResponseWriter, r *http.Request, par
 
 	providers := s.activeProviders(ctx)
 
-	favMap := map[int64]bool{}
-	for id, fav := range favorites {
-		favMap[id] = fav
-	}
-	usageMap := map[int64]pageUsage{}
-	for id, u := range usage {
-		entry := pageUsage{Count: u.Count}
-		if u.Last != nil {
-			t := u.Last.UTC().Format(time.RFC3339)
-			entry.Last = &t
-		}
-		usageMap[id] = entry
-	}
-
 	items := make([]applicationListItem, 0, len(page))
 	for _, item := range page {
-		items = append(items, s.buildListItem(item, providers, favMap, usageMap, caller))
+		items = append(items, s.buildListItem(item, providers, favorites, usageMapOf(usage), caller))
 	}
 	// Hand-rolled response (same pattern as ListApplications): the item shape
 	// is the shared applicationListItem, not the generated model struct.
@@ -502,15 +525,12 @@ func (s *Server) buildListItem(item catalog.ApplicationWithBinding, providers ma
 	favorites map[int64]bool, usage map[int64]pageUsage, caller *AuthenticatedUser) applicationListItem {
 	app := item.App
 	capsAny := map[string]any{}
-	var rt, pk, ext, im, em string
+	var rt, pk string
 	isBound := false
 	if item.Binding != nil && item.Binding.Enabled {
 		isBound = true
 		rt = item.Binding.RuntimeType
 		pk = item.Binding.ProviderKey
-		ext = item.Binding.ExternalResourceID
-		im = item.Binding.IdentityMode
-		em = item.Binding.ExecutionMode
 		var provID int64
 		if item.Binding.ProviderID != nil {
 			provID = *item.Binding.ProviderID
@@ -533,8 +553,7 @@ func (s *Server) buildListItem(item catalog.ApplicationWithBinding, providers ma
 		CategorySlug: app.CategorySlug, CategoryName: app.CategoryName,
 		IsPublic:    app.IsPublic,
 		Enabled:     app.Enabled,
-		RuntimeType: rt, ProviderKey: pk, ExternalResourceID: ext,
-		IdentityMode: im, ExecutionMode: em,
+		RuntimeType: rt, ProviderKey: pk,
 		Capabilities: capsAny, IsBound: isBound,
 		IsFavorite:     favorites[app.ID],
 		IsDefaultAgent: app.IsDefaultAgent,
@@ -552,14 +571,43 @@ func dispTime(s string) *string {
 	return &s
 }
 
+// GetApplication implements GET /api/v2/applications/{id} — the AUTHORING
+// read (二次复审 P0-3).
+//
+// The shape it answers with carries the provider-authoring fields
+// (`external_resource_id`, `identity_mode`, `execution_mode`), so it is not a
+// public read: the caller must be authenticated AND the application must be
+// visible to them. Both "does not exist" and "not visible" answer 404 — never
+// 403 — because the id is sequential and a distinguishable 403 would turn
+// this endpoint into an existence oracle for the whole catalog.
 func (s *Server) GetApplication(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
 	app, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
 	if err != nil {
 		writeDetail(w, http.StatusNotFound, "application not found")
 		return
 	}
+	if !catalog.VisibleTo(app, catalog.VisibleScopeManage, caller.ID, caller.IsStaff) {
+		s.denyApplicationVisibility("detail")
+		writeDetail(w, http.StatusNotFound, "application not found")
+		return
+	}
 	binding, _ := s.CatalogRepo.EnabledBinding(r.Context(), int64(id))
-	writeJSON(w, http.StatusOK, s.appDetail(app, binding, userFrom(r.Context())))
+	writeJSON(w, http.StatusOK, s.appDetail(app, binding, caller))
+}
+
+// denyApplicationVisibility records a visibility refusal. The response is
+// ALWAYS 404 (never 403), so without this signal an enumeration probe and a
+// caller that merely lost access are indistinguishable in the logs.
+func (s *Server) denyApplicationVisibility(surface string) {
+	if s.Metric == nil || s.Metric.ApplicationVisibilityDeniedTotal == nil {
+		return
+	}
+	s.Metric.ApplicationVisibilityDeniedTotal.WithLabelValues(surface).Inc()
 }
 
 func (s *Server) CreateApplication(w http.ResponseWriter, r *http.Request) {
@@ -796,9 +844,34 @@ var allowedAvatarExts = map[string]bool{"png": true, "jpg": true, "jpeg": true, 
 
 const avatarMaxBytes = 2 * 1024 * 1024
 
+// GetApplicationAvatar streams one application's avatar bytes (二次复审 P0-4).
+//
+// Order of checks is LOAD-BEARING:
+//
+//	authentication → visibility → ETag/304 → storage
+//
+// The ETag short-circuit must come AFTER the visibility check. Otherwise a
+// caller who lost access to an application would still get 304 Not Modified
+// for an ETag their browser already cached, i.e. they would keep seeing an
+// image they are no longer allowed to see (and `Cache-Control: immutable`
+// would keep it for a year).
+//
+// This handler is no longer reachable anonymously: it was removed from
+// publicRoutes, because a public by-id image made the sequential application
+// id an enumeration oracle.
 func (s *Server) GetApplicationAvatar(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
+	caller := userFrom(r.Context())
+	if caller == nil {
+		writeDetail(w, http.StatusUnauthorized, "Authentication credentials were not provided.")
+		return
+	}
 	app, err := s.CatalogRepo.ApplicationByID(r.Context(), int64(id))
 	if err != nil || app.AvatarKey == "" {
+		writeDetail(w, http.StatusNotFound, "avatar not set")
+		return
+	}
+	if !catalog.VisibleTo(app, catalog.VisibleScopeManage, caller.ID, caller.IsStaff) {
+		s.denyApplicationVisibility("avatar")
 		writeDetail(w, http.StatusNotFound, "avatar not set")
 		return
 	}

@@ -28,6 +28,7 @@ import {
   resolveApplication,
   type V2Application,
 } from '@/services/runApi';
+import { registerSessionReset } from '@/stores/resetSessionState';
 
 interface EntityState {
   byId: Record<number, V2Application>;
@@ -45,9 +46,15 @@ interface EntityState {
   /**
    * Resolve one application, cache-first.
    *
-   * `undefined` means unknown OR not visible to this caller — the API answers
-   * 404 for both on purpose (existence is never leaked), so callers must
-   * treat them identically.
+   * Resolves to `undefined` ONLY for a genuine 404 — "unknown or not visible
+   * to this caller", which the API answers identically on purpose
+   * (existence is never leaked).
+   *
+   * Every OTHER failure (500, timeout, network down) is REJECTED (二次复审
+   * P1-6). Swallowing all of them made a backend outage look exactly like
+   * "找不到应用：xxx", and HomeWorkspace then deleted the user's
+   * `?conversation=` deep link — destroying real navigation state to hide a
+   * transport error.
    */
   ensure: (id: number | null | undefined) => Promise<V2Application | undefined>;
   /** Same, by slug — the /chat/:slug and /app/:slug deep-link path. */
@@ -56,6 +63,20 @@ interface EntityState {
 
 /** De-duplicates concurrent lookups for the SAME key (deep-link remounts). */
 const inflight = new Map<string, Promise<V2Application | undefined>>();
+
+/**
+ * Bumped by `clear()` (二次复审 P0-2 §6). A resolve that was already in
+ * flight when the session ended must not write its answer afterwards: its
+ * generation no longer matches and its result is dropped. Clearing the map
+ * alone is not enough — the promise is still running and still resolves.
+ */
+let generation = 0;
+
+/** True only for a real 404 — the one failure that means "no such row". */
+function isNotFound(error: unknown): boolean {
+  const status = (error as any)?.response?.status;
+  return status === 404;
+}
 
 export const useApplicationEntityStore = create<EntityState>()((set, get) => ({
   byId: {},
@@ -101,7 +122,11 @@ export const useApplicationEntityStore = create<EntityState>()((set, get) => ({
     return { byId, bySlug };
   }),
 
-  clear: () => set({ byId: {}, bySlug: {} }),
+  clear: () => {
+    generation += 1;
+    inflight.clear();
+    set({ byId: {}, bySlug: {} });
+  },
 
   get: (id) => (id == null ? undefined : get().byId[id]),
   getBySlug: (slug) => (slug ? get().bySlug[slug] : undefined),
@@ -113,13 +138,22 @@ export const useApplicationEntityStore = create<EntityState>()((set, get) => ({
     const key = `id:${id}`;
     const pending = inflight.get(key);
     if (pending) return pending;
+    const myGeneration = generation;
     const request = resolveApplication({ id })
       .then((application) => {
+        // The session this request belongs to is over (P0-2).
+        if (generation !== myGeneration) return undefined;
         get().upsert(application);
         return application;
       })
-      .catch(() => undefined)
-      .finally(() => { inflight.delete(key); });
+      .catch((error: unknown) => {
+        if (generation !== myGeneration) return undefined;
+        if (isNotFound(error)) return undefined;
+        throw error;
+      })
+      .finally(() => {
+        if (inflight.get(key) === request) inflight.delete(key);
+      });
     inflight.set(key, request);
     return request;
   },
@@ -131,14 +165,27 @@ export const useApplicationEntityStore = create<EntityState>()((set, get) => ({
     const key = `slug:${slug}`;
     const pending = inflight.get(key);
     if (pending) return pending;
+    const myGeneration = generation;
     const request = resolveApplication({ slug })
       .then((application) => {
+        if (generation !== myGeneration) return undefined;
         get().upsert(application);
         return application;
       })
-      .catch(() => undefined)
-      .finally(() => { inflight.delete(key); });
+      .catch((error: unknown) => {
+        if (generation !== myGeneration) return undefined;
+        if (isNotFound(error)) return undefined;
+        throw error;
+      })
+      .finally(() => {
+        if (inflight.get(key) === request) inflight.delete(key);
+      });
     inflight.set(key, request);
     return request;
   },
 }));
+
+// Resolved application rows are cached by id + slug; they are per-caller
+// (visibility differs) and must not survive a user switch (P0-2). `clear()`
+// bumps the generation so an in-flight resolve is dropped, not written.
+registerSessionReset(() => useApplicationEntityStore.getState().clear());

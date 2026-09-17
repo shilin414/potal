@@ -26,6 +26,17 @@ import {
 export interface UseApplicationPageOptions {
   kind: 'chat' | 'fixed' | 'all';
   scope?: 'public' | 'manage' | 'mine';
+  /**
+   * `manage` (default) lists what the caller may ADMINISTER — including
+   * disabled, private and binding-less rows, which is what 智能体市场 and
+   * 应用中心 need in order to repair them.
+   *
+   * `consume` (二次复审 P0-5) lists what the caller may actually OPEN or
+   * RUN: enabled, and bound when `kind === 'chat'`. Every picker, switcher
+   * and shortcut list must use it — otherwise a staff user sees (and can
+   * click) a 停用 agent whose first message the run API refuses.
+   */
+  mode?: 'manage' | 'consume';
   includeUnbound?: boolean;
   /** Client-side category filter, sent to the backend as category_slug. */
   category?: string | null;
@@ -57,7 +68,7 @@ const dedupeById = (items: V2Application[]): V2Application[] => {
 
 export function useApplicationPage(options: UseApplicationPageOptions) {
   const {
-    kind, scope, includeUnbound, category, query, limit = 24,
+    kind, scope, mode, includeUnbound, category, query, limit = 24,
     debounceMs = 300, enabled = true,
   } = options;
 
@@ -92,6 +103,7 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
       const page = await fetchApplicationPage({
         kind,
         scope,
+        mode,
         includeUnbound,
         q: debouncedQuery,
         categorySlug: category || undefined,
@@ -112,7 +124,7 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
       if (requestIdRef.current === requestId) setLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled, kind, scope, includeUnbound, debouncedQuery, category, limit]);
+  }, [enabled, kind, scope, mode, includeUnbound, debouncedQuery, category, limit]);
 
   useEffect(() => { void fetchFirstPage(); }, [fetchFirstPage]);
 
@@ -137,7 +149,7 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
     setLoadingMore(true);
     try {
       const page = await fetchApplicationPage({
-        kind, scope, includeUnbound, q: debouncedQuery,
+        kind, scope, mode, includeUnbound, q: debouncedQuery,
         categorySlug: category || undefined, limit, cursor,
       });
       if (requestIdRef.current !== requestId) return; // filters changed mid-flight
@@ -150,7 +162,7 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
     } finally {
       if (requestIdRef.current === requestId) setLoadingMore(false);
     }
-  }, [enabled, kind, scope, includeUnbound, debouncedQuery, category, limit, cursor, loadingMore, loading]);
+  }, [enabled, kind, scope, mode, includeUnbound, debouncedQuery, category, limit, cursor, loadingMore, loading]);
 
   /** Local update of ONE card (执行报告 §31 — never a full reload). */
   const patchItem = useCallback((id: number, patch: Partial<V2Application>) => {

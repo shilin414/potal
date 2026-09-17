@@ -17,6 +17,7 @@ import { ArrowRightOutlined, SearchOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { useCatalogUiStore } from '@/stores/useCatalogUiStore';
 import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
+import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useApplicationPage } from '@/hooks/useApplicationPage';
 import { updateAgentApplication } from '@/services/runApi';
@@ -73,6 +74,37 @@ const AppsPage: React.FC = () => {
   const upsertEntities = useApplicationEntityStore((state) => state.upsertMany);
   useEffect(() => { upsertEntities(apps); }, [apps, upsertEntities]);
 
+  /**
+   * One mutation, THREE writes (二次复审 P1-3).
+   *
+   * A row this page has rendered is known in three places: the paged list,
+   * the entity cache (a card click resolves `/app/:slug` from it without a
+   * request), and the workspace bootstrap (首页 固定应用 + the category
+   * rails). Writing only the first used to leave the other two stale: the
+   * switch showed 停用 while the cached entity — the one a deep link opens —
+   * still said enabled, and 首页 kept offering the app.
+   */
+  const applyApplicationMutation = (
+    id: number,
+    patch: Partial<V2Application>,
+  ) => {
+    patchItem(id, patch);
+    useApplicationEntityStore.getState().patch(id, patch);
+
+    if (patch.enabled === undefined && patch.is_public === undefined) return;
+    // Visibility changed, so every bootstrap group's membership may have
+    // changed too (a 停用 app leaves 常用应用; an enabled one may enter 最近
+    // / 推荐 / a category count). The client cannot recompute a server-side
+    // Top-8, so it marks the bootstrap stale and lets the next home visit
+    // settle it (P1-4).
+    useWorkspaceBootstrapStore.getState().invalidate();
+    if (patch.enabled === false) {
+      // Remove it NOW as well: 首页 must stop offering it in this session,
+      // not after the user happens to reopen the home page.
+      useWorkspaceBootstrapStore.getState().remove(id);
+    }
+  };
+
   const handleToggle = async (
     app: V2Application,
     patch: { enabled?: boolean; is_public?: boolean },
@@ -84,7 +116,7 @@ const AppsPage: React.FC = () => {
       // Local patch only (执行报告 §31): the switch is the source of truth
       // the moment the server accepted it — re-downloading the whole catalog
       // for one boolean was the pre-pagination behaviour.
-      patchItem(app.id, patch);
+      applyApplicationMutation(app.id, patch);
       message.success(`${app.name} ${hint}`);
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '操作失败，请重试');

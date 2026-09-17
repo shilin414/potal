@@ -127,8 +127,7 @@ const summary = (over: Partial<ApplicationSummary> & { id: number; name: string 
 
 const app = (over: Partial<V2Application> & { id: number; name: string }): V2Application => ({
   slug: `slug-${over.id}`, description: '', icon: '', kind: 'chat',
-  runtime_type: 'agent', provider_key: 'feishu_aily', identity_mode: 'user',
-  execution_mode: 'interactive', capabilities: {}, enabled: true,
+  runtime_type: 'agent', provider_key: 'feishu_aily', capabilities: {}, enabled: true,
   ...over,
 });
 

@@ -385,6 +385,19 @@ paths:
           in: query
           schema: { type: string, enum: [public, mine, manage], default: public }
           description: Invalid values fall back to public.
+        - name: mode
+          in: query
+          schema: { type: string, enum: [manage, consume], default: manage }
+          description: >
+            WHO may see the row is `scope`; whether the row may actually be
+            USED is `mode` (二次复审 P0-5). `manage` (default) is the
+            management surface (智能体市场 / 应用中心): staff also sees
+            disabled, private and binding-less rows so they can repair them.
+            `consume` is every surface that opens or runs something
+            (切换器 / 移动端目录 / bootstrap 分组): it requires
+            `enabled = 1` and, for `kind = chat`, an enabled runtime binding —
+            exactly the predicate `AuthorizeExecution` enforces, so the UI can
+            no longer offer an application that the run API then refuses.
         - name: include_unbound
           in: query
           schema: { type: string }
@@ -431,6 +444,11 @@ paths:
         visible — existence is never leaked. This is what makes
         "open /chat/sales" cost one small request instead of a catalog
         download plus Array.find().
+
+        Resolution is a CONSUMPTION entry point (二次复审 P0-5), so it also
+        requires `catalog.Usable`: `enabled = 1` and, for `kind = chat`, an
+        enabled runtime binding. Without that a staff caller could open
+        /chat/disabled-agent, type a message, and have the run API refuse it.
       parameters:
         - name: slug
           in: query
@@ -451,8 +469,13 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
+        "401":
+          description: not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
         "404":
-          description: unknown or not visible to this caller
+          description: unknown, not visible, or not usable by this caller
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
@@ -469,6 +492,10 @@ paths:
         ranked (exact name/slug first, then name prefixes, then name
         substrings) and capped, so the composer never needs the whole catalog
         to route `@销售助手 帮我查一下`.
+
+        Like `resolve`, this is a CONSUMPTION entry point (二次复审 P0-5): only
+        usable applications are candidates, so `@` can never switch the
+        composer to an application the next send would be refused for.
       parameters:
         - name: q
           in: query
@@ -495,15 +522,27 @@ paths:
     get:
       operationId: getApplication
       tags: [applications]
-      summary: Application detail (compact shape)
+      summary: Application detail (compact authoring shape)
+      description: >
+        Carries provider-authoring fields (`external_resource_id`,
+        `identity_mode`, `execution_mode`), so it is NOT a public read: the
+        caller must be authenticated and the application must be VISIBLE to
+        them (二次复审 P0-3). Invisible and nonexistent both answer 404 —
+        otherwise the sequential id would let any logged-in user enumerate
+        every agent's provider resource id.
       responses:
         "200":
           description: Detail
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApplicationDetail" }
+        "401":
+          description: not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
         "404":
-          description: application not found
+          description: unknown or not visible to this caller
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
@@ -589,7 +628,15 @@ paths:
     get:
       operationId: getApplicationAvatar
       tags: [applications]
-      summary: Stream avatar image bytes
+      summary: Stream avatar image bytes (session-authenticated, visibility-checked)
+      description: >
+        NOT a public route (二次复审 P0-4): it used to sit in `publicRoutes`,
+        which made every avatar readable by id without a session and turned
+        the sequential application id into an enumeration oracle. An `<img>`
+        on a studio page is a same-origin request and already carries the
+        Studio Session cookie, so authentication costs nothing. The
+        visibility check runs BEFORE the ETag / 304 short-circuit, so a
+        cached browser can never keep an image the caller has lost access to.
       responses:
         "200":
           description: Image bytes
@@ -598,8 +645,13 @@ paths:
             image/jpeg: {}
             image/gif: {}
             image/webp: {}
+        "401":
+          description: not authenticated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
         "404":
-          description: avatar not set
+          description: avatar not set, or application not visible to this caller
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }

@@ -66,6 +66,74 @@ type Querier interface {
 	// caller must treat that as a conflict, never overwrite.
 	BindAgentThreadSessionOwned(ctx context.Context, arg BindAgentThreadSessionOwnedParams) (sql.Result, error)
 	BindAttachmentToRun(ctx context.Context, arg BindAttachmentToRunParams) error
+	// 智能体分类 rail. Grouped in SQL (never in Go over a pool) and ordered by
+	// first appearance (MIN(created_at)) — the order the market itself lists
+	// applications in. Rows with no category come back with an EMPTY slug and
+	// are rendered as the `__uncategorized__` sentinel by the caller.
+	BootstrapAgentCategories(ctx context.Context, showAll interface{}) ([]BootstrapAgentCategoriesRow, error)
+	// Same rail for 应用中心 (kind <> 'chat'), which needs no runtime binding.
+	BootstrapAppCategories(ctx context.Context, showAll interface{}) ([]BootstrapAppCategoriesRow, error)
+	// ─────────────────────────────────────────────────────────────────────────
+	// Workspace bootstrap groups (二次复审 P1-1)
+	//
+	// The first version of the bootstrap ran ONE `ListApplicationPage` with
+	// `Limit = 5000` and derived the groups in Go. That made the HTTP RESPONSE
+	// constant-size but not the COST: rows examined, Go memory and CPU all grew
+	// with the catalog, and past row 5000 the result was silently WRONG (a
+	// category, the top 推荐 agent or the only valid default fallback that sorts
+	// after row 5000 simply disappeared).
+	//
+	// These queries ask the database for the business answer directly, so the
+	// cost is bounded by the groups themselves (≤ 8 rows each):
+	//
+	//   query count      fixed (one per group + one row fetch)
+	//   rows examined    bounded by the indexes, not the catalog
+	//   Go objects       ≤ ~40 applications, regardless of catalog size
+	//
+	// Every one of them applies, IN SQL:
+	//
+	//   * the visibility policy  — `show_all` (staff) OR `is_public = 1`;
+	//   * the CONSUME policy     — `enabled = 1` AND, for kind='chat', an
+	//                              enabled runtime binding (P0-5); a bootstrap
+	//                              group is a shortcut the user will click, so
+	//                              it must never offer something the run API
+	//                              would refuse.
+	//
+	// `ONLY_FULL_GROUP_BY` (MySQL 5.7 default) is why the usage aggregate is a
+	// DERIVED TABLE joined on application_id instead of a `GROUP BY a.id` over
+	// the selected application columns: grouping by the primary key alone is not
+	// enough for the server to accept the other selected columns.
+	// ─────────────────────────────────────────────────────────────────────────
+	// 默认智能体: the explicit main agent wins; otherwise the first enabled +
+	// bound chat application in catalog order (created_at, id) — the same
+	// fallback the old Go-side `buildBootstrapGroups` implemented, so a fresh
+	// install with nothing configured still gets a working composer.
+	//
+	// `enabled = 1` is NEW (二次复审 P0-6): a disabled application used to stay
+	// the default if it was promoted before being switched off, which bound the
+	// home composer to an agent that cannot execute.
+	BootstrapDefaultApplication(ctx context.Context, arg BootstrapDefaultApplicationParams) (BootstrapDefaultApplicationRow, error)
+	// 收藏: chat applications this caller starred, most recently used first.
+	// NULL `last_used_at` sorts LAST under DESC, matching the old Go `usedAt()`
+	// (a missing timestamp meant "never used", i.e. the oldest possible).
+	BootstrapFavoriteApplications(ctx context.Context, arg BootstrapFavoriteApplicationsParams) ([]BootstrapFavoriteApplicationsRow, error)
+	// 常用智能体: chat applications this caller has actually run, most runs first.
+	BootstrapFrequentApplications(ctx context.Context, arg BootstrapFrequentApplicationsParams) ([]BootstrapFrequentApplicationsRow, error)
+	// 最近使用: chat applications this caller ran, most recent first (the pool's
+	// created_at order breaks ties, reproducing the old stable Go sort).
+	BootstrapRecentApplications(ctx context.Context, arg BootstrapRecentApplicationsParams) ([]BootstrapRecentApplicationsRow, error)
+	// 常用应用 (应用中心 entries on the home page): enabled non-chat
+	// applications, the recently opened ones first, then catalog order. No
+	// runtime binding is required — a fixed application is a page delivered by
+	// the build, not a provider runtime.
+	//
+	// The group must still SHOW the fixed apps on a workspace nobody has used
+	// yet, so `used` is an ORDERING key only, never a filter.
+	BootstrapRecentFixedApplications(ctx context.Context, arg BootstrapRecentFixedApplicationsParams) ([]BootstrapRecentFixedApplicationsRow, error)
+	// 推荐: chat applications this caller has NEVER used and never starred, most
+	// used GLOBALLY first. "Never used" is the definition, so both exclusions
+	// are NOT EXISTS — not a left join whose result is then filtered in Go.
+	BootstrapRecommendedApplications(ctx context.Context, arg BootstrapRecommendedApplicationsParams) ([]BootstrapRecommendedApplicationsRow, error)
 	// Claims the sequence read above. Written as `x + 1` rather than a computed
 	// literal because MySQL reports CHANGED rows: assigning the already-read
 	// value would report 0 and be indistinguishable from a missing run row.
@@ -604,6 +672,16 @@ type Querier interface {
 	//   regular users    → enabled = 1, plus
 	//     scope=mine     → own rows (private included),
 	//     scope=public/manage → is_public = 1.
+	// `mode` (二次复审 P0-5) is ORTHOGONAL to scope: scope is "who may SEE the
+	// row" (a management concern), mode is "may anyone actually USE it"
+	// (consumption).
+	//   mode=consume   → additionally `enabled = 1` AND, for kind='chat', an
+	//                    enabled runtime binding (b.id IS NOT NULL). That is the
+	//                    SAME predicate AuthorizeExecution enforces, so a
+	//                    consumer surface can never list something the run API
+	//                    would then refuse. Staff is deliberately NOT exempt:
+	//                    seeing a disabled agent in 智能体市场 is a management
+	//                    need, opening it from the switcher is not.
 	// kind: exclude_fixed → chat only; exclude_chat → non-chat ("fixed");
 	// neither → all. exclude_unbound drops binding-less rows (the legacy
 	// include_unbound=false semantics). Search is a case-insensitive substring
@@ -623,6 +701,13 @@ type Querier interface {
 	// The cursor is the (created_at, id) keyset in ascending order — the same
 	// order the legacy list used, so page one keeps the existing UI ordering.
 	ListApplicationPage(ctx context.Context, arg ListApplicationPageParams) ([]ListApplicationPageRow, error)
+	// Full catalog rows for EXACTLY the ids the bootstrap groups selected — the
+	// single row-fetch that replaces materialising a 5000-row pool.
+	//
+	// The visibility + consume predicates are repeated here deliberately: the
+	// ids came from queries that already applied them, but re-applying makes
+	// the row fetch safe on its own (and keeps the two from drifting).
+	ListApplicationRowsByIDs(ctx context.Context, arg ListApplicationRowsByIDsParams) ([]ListApplicationRowsByIDsRow, error)
 	// show_all lets staff bypass the SQL pre-filter; the authoritative
 	// scope check still happens in Go (visible()).
 	ListApplicationsByVisibility(ctx context.Context, arg ListApplicationsByVisibilityParams) ([]ListApplicationsByVisibilityRow, error)

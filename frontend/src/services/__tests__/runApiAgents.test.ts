@@ -52,7 +52,7 @@ describe('workspace bootstrap + single-application resolution', () => {
   it('reads the constant-size start-up payload', async () => {
     await fetchWorkspaceBootstrap();
 
-    expect(mocks.get).toHaveBeenCalledWith('/workspace/bootstrap');
+    expect(mocks.get).toHaveBeenCalledWith('/v2/workspace/bootstrap');
   });
 
   it('never asks for the legacy whole-catalog array any more', async () => {

@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { registerSessionReset } from '@/stores/resetSessionState';
 import { persist } from 'zustand/middleware';
 import axiosInstance from '@/services/axios';
 import {
@@ -104,6 +105,13 @@ interface ConversationState extends AgentRuntimeState {
   deleteConversation: (conversationId: string) => Promise<void>;
   setCurrentConversation: (conversation: ConversationDetail | null) => void;
   clearError: () => void;
+  /**
+   * Forget every transcript (二次复审 P0-2). See
+   * `resetSessionScopedState` — this store is `persist`ed, so without an
+   * explicit clear the previous user's conversation list comes straight
+   * back out of localStorage on the next reload.
+   */
+  clearAll: () => void;
 }
 
 export const useConversationStore = create<ConversationState>()(
@@ -117,6 +125,17 @@ export const useConversationStore = create<ConversationState>()(
       pendingQuestion: null,
       agentActivity: null,
       ...initialAgentRuntimeState(),
+
+      clearAll: () => set({
+        conversations: [],
+        currentConversation: null,
+        isLoading: false,
+        error: null,
+        streamingMessageId: null,
+        pendingQuestion: null,
+        agentActivity: null,
+        ...initialAgentRuntimeState(),
+      }),
 
       fetchConversations: async () => {
         set({ isLoading: true, error: null });
@@ -703,3 +722,6 @@ export const useConversationStore = create<ConversationState>()(
     }
   )
 );
+
+// The legacy transcript store, also persisted (P0-2).
+registerSessionReset(() => useConversationStore.getState().clearAll());

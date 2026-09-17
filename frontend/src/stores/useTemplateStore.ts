@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { registerSessionReset } from '@/stores/resetSessionState';
 import { api } from '@/services/api';
 import type {
   TemplateCategory,
@@ -20,6 +21,8 @@ interface TemplateState {
   clearCurrentTemplate: () => void;
   selectCategory: (slug: string | null) => void;
   setSearchQuery: (query: string) => void;
+  /** Back to the inert state — called by resetSessionScopedState (P0-2). */
+  reset: () => void;
 }
 
 const unwrap = <T,>(response: T[] | { results?: T[] }): T[] =>
@@ -33,6 +36,16 @@ export const useTemplateStore = create<TemplateState>((set, get) => ({
   selectedCategory: null,
   searchQuery: '',
   isLoading: false,
+
+  reset: () => set({
+    categories: [],
+    templates: [],
+    currentTemplate: null,
+    isLoadingTemplate: false,
+    selectedCategory: null,
+    searchQuery: '',
+    isLoading: false,
+  }),
 
   loadCategories: async () => {
     try {
@@ -84,3 +97,6 @@ export const useTemplateStore = create<TemplateState>((set, get) => ({
   selectCategory: (slug) => set({ selectedCategory: slug }),
   setSearchQuery: (query) => set({ searchQuery: query }),
 }));
+
+// Template lists and the open template are per-user (P0-2).
+registerSessionReset(() => useTemplateStore.getState().reset());

@@ -14,8 +14,7 @@ import type { ApplicationSummary, V2Application } from '@/services/runApi';
 
 const app = (over: Partial<V2Application>): V2Application => ({
   id: 1, slug: 's', name: 'A', description: '', icon: '', kind: 'chat',
-  runtime_type: 'agent', provider_key: 'feishu_aily', identity_mode: 'user',
-  execution_mode: 'interactive', capabilities: {},
+  runtime_type: 'agent', provider_key: 'feishu_aily', capabilities: {},
   ...over,
 });
 

@@ -27,22 +27,14 @@ import (
 // query PER ROW), plus the caller's own usage and favourites, which are
 // bounded by what that caller actually did.
 
-const (
-	// bootstrapPoolLimit bounds the single pool query that feeds the groups.
-	// The groups below are capped at 8 rows each and the category rails are
-	// a handful of entries, so this only has to be "larger than any real
-	// catalog": beyond it the rails and 推荐 would under-report, which is why
-	// the value is deliberately generous.
-	bootstrapPoolLimit = 5000
-
-	// bootstrapGroupLimit is the home-shortcut budget per group (§35).
-	bootstrapGroupLimit = 8
-
-	// mentionCandidateLimit caps the `@` candidate list (§14). The composer
-	// only needs the few applications whose names could match the token the
-	// user typed.
-	mentionCandidateLimit = 10
-)
+// mentionCandidateLimit caps the `@` candidate list (§14). The composer
+// only needs the few applications whose names could match the token the
+// user typed.
+//
+// note: the home-shortcut budget per group lives in
+// catalog.BootstrapGroupLimit — it is the SQL LIMIT of every bootstrap
+// group query, so it has exactly one definition.
+const mentionCandidateLimit = 10
 
 type applicationCategory struct {
 	Slug  string `json:"slug"`
@@ -69,6 +61,25 @@ type mentionCandidate struct {
 }
 
 // GetWorkspaceBootstrap implements GET /api/v2/workspace/bootstrap.
+//
+// Cost model (二次复审 P1-1): a FIXED number of queries, each capped at
+// `catalog.BootstrapGroupLimit` rows, plus ONE row fetch over the ≤ ~40 ids
+// those queries selected. Nothing here scales with the catalog:
+//
+//	DB rows examined   bounded by the indexes
+//	Go Application objects  ≤ ~40
+//	HTTP response      ~30 rows
+//
+// The previous implementation ran one `ListApplicationPage{Limit: 5000}` and
+// derived the groups in Go. That only made the RESPONSE constant-size; rows
+// examined, Go memory and CPU still grew with the catalog, and past row 5000
+// the answer was silently WRONG — a category that only appears later, the
+// top-`usage_count` 推荐 agent, or the only valid default fallback would
+// simply vanish.
+//
+// Every group is a CONSUMPTION list (P0-5): `enabled = 1` and, for
+// `kind = chat`, an enabled runtime binding are enforced in SQL, so no
+// shortcut can offer an application the run API would refuse.
 func (s *Server) GetWorkspaceBootstrap(w http.ResponseWriter, r *http.Request) {
 	caller := userFrom(r.Context())
 	if caller == nil {
@@ -76,53 +87,203 @@ func (s *Server) GetWorkspaceBootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := r.Context()
+	if s.Metric != nil {
+		s.Metric.WorkspaceBootstrapRequestsTotal.Inc()
+	}
 
-	// scope=manage + include_unbound mirrors what the legacy whole-catalog
-	// load used, so nothing that used to appear can disappear: a caller's own
-	// private agents and the marketplace's repairable unbound agents stay in
-	// the pool (visible() already applies enabled/public for non-staff).
-	pool, err := s.CatalogRepo.ListApplicationPage(ctx, catalog.ApplicationPageQuery{
-		Scope:          catalog.VisibleScopeManage,
-		Kind:           catalog.PageQueryKindAll,
-		IncludeUnbound: true,
-		Limit:          bootstrapPoolLimit,
-		CallerID:       caller.ID,
-		IsStaff:        caller.IsStaff,
+	groups, err := s.CatalogRepo.BootstrapGroups(ctx, catalog.BootstrapGroupQuery{
+		CallerID: caller.ID, IsStaff: caller.IsStaff,
 	})
 	if err != nil {
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	categories, err := s.CatalogRepo.BootstrapCategories(ctx, caller.IsStaff)
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 
-	usage := s.personalUsage(ctx, caller.ID)
-	favorites := s.personalFavorites(ctx, caller.ID)
+	// ONE row fetch for every id the groups selected. The order lives in the
+	// group slices, not in the `IN (...)`, so rows are indexed by id and
+	// re-emitted in group order below.
+	ids := bootstrapGroupIDs(groups)
+	rows, err := s.CatalogRepo.ListApplicationRowsByIDs(ctx, ids, caller.IsStaff)
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Favourites are the ONE personal fact the ranking queries do not carry
+	// for every group (推荐 excludes them by definition, but 常用 / 最近 /
+	// 常用应用 must still show the ✩), so it is one bounded `IN (...)`.
+	favorites, err := s.CatalogRepo.FavoritesByApplications(ctx, caller.ID, ids)
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	providers := s.activeProviders(ctx)
 
-	items := make([]applicationListItem, 0, len(pool))
-	for _, entry := range pool {
-		items = append(items, s.buildListItem(entry, providers, favorites, usage, caller))
+	items := make(map[int64]applicationListItem, len(rows))
+	for _, row := range rows {
+		items[row.App.ID] = s.buildListItem(row, providers, favorites,
+			bootstrapUsage(groups, row.App.ID), caller)
 	}
 
-	groups := buildBootstrapGroups(items)
 	out := workspaceBootstrap{
-		Favorites:       summarizeAll(groups.Favorites),
-		Frequent:        summarizeAll(groups.Frequent),
-		Recent:          summarizeAll(groups.Recent),
-		Recommended:     summarizeAll(groups.Recommended),
-		RecentFixedApps: summarizeAll(groups.RecentFixedApps),
-		AgentCategories: groups.AgentCategories,
-		AppCategories:   groups.AppCategories,
+		Favorites:       bootstrapSummaries(groups.Favorites, items),
+		Frequent:        bootstrapSummaries(groups.Frequent, items),
+		Recent:          bootstrapSummaries(groups.Recent, items),
+		Recommended:     bootstrapSummaries(groups.Recommended, items),
+		RecentFixedApps: bootstrapSummaries(groups.RecentFixedApps, items),
+		AgentCategories: bootstrapCategoryRail(categories.Agents),
+		AppCategories:   bootstrapCategoryRail(categories.Apps),
 	}
-	if groups.DefaultApplication != nil {
-		// The composer bound to this application renders its 技能 chips and
-		// chooses its attachment entry from the runtime capabilities, so this
-		// ONE row carries the two fields the display projection drops (§11).
-		def := summaryOf(*groups.DefaultApplication)
-		def.Skills = groups.DefaultApplication.Skills
-		def.Capabilities = groups.DefaultApplication.Capabilities
-		out.DefaultApplication = &def
+	if groups.Default != nil {
+		if item, ok := items[groups.Default.ApplicationID]; ok {
+			// The composer bound to this application renders its 技能 chips
+			// and chooses its attachment entry from the runtime capabilities,
+			// so this ONE row carries the two fields the display projection
+			// drops (§11).
+			def := summaryOf(item)
+			def.Skills = item.Skills
+			def.Capabilities = item.Capabilities
+			out.DefaultApplication = &def
+		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// bootstrapGroupIDs collects every id the groups selected, deduplicated — the
+// input of the single row fetch.
+func bootstrapGroupIDs(groups catalog.BootstrapGroups) []int64 {
+	seen := map[int64]bool{}
+	out := make([]int64, 0, catalog.BootstrapGroupLimit*6)
+	appendRow := func(row *catalog.BootstrapGroupRow) {
+		if row == nil || seen[row.ApplicationID] {
+			return
+		}
+		seen[row.ApplicationID] = true
+		out = append(out, row.ApplicationID)
+	}
+	appendRow(groups.Default)
+	for i := range groups.Favorites {
+		appendRow(&groups.Favorites[i])
+	}
+	for i := range groups.Frequent {
+		appendRow(&groups.Frequent[i])
+	}
+	for i := range groups.Recent {
+		appendRow(&groups.Recent[i])
+	}
+	for i := range groups.Recommended {
+		appendRow(&groups.Recommended[i])
+	}
+	for i := range groups.RecentFixedApps {
+		appendRow(&groups.RecentFixedApps[i])
+	}
+	return out
+}
+
+// bootstrapUsage rebuilds the per-application usage map `buildListItem`
+// expects, from the personal usage the ranking query already returned for
+// that row.
+func bootstrapUsage(groups catalog.BootstrapGroups, id int64) map[int64]pageUsage {
+	entry := func(row *catalog.BootstrapGroupRow) (pageUsage, bool) {
+		if row == nil {
+			return pageUsage{}, false
+		}
+		out := pageUsage{Count: row.UsageCount}
+		if row.LastUsedAt != nil {
+			t := row.LastUsedAt.UTC().Format(time.RFC3339)
+			out.Last = &t
+		}
+		return out, true
+	}
+	if groups.Default != nil && groups.Default.ApplicationID == id {
+		if u, ok := entry(groups.Default); ok {
+			return map[int64]pageUsage{id: u}
+		}
+	}
+	for i := range groups.Favorites {
+		if groups.Favorites[i].ApplicationID != id {
+			continue
+		}
+		if u, ok := entry(&groups.Favorites[i]); ok {
+			return map[int64]pageUsage{id: u}
+		}
+	}
+	for i := range groups.Frequent {
+		if groups.Frequent[i].ApplicationID != id {
+			continue
+		}
+		if u, ok := entry(&groups.Frequent[i]); ok {
+			return map[int64]pageUsage{id: u}
+		}
+	}
+	for i := range groups.Recent {
+		if groups.Recent[i].ApplicationID != id {
+			continue
+		}
+		if u, ok := entry(&groups.Recent[i]); ok {
+			return map[int64]pageUsage{id: u}
+		}
+	}
+	for i := range groups.RecentFixedApps {
+		if groups.RecentFixedApps[i].ApplicationID != id {
+			continue
+		}
+		if u, ok := entry(&groups.RecentFixedApps[i]); ok {
+			return map[int64]pageUsage{id: u}
+		}
+	}
+	return nil
+}
+
+// bootstrapSummaries emits one group in the order the SQL returned, skipping
+// ids the row fetch could not resolve (a row deleted between the two
+// queries, or one whose visibility changed).
+func bootstrapSummaries(
+	group []catalog.BootstrapGroupRow,
+	items map[int64]applicationListItem,
+) []applicationSummary {
+	out := make([]applicationSummary, 0, len(group))
+	for _, row := range group {
+		item, ok := items[row.ApplicationID]
+		if !ok {
+			continue
+		}
+		out = append(out, summaryOf(item))
+	}
+	return out
+}
+
+// bootstrapCategoryRail renders one category rail, turning the SQL's empty
+// slug (rows with no category at all) into the `__uncategorized__` sentinel
+// the paged endpoint understands — so a tap on 其他 needs no client-side
+// special case.
+func bootstrapCategoryRail(rows []catalog.BootstrapCategory) []applicationCategory {
+	out := make([]applicationCategory, 0, len(rows)+1)
+	for _, row := range rows {
+		slug := strings.TrimSpace(row.Slug)
+		if slug == "" {
+			// Deferred: appended once at the end so the rail keeps the
+			// first-appearance order of the real categories.
+			continue
+		}
+		name := strings.TrimSpace(row.Name)
+		if name == "" {
+			name = slug
+		}
+		out = append(out, applicationCategory{Slug: slug, Name: name, Count: row.Count})
+	}
+	for _, row := range rows {
+		if strings.TrimSpace(row.Slug) != "" {
+			continue
+		}
+		out = append(out, applicationCategory{
+			Slug: catalog.PageUncategorizedSlug, Name: "其他", Count: row.Count})
+	}
+	return out
 }
 
 // ResolveApplication implements GET /api/v2/applications/resolve (§12).
@@ -170,12 +331,35 @@ func (s *Server) ResolveApplication(w http.ResponseWriter, r *http.Request, para
 	}
 
 	binding, _ := s.CatalogRepo.EnabledBinding(ctx, app.ID)
-	usage := s.personalUsage(ctx, caller.ID)
-	favorites := s.personalFavorites(ctx, caller.ID)
+	// Resolution is a CONSUMPTION entry point (二次复审 P0-5): a deep link
+	// is "open this and let me talk to it", so the same `Usable` predicate
+	// AuthorizeExecution enforces applies here. Without it a staff caller
+	// could open /chat/disabled-agent and only discover at send time that
+	// the run is refused.
+	if !catalog.Usable(app, binding) {
+		writeDetail(w, http.StatusNotFound, "application not found")
+		return
+	}
+
+	// ONE application ⇒ ONE usage row (二次复审 P1-2). `personalUsage()`
+	// re-aggregated the caller's ENTIRE run history on every deep link —
+	// the very cost the paged endpoint was refactored to avoid. Both
+	// queries are index-covered by idx_runs_user_application_created
+	// (migration 0025).
+	usage, err := s.CatalogRepo.UsageByApplications(ctx, caller.ID, []int64{app.ID})
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	favorites, err := s.CatalogRepo.FavoritesByApplications(ctx, caller.ID, []int64{app.ID})
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	providers := s.activeProviders(ctx)
 	item := s.buildListItem(
 		catalog.ApplicationWithBinding{App: app, Binding: binding},
-		providers, favorites, usage, caller)
+		providers, favorites, usageMapOf(usage), caller)
 	writeJSON(w, http.StatusOK, item)
 }
 
@@ -197,8 +381,15 @@ func (s *Server) ResolveApplicationMention(w http.ResponseWriter, r *http.Reques
 	// One narrow search over the same SQL the catalog page uses: `q` is the
 	// token the user typed, so anything whose NAME could match is already in
 	// this page (name/description/category LIKE, case-insensitively).
+	//
+	// Mode=consume (二次复审 P0-5): `@` SWITCHES the composer, so a
+	// candidate must be runnable — offering a disabled or binding-less
+	// agent here would let the user select something the next send refuses.
+	// `IncludeUnbound` stays true only so the consume predicate itself
+	// decides (it drops unbound chat rows anyway).
 	pool, err := s.CatalogRepo.ListApplicationPage(ctx, catalog.ApplicationPageQuery{
 		Scope:          catalog.VisibleScopeManage,
+		Mode:           catalog.PageModeConsume,
 		Kind:           catalog.PageQueryKindAll,
 		IncludeUnbound: true,
 		Search:         q,
@@ -216,149 +407,20 @@ func (s *Server) ResolveApplicationMention(w http.ResponseWriter, r *http.Reques
 	// A slug mention (`@sales-agent`) is an EXACT identifier that the
 	// substring search above may miss when the display name is unrelated
 	// (e.g. slug `sales-agent`, name `销售助手`) — the client-side router
-	// accepted it, so the server side must too.
+	// accepted it, so the server side must too. The same consume gate
+	// applies: an exact slug hit that cannot be run is not a candidate.
 	if app, err := s.CatalogRepo.ApplicationBySlug(ctx, q); err == nil &&
 		catalog.VisibleTo(app, catalog.VisibleScopeManage, caller.ID, caller.IsStaff) {
-		out = prependMention(out, mentionCandidate{
-			ID: app.ID, Slug: app.Slug, Name: app.Name, Kind: app.Kind,
-		})
+		if binding, _ := s.CatalogRepo.EnabledBinding(ctx, app.ID); catalog.Usable(app, binding) {
+			out = prependMention(out, mentionCandidate{
+				ID: app.ID, Slug: app.Slug, Name: app.Name, Kind: app.Kind,
+			})
+		}
 	}
 	if out == nil {
 		out = []mentionCandidate{}
 	}
 	writeJSON(w, http.StatusOK, out)
-}
-
-// ─────────────────────────────────────────────────────────── derivation ──
-
-// bootstrapGroups is the pure derivation output: everything the bootstrap
-// response carries, still in the internal item shape.
-type bootstrapGroups struct {
-	DefaultApplication *applicationListItem
-	Favorites          []applicationListItem
-	Frequent           []applicationListItem
-	Recent             []applicationListItem
-	Recommended        []applicationListItem
-	RecentFixedApps    []applicationListItem
-	AgentCategories    []applicationCategory
-	AppCategories      []applicationCategory
-}
-
-// buildBootstrapGroups derives the home/mobile groups from ONE pool, with the
-// same rules the client-side helpers used to apply (so no shortcut changes
-// behaviour, only where it is computed):
-//
-//	收藏      chat + starred, most recently used first
-//	常用智能体 chat + this caller has run it, most runs first
-//	最近使用   chat + this caller ran it, most recent first
-//	推荐      chat + this caller has NEVER used it, most used globally first
-//	常用应用   非-chat: 最近打开的在前，其余按目录顺序补足 (首页 固定应用 入口)
-//	默认智能体  explicit is_default_agent, else the first bound chat app
-//
-// 停用 (enabled=false) applications are dropped from every GROUP — they are
-// consumption entries — while the category rails keep counting what the
-// catalog actually holds (staff can see disabled rows, and the rails must
-// still describe the market). Pure + DB-free so it is unit tested directly.
-func buildBootstrapGroups(pool []applicationListItem) bootstrapGroups {
-	var g bootstrapGroups
-	chat := make([]applicationListItem, 0, len(pool))
-	fixed := make([]applicationListItem, 0, len(pool))
-	for _, item := range pool {
-		if item.Kind == "chat" {
-			chat = append(chat, item)
-		} else {
-			fixed = append(fixed, item)
-		}
-	}
-
-	// 默认智能体: the explicit main agent wins; otherwise the first bound chat
-	// application in the pool's own (created_at ascending) order — exactly
-	// resolveDefaultApplication's fallback, so the composer keeps working on a
-	// fresh install with nothing configured.
-	for i := range chat {
-		if !chat[i].IsBound {
-			continue
-		}
-		if chat[i].IsDefaultAgent {
-			app := chat[i]
-			g.DefaultApplication = &app
-			break
-		}
-		if g.DefaultApplication == nil {
-			app := chat[i]
-			g.DefaultApplication = &app
-		}
-	}
-
-	enabled := func(items []applicationListItem, pick func(applicationListItem) bool) []applicationListItem {
-		out := make([]applicationListItem, 0, len(items))
-		for _, item := range items {
-			if !item.Enabled || !pick(item) {
-				continue
-			}
-			out = append(out, item)
-		}
-		return out
-	}
-
-	g.Favorites = enabled(chat, func(item applicationListItem) bool { return item.IsFavorite })
-	sort.SliceStable(g.Favorites, func(i, j int) bool {
-		if a, b := usedAt(g.Favorites[i]), usedAt(g.Favorites[j]); a != b {
-			return a.After(b)
-		}
-		return byName(g.Favorites[i], g.Favorites[j])
-	})
-	g.Favorites = capItems(g.Favorites)
-
-	g.Frequent = enabled(chat, func(item applicationListItem) bool { return item.UsageCount > 0 })
-	sort.SliceStable(g.Frequent, func(i, j int) bool {
-		if a, b := g.Frequent[i].UsageCount, g.Frequent[j].UsageCount; a != b {
-			return a > b
-		}
-		if a, b := usedAt(g.Frequent[i]), usedAt(g.Frequent[j]); a != b {
-			return a.After(b)
-		}
-		return byName(g.Frequent[i], g.Frequent[j])
-	})
-	g.Frequent = capItems(g.Frequent)
-
-	g.Recent = enabled(chat, func(item applicationListItem) bool { return !usedAt(item).IsZero() })
-	sort.SliceStable(g.Recent, func(i, j int) bool {
-		return usedAt(g.Recent[i]).After(usedAt(g.Recent[j]))
-	})
-	g.Recent = capItems(g.Recent)
-
-	// 推荐 means "not used yet", so it must consider EVERY used application —
-	// not only those that survived the per-group caps above.
-	g.Recommended = enabled(chat, func(item applicationListItem) bool {
-		return item.UsageCount == 0 && usedAt(item).IsZero() && !item.IsFavorite
-	})
-	sort.SliceStable(g.Recommended, func(i, j int) bool {
-		if a, b := g.Recommended[i].GlobalUsageCount, g.Recommended[j].GlobalUsageCount; a != b {
-			return a > b
-		}
-		return byName(g.Recommended[i], g.Recommended[j])
-	})
-	g.Recommended = capItems(g.Recommended)
-
-	// 常用应用: fixed applications the caller recently opened come first, then
-	// the rest in catalog order — the group must still SHOW the fixed apps on
-	// a workspace nobody has used yet (the previous client-side list was
-	// `non-chat enabled, first 8`, so a "used only" filter would silently
-	// empty the 首页 entry on a fresh install).
-	g.RecentFixedApps = enabled(fixed, func(applicationListItem) bool { return true })
-	sort.SliceStable(g.RecentFixedApps, func(i, j int) bool {
-		a, b := usedAt(g.RecentFixedApps[i]), usedAt(g.RecentFixedApps[j])
-		if !a.Equal(b) {
-			return a.After(b)
-		}
-		return false // stable: keep the pool's created_at order
-	})
-	g.RecentFixedApps = capItems(g.RecentFixedApps)
-
-	g.AgentCategories = categoryRails(chat)
-	g.AppCategories = categoryRails(fixed)
-	return g
 }
 
 // mentionSource is the only part of an application the `@` router needs.
@@ -455,69 +517,4 @@ func prependMention(list []mentionCandidate, head mentionCandidate) []mentionCan
 		out = out[:mentionCandidateLimit]
 	}
 	return out
-}
-
-func summarizeAll(items []applicationListItem) []applicationSummary {
-	out := make([]applicationSummary, 0, len(items))
-	for _, item := range items {
-		out = append(out, summaryOf(item))
-	}
-	return out
-}
-
-// categoryRails renders the ordered category list for one kind slice:
-// first-appearance order (the pool is created_at ascending, the same order
-// the market lists applications in), with the 其他 sentinel appended only
-// when rows genuinely have no category.
-func categoryRails(items []applicationListItem) []applicationCategory {
-	out := make([]applicationCategory, 0, 8)
-	index := map[string]int{}
-	uncategorized := int64(0)
-	for _, item := range items {
-		slug := strings.TrimSpace(item.CategorySlug)
-		if slug == "" {
-			uncategorized++
-			continue
-		}
-		if at, ok := index[slug]; ok {
-			out[at].Count++
-			continue
-		}
-		name := strings.TrimSpace(item.CategoryName)
-		if name == "" {
-			name = slug
-		}
-		index[slug] = len(out)
-		out = append(out, applicationCategory{Slug: slug, Name: name, Count: 1})
-	}
-	// The sentinel is the SAME string the paged endpoint understands
-	// (catalog.PageUncategorizedSlug), so a tap on 其他 needs no client-side
-	// special case.
-	if uncategorized > 0 {
-		out = append(out, applicationCategory{
-			Slug: catalog.PageUncategorizedSlug, Name: "其他", Count: uncategorized})
-	}
-	return out
-}
-
-func byName(a, b applicationListItem) bool { return a.Name < b.Name }
-
-func capItems(items []applicationListItem) []applicationListItem {
-	if len(items) > bootstrapGroupLimit {
-		return items[:bootstrapGroupLimit]
-	}
-	return items
-}
-
-// usedAt reads the per-caller last-used timestamp; a missing or unparsable
-// value is "never used" (zero time), which is what the group predicates mean.
-func usedAt(item applicationListItem) time.Time {
-	if item.LastUsedAt == nil {
-		return time.Time{}
-	}
-	t, err := time.Parse(time.RFC3339, *item.LastUsedAt)
-	if err != nil {
-		return time.Time{}
-	}
-	return t
 }

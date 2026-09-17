@@ -396,6 +396,47 @@ func VisibleTo(app *Application, scope string, callerID int64, isStaff bool) boo
 // VisibleScopeManage is the scope the workspace surfaces resolve with.
 const VisibleScopeManage = "manage"
 
+// Usable reports whether an application can actually be CONSUMED — opened
+// and, for a chat application, run (二次复审 P0-5).
+//
+// Visibility answers "who may SEE the row" and is a management concern: staff
+// must see disabled, private and binding-less applications in 智能体市场 /
+// 应用中心 so they can repair them. Usability answers "may anyone actually
+// USE it", and it is the SAME predicate `AuthorizeExecution` enforces:
+//
+//	enabled = 1                        the admin kill switch is absolute
+//	kind <> 'chat' OR enabled binding  a chat app without a runtime cannot run
+//
+// Reusing one predicate is the point. Before this existed the two disagreed:
+// the catalog listed disabled / unbound agents for staff, `resolve` happily
+// opened them, `@` could switch to them, and then POST /v2/runs refused the
+// send — "UI 可以看到，真正发送：拒绝".
+//
+// A fixed application (kind <> 'chat') is a front-end page delivered by the
+// build, so it needs no runtime binding; only `enabled` gates it.
+func Usable(app *Application, binding *Binding) bool {
+	if app == nil || !app.Enabled {
+		return false
+	}
+	if app.Kind != "chat" {
+		return true
+	}
+	return binding != nil && binding.Enabled
+}
+
+// PageModeManage / PageModeConsume select whether a catalog page lists rows
+// the caller may MANAGE or rows the caller may actually USE (二次复审 P0-5).
+//
+//	manage   the authoring surfaces (智能体市场, 应用中心): everything
+//	         `visible()` allows, including disabled / private / unbound.
+//	consume  every surface that opens or runs something (切换器, 移动端
+//	         目录, bootstrap 分组, resolve, @mention): additionally filtered
+//	         by `Usable`.
+const (
+	PageModeManage  = "manage"
+	PageModeConsume = "consume"
+)
+
 // ─────────────────────────────────────────── keyset-paginated catalog page ──
 
 // PageCursor is the opaque keyset cursor: base64url(JSON) of the
@@ -461,6 +502,8 @@ const PageUncategorizedSlug = "__uncategorized__"
 type ApplicationPageQuery struct {
 	// Scope: public | mine | manage (same values as the legacy list).
 	Scope string
+	// Mode: PageModeManage (default) | PageModeConsume — see PageModeManage.
+	Mode string
 	// Kind: PageQueryKindChat (default) | PageQueryKindFixed | PageQueryKindAll.
 	Kind string
 	// IncludeUnbound keeps binding-less rows (the legacy include_unbound).
@@ -499,6 +542,10 @@ func (r *Repo) ListApplicationPage(ctx context.Context, q ApplicationPageQuery) 
 	mineOnly := !q.IsStaff && q.Scope == "mine"
 	search := strings.TrimSpace(q.Search)
 	uncategorized := q.CategorySlug == PageUncategorizedSlug
+	// consume mode applies `Usable` IN SQL, not in Go: filtering afterwards
+	// would under-fill pages and break the keyset cursor's determinism
+	// (the same reason visible() lives in the WHERE clause).
+	consumeOnly := q.Mode == PageModeConsume
 	// narg probe: nil → `? IS NULL` short-circuits the LIKE branches; any
 	// non-nil value activates them.
 	var searchArg interface{}
@@ -511,6 +558,7 @@ func (r *Repo) ListApplicationPage(ctx context.Context, q ApplicationPageQuery) 
 		MineOnly:       boolArg(mineOnly),
 		PageCallerID:   sql.NullInt64{Int64: q.CallerID, Valid: true},
 		PublicOnly:     boolArg(!q.IsStaff && !mineOnly),
+		ConsumeOnly:    boolArg(consumeOnly),
 		KindChatOnly:   boolArg(q.Kind == PageQueryKindChat),
 		KindFixedOnly:  boolArg(q.Kind == PageQueryKindFixed),
 		KindAll:        boolArg(q.Kind != PageQueryKindChat && q.Kind != PageQueryKindFixed),
@@ -629,6 +677,77 @@ func applicationPageRow(row db.ListApplicationPageRow) ApplicationWithBinding {
 	return out
 }
 
+// applicationRowByID projects a bootstrap row-fetch row onto the SAME
+// ApplicationWithBinding shape `applicationPageRow` produces.
+//
+// It is a deliberate mirror rather than a shared helper: sqlc emits one
+// struct per query, so the two projections cannot share a signature — but
+// they MUST stay field-for-field identical, because both feed
+// `buildListItem` and a divergence would show up as a bootstrap card missing
+// a field a market card has.
+func applicationRowByID(row db.ListApplicationRowsByIDsRow) ApplicationWithBinding {
+	app := &Application{
+		ID:             int64(row.ID),
+		Slug:           row.Slug,
+		Name:           row.Name,
+		Description:    row.Description,
+		Icon:           row.Icon,
+		AvatarKey:      row.AvatarKey,
+		Color:          row.Color,
+		Kind:           row.Kind,
+		RendererKey:    row.RendererKey,
+		ExecutorKey:    row.ExecutorKey,
+		CategorySlug:   row.CategorySlug.String,
+		CategoryName:   row.CategoryName.String,
+		IsPublic:       row.IsPublic,
+		Enabled:        row.Enabled,
+		IsDefaultAgent: row.IsDefaultAgent,
+		UsageCount:     int64(row.UsageCount),
+		Skills:         ParseSkills(row.DefaultConfig),
+		CreatedAt:      row.CreatedAt,
+		UpdatedAt:      row.UpdatedAt,
+	}
+	if row.CategoryID.Valid {
+		v := row.CategoryID.Int64
+		app.CategoryID = &v
+	}
+	if row.CreatedBy.Valid {
+		v := row.CreatedBy.Int64
+		app.CreatedBy = &v
+	}
+	out := ApplicationWithBinding{App: app}
+	if !row.BindingID.Valid {
+		return out
+	}
+	b := &Binding{
+		ID:                 row.BindingID.Int64,
+		ApplicationID:      app.ID,
+		ProviderKey:        row.BindingProviderKey.String,
+		RuntimeType:        row.BindingRuntimeType.String,
+		ExternalResourceID: row.BindingExternalResourceID.String,
+		IdentityMode:       row.BindingIdentityMode.String,
+		ExecutionMode:      row.BindingExecutionMode.String,
+		SessionPolicy:      row.BindingSessionPolicy.String,
+		ArtifactPolicy:     row.BindingArtifactPolicy.String,
+		TimeoutSeconds:     int64(row.BindingTimeoutSeconds.Int32),
+		Enabled:            row.BindingEnabled.Bool,
+	}
+	if row.BindingProviderID.Valid {
+		v := row.BindingProviderID.Int64
+		b.ProviderID = &v
+	}
+	_ = json.Unmarshal(row.BindingCapabilities, &b.Capabilities)
+	_ = json.Unmarshal(row.BindingConfig, &b.Config)
+	if b.Capabilities == nil {
+		b.Capabilities = map[string]any{}
+	}
+	if b.Config == nil {
+		b.Config = map[string]any{}
+	}
+	out.Binding = b
+	return out
+}
+
 // PersonalUsage is a user's run history for ONE application.
 type PersonalUsage struct {
 	Count int64
@@ -684,4 +803,249 @@ func (r *Repo) FavoritesByApplications(ctx context.Context, userID int64, appIDs
 		out[int64(row)] = true
 	}
 	return out, nil
+}
+
+// ──────────────────────────────────────────────── bootstrap groups (P1-1) ──
+
+// BootstrapGroupLimit is the home-shortcut budget per group (§35). It is the
+// single source of truth for the group size: the SQL takes it as its LIMIT,
+// so the query cannot return more rows than the UI renders.
+const BootstrapGroupLimit = 8
+
+// BootstrapGroupRow is one member of a bootstrap group: the application id
+// plus the PERSONAL usage facts the group was ordered by.
+//
+// The ranking queries return these instead of full rows so that the group
+// ORDER survives the single row-fetch that follows (a plain `IN (...)` has
+// no order). `LastUsedAt == nil` means "never used".
+type BootstrapGroupRow struct {
+	ApplicationID int64
+	UsageCount    int64
+	LastUsedAt    *time.Time
+}
+
+// BootstrapGroups is every ordered group the workspace bootstrap answers
+// with, still as (id, usage) pairs — the caller resolves the rows once.
+type BootstrapGroups struct {
+	Default         *BootstrapGroupRow
+	Favorites       []BootstrapGroupRow
+	Frequent        []BootstrapGroupRow
+	Recent          []BootstrapGroupRow
+	Recommended     []BootstrapGroupRow
+	RecentFixedApps []BootstrapGroupRow
+}
+
+// BootstrapCategory is one entry of a category rail.
+type BootstrapCategory struct {
+	Slug  string
+	Name  string
+	Count int64
+}
+
+// BootstrapCategories holds the two category rails: 智能体 (chat) and
+// 应用中心 (non-chat).
+type BootstrapCategories struct {
+	Agents []BootstrapCategory
+	Apps   []BootstrapCategory
+}
+
+// BootstrapGroupQuery describes one bootstrap group request.
+type BootstrapGroupQuery struct {
+	CallerID int64
+	IsStaff  bool
+}
+
+// BootstrapGroups loads the ordered shortcut groups in a FIXED number of
+// queries, each returning at most BootstrapGroupLimit rows (二次复审 P1-1).
+//
+// This replaces the previous `ListApplicationPage{Limit: 5000}` + Go-side
+// projection, whose cost grew with the catalog and whose result was silently
+// wrong past row 5000: a category, the top 推荐 agent or the only valid
+// default fallback that sorted later simply disappeared. Here every group is
+// the database's own answer to its own business question.
+//
+// `sql.ErrNoRows` from the default-agent query is NOT an error: a workspace
+// with no usable chat agent yet has no default, and the composer simply
+// starts unbound.
+func (r *Repo) BootstrapGroups(ctx context.Context, q BootstrapGroupQuery) (BootstrapGroups, error) {
+	var out BootstrapGroups
+	caller := sql.NullInt64{Int64: q.CallerID, Valid: true}
+	showAll := boolArg(q.IsStaff)
+	limit := int32(BootstrapGroupLimit)
+	favUser := uint64(max64(q.CallerID, 0))
+
+	def, err := r.q(ctx).BootstrapDefaultApplication(ctx, db.BootstrapDefaultApplicationParams{
+		CallerID: caller, ShowAll: showAll,
+	})
+	switch {
+	case err == nil:
+		row := bootstrapGroupRow(def.ID, def.PersonalUsageCount, def.LastUsedAt)
+		out.Default = &row
+	case errors.Is(err, sql.ErrNoRows):
+		// No usable default yet — legitimate, not a failure.
+	default:
+		return out, err
+	}
+
+	if rows, err := r.q(ctx).BootstrapFavoriteApplications(ctx, db.BootstrapFavoriteApplicationsParams{
+		CallerID: caller, FavUserID: favUser, ShowAll: showAll, Limit: limit,
+	}); err != nil {
+		return out, err
+	} else {
+		out.Favorites = bootstrapGroupRowsFavorite(rows)
+	}
+
+	if rows, err := r.q(ctx).BootstrapFrequentApplications(ctx, db.BootstrapFrequentApplicationsParams{
+		CallerID: caller, ShowAll: showAll, Limit: limit,
+	}); err != nil {
+		return out, err
+	} else {
+		out.Frequent = bootstrapGroupRowsFrequent(rows)
+	}
+
+	if rows, err := r.q(ctx).BootstrapRecentApplications(ctx, db.BootstrapRecentApplicationsParams{
+		CallerID: caller, ShowAll: showAll, Limit: limit,
+	}); err != nil {
+		return out, err
+	} else {
+		out.Recent = bootstrapGroupRowsRecent(rows)
+	}
+
+	if rows, err := r.q(ctx).BootstrapRecommendedApplications(ctx, db.BootstrapRecommendedApplicationsParams{
+		CallerID: caller, ShowAll: showAll, FavUserID: favUser, Limit: limit,
+	}); err != nil {
+		return out, err
+	} else {
+		out.Recommended = bootstrapGroupRowsRecommended(rows)
+	}
+
+	if rows, err := r.q(ctx).BootstrapRecentFixedApplications(ctx, db.BootstrapRecentFixedApplicationsParams{
+		CallerID: caller, ShowAll: showAll, Limit: limit,
+	}); err != nil {
+		return out, err
+	} else {
+		out.RecentFixedApps = bootstrapGroupRowsFixed(rows)
+	}
+	return out, nil
+}
+
+// BootstrapCategories loads the two category rails with a SQL GROUP BY
+// (二次复审 §17): one row per category, counted and ordered by first
+// appearance. Rows with no category come back with an empty slug, which the
+// HTTP layer renders as the `__uncategorized__` sentinel.
+func (r *Repo) BootstrapCategories(ctx context.Context, isStaff bool) (BootstrapCategories, error) {
+	var out BootstrapCategories
+	showAll := boolArg(isStaff)
+	agents, err := r.q(ctx).BootstrapAgentCategories(ctx, showAll)
+	if err != nil {
+		return out, err
+	}
+	out.Agents = bootstrapAgentCategories(agents)
+	apps, err := r.q(ctx).BootstrapAppCategories(ctx, showAll)
+	if err != nil {
+		return out, err
+	}
+	out.Apps = bootstrapAppCategories(apps)
+	return out, nil
+}
+
+// ListApplicationRowsByIDs materialises the applications the bootstrap
+// groups selected — bounded by the groups themselves (≤ ~40 rows), never by
+// the catalog. The visibility + consume predicates are applied again so this
+// fetch is safe on its own.
+func (r *Repo) ListApplicationRowsByIDs(ctx context.Context, appIDs []int64, isStaff bool) ([]ApplicationWithBinding, error) {
+	out := make([]ApplicationWithBinding, 0, len(appIDs))
+	if len(appIDs) == 0 {
+		return out, nil
+	}
+	rows, err := r.q(ctx).ListApplicationRowsByIDs(ctx, db.ListApplicationRowsByIDsParams{
+		AppIds:  favoriteIDs(appIDs),
+		ShowAll: boolArg(isStaff),
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		out = append(out, applicationRowByID(row))
+	}
+	return out, nil
+}
+
+// bootstrapGroupRow converts one sqlc group row. Every group query returns
+// the identical `(id, personal_usage_count, last_used_at)` triple, so the
+// conversion is shared; the per-query wrappers below only adapt the slice
+// type (sqlc emits one struct per query).
+func bootstrapGroupRow(id uint64, count int64, last interface{}) BootstrapGroupRow {
+	row := BootstrapGroupRow{ApplicationID: int64(id), UsageCount: count}
+	if t, ok := last.(time.Time); ok {
+		tt := t
+		row.LastUsedAt = &tt
+	}
+	return row
+}
+
+func bootstrapGroupRowsDefault(rows []db.BootstrapDefaultApplicationRow) []BootstrapGroupRow {
+	out := make([]BootstrapGroupRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, bootstrapGroupRow(row.ID, row.PersonalUsageCount, row.LastUsedAt))
+	}
+	return out
+}
+
+func bootstrapGroupRowsFavorite(rows []db.BootstrapFavoriteApplicationsRow) []BootstrapGroupRow {
+	out := make([]BootstrapGroupRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, bootstrapGroupRow(row.ID, row.PersonalUsageCount, row.LastUsedAt))
+	}
+	return out
+}
+
+func bootstrapGroupRowsFrequent(rows []db.BootstrapFrequentApplicationsRow) []BootstrapGroupRow {
+	out := make([]BootstrapGroupRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, bootstrapGroupRow(row.ID, row.PersonalUsageCount, row.LastUsedAt))
+	}
+	return out
+}
+
+func bootstrapGroupRowsRecent(rows []db.BootstrapRecentApplicationsRow) []BootstrapGroupRow {
+	out := make([]BootstrapGroupRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, bootstrapGroupRow(row.ID, row.PersonalUsageCount, row.LastUsedAt))
+	}
+	return out
+}
+
+func bootstrapGroupRowsRecommended(rows []db.BootstrapRecommendedApplicationsRow) []BootstrapGroupRow {
+	out := make([]BootstrapGroupRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, bootstrapGroupRow(row.ID, row.PersonalUsageCount, row.LastUsedAt))
+	}
+	return out
+}
+
+func bootstrapGroupRowsFixed(rows []db.BootstrapRecentFixedApplicationsRow) []BootstrapGroupRow {
+	out := make([]BootstrapGroupRow, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, bootstrapGroupRow(row.ID, row.PersonalUsageCount, row.LastUsedAt))
+	}
+	return out
+}
+
+func bootstrapAgentCategories(rows []db.BootstrapAgentCategoriesRow) []BootstrapCategory {
+	out := make([]BootstrapCategory, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, BootstrapCategory{
+			Slug: row.CategorySlug, Name: row.CategoryName, Count: row.CategoryCount})
+	}
+	return out
+}
+
+func bootstrapAppCategories(rows []db.BootstrapAppCategoriesRow) []BootstrapCategory {
+	out := make([]BootstrapCategory, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, BootstrapCategory{
+			Slug: row.CategorySlug, Name: row.CategoryName, Count: row.CategoryCount})
+	}
+	return out
 }
