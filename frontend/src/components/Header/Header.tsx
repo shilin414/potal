@@ -8,13 +8,12 @@ import { useApplicationCatalogStore, resolveDefaultApplication } from '@/stores/
 import { ThemeToggle } from '@/components/Theme';
 import './Header.css';
 
+// 技能 / 案例库 / 工作流三个入口已从主页导航下掉（页面、路由与数据都保留，
+// 仍可直接访问 /skills、/templates、/workflows）。恢复时把对应项加回数组即可。
 const navItems = [
   { key: '/', label: '💬 对话' },
   { key: '/agents', label: '🤖 智能体' },
-  { key: '/skills', label: '⚡ 技能' },
-  { key: '/templates', label: '📚 案例库' },
   { key: '/apps', label: '🧩 应用' },
-  { key: '/workflows', label: '🔀 工作流' },
   { key: '/schedules', label: '⏰ 定时任务' },
   { key: '/enterprise', label: '🏢 企业控制台' },
 ];

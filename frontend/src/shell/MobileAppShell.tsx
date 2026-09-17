@@ -1,21 +1,21 @@
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
-import { Drawer } from 'antd';
-import { MenuOutlined } from '@ant-design/icons';
+import { Button, Drawer } from 'antd';
+import { MenuOutlined, PlusOutlined } from '@ant-design/icons';
 import ConversationHistory from '@/components/ConversationHistory/ConversationHistory';
 import ApplicationSwitcher from '@/components/Workspace/ApplicationSwitcher';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
-import { useAuthStore } from '@/stores/useAuthStore';
-import { userAvatarFallback, userAvatarUrl } from '@/lib/chatIdentity';
 import { useApplicationCatalogStore, resolveDefaultApplication } from '@/stores/useApplicationCatalogStore';
 import { useRunChatStore } from '@/stores/useRunChatStore';
 import type { ShellChrome } from './useShellChrome';
 import './shell.css';
 
+// 技能 / 案例库 / 工作流三个入口已从主页导航下掉（桌面端 Header 同步改动）；
+// 页面、路由与数据都保留，仍可直接访问 /skills、/templates、/workflows。
+// 恢复时把对应项加回数组即可。
 const NAV_ITEMS = [
   { key: '/', label: '首页', icon: '🏠' },
   { key: '/agents', label: '智能体', icon: '🤖' },
   { key: '/apps', label: '应用', icon: '🧩' },
-  { key: '/workflows', label: '工作流', icon: '🔀' },
   { key: '/schedules', label: '定时任务', icon: '⏰' },
   { key: '/enterprise', label: '企业控制台', icon: '🏢' },
 ];
@@ -30,7 +30,6 @@ const NAV_ITEMS = [
 const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
   const mobileNavOpen = useWorkspaceStore((state) => state.mobileNavOpen);
   const setMobileNavOpen = useWorkspaceStore((state) => state.setMobileNavOpen);
-  const user = useAuthStore((state) => state.user);
   const navigate = useNavigate();
   const location = useLocation();
   const path = location.pathname;
@@ -75,11 +74,17 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
             <MenuOutlined />
           </button>
           <ApplicationSwitcher compact />
-          <div className="mobile-shell__avatar">
-            {userAvatarUrl(user)
-              ? <img src={userAvatarUrl(user)} alt="" />
-              : userAvatarFallback(user)}
-          </div>
+          {/* 右侧主操作：回到首页。这里原本是账号头像（纯展示、无下拉，
+              账号菜单本来就在移动端不可达），换成一个更常用的动作。 */}
+          <Button
+            type="primary"
+            size="small"
+            icon={<PlusOutlined />}
+            className="mobile-shell__task-btn"
+            onClick={() => go('/')}
+          >
+            新任务
+          </Button>
         </header>
       )}
 

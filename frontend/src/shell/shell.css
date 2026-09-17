@@ -46,23 +46,23 @@
   min-width: 0;
 }
 
-.mobile-shell__avatar {
-  display: grid;
-  place-items: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 50%;
-  overflow: hidden;
-  background: var(--color-bg-elevated);
-  color: var(--color-primary);
-  font-weight: 600;
+/* 顶栏右侧主操作：新任务（回到首页）。与抽屉里的「新建对话」同款主色，
+   收成小圆角胶囊，免得在 56px 顶栏里显得笨重；hover/active 交给 antd 主题。 */
+.mobile-shell__task-btn.ant-btn {
+  flex: none;
+  height: 32px;
+  padding: 0 13px;
+  border-radius: 999px;
   font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  /* 移动端点击不要出现系统高亮块 */
+  -webkit-tap-highlight-color: transparent;
 }
 
-.mobile-shell__avatar img {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
+/* antd 小尺寸下图标与文字的默认间距偏紧，补一点呼吸 */
+.mobile-shell__task-btn.ant-btn > .anticon + span {
+  margin-inline-start: 5px;
 }
 
 /* The workspace fills the space between the bar and the composer, which the
