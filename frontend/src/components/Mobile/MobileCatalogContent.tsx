@@ -19,7 +19,7 @@
  * agent page enables favorites (§15) — same payload, same paged endpoint.
  */
 import React, { useEffect, useMemo, useState } from 'react';
-import { Input, Skeleton, message } from 'antd';
+import { Button, Input, Skeleton, message } from 'antd';
 import { CheckOutlined, SearchOutlined } from '@ant-design/icons';
 import type { ApplicationSummary, V2Application } from '@/services/runApi';
 import { setApplicationFavorite } from '@/services/runApi';
@@ -185,6 +185,10 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
   const [query, setQuery] = useState('');
   const [searchMode, setSearchMode] = useState(false);
 
+  // Legacy local-pool mode must never fire a server request (P2-3):
+  // `serverMode` is computed BEFORE the hook so `enabled` gates ALL fetches.
+  const serverMode = applications === undefined;
+
   // ── Server-paged mode (production) ──
   // agent lists exclude unbound chat apps; consume mode keeps 停用/未绑定
   // rows out (see MobileCatalogSheet's history — rules preserved §22).
@@ -195,7 +199,7 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
     category: category === 'all' ? null : category,
     query,
     limit: MOBILE_SHEET_PAGE_SIZE,
-    enabled: active,
+    enabled: active && serverMode,
   });
 
   // Category rails and server-side recency come from the workspace bootstrap:
@@ -211,8 +215,6 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
   useEffect(() => {
     if (active) void loadBootstrap();
   }, [active, loadBootstrap]);
-
-  const serverMode = applications === undefined;
 
   // The active row is injected only in the unfiltered view (§4.3).
   const canPinActive = serverMode
@@ -307,11 +309,35 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
   };
 
   const narrowed = searching || category !== 'all';
-  const catalogEmpty = !pool.length && !narrowed;
+  // A request failure must never masquerade as an empty catalog (P1-3):
+  // fatal = the first page failed with nothing loaded (full error state);
+  // partial = a later loadMore failed (keep the loaded rows, retry inline —
+  // useApplicationPage deliberately preserves already-loaded items on error).
+  const fatalError = serverMode && Boolean(paged.error) && pool.length === 0;
+  const partialError = serverMode && Boolean(paged.error) && pool.length > 0;
+  const catalogEmpty = !pool.length && !narrowed && !fatalError;
+  // A failed loadMore keeps its cursor (retry = loadMore); a failed search /
+  // first page clears it (retry = refresh) — pick by what the hook still offers.
+  const retryPartial = () => (paged.hasMore ? void paged.loadMore() : void paged.refresh());
 
   // ── Sheet body: identical markup to the pre-extraction sheet ──
   const renderSheetBody = () => {
     if (loading && !pool.length) return <RowSkeletons />;
+    if (fatalError) {
+      return (
+        <div className="mobile-sheet__empty">
+          <strong>加载失败</strong>
+          请检查网络后重试
+          <button
+            type="button"
+            className="mobile-sheet__more-btn"
+            onClick={() => void paged.refresh()}
+          >
+            重试
+          </button>
+        </div>
+      );
+    }
     if (catalogEmpty) {
       return (
         <div className="mobile-sheet__empty">
@@ -367,9 +393,11 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
 
         {filtered.length === 0 ? (
           // An unmatched search must NOT fall back to showing everything (§15.3).
-          <div className="mobile-sheet__empty">
-            {searching ? <>没有找到“{query.trim()}”</> : <>该分类下暂无内容</>}
-          </div>
+          searching ? (
+            <div className="mobile-sheet__empty">没有找到“{query.trim()}”</div>
+          ) : (
+            <div className="mobile-sheet__empty">该分类下暂无内容</div>
+          )
         ) : (
           <>
             {rendered.map((app) => (
@@ -389,6 +417,16 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
                   : setVisibleCount((current: number) => current + MOBILE_SHEET_MAX_ROWS))}
               >
                 加载更多
+              </button>
+            )}
+            {partialError && (
+              // A failed loadMore/search keeps every rendered row; retry inline.
+              <button
+                type="button"
+                className="mobile-sheet__more-btn"
+                onClick={retryPartial}
+              >
+                加载失败，点击重试
               </button>
             )}
           </>
@@ -443,6 +481,15 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
   // ── Page body: search + rail + recent + full list (§12/§19) ──
   const renderPageList = () => {
     if (loading && !pool.length) return <RowSkeletons />;
+    if (fatalError) {
+      return (
+        <MobileEmptyState
+          title="加载失败"
+          hint={paged.error ?? undefined}
+          action={<Button onClick={() => void paged.refresh()}>重新加载</Button>}
+        />
+      );
+    }
     if (catalogEmpty) {
       return (
         <MobileEmptyState
@@ -478,6 +525,16 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
               : setVisibleCount((current: number) => current + MOBILE_SHEET_MAX_ROWS))}
           >
             加载更多
+          </button>
+        )}
+        {partialError && (
+          // A failed loadMore/search keeps every rendered row; retry inline.
+          <button
+            type="button"
+            className="mobile-console-more"
+            onClick={retryPartial}
+          >
+            加载失败，点击重试
           </button>
         )}
       </>

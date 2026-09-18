@@ -165,6 +165,9 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
       setItems((current) => dedupeById([...current, ...page.items]));
       setCursor(page.next_cursor);
       setHasMore(page.has_more);
+      // A successful retry clears the 加载更多失败 indicator (二次复审 P2):
+      // consumers render a persistent partial-error tail off `error`.
+      setError(null);
     } catch (err: any) {
       // 加载更多 keeps the already-rendered pages; the next click retries.
       setError(err?.response?.data?.detail || '加载更多失败');

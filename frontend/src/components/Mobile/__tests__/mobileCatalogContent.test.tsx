@@ -132,13 +132,14 @@ describe('MobileCatalogContent, page mode', () => {
     expect(titles).not.toContain('看板应用');   // app split (§22)
     expect(titles).not.toContain('停用的智能体'); // disabled never listed (§22)
 
-    // Rich row: meta carries 分类 · Provider (§14).
+    // Rich row: meta carries 分类 · Provider (§14). P2-1: the interactive
+    // surface is the main button inside the wrapper.
     const row = Array.from(document.querySelectorAll('.mobile-console-row'))
       .find((el) => el.textContent!.includes('财务助手'))!;
     expect(row.querySelector('.mobile-console-row__meta')!.textContent)
       .toBe('财务 · aily');
 
-    await click(row);
+    await click(row.querySelector('.mobile-console-row__main')!);
     expect(onSelect).toHaveBeenCalledTimes(1);
   });
 
@@ -213,5 +214,75 @@ describe('MobileCatalogContent, page mode', () => {
     await click(star);
     await flush(20);
     expect(mocks.setApplicationFavorite).toHaveBeenCalledWith(1, true);
+  });
+});
+
+describe('MobileCatalogContent — data boundary hardening (二次复审 P1-3/P2-3)', () => {
+  it('a legacy local pool never fires a server request (P2-3)', async () => {
+    await mountTracked(
+      <MobileCatalogContent
+        type="agent" mode="page" applications={POOL} recentIds={[]}
+        onSelect={() => {}}
+      />,
+    );
+    expect(mocks.fetchApplicationPage).not.toHaveBeenCalled();
+  });
+
+  it('a first-page request failure is an error state, not an empty catalog (P1-3)', async () => {
+    mocks.fetchApplicationPage.mockReset().mockRejectedValueOnce(
+      new Error('network down'),
+    );
+    await mountTracked(
+      <MobileCatalogContent type="agent" mode="page" recentIds={[]} onSelect={() => {}} />,
+    );
+
+    expect(document.body.textContent).toContain('加载失败');
+    expect(document.body.textContent).not.toContain('暂无可用智能体');
+    expect(document.body.textContent).not.toContain('请联系管理员');
+
+    const retry = Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '重新加载');
+    expect(retry).toBeTruthy();
+  });
+
+  it('a failed search request is an error, not 没有找到 (P1-3)', async () => {
+    mocks.fetchApplicationPage.mockReset().mockResolvedValue({
+      items: [app({ id: 1, name: '财务助手' })], next_cursor: '', has_more: false,
+    });
+    const { root } = await mountTracked(
+      <MobileCatalogContent type="agent" mode="page" recentIds={[]} onSelect={() => {}} />,
+    );
+    const input = document.querySelector<HTMLInputElement>('.mobile-console-search input')!;
+    await act(async () => { setNativeValue(input, '财务'); });
+    mocks.fetchApplicationPage.mockRejectedValueOnce(new Error('network down'));
+    await flush(400);
+
+    expect(document.body.textContent).toContain('加载失败');
+    expect(document.body.textContent).not.toContain('没有找到');
+
+    await act(async () => { root.unmount(); });
+  });
+
+  it('a failed loadMore keeps the already-rendered rows (P1-3)', async () => {
+    mocks.fetchApplicationPage.mockReset()
+      .mockResolvedValueOnce({
+        items: [app({ id: 1, name: '财务助手' })],
+        next_cursor: 'c1', has_more: true,
+      })
+      .mockRejectedValueOnce(new Error('network down'));
+    await mountTracked(
+      <MobileCatalogContent type="agent" mode="page" recentIds={[]} onSelect={() => {}} />,
+    );
+    expect(document.body.textContent).toContain('财务助手');
+
+    const more = Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '加载更多');
+    expect(more).toBeTruthy();
+    await click(more!);
+    await flush(20);
+
+    // The first page is still rendered; the failure surfaces as a retry.
+    expect(document.body.textContent).toContain('财务助手');
+    expect(document.body.textContent).toContain('加载失败，点击重试');
   });
 });
