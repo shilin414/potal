@@ -169,6 +169,15 @@ export default function MobileResourcePage({ kind }: { kind: 'chat' | 'fixed' })
     ? [app.provider_key, app.runtime_type].filter(Boolean).join(' · ') || '企业智能体'
     : [KIND_LABELS[app.kind] || app.kind, app.renderer_key].filter(Boolean).join(' · '));
 
+  // 错误分类（二次复审 P2-10）：useApplicationPage 在 loadMore 失败时故意保留
+  // 已加载行——fatal（首页失败、无数据）给整页错误态；partial（翻页/搜索失败）
+  // 只给 Alert + 重试，已有列表绝不能消失。
+  const fatalError = Boolean(error) && items.length === 0;
+  const partialError = Boolean(error) && items.length > 0;
+  // A failed loadMore keeps its cursor (retry = loadMore); a failed search /
+  // first page clears it (retry = refresh).
+  const retryPartial = () => (hasMore ? void loadMore() : void refresh());
+
   return (
     <MobilePage>
       <div className="mobile-console-page__sticky">
@@ -179,64 +188,73 @@ export default function MobileResourcePage({ kind }: { kind: 'chat' | 'fixed' })
         />
       </div>
 
-      {error && (
-        <Alert
-          type="error"
-          showIcon
-          message="加载资源失败"
-          description={error}
-          action={<Button size="small" onClick={() => void refresh()}>重试</Button>}
-          style={{ marginTop: 12 }}
-        />
-      )}
-
-      {!error && (loading && items.length === 0 ? (
-        <div style={{ padding: '12px 0' }}>
-          <Skeleton active avatar paragraph={{ rows: 1 }} />
-          <Skeleton active avatar paragraph={{ rows: 1 }} />
-          <Skeleton active avatar paragraph={{ rows: 1 }} />
-        </div>
-      ) : items.length === 0 ? (
+      {fatalError ? (
         <MobileEmptyState
-          title={kind === 'chat' ? '暂无智能体' : '暂无应用'}
-          hint={kind === 'chat' ? '点击右上角新建智能体' : '点击右上角注册应用'}
+          title="加载资源失败"
+          hint={error ?? undefined}
+          action={<Button onClick={() => void refresh()}>重试</Button>}
         />
       ) : (
         <>
-          <div className="mobile-console-section__rows" style={{ marginTop: 12 }}>
-            {items.map((app) => (
-              <MobileEntityRow
-                key={app.id}
-                avatar={(
-                  <AgentAvatar
-                    application={app}
-                    size={44}
-                    shape={kind === 'chat' ? 'circle' : 'square'}
-                    tint={app.color}
+          {partialError && (
+            <Alert
+              type="error"
+              showIcon
+              message="加载失败"
+              description={error}
+              action={<Button size="small" onClick={retryPartial}>重试</Button>}
+              style={{ marginTop: 12 }}
+            />
+          )}
+          {loading && items.length === 0 ? (
+            <div style={{ padding: '12px 0' }}>
+              <Skeleton active avatar paragraph={{ rows: 1 }} />
+              <Skeleton active avatar paragraph={{ rows: 1 }} />
+              <Skeleton active avatar paragraph={{ rows: 1 }} />
+            </div>
+          ) : items.length === 0 ? (
+            <MobileEmptyState
+              title={kind === 'chat' ? '暂无智能体' : '暂无应用'}
+              hint={kind === 'chat' ? '点击右上角新建智能体' : '点击右上角注册应用'}
+            />
+          ) : (
+            <>
+              <div className="mobile-console-section__rows" style={{ marginTop: 12 }}>
+                {items.map((app) => (
+                  <MobileEntityRow
+                    key={app.id}
+                    avatar={(
+                      <AgentAvatar
+                        application={app}
+                        size={44}
+                        shape={kind === 'chat' ? 'circle' : 'square'}
+                        tint={app.color}
+                      />
+                    )}
+                    title={app.name}
+                    description={app.slug}
+                    meta={rowMeta(app)}
+                    badge={app.is_default_agent ? '默认' : undefined}
+                    statusDot={app.enabled !== false ? 'on' : 'off'}
+                    statusLabel={app.enabled !== false ? '启用' : '停用'}
+                    onMore={() => setSheetFor(app)}
+                    onClick={() => setSheetFor(app)}
                   />
-                )}
-                title={app.name}
-                description={app.slug}
-                meta={rowMeta(app)}
-                badge={app.is_default_agent ? '默认' : undefined}
-                statusDot={app.enabled !== false ? 'on' : 'off'}
-                statusLabel={app.enabled !== false ? '启用' : '停用'}
-                onMore={() => setSheetFor(app)}
-                onClick={() => setSheetFor(app)}
-              />
-            ))}
-          </div>
-          {hasMore && (
-            <button
-              type="button"
-              className="mobile-console-more"
-              onClick={() => void loadMore()}
-            >
-              {loadingMore ? '加载中…' : '加载更多'}
-            </button>
+                ))}
+              </div>
+              {hasMore && (
+                <button
+                  type="button"
+                  className="mobile-console-more"
+                  onClick={() => void loadMore()}
+                >
+                  {loadingMore ? '加载中…' : partialError ? '加载失败，点击重试' : '加载更多'}
+                </button>
+              )}
+            </>
           )}
         </>
-      ))}
+      )}
 
       <MobileActionSheet
         open={sheetFor !== null}

@@ -1,9 +1,10 @@
 /**
  * MobileAuditPage — 移动端审计日志（开发执行报告 §50）：
  * Timeline 列表；JSON detail 不整块铺出，点「查看详情」用 Bottom Sheet 看。
+ * 请求失败 ≠ 暂无审计日志（二次复审 P2-9）：错误态 + 重试。
  */
-import React, { useEffect, useState } from 'react';
-import { Drawer, Skeleton } from 'antd';
+import React, { useCallback, useEffect, useState } from 'react';
+import { Button, Drawer, Skeleton } from 'antd';
 import { enterpriseApi, type AuditLog } from '../enterpriseApi';
 import { fmt } from '../enterpriseNav';
 import { MobileEmptyState, MobilePage, MobileSection } from '@/components/MobileConsole';
@@ -11,18 +12,27 @@ import '../EnterpriseMobile.css';
 
 export default function MobileAuditPage() {
   const [rows, setRows] = useState<AuditLog[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [detail, setDetail] = useState<AuditLog | null>(null);
 
-  useEffect(() => {
-    void enterpriseApi.audits()
+  const load = useCallback(() => {
+    setError(null);
+    enterpriseApi.audits()
       .then(setRows)
-      .catch(() => setRows([]));
+      .catch(() => setError('加载审计日志失败'));
   }, []);
+
+  useEffect(() => { load(); }, [load]);
 
   return (
     <MobilePage>
       <MobileSection title="关键操作" flush>
-        {rows === null ? (
+        {error ? (
+          <MobileEmptyState
+            title="加载审计日志失败"
+            action={<Button onClick={load}>重试</Button>}
+          />
+        ) : rows === null ? (
           <div style={{ padding: 16 }}>
             <Skeleton active paragraph={{ rows: 2 }} />
             <Skeleton active paragraph={{ rows: 2 }} />

@@ -9,6 +9,7 @@ import {
   Input,
   InputNumber,
   Select,
+  Skeleton,
   Switch,
   Tag,
   TimePicker,
@@ -34,17 +35,25 @@ export default function MobileSyncPage() {
   const [cfg, setCfg] = useState<SyncConfig | null>(null);
   const [runs, setRuns] = useState<SyncRun[]>([]);
   const [syncing, setSyncing] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [form] = Form.useForm();
   const [saving, setSaving] = useState(false);
 
+  // 失败保留旧数据（cfg/runs 不清空），显式错误态 + 重试（二次复审 P2-8）；
+  // 不再让 Promise 错误静默逃逸成 unhandled rejection。
   const load = useCallback(async () => {
-    const [c, r] = await Promise.all([
-      enterpriseApi.syncConfig(),
-      enterpriseApi.syncRuns(),
-    ]);
-    setCfg(c);
-    setRuns(r);
-    form.setFieldsValue({ ...c, daily_time: dayjs(c.daily_time, 'HH:mm') });
+    setLoadError(null);
+    try {
+      const [c, r] = await Promise.all([
+        enterpriseApi.syncConfig(),
+        enterpriseApi.syncRuns(),
+      ]);
+      setCfg(c);
+      setRuns(r);
+      form.setFieldsValue({ ...c, daily_time: dayjs(c.daily_time, 'HH:mm') });
+    } catch {
+      setLoadError('加载同步信息失败');
+    }
   }, [form]);
 
   useEffect(() => {
@@ -61,6 +70,8 @@ export default function MobileSyncPage() {
       });
       setCfg(next);
       message.success('同步设置已保存');
+    } catch {
+      message.error('保存同步设置失败');
     } finally {
       setSaving(false);
     }
@@ -72,6 +83,8 @@ export default function MobileSyncPage() {
       await enterpriseApi.triggerSync();
       message.success('同步任务已进入队列');
       await load();
+    } catch {
+      message.error('发起同步失败');
     } finally {
       setSyncing(false);
     }
@@ -82,7 +95,15 @@ export default function MobileSyncPage() {
   return (
     <MobilePage>
       <MobileSection title="最近同步">
-        {cfg ? (
+        {cfg === null && loadError ? (
+          <div className="mobile-console-empty">
+            <strong>加载失败</strong>
+            {loadError}
+            <Button onClick={() => void load()}>重试</Button>
+          </div>
+        ) : cfg === null ? (
+          <Skeleton active />
+        ) : (
           <div className="mobile-sync__status">
             <div className="mobile-sync__status-line">
               {last && (
@@ -101,7 +122,7 @@ export default function MobileSyncPage() {
               </div>
             )}
           </div>
-        ) : null}
+        )}
         <Button
           type="primary"
           block

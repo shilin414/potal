@@ -3,8 +3,8 @@
  * 概览 StatCard（2 列）+ 资源/权限/组织/平台四组 SettingsGroup 菜单。
  * 导航 key 与桌面 Sider 完全一致（§88）。
  */
-import React, { useEffect, useState } from 'react';
-import { Alert } from 'antd';
+import React, { useCallback, useEffect, useState } from 'react';
+import { Alert, Button } from 'antd';
 import { enterpriseApi, type DirectoryStats, type SyncRun } from '../enterpriseApi';
 import { ENTERPRISE_SECTIONS, pagePath } from '../enterpriseNav';
 import { useNavigate } from 'react-router-dom';
@@ -25,15 +25,21 @@ export default function MobileEnterpriseHome() {
   const navigate = useNavigate();
   const [stats, setStats] = useState<DirectoryStats | null>(null);
   const [runs, setRuns] = useState<SyncRun[]>([]);
+  const [error, setError] = useState(false);
 
-  useEffect(() => {
+  // 概览加载失败只影响概览本身（二次复审 P2-9）：给轻量错误提示 + 重试，
+  // 菜单永远可用，不阻塞导航。
+  const load = useCallback(() => {
+    setError(false);
     void Promise.all([enterpriseApi.stats(), enterpriseApi.syncRuns(1)])
       .then(([s, r]) => {
         setStats(s);
         setRuns(r);
       })
-      .catch(() => {/* 首页保持空态，不阻塞菜单 */});
+      .catch(() => setError(true));
   }, []);
+
+  useEffect(() => { load(); }, [load]);
 
   const oauthMatch = stats && stats.oauth_users
     ? Math.round((stats.linked_directory_users * 100) / stats.oauth_users)
@@ -42,32 +48,43 @@ export default function MobileEnterpriseHome() {
   return (
     <MobilePage>
       <MobileSection title="企业概览">
-        <div className="mobile-console-stat-grid">
-          <MobileStatCard
-            value={stats ? `${stats.departments_active} / ${stats.departments_total}` : '—'}
-            label="有效部门"
-          />
-          <MobileStatCard
-            value={stats ? `${stats.users_active} / ${stats.users_total}` : '—'}
-            label="有效员工"
-          />
-          <MobileStatCard
-            value={stats ? `${oauthMatch}%` : '—'}
-            label="OAuth 关联"
-            sub={stats ? `${stats.linked_directory_users} / ${stats.oauth_users}` : undefined}
-          />
-          <MobileStatCard
-            value={runs[0] ? (STATUS_LABEL[runs[0].status] ?? runs[0].status) : '未执行'}
-            label="最近同步"
-          />
-        </div>
-        {stats && stats.users_resigned > 0 && (
+        {error ? (
           <Alert
-            type="info"
+            type="warning"
             showIcon
-            style={{ marginTop: 12 }}
-            message={`目录中有 ${stats.users_resigned} 名离职员工，ACL 已自动排除。`}
+            message="企业概览暂时无法加载"
+            action={<Button size="small" onClick={load}>重试</Button>}
           />
+        ) : (
+          <>
+            <div className="mobile-console-stat-grid">
+              <MobileStatCard
+                value={stats ? `${stats.departments_active} / ${stats.departments_total}` : '—'}
+                label="有效部门"
+              />
+              <MobileStatCard
+                value={stats ? `${stats.users_active} / ${stats.users_total}` : '—'}
+                label="有效员工"
+              />
+              <MobileStatCard
+                value={stats ? `${oauthMatch}%` : '—'}
+                label="OAuth 关联"
+                sub={stats ? `${stats.linked_directory_users} / ${stats.oauth_users}` : undefined}
+              />
+              <MobileStatCard
+                value={runs[0] ? (STATUS_LABEL[runs[0].status] ?? runs[0].status) : '未执行'}
+                label="最近同步"
+              />
+            </div>
+            {stats && stats.users_resigned > 0 && (
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginTop: 12 }}
+                message={`目录中有 ${stats.users_resigned} 名离职员工，ACL 已自动排除。`}
+              />
+            )}
+          </>
         )}
       </MobileSection>
 
