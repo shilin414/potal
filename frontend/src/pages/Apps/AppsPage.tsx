@@ -5,6 +5,8 @@ import { useNavigate } from "react-router-dom";
 import { useCatalogUiStore } from "@/stores/useCatalogUiStore";
 import { useApplicationPage } from "@/hooks/useApplicationPage";
 import type { V2Application } from "@/services/runApi";
+import { useIsMobile } from "@/shell/useIsMobile";
+import MobileAppCenter from "./MobileAppCenter";
 import "./AppsPage.css";
 
 const { Search } = Input;
@@ -19,7 +21,8 @@ const cardDelay = (index: number): React.CSSProperties => ({
   animationDelay: `${Math.min(index, 8) * 60}ms`,
 });
 
-const AppsPage: React.FC = () => {
+/** Desktop grid with thumbnails — unchanged (开发执行报告 §20/§54). */
+const DesktopAppCenter: React.FC = () => {
   const navigate = useNavigate();
   const category = useCatalogUiStore((state) => state.fixedCategory);
   const [query, setQuery] = useState("");
@@ -125,5 +128,11 @@ const AppsPage: React.FC = () => {
       )}
     </div>
   );
+};
+
+/** Router adapter (开发执行报告 §18): React-level switch, no CSS hiding. */
+const AppsPage: React.FC = () => {
+  const isMobile = useIsMobile();
+  return isMobile ? <MobileAppCenter /> : <DesktopAppCenter />;
 };
 export default AppsPage;
