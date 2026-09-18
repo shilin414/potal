@@ -24,6 +24,13 @@ export interface UseDirectoryUsersOptions {
   limit?: number;
   /** Debounce for query changes (default 300 ms). */
   debounceMs?: number;
+  /**
+   * Directory management wants resigned users too; ACL pickers should only
+   * offer active employees (二次复审 D1). Defaults to true — the directory
+   * page's existing contract. False omits include_inactive entirely, which
+   * the backend defaults to false.
+   */
+  includeInactive?: boolean;
 }
 
 const dedupeById = (items: DirectoryUser[]): DirectoryUser[] => {
@@ -42,6 +49,7 @@ export function useDirectoryUsers({
   enabled = true,
   limit = 50,
   debounceMs = 300,
+  includeInactive = true,
 }: UseDirectoryUsersOptions) {
   const [items, setItems] = useState<DirectoryUser[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
@@ -66,7 +74,8 @@ export function useDirectoryUsers({
     try {
       const page = await enterpriseApi.users({
         q: debouncedQuery.trim() || undefined,
-        include_inactive: true,
+        // Backend default is false — only the directory wants the resigned.
+        ...(includeInactive ? { include_inactive: true } : {}),
         limit,
       });
       if (requestIdRef.current !== requestId) return;
@@ -84,7 +93,7 @@ export function useDirectoryUsers({
     } finally {
       if (requestIdRef.current === requestId) setLoading(false);
     }
-  }, [enabled, debouncedQuery, limit]);
+  }, [enabled, debouncedQuery, limit, includeInactive]);
 
   useEffect(() => { void fetchFirstPage(); }, [fetchFirstPage]);
 
@@ -95,7 +104,8 @@ export function useDirectoryUsers({
     try {
       const page = await enterpriseApi.users({
         q: debouncedQuery.trim() || undefined,
-        include_inactive: true,
+        // Backend default is false — only the directory wants the resigned.
+        ...(includeInactive ? { include_inactive: true } : {}),
         limit,
         cursor,
       });
@@ -103,6 +113,9 @@ export function useDirectoryUsers({
       setItems((current) => dedupeById([...current, ...page.results]));
       setCursor(page.next_cursor ?? null);
       setHasMore(Boolean(page.next_cursor));
+      // A successful retry clears the 加载更多失败 indicator (二次复审 P2-1):
+      // consumers render a persistent error tail off `error`.
+      setError(null);
     } catch {
       if (requestIdRef.current !== requestId) return;
       // 加载更多 keeps the already-rendered rows; the next click retries.
@@ -110,7 +123,7 @@ export function useDirectoryUsers({
     } finally {
       if (requestIdRef.current === requestId) setLoadingMore(false);
     }
-  }, [enabled, debouncedQuery, limit, cursor, loadingMore, loading]);
+  }, [enabled, debouncedQuery, limit, includeInactive, cursor, loadingMore, loading]);
 
   return {
     items, hasMore, loading, loadingMore, error,

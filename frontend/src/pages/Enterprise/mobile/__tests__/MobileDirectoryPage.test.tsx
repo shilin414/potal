@@ -224,6 +224,38 @@ describe('MobileDirectoryPage — users cursor pagination (P1-4)', () => {
       .find((b) => b.textContent === '加载更多')).toBeUndefined();
   });
 
+  it('a loadMore failure then a successful retry clears the error indicator (P2-1)', async () => {
+    mocks.users.mockReset()
+      .mockResolvedValueOnce({ results: [user(1, '张三')], next_cursor: 'cursor-1' });
+    await mountPage();
+    await click(document.querySelector('[data-value="users"]')!);
+    await flush(20);
+
+    const more = Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '加载更多')!;
+    expect(more).toBeTruthy();
+
+    // The loadMore request fails — rows survive, the indicator flips on.
+    mocks.users.mockRejectedValueOnce(new Error('network down'));
+    await click(more);
+    await flush(20);
+    expect(document.body.textContent).toContain('加载失败，点击重试');
+    expect(document.body.textContent).toContain('张三');
+
+    // The retry succeeds — the error indicator MUST disappear.
+    mocks.users.mockResolvedValueOnce({ results: [user(3, '王五')], next_cursor: null });
+    const retry = Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '加载失败，点击重试')!;
+    await click(retry);
+    await flush(20);
+
+    expect(document.body.textContent).not.toContain('加载失败，点击重试');
+    expect(document.body.textContent).toContain('王五');
+    // next_cursor exhausted → the 加载更多 button is gone too.
+    expect(Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '加载更多')).toBeUndefined();
+  });
+
   it('the users tab does not show a fake total count', async () => {
     await mountPage();
     const usersTab = document.querySelector('[data-value="users"]')!;
