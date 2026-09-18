@@ -1,0 +1,252 @@
+/**
+ * ScheduleEditorFields / useScheduleEditor — agent picker data boundary
+ * (二次复审 P1-2).
+ *
+ * The selector used to download ONE page of 100 agents and filter it in the
+ * browser — agents 101+ could never be scheduled. Pin the new contract:
+ *   · the search term goes to the SERVER (q on fetchApplicationPage), so an
+ *     agent outside the first page is findable;
+ *   · has_more + onPopupScroll loads the next cursor page;
+ *   · editing a schedule whose application is NOT on the first page resolves
+ *     it by id (fetchApplicationDetail) so the Select never shows blank.
+ */
+// @vitest-environment jsdom
+import React from 'react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createRoot, type Root } from 'react-dom/client';
+import { act } from 'react-dom/test-utils';
+
+import type { Schedule } from '@/types/schedule';
+
+const mocks = vi.hoisted(() => ({
+  fetchApplicationPage: vi.fn(),
+  fetchApplicationDetail: vi.fn(),
+}));
+
+vi.mock('@/services/runApi', () => ({
+  fetchApplicationPage: mocks.fetchApplicationPage,
+  fetchApplicationDetail: mocks.fetchApplicationDetail,
+}));
+
+vi.mock('@/services/shareApi', () => ({
+  fetchFeishuTargets: vi.fn(async () => []),
+}));
+
+vi.mock('@/services/scheduleApi', () => ({
+  createSchedule: vi.fn(async () => ({ id: 1 })),
+  updateSchedule: vi.fn(async () => ({ id: 1 })),
+  previewScheduleRuns: vi.fn(async () => []),
+}));
+
+import { ScheduleEditorModal } from '../ScheduleEditorModal';
+
+// ── jsdom 环境补齐（antd 依赖） ────────────────────────────────────
+(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+(globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+};
+(globalThis as unknown as { matchMedia: unknown }).matchMedia = (query: string) => ({
+  matches: false, media: query, onchange: null,
+  addListener() {}, removeListener() {},
+  addEventListener() {}, removeEventListener() {},
+  dispatchEvent: () => false,
+});
+
+const flush = async (ms = 0) => {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  });
+};
+
+function setNativeValue(el: HTMLInputElement, value: string) {
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!
+    .set!.call(el, value);
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function click(el: Element) {
+  return act(async () => {
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  });
+}
+
+async function mount(node: React.ReactElement): Promise<{ host: HTMLElement; root: Root }> {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  await act(async () => {
+    root.render(node);
+  });
+  await flush(50);
+  return { host, root };
+}
+
+async function unmount(root: Root, host: HTMLElement) {
+  await act(async () => { root.unmount(); });
+  host.remove();
+  document.body.innerHTML = '';
+}
+
+/** The 智能体 Select — Form.Item stamps its name onto the search input id. */
+function agentSelect() {
+  const input = document.querySelector('#application_id');
+  expect(input, '未找到智能体下拉').toBeTruthy();
+  return input!.closest('.ant-select')!;
+}
+
+/** The selected value INSIDE the 智能体 Select (other Selects exist on the form). */
+function agentSelectionItem() {
+  return agentSelect().querySelector('.ant-select-selection-item');
+}
+
+const editingSchedule: Schedule = {
+  id: 9,
+  name: '每日日报',
+  description: '',
+  application_id: 888,
+  prompt: '总结今天的数据',
+  schedule_type: 'daily',
+  cron_expression: '0 0 9 * * *',
+  timezone: 'Asia/Shanghai',
+  run_at: null,
+  trigger: { time: '09:00', days_of_week: [1, 2, 3, 4, 5], day_of_month: 1 },
+  enabled: true,
+  conversation_policy: 'new_each_run',
+  overlap_policy: 'queue',
+  misfire_policy: 'fire_once',
+  deadline_policy: 'execute_anyway',
+  execution_window_seconds: 0,
+  next_run_at: null,
+  last_run_at: null,
+  created_at: '2026-09-01T00:00:00Z',
+  updated_at: '2026-09-01T00:00:00Z',
+  deliveries: [],
+};
+
+beforeEach(() => {
+  mocks.fetchApplicationPage.mockReset();
+  mocks.fetchApplicationDetail.mockReset();
+});
+
+describe('agent picker — server-side search (P1-2)', () => {
+  it('sends the search term to the server and lists an agent outside page one', async () => {
+    mocks.fetchApplicationPage.mockImplementation(async (opts: { q?: string }) => (
+      opts?.q === '财务'
+        ? { items: [{ id: 8, name: '财务助手', enabled: true, is_bound: true }], next_cursor: '', has_more: false }
+        : { items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }], next_cursor: '', has_more: false }
+    ));
+
+    const { root, host } = await mount(
+      <ScheduleEditorModal open editing={null} onClose={() => {}} onSaved={() => {}} />,
+    );
+
+    await click(agentSelect().querySelector('.ant-select-selector')!);
+    await flush(30);
+    expect(mocks.fetchApplicationPage).toHaveBeenLastCalledWith(
+      expect.not.objectContaining({ q: '财务' }),
+    );
+
+    const searchInput = agentSelect()
+      .querySelector<HTMLInputElement>('.ant-select-selection-search-input')!;
+    await act(async () => { setNativeValue(searchInput, '财务'); });
+    await flush(400); // useApplicationPage's 300 ms debounce
+
+    expect(mocks.fetchApplicationPage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ q: '财务' }),
+    );
+    const option = Array.from(document.querySelectorAll<HTMLElement>('.ant-select-item-option'))
+      .find((el) => el.textContent?.includes('财务助手'));
+    expect(option, '服务端搜索结果应出现在候选里').toBeTruthy();
+
+    await unmount(root, host);
+  });
+});
+
+describe('agent picker — popup scroll pagination (P1-2)', () => {
+  it('scrolling near the bottom of the dropdown fetches the next cursor page', async () => {
+    // Small pages: antd's virtual list renders only what fits the (jsdom
+    // zero-height) viewport, so keep the total option count tiny.
+    mocks.fetchApplicationPage.mockImplementation(async (opts: { cursor?: string }) => (
+      opts?.cursor === 'c1'
+        ? { items: [{ id: 60, name: '第二页智能体', enabled: true, is_bound: true }], next_cursor: '', has_more: false }
+        : {
+          items: [
+            { id: 1, name: '智能体1', enabled: true, is_bound: true },
+            { id: 2, name: '智能体2', enabled: true, is_bound: true },
+            { id: 3, name: '智能体3', enabled: true, is_bound: true },
+          ],
+          next_cursor: 'c1', has_more: true,
+        }
+    ));
+
+    const { root, host } = await mount(
+      <ScheduleEditorModal open editing={null} onClose={() => {}} onSaved={() => {}} />,
+    );
+
+    await click(agentSelect().querySelector('.ant-select-selector')!);
+    await flush(30);
+    expect(mocks.fetchApplicationPage).toHaveBeenCalledTimes(1);
+
+    // jsdom: scrollHeight/clientHeight are both 0 → the near-bottom check
+    // (scrollHeight - scrollTop - clientHeight < 24) fires on any scroll event.
+    // rc-select binds onPopupScroll to the virtual-list holder, not to the
+    // dropdown root.
+    const holder = document.querySelector('.rc-virtual-list-holder');
+    expect(holder, '下拉未打开').toBeTruthy();
+    await act(async () => {
+      holder!.dispatchEvent(new Event('scroll'));
+    });
+    await flush(30);
+
+    expect(mocks.fetchApplicationPage).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cursor: 'c1' }),
+    );
+    const option = Array.from(document.querySelectorAll<HTMLElement>('.ant-select-item-option'))
+      .find((el) => el.textContent?.includes('第二页智能体'));
+    expect(option, '第二页候选应出现在下拉里').toBeTruthy();
+
+    await unmount(root, host);
+  });
+});
+
+describe('agent picker — editing backfill (P1-2)', () => {
+  it('resolves the bound agent by id when it is not on the first page', async () => {
+    mocks.fetchApplicationPage.mockResolvedValue({
+      items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }],
+      next_cursor: '', has_more: false,
+    });
+    mocks.fetchApplicationDetail.mockResolvedValue({ name: '第一页之外的智能体' });
+
+    const { root, host } = await mount(
+      <ScheduleEditorModal open editing={editingSchedule} onClose={() => {}} onSaved={() => {}} />,
+    );
+
+    expect(mocks.fetchApplicationDetail).toHaveBeenCalledWith(888);
+    // The Select shows the resolved name instead of a blank value.
+    const selected = agentSelectionItem();
+    expect(selected?.textContent).toContain('第一页之外的智能体');
+
+    await unmount(root, host);
+  });
+
+  it('falls back to 智能体 #id when the detail read fails — the form stays usable', async () => {
+    mocks.fetchApplicationPage.mockResolvedValue({
+      items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }],
+      next_cursor: '', has_more: false,
+    });
+    mocks.fetchApplicationDetail.mockRejectedValue(new Error('403'));
+
+    const { root, host } = await mount(
+      <ScheduleEditorModal open editing={editingSchedule} onClose={() => {}} onSaved={() => {}} />,
+    );
+
+    const selected = agentSelectionItem();
+    expect(selected?.textContent).toContain('智能体 #888');
+
+    await unmount(root, host);
+  });
+});
