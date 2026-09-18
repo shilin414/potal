@@ -10,9 +10,13 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Form, message } from 'antd';
-import { fetchApplicationPage, type V2Application } from '@/services/runApi';
+import {
+  fetchApplicationDetail,
+  type V2Application,
+} from '@/services/runApi';
 import { fetchFeishuTargets, type FeishuForwardTarget } from '@/services/shareApi';
 import { createSchedule, previewScheduleRuns, updateSchedule } from '@/services/scheduleApi';
+import { useApplicationPage } from '@/hooks/useApplicationPage';
 import type { Schedule, ScheduleType } from '@/types/schedule';
 import {
   formToPayload,
@@ -34,14 +38,66 @@ export function useScheduleEditor({
 }: UseScheduleEditorOptions) {
   const [form] = Form.useForm<ScheduleFormValues>();
   const [saving, setSaving] = useState(false);
-  const [apps, setApps] = useState<V2Application[]>([]);
-  const [appsLoading, setAppsLoading] = useState(false);
   const [scheduleType, setScheduleType] = useState<ScheduleType>('daily');
   const [deliveryOn, setDeliveryOn] = useState(false);
   const [targets, setTargets] = useState<FeishuForwardTarget[]>([]);
   const [targetsLoading, setTargetsLoading] = useState(false);
   const [preview, setPreview] = useState<string[]>([]);
   const [previewing, setPreviewing] = useState(false);
+
+  // 可调度智能体（二次复审 P1-2）：复用 useApplicationPage 走服务端分页 +
+  // 服务端搜索（mode 'consume' 让后端过滤 enabled/bound），拥有 >50 个智能体
+  // 也能通过 loadMore 全部选到；搜索词直发后端，浏览器不再只在前 N 条里
+  // 本地过滤。编辑器关闭时 `enabled: false` 完全静默。
+  const [appQuery, setAppQuery] = useState('');
+  const {
+    items: apps,
+    loading: appsLoading,
+    loadingMore: appsLoadingMore,
+    hasMore: appsHasMore,
+    loadMore: loadMoreApps,
+  } = useApplicationPage({
+    kind: 'chat',
+    scope: 'mine',
+    mode: 'consume',
+    query: appQuery,
+    limit: 50,
+    enabled: open,
+  });
+
+  // Reopen starts from an empty search — the shells stay mounted, so the
+  // previous session's term would otherwise filter the dropdown invisibly.
+  useEffect(() => {
+    if (!open) setAppQuery('');
+  }, [open]);
+
+  // 编辑回填（P1-2 边界）：已绑定智能体可能不在当前页（搜索词/翻页都够不
+  // 到）——按 ID resolve 一次注入 options，避免 Select 显示空白；detail 读
+  // 失败（如权限）时退回 “智能体 #id”，编辑与保存照常可用。
+  const [extraApp, setExtraApp] = useState<{ id: number; name: string } | null>(null);
+  useEffect(() => {
+    const id = editing?.application_id ?? null;
+    if (!open || !id) {
+      setExtraApp(null);
+      return;
+    }
+    if (extraApp?.id === id) return;
+    if (appsLoading) return; // 等 first page 到位再判断是否真的够不到
+    if (apps.some((a) => a.id === id)) return;
+    let stale = false;
+    fetchApplicationDetail(id)
+      .then((detail) => { if (!stale) setExtraApp({ id, name: detail.name }); })
+      .catch(() => { if (!stale) setExtraApp({ id, name: `智能体 #${id}` }); });
+    return () => { stale = true; };
+  }, [open, editing, apps, appsLoading, extraApp]);
+
+  // The editor reads `apps` for options — splice the resolved row in without
+  // duplicating a value the current page already carries.
+  const pickerApps = useMemo<V2Application[]>(() => (
+    extraApp && !apps.some((a) => a.id === extraApp.id)
+      ? [...apps, { id: extraApp.id, name: extraApp.name } as V2Application]
+      : apps
+  ), [apps, extraApp]);
 
   // 打开时初始化：编辑回填 or 新建默认值。
   useEffect(() => {
@@ -71,19 +127,6 @@ export function useScheduleEditor({
     }
     setPreview([]);
   }, [open, editing, presetApplicationId, form]);
-
-  // 可调度应用：chat + 已启用 + 有运行时绑定（后端仍会做权威校验）。
-  // Reads the PAGED endpoint (执行报告 §16.2) — a schedule form must not
-  // download the whole catalog to render a dropdown.
-  useEffect(() => {
-    if (!open) return;
-    setAppsLoading(true);
-    fetchApplicationPage({ kind: 'chat', scope: 'mine', limit: 100 })
-      .then((page) => setApps(page.items.filter(
-        (a) => a.enabled !== false && a.is_bound !== false)))
-      .catch(() => setApps([]))
-      .finally(() => setAppsLoading(false));
-  }, [open]);
 
   // 飞书目标：开启投递时加载（用户 + 群聊）。
   useEffect(() => {
@@ -149,13 +192,16 @@ export function useScheduleEditor({
 
   const watchedAppId = Form.useWatch('application_id', form);
   const selectedApp = useMemo(
-    () => apps.find((a) => a.id === watchedAppId),
-    [apps, watchedAppId],
+    () => pickerApps.find((a) => a.id === watchedAppId),
+    [pickerApps, watchedAppId],
   );
   void selectedApp; // 展示预留：选中智能体的头像/名称随后续迭代上屏
 
   return {
-    form, saving, apps, appsLoading,
+    form, saving,
+    apps: pickerApps, appsLoading,
+    appsHasMore, appsLoadingMore, loadMoreApps,
+    appQuery, setAppQuery,
     scheduleType, setScheduleType, setPreview,
     deliveryOn, setDeliveryOn,
     targets, targetsLoading,

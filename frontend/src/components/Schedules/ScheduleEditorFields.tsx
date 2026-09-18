@@ -28,7 +28,8 @@ const TIME_OPTIONS = Array.from({ length: 24 }, (_, h) => ({
 
 export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) {
   const {
-    form, apps, appsLoading, scheduleType, setScheduleType,
+    form, apps, appsLoading, appsHasMore, appsLoadingMore, loadMoreApps,
+    setAppQuery, scheduleType, setScheduleType,
     setPreview, deliveryOn, setDeliveryOn, targets, targetsLoading,
     preview, previewing, refreshPreview,
   } = state;
@@ -49,11 +50,23 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
           label="选择智能体"
           rules={[{ required: true, message: '请选择一个智能体' }]}
         >
+          {/* 服务端搜索 + 分页（二次复审 P1-2）：filterOption=false 让搜索词
+              直发后端（覆盖全部智能体，而不只是已加载页）；下拉滚到底再拉
+              下一页，>50 个可调度智能体也不会被截断。 */}
           <Select
             loading={appsLoading}
             placeholder="选择要定时执行的智能体"
             showSearch
-            optionFilterProp="label"
+            filterOption={false}
+            onSearch={setAppQuery}
+            onPopupScroll={(e) => {
+              const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
+              if (appsHasMore
+                && !appsLoadingMore
+                && scrollHeight - scrollTop - clientHeight < 24) {
+                void loadMoreApps();
+              }
+            }}
             options={apps.map((a) => ({
               value: a.id,
               label: a.name,
