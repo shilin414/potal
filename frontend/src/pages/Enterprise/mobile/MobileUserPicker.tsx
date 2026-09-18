@@ -1,14 +1,19 @@
 /**
  * MobileUserPicker — 移动端人员选择 Bottom Sheet（开发执行报告 §43）。
  *
- * 多选 + 搜索（enterpriseApi.users({q})，300ms 防抖由调用侧 search 触发）。
- * 底部固定「已选择 N 人 · 完成」。与桌面 Select mode="multiple" 同一数据
- * 源，仅交互换成了适合手指的行选择。
+ * 多选 + 搜索。数据面复用 useDirectoryUsers（二次复审 P2-5）：
+ *   · 服务端搜索（防抖 300ms，q 直发后端）；
+ *   · cursor 分页 + 加载更多 —— 不再被 100 人上限截断；
+ *   · ACL 选人只看有效员工（include_inactive: false，后端默认值）；
+ *   · 请求失败是错误态 + 重试，绝不伪装成“没有匹配的人员”；
+ *   · 跨页选择保留（picked 独立于当前结果页）。
+ * 底部固定「已选择 N 人 · 完成」。与桌面 Select mode="multiple" 同一数据源。
  */
 import React, { useEffect, useState } from 'react';
-import { Avatar, Drawer, Input } from 'antd';
+import { Avatar, Button, Drawer, Input } from 'antd';
 import { CheckOutlined, SearchOutlined } from '@ant-design/icons';
-import { enterpriseApi, type DirectoryUser } from '../enterpriseApi';
+import type { DirectoryUser } from '../enterpriseApi';
+import { useDirectoryUsers } from '../hooks/useDirectoryUsers';
 import '../EnterpriseMobile.css';
 
 export interface MobilePickedUser {
@@ -26,8 +31,6 @@ export interface MobileUserPickerProps {
   onDone: (users: MobilePickedUser[]) => void;
 }
 
-const USER_PAGE_LIMIT = 100;
-
 /** A search result (DirectoryUser) flattened to the picker's selection shape. */
 const toPicked = (user: DirectoryUser): MobilePickedUser => ({
   id: user.id,
@@ -40,8 +43,6 @@ export default function MobileUserPicker({
   open, selectedUsers, onClose, onDone,
 }: MobileUserPickerProps) {
   const [query, setQuery] = useState('');
-  const [results, setResults] = useState<DirectoryUser[]>([]);
-  const [loading, setLoading] = useState(false);
   const [picked, setPicked] = useState<MobilePickedUser[]>([]);
 
   useEffect(() => {
@@ -52,21 +53,19 @@ export default function MobileUserPicker({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  useEffect(() => {
-    if (!open) return undefined;
-    let stale = false;
-    setLoading(true);
-    const timer = setTimeout(() => {
-      enterpriseApi.users({ q: query.trim() || undefined, limit: USER_PAGE_LIMIT })
-        .then((page) => { if (!stale) setResults(page.results); })
-        .catch(() => { if (!stale) setResults([]); })
-        .finally(() => { if (!stale) setLoading(false); });
-    }, 300);
-    return () => {
-      stale = true;
-      clearTimeout(timer);
-    };
-  }, [open, query]);
+  const {
+    items: results,
+    loading,
+    loadingMore,
+    hasMore,
+    error,
+    loadMore,
+    refresh,
+  } = useDirectoryUsers({
+    query,
+    enabled: open,
+    includeInactive: false,
+  });
 
   const pickedIds = new Set(picked.map((u) => u.id));
 
@@ -78,6 +77,10 @@ export default function MobileUserPicker({
       return [...current, toPicked(user)];
     });
   };
+
+  // A first-page failure is a full error state; a failed loadMore keeps the
+  // rows and swaps the 加载更多 CTA for a retry (ERROR != EMPTY, P2-5).
+  const fatalError = Boolean(error) && results.length === 0;
 
   return (
     <Drawer
@@ -109,35 +112,62 @@ export default function MobileUserPicker({
             />
           </div>
           <div className="mobile-picker__body">
-            {loading && results.length === 0 ? (
+            {fatalError ? (
+              <div className="mobile-console-empty">
+                <strong>加载人员失败</strong>
+                <Button onClick={() => void refresh()}>重试</Button>
+              </div>
+            ) : loading && results.length === 0 ? (
               <div className="mobile-console-empty">搜索中…</div>
             ) : results.length === 0 ? (
               <div className="mobile-console-empty">没有匹配的人员</div>
-            ) : results.map((user) => {
-              const checked = pickedIds.has(user.id);
-              return (
-                <button
-                  key={user.id}
-                  type="button"
-                  className="mobile-picker__row"
-                  aria-pressed={checked}
-                  onClick={() => toggle(user)}
-                >
-                  <Avatar src={user.avatar_url} size={36}>
-                    {user.name.slice(0, 1)}
-                  </Avatar>
-                  <span className="mobile-picker__row-body">
-                    <span className="mobile-picker__row-name">{user.name}</span>
-                    <span className="mobile-picker__row-meta">
-                      {user.departments.map((d) => d.name).join(' / ') || '—'}
-                    </span>
-                  </span>
-                  <span className={`mobile-picker__check${checked ? ' mobile-picker__check--on' : ''}`}>
-                    <CheckOutlined />
-                  </span>
-                </button>
-              );
-            })}
+            ) : (
+              <>
+                {results.map((user) => {
+                  const checked = pickedIds.has(user.id);
+                  return (
+                    <button
+                      key={user.id}
+                      type="button"
+                      className="mobile-picker__row"
+                      aria-pressed={checked}
+                      onClick={() => toggle(user)}
+                    >
+                      <Avatar src={user.avatar_url} size={36}>
+                        {user.name.slice(0, 1)}
+                      </Avatar>
+                      <span className="mobile-picker__row-body">
+                        <span className="mobile-picker__row-name">{user.name}</span>
+                        <span className="mobile-picker__row-meta">
+                          {user.departments.map((d) => d.name).join(' / ') || '—'}
+                        </span>
+                      </span>
+                      <span className={`mobile-picker__check${checked ? ' mobile-picker__check--on' : ''}`}>
+                        <CheckOutlined />
+                      </span>
+                    </button>
+                  );
+                })}
+                {/* One CTA, never two: a failed loadMore REPLACES 加载更多. */}
+                {error ? (
+                  <button
+                    type="button"
+                    className="mobile-console-more"
+                    onClick={() => void loadMore()}
+                  >
+                    加载失败，点击重试
+                  </button>
+                ) : hasMore ? (
+                  <button
+                    type="button"
+                    className="mobile-console-more"
+                    onClick={() => void loadMore()}
+                  >
+                    {loadingMore ? '加载中…' : '加载更多'}
+                  </button>
+                ) : null}
+              </>
+            )}
           </div>
           <div className="mobile-picker__footer">
             <span className="mobile-picker__footer-count">已选择 {picked.length} 人</span>
