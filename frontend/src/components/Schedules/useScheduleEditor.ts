@@ -11,7 +11,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Form, message } from 'antd';
 import {
-  fetchApplicationDetail,
+  resolveApplication,
   type V2Application,
 } from '@/services/runApi';
 import { fetchFeishuTargets, type FeishuForwardTarget } from '@/services/shareApi';
@@ -71,25 +71,34 @@ export function useScheduleEditor({
     if (!open) setAppQuery('');
   }, [open]);
 
-  // 编辑回填（P1-2 边界）：已绑定智能体可能不在当前页（搜索词/翻页都够不
-  // 到）——按 ID resolve 一次注入 options，避免 Select 显示空白；detail 读
-  // 失败（如权限）时退回 “智能体 #id”，编辑与保存照常可用。
+  // 回填目标（二次复审 P1-2/P1-3）：编辑的已绑定智能体，或从智能体卡片/
+  // 对话页带入的 presetApplicationId —— 两者都可能不在当前页（搜索词/翻页
+  // 都够不到），按 ID resolve 一次注入 options，避免 Select 显示空白。
+  const targetApplicationId = editing?.application_id ?? presetApplicationId ?? null;
+  // 消费面必须走 resolveApplication（catalog visibility），绝不能走
+  // fetchApplicationDetail —— 那是 staff-only 的 authoring 读法，/schedules
+  // 普通用户也能进，旧逻辑让每个"目标不在第一页"的普通用户都先吃一条 403
+  // 再退化成 “智能体 #id”。
   const [extraApp, setExtraApp] = useState<{ id: number; name: string } | null>(null);
   useEffect(() => {
-    const id = editing?.application_id ?? null;
+    const id = targetApplicationId;
     if (!open || !id) {
       setExtraApp(null);
       return;
     }
     if (extraApp?.id === id) return;
     if (appsLoading) return; // 等 first page 到位再判断是否真的够不到
-    if (apps.some((a) => a.id === id)) return;
+    if (apps.some((a) => a.id === id)) {
+      // 目标已经在当前页：清掉上一次 editing 残留的 extraApp（§15 收口）。
+      setExtraApp(null);
+      return;
+    }
     let stale = false;
-    fetchApplicationDetail(id)
-      .then((detail) => { if (!stale) setExtraApp({ id, name: detail.name }); })
+    resolveApplication({ id })
+      .then((resolved) => { if (!stale) setExtraApp({ id, name: resolved.name }); })
       .catch(() => { if (!stale) setExtraApp({ id, name: `智能体 #${id}` }); });
     return () => { stale = true; };
-  }, [open, editing, apps, appsLoading, extraApp]);
+  }, [open, targetApplicationId, apps, appsLoading, extraApp]);
 
   // The editor reads `apps` for options — splice the resolved row in without
   // duplicating a value the current page already carries.

@@ -1,14 +1,16 @@
 /**
  * ScheduleEditorFields / useScheduleEditor — agent picker data boundary
- * (二次复审 P1-2).
+ * (二次复审 P1-2/P1-3).
  *
  * The selector used to download ONE page of 100 agents and filter it in the
  * browser — agents 101+ could never be scheduled. Pin the new contract:
  *   · the search term goes to the SERVER (q on fetchApplicationPage), so an
  *     agent outside the first page is findable;
  *   · has_more + onPopupScroll loads the next cursor page;
- *   · editing a schedule whose application is NOT on the first page resolves
- *     it by id (fetchApplicationDetail) so the Select never shows blank.
+ *   · editing a schedule (or a preset agent id) whose application is NOT on
+ *     the first page resolves it through the CONSUMER resolver
+ *     resolveApplication({ id }) — never the staff-only authoring read
+ *     fetchApplicationDetail — so the Select never shows blank.
  */
 // @vitest-environment jsdom
 import React from 'react';
@@ -20,11 +22,13 @@ import type { Schedule } from '@/types/schedule';
 
 const mocks = vi.hoisted(() => ({
   fetchApplicationPage: vi.fn(),
+  resolveApplication: vi.fn(),
   fetchApplicationDetail: vi.fn(),
 }));
 
 vi.mock('@/services/runApi', () => ({
   fetchApplicationPage: mocks.fetchApplicationPage,
+  resolveApplication: mocks.resolveApplication,
   fetchApplicationDetail: mocks.fetchApplicationDetail,
 }));
 
@@ -129,6 +133,7 @@ const editingSchedule: Schedule = {
 
 beforeEach(() => {
   mocks.fetchApplicationPage.mockReset();
+  mocks.resolveApplication.mockReset();
   mocks.fetchApplicationDetail.mockReset();
 });
 
@@ -213,19 +218,20 @@ describe('agent picker — popup scroll pagination (P1-2)', () => {
   });
 });
 
-describe('agent picker — editing backfill (P1-2)', () => {
-  it('resolves the bound agent by id when it is not on the first page', async () => {
+describe('agent picker — editing backfill (P1-2/P1-3)', () => {
+  it('resolves the bound agent through the CONSUMER resolver, never the authoring detail read', async () => {
     mocks.fetchApplicationPage.mockResolvedValue({
       items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }],
       next_cursor: '', has_more: false,
     });
-    mocks.fetchApplicationDetail.mockResolvedValue({ name: '第一页之外的智能体' });
+    mocks.resolveApplication.mockResolvedValue({ name: '第一页之外的智能体' });
 
     const { root, host } = await mount(
       <ScheduleEditorModal open editing={editingSchedule} onClose={() => {}} onSaved={() => {}} />,
     );
 
-    expect(mocks.fetchApplicationDetail).toHaveBeenCalledWith(888);
+    expect(mocks.resolveApplication).toHaveBeenCalledWith({ id: 888 });
+    expect(mocks.fetchApplicationDetail).not.toHaveBeenCalled();
     // The Select shows the resolved name instead of a blank value.
     const selected = agentSelectionItem();
     expect(selected?.textContent).toContain('第一页之外的智能体');
@@ -233,12 +239,12 @@ describe('agent picker — editing backfill (P1-2)', () => {
     await unmount(root, host);
   });
 
-  it('falls back to 智能体 #id when the detail read fails — the form stays usable', async () => {
+  it('falls back to 智能体 #id when the resolve fails — the form stays usable', async () => {
     mocks.fetchApplicationPage.mockResolvedValue({
       items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }],
       next_cursor: '', has_more: false,
     });
-    mocks.fetchApplicationDetail.mockRejectedValue(new Error('403'));
+    mocks.resolveApplication.mockRejectedValue(new Error('404'));
 
     const { root, host } = await mount(
       <ScheduleEditorModal open editing={editingSchedule} onClose={() => {}} onSaved={() => {}} />,
@@ -246,6 +252,48 @@ describe('agent picker — editing backfill (P1-2)', () => {
 
     const selected = agentSelectionItem();
     expect(selected?.textContent).toContain('智能体 #888');
+
+    await unmount(root, host);
+  });
+
+  it('a preset agent id from a card/chat page resolves the same way (P1-3)', async () => {
+    mocks.fetchApplicationPage.mockResolvedValue({
+      items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }],
+      next_cursor: '', has_more: false,
+    });
+    mocks.resolveApplication.mockResolvedValue({ name: '卡片带入的智能体' });
+
+    const { root, host } = await mount(
+      <ScheduleEditorModal open editing={null} presetApplicationId={888} onClose={() => {}} onSaved={() => {}} />,
+    );
+
+    expect(mocks.resolveApplication).toHaveBeenCalledWith({ id: 888 });
+    const selected = agentSelectionItem();
+    expect(selected?.textContent).toContain('卡片带入的智能体');
+
+    await unmount(root, host);
+  });
+
+  it('a target that IS on the first page sends no resolve request', async () => {
+    mocks.fetchApplicationPage.mockResolvedValue({
+      items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }],
+      next_cursor: '', has_more: false,
+    });
+
+    const { root, host } = await mount(
+      <ScheduleEditorModal
+        open
+        editing={{ ...editingSchedule, application_id: 7 }}
+        onClose={() => {}}
+        onSaved={() => {}}
+      />,
+    );
+    await flush(50);
+
+    expect(mocks.resolveApplication).not.toHaveBeenCalled();
+    expect(mocks.fetchApplicationDetail).not.toHaveBeenCalled();
+    const selected = agentSelectionItem();
+    expect(selected?.textContent).toContain('日报智能体');
 
     await unmount(root, host);
   });

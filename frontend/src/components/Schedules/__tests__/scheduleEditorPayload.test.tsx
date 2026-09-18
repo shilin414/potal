@@ -27,16 +27,16 @@ const lastPayload = (): ScheduleUpsertPayload => sent[sent.length - 1];
 
 // The picker reads the PAGED endpoint (执行报告 §16.2) — the legacy
 // whole-array client no longer exists, so the mock has to answer the paged
-// shape the component actually consumes. fetchApplicationDetail backs the
-// out-of-page backfill (P1-2): id 7 is on the mocked page so it stays unused,
-// but the export must exist — useScheduleEditor imports it.
+// shape the component actually consumes. resolveApplication backs the
+// out-of-page backfill (P1-2/P1-3): id 7 is on the mocked page so it stays
+// unused, but the export must exist — useScheduleEditor imports it.
 vi.mock('@/services/runApi', () => ({
   fetchApplicationPage: vi.fn(async () => ({
     items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }],
     next_cursor: '',
     has_more: false,
   })),
-  fetchApplicationDetail: vi.fn(async () => ({ name: '日报智能体' })),
+  resolveApplication: vi.fn(async () => ({ name: '日报智能体' })),
 }));
 
 vi.mock('@/services/shareApi', () => ({
