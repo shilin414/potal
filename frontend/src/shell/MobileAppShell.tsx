@@ -131,7 +131,9 @@ const MobileShellContent: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
         </header>
       )}
 
-      <main className={`mobile-shell__main${chrome.padded ? ' mobile-shell__main--padded' : ''}`}>
+      {/* No `--padded` modifier: MobilePage owns its own padding (二次复审
+          P3-4 — a class with no CSS behind it only misleads). */}
+      <main className="mobile-shell__main">
         <Outlet />
       </main>
 

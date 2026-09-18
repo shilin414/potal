@@ -61,10 +61,15 @@ export function MobileHeaderProvider({ children }: { children: React.ReactNode }
         const next = prev.filter((layer) => layer.id !== id);
         return next.length === prev.length ? prev : next;
       }
-      const existing = prev.find((layer) => layer.id === id);
-      if (existing && overrideEqual(existing.override, override)) return prev;
-      const next = prev.filter((layer) => layer.id !== id);
-      next.push({ id, override });
+      // Update IN PLACE (二次复审 P3-3): an existing layer keeps its original
+      // registration slot instead of being re-pushed to the tail — otherwise
+      // priority silently becomes "most recently updated wins" rather than
+      // the registration order this module documents.
+      const index = prev.findIndex((layer) => layer.id === id);
+      if (index === -1) return [...prev, { id, override }];
+      if (overrideEqual(prev[index].override, override)) return prev;
+      const next = [...prev];
+      next[index] = { id, override };
       return next;
     });
   }, []);
