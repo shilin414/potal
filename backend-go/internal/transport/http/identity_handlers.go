@@ -50,6 +50,13 @@ func (l *loginAttemptLimiter) allow(key string) bool {
 	return true
 }
 
+// reset clears the failed-attempt budget after a successful authentication.
+func (l *loginAttemptLimiter) reset(key string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.attempts, key)
+}
+
 // ──────────────────────────────────────────────────── OAuth endpoints ──
 
 func (s *Server) OauthStart(w http.ResponseWriter, r *http.Request, params genapi.OauthStartParams) {
@@ -124,11 +131,19 @@ func clientIP(r *http.Request) string {
 
 // allowAdminLogin enforces the per username+IP attempt budget. The
 // limiter initializes lazily so every Server construction path gets it.
-func (s *Server) allowAdminLogin(username string, r *http.Request) bool {
+func adminLoginKey(username string, r *http.Request) string {
+	return username + "|" + clientIP(r)
+}
+
+func (s *Server) adminLoginAttempts() *loginAttemptLimiter {
 	s.adminLimiterOnce.Do(func() {
 		s.adminLoginLimiter = newLoginAttemptLimiter(adminLoginMaxAttempts, adminLoginWindow)
 	})
-	return s.adminLoginLimiter.allow(username + "|" + clientIP(r))
+	return s.adminLoginLimiter
+}
+
+func (s *Server) allowAdminLogin(username string, r *http.Request) bool {
+	return s.adminLoginAttempts().allow(adminLoginKey(username, r))
 }
 
 func (s *Server) AdminLogin(w http.ResponseWriter, r *http.Request) {
@@ -158,6 +173,7 @@ func (s *Server) AdminLogin(w http.ResponseWriter, r *http.Request) {
 		writeSimpleError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
+	s.adminLoginAttempts().reset(adminLoginKey(body.Username, r))
 	s.IdentityRepo.WriteAuditLog(r.Context(), &user.ID, "admin.login.success", body.Username, map[string]any{
 		"ip": clientIP(r),
 	})
@@ -206,6 +222,7 @@ func (s *Server) AuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeDetail(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
+	s.adminLoginAttempts().reset(adminLoginKey(body.Username, r))
 	s.IdentityRepo.WriteAuditLog(r.Context(), &user.ID, "admin.login.success", body.Username, map[string]any{
 		"ip":     clientIP(r),
 		"legacy": true,
@@ -221,15 +238,7 @@ func (s *Server) AuthLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(s.Store.CookieName()); err == nil {
 		_ = s.Store.Revoke(r.Context(), c.Value)
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     s.Store.CookieName(),
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-		Secure:   s.Config.Session.Secure,
-		SameSite: http.SameSiteLaxMode,
-	})
+	s.clearSessionCookies(w)
 	writeJSON(w, http.StatusOK, map[string]string{"detail": "登出成功"})
 }
 
@@ -295,6 +304,26 @@ func (s *Server) TokenRefresh(w http.ResponseWriter, r *http.Request) {
 }
 
 // ──────────────────────────────────────────────────────── cookies ──
+
+func (s *Server) clearSessionCookies(w http.ResponseWriter) {
+	for _, cookie := range []struct {
+		name     string
+		httpOnly bool
+	}{
+		{name: s.Store.CookieName(), httpOnly: true},
+		{name: s.Store.CSRFName(), httpOnly: false},
+	} {
+		http.SetCookie(w, &http.Cookie{
+			Name:     cookie.name,
+			Value:    "",
+			Path:     "/",
+			MaxAge:   -1,
+			HttpOnly: cookie.httpOnly,
+			Secure:   s.Config.Session.Secure,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
+}
 
 func (s *Server) setSessionCookie(w http.ResponseWriter, r *http.Request, user *identity.User) {
 	token, csrf, err := s.Store.Create(r.Context(), identity.Session{

@@ -22,6 +22,7 @@ import { useAuthStore } from '@/stores/useAuthStore';
 import { useApplicationPage } from '@/hooks/useApplicationPage';
 import { updateAgentApplication } from '@/services/runApi';
 import type { V2Application } from '@/services/runApi';
+import { applicationConsumeBlock } from '@/lib/applicationConsumability';
 import './AppsPage.css';
 
 const { Search } = Input;
@@ -84,6 +85,15 @@ const AppsPage: React.FC = () => {
    * switch showed 停用 while the cached entity — the one a deep link opens —
    * still said enabled, and 首页 kept offering the app.
    */
+  const openApplication = (app: V2Application) => {
+    const consumeBlock = applicationConsumeBlock(app);
+    if (consumeBlock) {
+      message.warning(consumeBlock);
+      return;
+    }
+    navigate(`/app/${app.slug}`);
+  };
+
   const applyApplicationMutation = (
     id: number,
     patch: Partial<V2Application>,
@@ -112,11 +122,16 @@ const AppsPage: React.FC = () => {
   ) => {
     setTogglingId(app.id);
     try {
-      await updateAgentApplication(app.id, patch);
+      const updated = await updateAgentApplication(app.id, patch);
+      const acceptedPatch: Partial<V2Application> = {
+        ...patch,
+        is_consumable: updated.is_consumable,
+        consume_block_reason: updated.consume_block_reason,
+      };
       // Local patch only (执行报告 §31): the switch is the source of truth
       // the moment the server accepted it — re-downloading the whole catalog
       // for one boolean was the pre-pagination behaviour.
-      applyApplicationMutation(app.id, patch);
+      applyApplicationMutation(app.id, acceptedPatch);
       message.success(`${app.name} ${hint}`);
     } catch (error: any) {
       message.error(error?.response?.data?.detail || '操作失败，请重试');
@@ -161,11 +176,11 @@ const AppsPage: React.FC = () => {
                 style={cardDelay(index)}
                 role="button"
                 tabIndex={0}
-                onClick={() => navigate(`/app/${app.slug}`)}
+                onClick={() => openApplication(app)}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' || event.key === ' ') {
                     event.preventDefault();
-                    navigate(`/app/${app.slug}`);
+                    openApplication(app);
                   }
                 }}
               >

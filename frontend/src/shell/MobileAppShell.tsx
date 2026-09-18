@@ -2,6 +2,7 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { Button, Drawer } from 'antd';
 import { MenuOutlined, PlusOutlined } from '@ant-design/icons';
 import ConversationHistory from '@/components/ConversationHistory/ConversationHistory';
+import AccountMenu from '@/components/AccountMenu/AccountMenu';
 import MobileAgentSwitcher from '@/components/Mobile/MobileAgentSwitcher';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
@@ -123,6 +124,10 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
             onNewConversation={handleNewConversation}
           />
         </div>
+        <AccountMenu
+          variant="panel"
+          onLogoutComplete={() => setMobileNavOpen(false)}
+        />
       </Drawer>
     </div>
   );

@@ -36,26 +36,28 @@ import (
 // It is a strict projection of applicationListItem so the two shapes can
 // never drift: every summary is built by summaryOf(item).
 type applicationSummary struct {
-	ID               int64   `json:"id"`
-	Slug             string  `json:"slug"`
-	Name             string  `json:"name"`
-	Description      string  `json:"description"`
-	Icon             string  `json:"icon"`
-	AvatarURL        string  `json:"avatar_url"`
-	Color            string  `json:"color"`
-	Kind             string  `json:"kind"`
-	RendererKey      string  `json:"renderer_key"`
-	CategorySlug     string  `json:"category_slug"`
-	CategoryName     string  `json:"category_name"`
-	ProviderKey      string  `json:"provider_key"`
-	RuntimeType      string  `json:"runtime_type"`
-	Enabled          bool    `json:"enabled"`
-	IsBound          bool    `json:"is_bound"`
-	IsFavorite       bool    `json:"is_favorite"`
-	IsDefaultAgent   bool    `json:"is_default_agent"`
-	UsageCount       int64   `json:"usage_count"`
-	LastUsedAt       *string `json:"last_used_at"`
-	GlobalUsageCount int64   `json:"global_usage_count"`
+	ID                 int64   `json:"id"`
+	Slug               string  `json:"slug"`
+	Name               string  `json:"name"`
+	Description        string  `json:"description"`
+	Icon               string  `json:"icon"`
+	AvatarURL          string  `json:"avatar_url"`
+	Color              string  `json:"color"`
+	Kind               string  `json:"kind"`
+	RendererKey        string  `json:"renderer_key"`
+	CategorySlug       string  `json:"category_slug"`
+	CategoryName       string  `json:"category_name"`
+	ProviderKey        string  `json:"provider_key"`
+	RuntimeType        string  `json:"runtime_type"`
+	Enabled            bool    `json:"enabled"`
+	IsBound            bool    `json:"is_bound"`
+	IsConsumable       bool    `json:"is_consumable"`
+	ConsumeBlockReason string  `json:"consume_block_reason,omitempty"`
+	IsFavorite         bool    `json:"is_favorite"`
+	IsDefaultAgent     bool    `json:"is_default_agent"`
+	UsageCount         int64   `json:"usage_count"`
+	LastUsedAt         *string `json:"last_used_at"`
+	GlobalUsageCount   int64   `json:"global_usage_count"`
 
 	// Only on default_application: the home composer renders this agent's
 	// 技能 chips and gates the attachment entry on its runtime
@@ -73,6 +75,7 @@ func summaryOf(item applicationListItem) applicationSummary {
 		CategorySlug: item.CategorySlug, CategoryName: item.CategoryName,
 		ProviderKey: item.ProviderKey, RuntimeType: item.RuntimeType,
 		Enabled: item.Enabled, IsBound: item.IsBound,
+		IsConsumable: item.IsConsumable, ConsumeBlockReason: item.ConsumeBlockReason,
 		IsFavorite: item.IsFavorite, IsDefaultAgent: item.IsDefaultAgent,
 		UsageCount: item.UsageCount, LastUsedAt: item.LastUsedAt,
 		GlobalUsageCount: item.GlobalUsageCount,
@@ -93,30 +96,32 @@ func summaryOf(item applicationListItem) applicationSummary {
 // `RuntimeType` / `ProviderKey` stay because a card legitimately renders
 // “飞书 Aily 自定义智能体” and because they are not secrets.
 type applicationListItem struct {
-	ID               int64          `json:"id"`
-	Slug             string         `json:"slug"`
-	Name             string         `json:"name"`
-	Description      string         `json:"description"`
-	Icon             string         `json:"icon"`
-	AvatarURL        string         `json:"avatar_url"`
-	Color            string         `json:"color"`
-	Kind             string         `json:"kind"`
-	RendererKey      string         `json:"renderer_key"`
-	ExecutorKey      string         `json:"executor_key"`
-	CategorySlug     string         `json:"category_slug"`
-	CategoryName     string         `json:"category_name"`
-	IsPublic         bool           `json:"is_public"`
-	Enabled          bool           `json:"enabled"`
-	RuntimeType      string         `json:"runtime_type"`
-	ProviderKey      string         `json:"provider_key"`
-	Capabilities     map[string]any `json:"capabilities"`
-	IsBound          bool           `json:"is_bound"`
-	IsFavorite       bool           `json:"is_favorite"`
-	IsDefaultAgent   bool           `json:"is_default_agent"`
-	CanManage        bool           `json:"can_manage"`
-	UsageCount       int64          `json:"usage_count"`
-	LastUsedAt       *string        `json:"last_used_at"`
-	GlobalUsageCount int64          `json:"global_usage_count"`
+	ID                 int64          `json:"id"`
+	Slug               string         `json:"slug"`
+	Name               string         `json:"name"`
+	Description        string         `json:"description"`
+	Icon               string         `json:"icon"`
+	AvatarURL          string         `json:"avatar_url"`
+	Color              string         `json:"color"`
+	Kind               string         `json:"kind"`
+	RendererKey        string         `json:"renderer_key"`
+	ExecutorKey        string         `json:"executor_key"`
+	CategorySlug       string         `json:"category_slug"`
+	CategoryName       string         `json:"category_name"`
+	IsPublic           bool           `json:"is_public"`
+	Enabled            bool           `json:"enabled"`
+	RuntimeType        string         `json:"runtime_type"`
+	ProviderKey        string         `json:"provider_key"`
+	Capabilities       map[string]any `json:"capabilities"`
+	IsBound            bool           `json:"is_bound"`
+	IsConsumable       bool           `json:"is_consumable"`
+	ConsumeBlockReason string         `json:"consume_block_reason,omitempty"`
+	IsFavorite         bool           `json:"is_favorite"`
+	IsDefaultAgent     bool           `json:"is_default_agent"`
+	CanManage          bool           `json:"can_manage"`
+	UsageCount         int64          `json:"usage_count"`
+	LastUsedAt         *string        `json:"last_used_at"`
+	GlobalUsageCount   int64          `json:"global_usage_count"`
 	// 技能配置 (agent-scoped prompt prefixes). Always present — an agent with
 	// no skills sends `[]`, never `null`, so the mobile skill sheet needs no
 	// null-guard and can distinguish "not loaded" from "none configured".
@@ -139,6 +144,8 @@ type applicationDetail struct {
 	CategoryName       string `json:"category_name"`
 	IsDefaultAgent     bool   `json:"is_default_agent"`
 	IsBound            bool   `json:"is_bound"`
+	IsConsumable       bool   `json:"is_consumable"`
+	ConsumeBlockReason string `json:"consume_block_reason,omitempty"`
 	RuntimeType        string `json:"runtime_type"`
 	ProviderKey        string `json:"provider_key"`
 	ExternalResourceID string `json:"external_resource_id"`
@@ -176,7 +183,7 @@ func avatarURL(app *catalog.Application) string {
 	return fmt.Sprintf("/api/v2/applications/%d/avatar?v=%s", app.ID, avatarVersion(app.AvatarKey))
 }
 
-func (s *Server) appDetail(app *catalog.Application, binding *catalog.Binding, caller *AuthenticatedUser) applicationDetail {
+func (s *Server) appDetail(ctx context.Context, app *catalog.Application, binding *catalog.Binding, caller *AuthenticatedUser) applicationDetail {
 	manage := canManageCaller(app, caller)
 	d := applicationDetail{
 		ID:             app.ID,
@@ -196,6 +203,7 @@ func (s *Server) appDetail(app *catalog.Application, binding *catalog.Binding, c
 		UpdatedAt:      app.UpdatedAt.UTC().Format(time.RFC3339),
 		Skills:         app.Skills,
 	}
+	var provider *catalog.Provider
 	if binding != nil && binding.Enabled {
 		d.IsBound = true
 		d.RuntimeType = binding.RuntimeType
@@ -203,7 +211,9 @@ func (s *Server) appDetail(app *catalog.Application, binding *catalog.Binding, c
 		d.ExternalResourceID = binding.ExternalResourceID
 		d.IdentityMode = binding.IdentityMode
 		d.ExecutionMode = binding.ExecutionMode
+		provider = activeProviderForBinding(binding, s.activeProviders(ctx))
 	}
+	d.IsConsumable, d.ConsumeBlockReason = consumptionStatus(app, binding, provider)
 	return d
 }
 
@@ -521,26 +531,61 @@ func (s *Server) personalFavorites(ctx context.Context, userID int64) map[int64]
 	return favorites
 }
 
+func activeProviderForBinding(binding *catalog.Binding, providers map[int64]*catalog.Provider) *catalog.Provider {
+	if binding == nil {
+		return nil
+	}
+	if binding.ProviderID != nil {
+		if provider := providers[*binding.ProviderID]; provider != nil {
+			return provider
+		}
+	}
+	for _, provider := range providers {
+		if provider.Key == binding.ProviderKey {
+			return provider
+		}
+	}
+	return nil
+}
+
+func consumptionStatus(app *catalog.Application, binding *catalog.Binding, provider *catalog.Provider) (bool, string) {
+	var providerStatus *string
+	if provider != nil {
+		providerStatus = &provider.Status
+	}
+	if catalog.Consumable(catalog.ConsumptionFacts{
+		Application: app, Binding: binding, ProviderStatus: providerStatus,
+	}) {
+		return true, ""
+	}
+	if app == nil || !app.Enabled {
+		return false, "disabled"
+	}
+	if app.Kind == "chat" && (binding == nil || !binding.Enabled) {
+		return false, "unbound"
+	}
+	return false, "runtime_unavailable"
+}
+
 func (s *Server) buildListItem(item catalog.ApplicationWithBinding, providers map[int64]*catalog.Provider,
 	favorites map[int64]bool, usage map[int64]pageUsage, caller *AuthenticatedUser) applicationListItem {
 	app := item.App
 	capsAny := map[string]any{}
 	var rt, pk string
+	var provider *catalog.Provider
 	isBound := false
 	if item.Binding != nil && item.Binding.Enabled {
 		isBound = true
 		rt = item.Binding.RuntimeType
 		pk = item.Binding.ProviderKey
-		var provID int64
-		if item.Binding.ProviderID != nil {
-			provID = *item.Binding.ProviderID
-		}
-		boolCaps := item.Binding.EffectiveCapabilities(providers[provID])
+		provider = activeProviderForBinding(item.Binding, providers)
+		boolCaps := item.Binding.EffectiveCapabilities(provider)
 		capsAny = map[string]any{}
 		for k, v := range boolCaps {
 			capsAny[k] = v
 		}
 	}
+	isConsumable, consumeBlockReason := consumptionStatus(app, item.Binding, provider)
 	entry := usage[app.ID]
 	disp := ""
 	if entry.Last != nil {
@@ -555,6 +600,7 @@ func (s *Server) buildListItem(item catalog.ApplicationWithBinding, providers ma
 		Enabled:     app.Enabled,
 		RuntimeType: rt, ProviderKey: pk,
 		Capabilities: capsAny, IsBound: isBound,
+		IsConsumable: isConsumable, ConsumeBlockReason: consumeBlockReason,
 		IsFavorite:     favorites[app.ID],
 		IsDefaultAgent: app.IsDefaultAgent,
 		CanManage:      canManageCaller(app, caller),
@@ -615,7 +661,7 @@ func (s *Server) GetApplication(w http.ResponseWriter, r *http.Request, id genap
 	if errors.Is(err, catalog.ErrNotFound) {
 		binding = nil
 	}
-	writeJSON(w, http.StatusOK, s.appDetail(app, binding, caller))
+	writeJSON(w, http.StatusOK, s.appDetail(r.Context(), app, binding, caller))
 }
 
 // denyApplicationVisibility records a visibility refusal. The response is
@@ -701,7 +747,7 @@ func (s *Server) CreateApplication(w http.ResponseWriter, r *http.Request) {
 		s.writeCatalogError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, s.appDetail(app, binding, caller))
+	writeJSON(w, http.StatusCreated, s.appDetail(r.Context(), app, binding, caller))
 }
 
 type runtimeInput struct {
@@ -769,7 +815,7 @@ func (s *Server) UpdateApplication(w http.ResponseWriter, r *http.Request, id ge
 		s.writeCatalogError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.appDetail(app, binding, caller))
+	writeJSON(w, http.StatusOK, s.appDetail(r.Context(), app, binding, caller))
 }
 
 func (s *Server) DeleteApplication(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
@@ -901,7 +947,7 @@ func (s *Server) SetDefaultAgent(w http.ResponseWriter, r *http.Request, id gena
 	if errors.Is(err, catalog.ErrNotFound) {
 		binding = nil
 	}
-	writeJSON(w, http.StatusOK, s.appDetail(app, binding, caller))
+	writeJSON(w, http.StatusOK, s.appDetail(r.Context(), app, binding, caller))
 }
 
 func (s *Server) UnsetDefaultAgent(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
@@ -934,7 +980,7 @@ func (s *Server) UnsetDefaultAgent(w http.ResponseWriter, r *http.Request, id ge
 	if errors.Is(err, catalog.ErrNotFound) {
 		binding = nil
 	}
-	writeJSON(w, http.StatusOK, s.appDetail(app, binding, caller))
+	writeJSON(w, http.StatusOK, s.appDetail(r.Context(), app, binding, caller))
 }
 
 // ───────────────────────────────────────────────────────────── avatar ──
@@ -1120,7 +1166,7 @@ func (s *Server) UploadApplicationAvatar(w http.ResponseWriter, r *http.Request,
 	if errors.Is(err, catalog.ErrNotFound) {
 		binding = nil
 	}
-	writeJSON(w, http.StatusOK, s.appDetail(updated, binding, caller))
+	writeJSON(w, http.StatusOK, s.appDetail(r.Context(), updated, binding, caller))
 }
 
 func (s *Server) ClearApplicationAvatar(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
@@ -1168,7 +1214,7 @@ func (s *Server) ClearApplicationAvatar(w http.ResponseWriter, r *http.Request, 
 	if errors.Is(err, catalog.ErrNotFound) {
 		binding = nil
 	}
-	writeJSON(w, http.StatusOK, s.appDetail(updated, binding, caller))
+	writeJSON(w, http.StatusOK, s.appDetail(r.Context(), updated, binding, caller))
 }
 
 // helpers

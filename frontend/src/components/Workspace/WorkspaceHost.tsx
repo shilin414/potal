@@ -51,7 +51,7 @@ const WorkspaceHost: React.FC<Props> = ({ kind = 'home' }) => {
     setResolvedSlug(applicationSlug);
     setResolvedApplication(undefined);
     setResolveFailed(false);
-    void ensureBySlug(applicationSlug, { maxAgeMs: 0 })
+    void ensureBySlug(applicationSlug, { maxAgeMs: 0, bypassBackoff: retryNonce > 0 })
       .then((application) => {
         if (!active) return;
         setResolvedApplication(application ?? null);

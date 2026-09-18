@@ -32,6 +32,7 @@ import AgentEditorModal, { type AgentEditorMode } from '@/components/Agents/Agen
 import AgentAvatarModal from '@/components/Agents/AgentAvatarModal';
 import AgentAvatar from '@/components/Agents/AgentAvatar';
 import { api } from '@/services/api';
+import { applicationConsumeBlock, consumeBlockMessage } from '@/lib/applicationConsumability';
 import {
   deleteAgentApplication,
   fetchAgentRuntimes,
@@ -229,8 +230,9 @@ const AgentsPage: React.FC = () => {
   };
 
   const openRuntimeAgent = async (agent: V2Application) => {
-    if (!agent.is_bound) {
-      message.warning('该智能体还没有可用的运行时绑定，无法对话；请先编辑补全。');
+    const consumeBlock = applicationConsumeBlock(agent);
+    if (consumeBlock) {
+      message.warning(consumeBlock);
       return;
     }
     // The workspace resolves the slug from the ENTITY cache (`/applications/
@@ -242,6 +244,11 @@ const AgentsPage: React.FC = () => {
   };
 
   const handleSetDefault = async (agent: V2Application, next: boolean) => {
+    const consumeBlock = applicationConsumeBlock(agent);
+    if (next && consumeBlock) {
+      message.warning(consumeBlock);
+      return;
+    }
     setBusyAppId(agent.id);
     try {
       const updated = await setDefaultAgent(agent.id, next);
@@ -336,6 +343,7 @@ const AgentsPage: React.FC = () => {
               size="small"
               icon={agent.is_default_agent ? <StarFilled /> : <StarOutlined />}
               loading={busyAppId === agent.id}
+              disabled={!agent.is_default_agent && agent.is_consumable !== true}
               aria-label={`设置 ${agent.name} 为默认智能体`}
               onClick={() => void handleSetDefault(agent, !agent.is_default_agent)}
             />
@@ -379,7 +387,9 @@ const AgentsPage: React.FC = () => {
         <span className="agent-card-tags">
           <Tag className="agent-tag">{labelFor(agent)}</Tag>
           {agent.category_name && <Tag className="agent-tag">{agent.category_name}</Tag>}
-          {!agent.is_bound && <Tag color="warning">未绑定</Tag>}
+          {agent.is_consumable !== true && (
+            <Tag color="warning">{consumeBlockMessage(agent.consume_block_reason)}</Tag>
+          )}
           {!agent.is_public && <Tag className="agent-tag">私有</Tag>}
         </span>
         <span className="agent-card-meta">

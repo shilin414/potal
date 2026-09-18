@@ -643,8 +643,10 @@ paths:
         the sequential application id into an enumeration oracle. An `<img>`
         on a studio page is a same-origin request and already carries the
         Studio Session cookie, so authentication costs nothing. The
-        visibility check runs BEFORE the ETag / 304 short-circuit, so a
-        cached browser can never keep an image the caller has lost access to.
+        Visibility is checked before any network ETag / 304 response.
+        `Vary: Cookie` partitions browser cache variants across authenticated
+        sessions. Previously cached bytes within the same session may remain
+        available for the immutable cache lifetime.
       responses:
         "200":
           description: Image bytes
@@ -1987,6 +1989,7 @@ components:
         - execution_mode
         - capabilities
         - is_bound
+        - is_consumable
         - is_favorite
         - is_default_agent
         - can_manage
@@ -2018,6 +2021,10 @@ components:
           type: object
           additionalProperties: { type: boolean }
         is_bound: { type: boolean }
+        is_consumable: { type: boolean }
+        consume_block_reason:
+          type: string
+          enum: [disabled, unbound, runtime_unavailable]
         is_favorite: { type: boolean }
         is_default_agent: { type: boolean }
         can_manage: { type: boolean }
@@ -2072,6 +2079,7 @@ components:
         - runtime_type
         - enabled
         - is_bound
+        - is_consumable
         - is_favorite
         - is_default_agent
         - usage_count
@@ -2093,6 +2101,10 @@ components:
         runtime_type: { type: string }
         enabled: { type: boolean }
         is_bound: { type: boolean }
+        is_consumable: { type: boolean }
+        consume_block_reason:
+          type: string
+          enum: [disabled, unbound, runtime_unavailable]
         is_favorite: { type: boolean }
         is_default_agent: { type: boolean }
         usage_count: { type: integer, description: this caller's own runs }
@@ -2233,6 +2245,7 @@ components:
         - category_name
         - is_default_agent
         - is_bound
+        - is_consumable
         - runtime_type
         - provider_key
         - external_resource_id
@@ -2255,6 +2268,10 @@ components:
         category_name: { type: string }
         is_default_agent: { type: boolean }
         is_bound: { type: boolean }
+        is_consumable: { type: boolean }
+        consume_block_reason:
+          type: string
+          enum: [disabled, unbound, runtime_unavailable]
         runtime_type: { type: string }
         provider_key: { type: string }
         external_resource_id: { type: string }

@@ -100,8 +100,35 @@
 }
 
 .mobile-shell__history {
-  height: calc(100% - 220px);
+  height: calc(100% - 340px);
   overflow: hidden;
+}
+
+.account-menu-panel {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+  border-top: 1px solid var(--color-border);
+}
+
+.account-menu-panel__identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.account-menu-panel__name {
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.account-menu-panel__id {
+  color: var(--color-text-sec);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ============================================

@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { message } from 'antd';
 import { useAuthStore } from '@/stores/useAuthStore';
+import { navigateToSessionLogin } from '@/services/authRedirect';
 
 const axiosInstance = axios.create({
   // Default '/api' matches the backend URL layout (every endpoint lives
@@ -69,12 +70,22 @@ const redirectToLogin = () => {
   // user's drafts / transcripts / shortcuts in memory until a new login
   // replaces them is the leak this fixes.
   useAuthStore.getState().clearAuth();
-  window.location.href = '/auth/login';
+  navigateToSessionLogin();
 };
 
 // Endpoints that own their own 401s (wrong password): we must NOT redirect
 // for these — surface the error to the caller (login form).
-const AUTH_PATHS = ['/auth/login/', '/auth/register/', '/auth/logout/'];
+const LOCAL_AUTH_FAILURE_PATHS = [
+  '/identity/admin/login',
+  '/auth/login/',
+  '/auth/register/',
+  '/auth/logout/',
+];
+
+function ownsOwn401(url?: string): boolean {
+  if (!url) return false;
+  return LOCAL_AUTH_FAILURE_PATHS.some((path) => url.includes(path));
+}
 
 axiosInstance.interceptors.response.use(
   (response) => {
@@ -83,15 +94,23 @@ axiosInstance.interceptors.response.use(
   (error) => {
     const originalRequest = error.config;
     const status = error.response?.status;
-    const isAuthRequest = AUTH_PATHS.some((p) => originalRequest?.url?.includes(p));
+    const localAuthFailure = ownsOwn401(originalRequest?.url);
 
     // 401 on an auth endpoint (login/register/logout): hand it back to the
     // caller (e.g. the login form showing "wrong password").
-    if (status === 401 && isAuthRequest) {
+    if (status === 401 && localAuthFailure) {
       return Promise.reject(error);
     }
 
-    // 401 elsewhere: the cookie session is gone/expired — re-login.
+    // The explicit logout state machine owns every in-flight 401 after the
+    // server revokes the session. A background request must not clear the
+    // `explicitlyLoggedOut` transition or redirect to the auto-login route.
+    const authState = useAuthStore.getState();
+    if (status === 401 && (authState.isLoggingOut || authState.explicitlyLoggedOut)) {
+      return Promise.reject(error);
+    }
+
+    // 401 elsewhere: the cookie session is gone/expired — auto re-authenticate.
     if (status === 401) {
       redirectToLogin();
       return Promise.reject(error);

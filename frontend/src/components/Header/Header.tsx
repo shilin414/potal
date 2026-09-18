@@ -1,9 +1,7 @@
 import React from 'react';
-import { Dropdown, Avatar } from 'antd';
-import { UserOutlined, LogoutOutlined, SettingOutlined } from '@ant-design/icons';
+
 import { useNavigate, useLocation } from 'react-router-dom';
-import { useAuthStore } from '@/stores/useAuthStore';
-import { userAvatarFallback, userAvatarUrl, userDisplayName } from '@/lib/chatIdentity';
+import AccountMenu from '@/components/AccountMenu/AccountMenu';
 import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { ThemeToggle } from '@/components/Theme';
 import './Header.css';
@@ -21,18 +19,12 @@ const navItems = [
 const Header: React.FC = () => {
   const navigate = useNavigate();
   const location = useLocation();
-  const { user, logout, isAuthenticated } = useAuthStore();
   // The main agent comes from the bootstrap payload (执行报告 §9) — the
   // header must not ask for the whole catalog just to link to "对话".
   const defaultApplication = useWorkspaceBootstrapStore((state) => state.defaultApplication);
   const loadBootstrap = useWorkspaceBootstrapStore((state) => state.load);
 
   React.useEffect(() => { void loadBootstrap(); }, [loadBootstrap]);
-
-  const handleLogout = async () => {
-    await logout();
-    navigate('/auth/login?logged_out=1', { replace: true });
-  };
 
   const handleNav = (key: string) => {
     // "对话" is the chat surface, not the idle home: open the main agent's
@@ -44,29 +36,6 @@ const Header: React.FC = () => {
     }
     navigate(key);
   };
-
-  const userMenuItems = [
-    {
-      key: 'profile',
-      icon: <UserOutlined />,
-      label: '个人中心',
-      onClick: () => navigate('/profile'),
-    },
-    {
-      key: 'settings',
-      icon: <SettingOutlined />,
-      label: '设置',
-      onClick: () => navigate('/settings'),
-    },
-    { type: 'divider' as const },
-    {
-      key: 'logout',
-      icon: <LogoutOutlined />,
-      label: '登出',
-      onClick: handleLogout,
-    },
-  ];
-
   const currentPath = location.pathname;
 
   return (
@@ -94,20 +63,7 @@ const Header: React.FC = () => {
       {/* Right: User */}
       <div className="header-right">
         <ThemeToggle />
-        {isAuthenticated && (
-          <Dropdown menu={{ items: userMenuItems }} placement="bottomRight">
-            <div className="header-user">
-              <div className="header-avatar">
-                {userAvatarUrl(user) ? (
-                  <Avatar size={32} src={userAvatarUrl(user)} />
-                ) : (
-                  userAvatarFallback(user)
-                )}
-              </div>
-              <span className="header-username">{userDisplayName(user)}</span>
-            </div>
-          </Dropdown>
-        )}
+        <AccountMenu />
       </div>
     </header>
   );

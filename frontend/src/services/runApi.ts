@@ -51,6 +51,8 @@ export interface RunArtifactRecord {
  * `V2Application` and on the bootstrap's `default_application` (the one
  * application a composer is bound to).
  */
+export type ConsumeBlockReason = 'disabled' | 'unbound' | 'runtime_unavailable';
+
 export interface ApplicationSummary {
   id: number;
   slug: string;
@@ -71,6 +73,9 @@ export interface ApplicationSummary {
   enabled?: boolean;
   /** False for fixed pages that have no runtime binding. */
   is_bound?: boolean;
+  /** Backend SSOT: identical to catalog.Consumable / run admission. */
+  is_consumable?: boolean;
+  consume_block_reason?: ConsumeBlockReason;
   is_favorite?: boolean;
   /** Marked as the workspace's default main agent (§38). */
   is_default_agent?: boolean;
@@ -317,6 +322,8 @@ export interface ManagedAgent {
   category_name: string;
   is_default_agent: boolean;
   is_bound: boolean;
+  is_consumable?: boolean;
+  consume_block_reason?: ConsumeBlockReason;
   runtime_type: string;
   provider_key: string;
   external_resource_id: string;

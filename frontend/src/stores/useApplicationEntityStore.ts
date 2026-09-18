@@ -46,6 +46,8 @@ export interface EntityResolveOptions {
   fresh?: boolean;
   /** Maximum accepted age of the last consume validation (ms). */
   maxAgeMs?: number;
+  /** Manual user retry: bypass the automatic failure backoff once. */
+  bypassBackoff?: boolean;
 }
 
 export const DEFAULT_CONSUME_TTL_MS = 45_000;
@@ -225,8 +227,10 @@ export const useApplicationEntityStore = create<EntityState>()((set, get) => ({
   ensure: (id, options) => {
     if (id == null) return Promise.resolve(undefined);
     const key = idKey(id);
-    const deferred = retryError(key);
-    if (deferred) return Promise.reject(deferred);
+    if (!options?.bypassBackoff) {
+      const deferred = retryError(key);
+      if (deferred) return Promise.reject(deferred);
+    }
 
     const cached = get().byId[id];
     const maxAgeMs = options?.maxAgeMs ?? DEFAULT_CONSUME_TTL_MS;
@@ -262,8 +266,10 @@ export const useApplicationEntityStore = create<EntityState>()((set, get) => ({
   ensureBySlug: (slug, options) => {
     if (!slug) return Promise.resolve(undefined);
     const key = slugKey(slug);
-    const deferred = retryError(key);
-    if (deferred) return Promise.reject(deferred);
+    if (!options?.bypassBackoff) {
+      const deferred = retryError(key);
+      if (deferred) return Promise.reject(deferred);
+    }
 
     const cached = get().bySlug[slug];
     const maxAgeMs = options?.maxAgeMs ?? DEFAULT_CONSUME_TTL_MS;

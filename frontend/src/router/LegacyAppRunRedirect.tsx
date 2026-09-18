@@ -41,8 +41,8 @@ const LegacyAppRunRedirect: React.FC = () => {
     setResolvedApplication(undefined);
     setResolveFailed(false);
     const lookup = isNumeric
-      ? ensure(numeric, { maxAgeMs: 0 })
-      : ensureBySlug(id, { maxAgeMs: 0 });
+      ? ensure(numeric, { maxAgeMs: 0, bypassBackoff: retryNonce > 0 })
+      : ensureBySlug(id, { maxAgeMs: 0, bypassBackoff: retryNonce > 0 });
     void lookup
       .then((application) => {
         if (!active) return;

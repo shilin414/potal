@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"strings"
 	"testing"
 )
@@ -57,5 +58,25 @@ func TestRunTimedBenchmarkExecutesEveryIteration(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("calls=%d, want 3", calls)
+	}
+}
+
+func TestSyntheticFixtureEnabledReturnsFlagParseErrors(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	_, _, err := syntheticFixtureEnabled(fs, []string{"-synthetic", "-applications=500O"})
+	if err == nil {
+		t.Fatal("invalid synthetic flag value must return an error")
+	}
+}
+
+func TestScenarioSQLUsesSyntheticCallerAndSearch(t *testing.T) {
+	got := scenarioSQL(
+		"SELECT * FROM runs WHERE user_id = 42 AND created_by = 42 AND name LIKE '%itest%'",
+		explainScenario{CallerID: 424242, Search: "Synthetic"},
+	)
+	for _, want := range []string{"user_id = 424242", "created_by = 424242", "%Synthetic%"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("scenario SQL %q does not contain %q", got, want)
+		}
 	}
 }

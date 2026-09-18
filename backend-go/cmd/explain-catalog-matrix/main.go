@@ -64,21 +64,23 @@ type syntheticFixture struct {
 	Users        int
 }
 
-func syntheticFixtureEnabled(fs *flag.FlagSet, args []string) (bool, syntheticConfig) {
+func syntheticFixtureEnabled(fs *flag.FlagSet, args []string) (bool, syntheticConfig, error) {
 	enabled := fs.Bool("synthetic", false, "seed an isolated fixture, time bootstrap/page/mention repository paths, then clean it up")
 	applications := fs.Int("applications", 5000, "synthetic applications to seed")
 	bindings := fs.Int("bindings", 5000, "synthetic applications with one active binding")
 	runsPerUser := fs.Int("runs", 100000, "synthetic runs per user to seed")
 	users := fs.Int("users", 1, "synthetic users to seed")
 	isolatedDB := fs.String("isolated-db", "", "REQUIRED confirmation: exact database name reserved for this benchmark")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return false, syntheticConfig{}, err
+	}
 	return *enabled, syntheticConfig{
 		Applications: *applications,
 		Bindings:     *bindings,
 		RunsPerUser:  *runsPerUser,
 		Users:        *users,
 		IsolatedDB:   *isolatedDB,
-	}
+	}, nil
 }
 
 func validateSyntheticConfig(cfg syntheticConfig) error {
@@ -273,12 +275,12 @@ func runTimedBenchmark(name string, iterations int, operation func() error) erro
 	pick := func(p float64) time.Duration {
 		return durations[int(float64(len(durations)-1)*p)]
 	}
-	fmt.Printf("synthetic %s p50=%s p95=%s p99=%s (n=%d)\n",
+	fmt.Printf("synthetic %s warm-cache p50=%s p95=%s p99=%s (n=%d)\n",
 		name, pick(0.50), pick(0.95), pick(0.99), len(durations))
 	return nil
 }
 
-func runSyntheticRepositoryBenchmarks(ctx context.Context, db *sql.DB, callerID int64) error {
+func runSyntheticRepositoryBenchmarks(ctx context.Context, db *sql.DB, callerID int64, search string) error {
 	repo := &catalog.Repo{DB: db}
 	const iterations = 40
 
@@ -337,7 +339,7 @@ func runSyntheticRepositoryBenchmarks(ctx context.Context, db *sql.DB, callerID 
 	}
 
 	return runTimedBenchmark("resolve-mention", iterations, func() error {
-		rows, err := repo.ResolveMentionCandidates(ctx, "synthetic", false, 10)
+		rows, err := repo.ResolveMentionCandidates(ctx, search, false, 10)
 		if err != nil {
 			return err
 		}
@@ -346,11 +348,23 @@ func runSyntheticRepositoryBenchmarks(ctx context.Context, db *sql.DB, callerID 
 	})
 }
 
+type explainScenario struct {
+	CallerID int64
+	Search   string
+}
+
+func scenarioSQL(query string, scenario explainScenario) string {
+	query = strings.ReplaceAll(query, "user_id = 42", fmt.Sprintf("user_id = %d", scenario.CallerID))
+	query = strings.ReplaceAll(query, "created_by = 42", fmt.Sprintf("created_by = %d", scenario.CallerID))
+	query = strings.ReplaceAll(query, "itest", strings.ReplaceAll(scenario.Search, "'", "''"))
+	return query
+}
+
 // page builds the ListApplicationPage query (db/queries/catalog.sql) with
 // inlined literals. The flags mirror sqlc's `sqlc.arg(bool)` → `?` emission:
 // 0/1 integers for the boolean flags, NULL-shaped predicates for the narg
 // probes (search / category).
-func page(scenario string, showAll, mineOnly, publicOnly, consumeOnly, kindChatOnly, kindFixedOnly, kindAll, allowUnbound int, search string, categorySlug string, categoryIsNull int, cursor string, limit int) {
+func page(db *sql.DB, explainParams explainScenario, scenario string, showAll, mineOnly, publicOnly, consumeOnly, kindChatOnly, kindFixedOnly, kindAll, allowUnbound int, search string, categorySlug string, categoryIsNull int, cursor string, limit int) {
 	searchPred := "NULL IS NULL"
 	if search != "" {
 		searchPred = fmt.Sprintf("(0 IS NULL OR a.name COLLATE utf8mb4_unicode_ci LIKE '%%%s%%' OR COALESCE(a.description,'') COLLATE utf8mb4_unicode_ci LIKE '%%%s%%' OR COALESCE(c.name,'') COLLATE utf8mb4_unicode_ci LIKE '%%%s%%')", search, search, search)
@@ -387,7 +401,7 @@ LEFT JOIN runtime_bindings b ON b.application_id = a.id AND b.enabled = 1
 LEFT JOIN runtime_bindings newer_b ON newer_b.application_id = b.application_id AND newer_b.enabled = 1 AND newer_b.id > b.id
 LEFT JOIN providers p ON p.provider_key = b.provider_key
 WHERE newer_b.id IS NULL
-  AND (%d OR (a.enabled = 1 AND ((%d AND a.created_by = 42) OR (%d AND a.is_public = 1))))
+  AND (%d OR (a.enabled = 1 AND ((%d AND a.created_by = %d) OR (%d AND a.is_public = 1))))
   AND (%d = 0 OR (a.enabled = 1 AND (a.kind <> 'chat' OR (b.id IS NOT NULL AND p.id IS NOT NULL AND p.status = 'active'))))
   AND ((%d AND a.kind = 'chat') OR (%d AND a.kind <> 'chat') OR %d)
   AND (a.kind <> 'chat' OR %d OR b.id IS NOT NULL)
@@ -396,24 +410,13 @@ WHERE newer_b.id IS NULL
   AND (%s)
 ORDER BY a.created_at, a.id
 LIMIT %d`,
-		showAll, mineOnly, publicOnly, consumeOnly, kindChatOnly, kindFixedOnly, kindAll, allowUnbound,
+		showAll, mineOnly, explainParams.CallerID, publicOnly, consumeOnly, kindChatOnly, kindFixedOnly, kindAll, allowUnbound,
 		searchPred, categoryPred, cursorPred, limit)
-	explain(scenario, sql)
+	explain(db, explainParams, scenario, sql)
 }
 
-func explain(scenario, sql string) {
-	cfg, err := config.Load()
-	if err != nil {
-		fmt.Println("config:", err)
-		os.Exit(1)
-	}
-	db, err := database.Open(context.Background(), cfg.Database)
-	if err != nil {
-		fmt.Println("open:", err)
-		os.Exit(1)
-	}
-	defer db.Close()
-	rows, err := db.Query("EXPLAIN " + sql)
+func explain(db *sql.DB, explainParams explainScenario, scenario, sql string) {
+	rows, err := db.Query("EXPLAIN " + scenarioSQL(sql, explainParams))
 	if err != nil {
 		fmt.Printf("== %s == EXPLAIN ERROR: %v\n", scenario, err)
 		return
@@ -448,8 +451,12 @@ func explain(scenario, sql string) {
 }
 
 func main() {
-	synthetic, syntheticCfg := syntheticFixtureEnabled(
+	synthetic, syntheticCfg, err := syntheticFixtureEnabled(
 		flag.NewFlagSet("explain-catalog-matrix", flag.ContinueOnError), os.Args[1:])
+	if err != nil {
+		fmt.Println("flags:", err)
+		os.Exit(2)
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		fmt.Println("config:", err)
@@ -467,7 +474,7 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Println("DB_VERSION:", version)
-	_ = cfg
+	explainParams := explainScenario{CallerID: 42, Search: "itest"}
 	if synthetic {
 		ctx := context.Background()
 		fixture, cleanup, err := seedSyntheticFixture(ctx, db, syntheticCfg)
@@ -478,7 +485,8 @@ func main() {
 		defer cleanup()
 		fmt.Printf("synthetic fixture ready: prefix=%s applications=%d bindings=%d users=%d runs=%d\n",
 			fixture.Prefix, fixture.Applications, fixture.Bindings, fixture.Users, fixture.Runs)
-		if err := runSyntheticRepositoryBenchmarks(ctx, db, 424242); err != nil {
+		explainParams = explainScenario{CallerID: 424242, Search: "Synthetic"}
+		if err := runSyntheticRepositoryBenchmarks(ctx, db, explainParams.CallerID, explainParams.Search); err != nil {
 			cleanup()
 			fmt.Println("synthetic:", err)
 			os.Exit(1)
@@ -487,18 +495,18 @@ func main() {
 	}
 
 	// ── page scenarios (P2-R1 matrix) ──
-	page("page chat/public page1", 0, 0, 1, 0, 1, 0, 0, 0, "", "", 0, "", 25)
-	page("page chat/consume page1", 0, 0, 1, 1, 1, 0, 0, 0, "", "", 0, "", 25)
-	page("page chat/manage(staff) page1", 1, 0, 0, 0, 1, 0, 0, 1, "", "", 0, "", 25)
-	page("page fixed/consume page1", 0, 0, 1, 1, 0, 1, 0, 0, "", "", 0, "", 25)
-	page("page fixed/manage page1", 0, 0, 1, 0, 0, 1, 0, 1, "", "", 0, "", 25)
-	page("page all/manage page1", 1, 0, 0, 0, 0, 0, 1, 1, "", "", 0, "", 25)
-	page("page chat/consume cursor-N", 0, 0, 1, 1, 1, 0, 0, 0, "", "", 0, "2026-01-01 00:00:00", 25)
-	page("page chat/consume category", 0, 0, 1, 1, 1, 0, 0, 0, "", "it", 0, "", 25)
-	page("page fixed/consume category-uncat", 0, 0, 1, 1, 0, 1, 0, 0, "", "__uncategorized__", 1, "", 25)
-	page("page chat/consume search", 0, 0, 1, 1, 1, 0, 0, 0, "itest", "", 0, "", 25)
+	page(db, explainParams, "page chat/public page1", 0, 0, 1, 0, 1, 0, 0, 0, "", "", 0, "", 25)
+	page(db, explainParams, "page chat/consume page1", 0, 0, 1, 1, 1, 0, 0, 0, "", "", 0, "", 25)
+	page(db, explainParams, "page chat/manage(staff) page1", 1, 0, 0, 0, 1, 0, 0, 1, "", "", 0, "", 25)
+	page(db, explainParams, "page fixed/consume page1", 0, 0, 1, 1, 0, 1, 0, 0, "", "", 0, "", 25)
+	page(db, explainParams, "page fixed/manage page1", 0, 0, 1, 0, 0, 1, 0, 1, "", "", 0, "", 25)
+	page(db, explainParams, "page all/manage page1", 1, 0, 0, 0, 0, 0, 1, 1, "", "", 0, "", 25)
+	page(db, explainParams, "page chat/consume cursor-N", 0, 0, 1, 1, 1, 0, 0, 0, "", "", 0, "2026-01-01 00:00:00", 25)
+	page(db, explainParams, "page chat/consume category", 0, 0, 1, 1, 1, 0, 0, 0, "", "it", 0, "", 25)
+	page(db, explainParams, "page fixed/consume category-uncat", 0, 0, 1, 1, 0, 1, 0, 0, "", "__uncategorized__", 1, "", 25)
+	page(db, explainParams, "page chat/consume search", 0, 0, 1, 1, 1, 0, 0, 0, explainParams.Search, "", 0, "", 25)
 
-	explain("bootstrap default (public)", `
+	explain(db, explainParams, "bootstrap default (public)", `
 SELECT a.id, COALESCE(u.usage_count,0) AS personal_usage_count, u.last_used_at
 FROM applications a
 LEFT JOIN runtime_bindings b ON b.application_id = a.id AND b.enabled = 1
@@ -511,7 +519,7 @@ WHERE newer_b.id IS NULL AND a.enabled = 1 AND a.kind = 'chat' AND b.id IS NOT N
   AND (0 OR a.is_public = 1)
 ORDER BY a.is_default_agent DESC, a.created_at, a.id LIMIT 8`)
 
-	explain("bootstrap frequent (public)", `
+	explain(db, explainParams, "bootstrap frequent (public)", `
 SELECT a.id, u.usage_count AS personal_usage_count, u.last_used_at
 FROM applications a
 JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
@@ -524,7 +532,7 @@ WHERE newer_b.id IS NULL AND a.enabled = 1 AND a.kind = 'chat' AND b.id IS NOT N
   AND (0 OR a.is_public = 1)
 ORDER BY u.usage_count DESC, u.last_used_at DESC, a.name LIMIT 8`)
 
-	explain("bootstrap recommended (public)", `
+	explain(db, explainParams, "bootstrap recommended (public)", `
 SELECT a.id, COALESCE(u.usage_count,0) AS personal_usage_count, u.last_used_at
 FROM applications a
 LEFT JOIN runtime_bindings b ON b.application_id = a.id AND b.enabled = 1
@@ -539,7 +547,7 @@ WHERE newer_b.id IS NULL AND a.enabled = 1 AND a.kind = 'chat' AND b.id IS NOT N
   AND NOT EXISTS (SELECT 1 FROM application_favorites f WHERE f.user_id = 42 AND f.application_id = a.id)
 ORDER BY a.usage_count DESC, a.name LIMIT 8`)
 
-	explain("bootstrap recent fixed (public)", `
+	explain(db, explainParams, "bootstrap recent fixed (public)", `
 SELECT a.id, COALESCE(u.usage_count,0) AS personal_usage_count, u.last_used_at
 FROM applications a
 LEFT JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
@@ -547,7 +555,7 @@ LEFT JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) A
 WHERE a.enabled = 1 AND a.kind <> 'chat' AND (0 OR a.is_public = 1)
 ORDER BY u.last_used_at DESC, a.created_at, a.id LIMIT 8`)
 
-	explain("bootstrap agent categories (public)", `
+	explain(db, explainParams, "bootstrap agent categories (public)", `
 SELECT COALESCE(c.slug,'') AS category_slug, COALESCE(c.name,'') AS category_name, COUNT(*) AS category_count
 FROM applications a
 LEFT JOIN application_categories c ON c.id = a.category_id
@@ -560,7 +568,7 @@ WHERE newer_b.id IS NULL AND a.enabled = 1 AND a.kind = 'chat' AND b.id IS NOT N
 GROUP BY a.category_id, c.slug, c.name
 ORDER BY MIN(a.created_at), category_slug`)
 
-	explain("page rows by ids (bootstrap row fetch)", `
+	explain(db, explainParams, "page rows by ids (bootstrap row fetch)", `
 SELECT a.id FROM applications a
 LEFT JOIN application_categories c ON c.id = a.category_id
 LEFT JOIN runtime_bindings b ON b.application_id = a.id AND b.enabled = 1
@@ -575,7 +583,7 @@ ORDER BY a.created_at, a.id`)
 	// idx_runs_user_application_created covers it (Using index) — re-check
 	// this plan when a single user's run history reaches 100k/1m rows
 	// before deciding on a user_application_usage summary table.
-	explain("usage aggregate on runs (idx_runs_user_application_created)", `
+	explain(db, explainParams, "usage aggregate on runs (idx_runs_user_application_created)", `
 SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
 FROM runs r WHERE r.user_id = 42 GROUP BY r.application_id`)
 }

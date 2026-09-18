@@ -162,3 +162,20 @@ describe('entity data and consume trust', () => {
     expect(mocks.resolve).toHaveBeenCalledTimes(3);
   });
 });
+
+  it('lets an explicit user retry bypass the automatic failure backoff', async () => {
+    mocks.resolve
+      .mockRejectedValueOnce(httpError(500))
+      .mockResolvedValueOnce(app(26, 'manual-retry', 'recovered'));
+
+    await expect(useApplicationEntityStore.getState().ensureBySlug('manual-retry'))
+      .rejects.toBeTruthy();
+    await expect(useApplicationEntityStore.getState().ensureBySlug('manual-retry'))
+      .rejects.toThrow('deferred');
+    await expect(useApplicationEntityStore.getState().ensureBySlug('manual-retry', {
+      maxAgeMs: 0,
+      bypassBackoff: true,
+    })).resolves.toMatchObject({ name: 'recovered' });
+
+    expect(mocks.resolve).toHaveBeenCalledTimes(2);
+  });
