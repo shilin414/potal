@@ -45,6 +45,15 @@ vi.mock('antd', () => {
   );
   (RadioMock as unknown as { Group: unknown }).Group = RadioGroupMock;
   return {
+    Button: ({ children, onClick, disabled }: {
+      children?: React.ReactNode;
+      onClick?: () => void;
+      disabled?: boolean;
+    }) => (
+      <button type="button" onClick={onClick} disabled={disabled}>
+        {children}
+      </button>
+    ),
     Empty: ({ description }: { description?: React.ReactNode }) => (
       <div data-testid="empty">{description}</div>
     ),
@@ -60,10 +69,20 @@ vi.mock('antd', () => {
 });
 
 vi.mock('@/components/MobileConsole', () => ({
-  MobileFullScreenDrawer: ({ open, title, actionText, onAction, children }: {
+  MobileEmptyState: ({ title, action }: {
+    title?: React.ReactNode;
+    action?: React.ReactNode;
+  }) => (
+    <div data-testid="empty-state">
+      <span>{title}</span>
+      {action}
+    </div>
+  ),
+  MobileFullScreenDrawer: ({ open, title, actionText, actionDisabled, onAction, children }: {
     open: boolean;
     title?: string;
     actionText?: string;
+    actionDisabled?: boolean;
     onAction?: () => void;
     children?: React.ReactNode;
   }) => (
@@ -71,7 +90,12 @@ vi.mock('@/components/MobileConsole', () => ({
       ? (
         <div data-testid="fs-drawer">
           <span data-testid="fs-title">{title}</span>
-          <button type="button" data-testid="fs-action" onClick={onAction}>
+          <button
+            type="button"
+            data-testid="fs-action"
+            disabled={actionDisabled}
+            onClick={onAction}
+          >
             {actionText}
           </button>
           {children}
@@ -205,5 +229,52 @@ describe('MobilePermissionEditor — save payload', () => {
       user_grants: [9],
     });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('MobilePermissionEditor — recoverable load failure (P2-6)', () => {
+  it('a failed access/departments load shows an error state, never an eternal Skeleton, and disables 保存', async () => {
+    mocks.access.mockRejectedValue(new Error('network down'));
+    await mountEditor({ id: 7, name: '财务助手' });
+    await flush(20);
+
+    // Not an infinite skeleton — a real error state with a retry.
+    expect(document.querySelector('[data-testid="empty-state"]')!.textContent)
+      .toContain('加载访问权限失败');
+    const save = document.querySelector<HTMLButtonElement>('[data-testid="fs-action"]')!;
+    expect(save.disabled).toBe(true);
+
+    // The retry succeeds — the editor becomes editable and 保存 re-enables.
+    mocks.access.mockResolvedValue(POLICY);
+    const retry = Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '重试')!;
+    expect(retry).toBeTruthy();
+    await act(async () => { retry.click(); });
+    await flush(20);
+
+    expect(document.body.textContent).toContain('财务部');
+    expect(document.body.textContent).toContain('张三');
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="fs-action"]')!.disabled,
+    ).toBe(false);
+  });
+
+  it('保存 is disabled while the first load is still in flight', async () => {
+    let release: (() => void) | null = null;
+    mocks.access.mockReturnValue(new Promise((resolve) => {
+      release = () => resolve(POLICY);
+    }));
+    await mountEditor({ id: 7, name: '财务助手' });
+
+    expect(document.querySelector('[data-testid="skeleton"]')).toBeTruthy();
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="fs-action"]')!.disabled,
+    ).toBe(true);
+
+    await act(async () => { release!(); });
+    await flush(20);
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="fs-action"]')!.disabled,
+    ).toBe(false);
   });
 });

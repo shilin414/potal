@@ -6,7 +6,7 @@
  * users / include_children），保存走同一个 updateAccess 契约。
  */
 import React, { useCallback, useEffect, useState } from 'react';
-import { Empty, Radio, Skeleton, Switch, message } from 'antd';
+import { Button, Empty, Radio, Skeleton, Switch, message } from 'antd';
 import { CloseOutlined } from '@ant-design/icons';
 import {
   enterpriseApi,
@@ -15,6 +15,7 @@ import {
   type DirectoryDepartment,
 } from '../enterpriseApi';
 import {
+  MobileEmptyState,
   MobileFullScreenDrawer,
   MobileSection,
 } from '@/components/MobileConsole';
@@ -33,6 +34,8 @@ export default function MobilePermissionEditor({
 }: MobilePermissionEditorProps) {
   const [policy, setPolicy] = useState<AccessPolicy | null>(null);
   const [deps, setDeps] = useState<DirectoryDepartment[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [depPickerOpen, setDepPickerOpen] = useState(false);
   const [userPickerOpen, setUserPickerOpen] = useState(false);
@@ -43,23 +46,29 @@ export default function MobilePermissionEditor({
   // 依赖 applicationId 而非 application 对象（P2-5）：父组件每次 render 都会
   // 产生新的 { id, name } 字面量，effect 若依赖对象 identity，编辑过程中父
   // 级任何重渲染都会重置 policy 并丢掉用户未保存的修改；名称只用于标题显示。
+  // 加载失败 = 可恢复错误态 + 重试（P2-6）：不再 toast 一下然后永久 Skeleton。
   const applicationId = application?.id;
+  const load = useCallback(async () => {
+    if (!applicationId) return;
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const [p, d] = await Promise.all([
+        enterpriseApi.access(applicationId),
+        enterpriseApi.departments(),
+      ]);
+      setPolicy(p);
+      setDeps(d);
+    } catch {
+      setLoadError('加载访问权限失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [applicationId]);
+
   useEffect(() => {
-    if (!open || !applicationId) return;
-    let stale = false;
-    setPolicy(null);
-    Promise.all([
-      enterpriseApi.access(applicationId),
-      enterpriseApi.departments(),
-    ])
-      .then(([p, d]) => {
-        if (stale) return;
-        setPolicy(p);
-        setDeps(d);
-      })
-      .catch(() => message.error('加载权限失败'));
-    return () => { stale = true; };
-  }, [open, applicationId]);
+    if (open && applicationId) void load();
+  }, [open, applicationId, load]);
 
   const save = useCallback(async () => {
     if (!applicationId || !policy) return;
@@ -118,10 +127,20 @@ export default function MobilePermissionEditor({
         title={`${application?.name ?? ''} 访问权限`}
         actionText="保存"
         actionLoading={saving}
+        actionDisabled={loading || Boolean(loadError) || !policy}
         onAction={() => void save()}
         onClose={onClose}
       >
-        {!policy ? (
+        {loading ? (
+          <Skeleton active />
+        ) : loadError ? (
+          // A failed load is recoverable in place (P2-6) — no eternal Skeleton,
+          // and 保存 stays disabled until a policy is actually loaded.
+          <MobileEmptyState
+            title="加载访问权限失败"
+            action={<Button onClick={() => void load()}>重试</Button>}
+          />
+        ) : !policy ? (
           <Skeleton active />
         ) : (
           <>

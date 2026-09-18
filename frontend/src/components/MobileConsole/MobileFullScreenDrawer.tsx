@@ -18,13 +18,15 @@ export interface MobileFullScreenDrawerProps {
   /** Trailing primary action, e.g. 保存 (§28). */
   actionText?: string;
   actionLoading?: boolean;
+  /** Disable the action until its surface is ready (二次复审 P2-6). */
+  actionDisabled?: boolean;
   onAction?: () => void;
   onClose: () => void;
   children: React.ReactNode;
 }
 
 const MobileFullScreenDrawer: React.FC<MobileFullScreenDrawerProps> = ({
-  open, title, actionText, actionLoading, onAction, onClose, children,
+  open, title, actionText, actionLoading, actionDisabled, onAction, onClose, children,
 }) => (
   <Drawer
     placement="right"
@@ -55,6 +57,7 @@ const MobileFullScreenDrawer: React.FC<MobileFullScreenDrawerProps> = ({
             size="small"
             className="mobile-fs-drawer__action"
             loading={actionLoading}
+            disabled={actionDisabled}
             onClick={onAction}
           >
             {actionText}
