@@ -662,3 +662,50 @@ LEFT JOIN providers p
   ON p.provider_key = b.provider_key
 WHERE newer_b.id IS NULL
   AND a.id = ?;
+
+-- name: ResolveMentionCandidates :many
+-- 四次复审 P1-R2: `@mention` ranking happens IN SQL, before LIMIT.
+--
+-- The previous implementation reused ListApplicationPage, whose search
+-- deliberately covers name + description + category name. With a small LIMIT
+-- a description-only noise pool could fill every slot before the real
+-- name/slug match (created later) was ever seen — `@销售助手` returned [] even
+-- though an exact agent existed. A larger pool only postponed the failure.
+--
+-- This query matches ONLY the fields the mention router actually ranks on
+-- (name / slug), applies the SAME visibility + consumption predicates as the
+-- consume page, and orders by exact → name prefix → slug prefix → substring
+-- before taking the final candidate budget.
+SELECT a.id, a.slug, a.name, a.kind
+FROM applications a
+LEFT JOIN runtime_bindings b
+  ON b.application_id = a.id
+ AND b.enabled = 1
+LEFT JOIN runtime_bindings newer_b
+  ON newer_b.application_id = b.application_id
+ AND newer_b.enabled = 1
+ AND newer_b.id > b.id
+LEFT JOIN providers p
+  ON p.provider_key = b.provider_key
+WHERE newer_b.id IS NULL
+  AND (sqlc.arg('show_all') OR a.is_public = 1)
+  AND a.enabled = 1
+  AND (a.kind <> 'chat'
+       OR (b.id IS NOT NULL AND p.id IS NOT NULL AND p.status = 'active'))
+  AND (a.name COLLATE utf8mb4_unicode_ci LIKE sqlc.arg('contains')
+       OR a.slug COLLATE utf8mb4_unicode_ci LIKE sqlc.arg('contains'))
+ORDER BY
+  CASE
+    WHEN a.name COLLATE utf8mb4_unicode_ci = sqlc.arg('exact')
+      OR a.slug COLLATE utf8mb4_unicode_ci = sqlc.arg('exact')
+      THEN 0
+    WHEN a.name COLLATE utf8mb4_unicode_ci LIKE sqlc.arg('prefix')
+      THEN 1
+    WHEN a.slug COLLATE utf8mb4_unicode_ci LIKE sqlc.arg('prefix')
+      THEN 2
+    ELSE 3
+  END,
+  CHAR_LENGTH(a.name),
+  a.name,
+  a.id
+LIMIT ?;

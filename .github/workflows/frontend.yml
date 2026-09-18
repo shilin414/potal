@@ -28,6 +28,12 @@ jobs:
       - name: typecheck
         run: npx tsc --noEmit
 
+      # The review gate requires lint, and `--max-warnings 0` is part of the
+      # repo's own script. Keeping lint only in the local developer path let
+      # unused imports and a conditional hook accumulate unnoticed.
+      - name: lint
+        run: npm run lint
+
       - name: unit tests
         run: npx vitest run
 

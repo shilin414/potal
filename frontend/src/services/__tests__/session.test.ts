@@ -13,6 +13,7 @@ vi.mock('@/services/axios', () => ({ default: { get: mocks.get } }));
 
 import { fetchSessionUser, syncSessionUser } from '@/services/session';
 import { useAuthStore } from '@/stores/useAuthStore';
+import { resetSessionScopedState } from '@/stores/resetSessionState';
 
 const setSignedIn = (user: Record<string, unknown> | null) => {
   useAuthStore.setState({
@@ -90,5 +91,35 @@ describe('syncSessionUser', () => {
 
     await expect(syncSessionUser()).resolves.toBeNull();
     expect((useAuthStore.getState().user as any).display_id).toBe('3');
+  });
+
+  it('drops an identity response that belongs to the previous account', async () => {
+    setSignedIn({ id: 'A', username: 'A', display_name: 'A', created_at: '' });
+    let release: (value: unknown) => void = () => {};
+    mocks.get.mockReturnValueOnce(new Promise((resolve) => { release = resolve; }));
+
+    const pending = syncSessionUser();
+    // A logs out, B logs in while A's /identity/session is still travelling.
+    resetSessionScopedState();
+    setSignedIn({ id: 'B', username: 'B', display_name: 'B', avatar_url: 'b.png', created_at: '' });
+    release({
+      id: 'A', username: 'A', display_name: 'A-renamed',
+      avatar_url: 'a.png', is_staff: true,
+    });
+    await expect(pending).resolves.toBeNull();
+
+    const user = useAuthStore.getState().user as any;
+    expect(user.id).toBe('B');
+    expect(user.display_name).toBe('B');
+    expect(user.avatar_url).toBe('b.png');
+    expect(user.is_staff).not.toBe(true);
+  });
+
+  it('drops a same-epoch payload that names a different user id', async () => {
+    setSignedIn({ id: 'B', username: 'B', display_name: 'B', created_at: '' });
+    mocks.get.mockResolvedValue({ id: 'A', username: 'A', display_name: 'A' });
+
+    await expect(syncSessionUser()).resolves.toBeNull();
+    expect((useAuthStore.getState().user as any).display_name).toBe('B');
   });
 });

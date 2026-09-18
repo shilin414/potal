@@ -43,6 +43,32 @@ type ResetFn = () => void;
 const resetters: ResetFn[] = [];
 
 /**
+ * The global session epoch (四次复审 P0-R1).
+ *
+ * This is the ONE generation every session-scoped async action captures
+ * before it awaits. A login/logout that ends an identity bumps it, so an
+ * answer that was already in flight for the previous user can never write
+ * into the next user's state — the same rule the bootstrap and entity stores
+ * already enforce locally, lifted to a single place so no store needs its
+ * own copy.
+ *
+ * `let` + two tiny accessors keeps the epoch private to this module; no
+ * caller can set it, and no caller can compare it except through the same
+ * helper it captured from.
+ */
+let sessionGeneration = 0;
+
+/** Snapshot the current epoch before an async operation starts. */
+export function captureSessionGeneration(): number {
+  return sessionGeneration;
+}
+
+/** `true` while `captured` still names the session that started the work. */
+export function sessionStillCurrent(captured: number): boolean {
+  return captured === sessionGeneration;
+}
+
+/**
  * Register one store's "forget everything about the current user" action.
  *
  * Call it at module scope, next to the store definition — that is the only
@@ -64,8 +90,18 @@ export function registerSessionReset(fn: ResetFn): void {
  *
  * Deliberately NOT in this list: `theme-storage` and any other real
  * cross-user client preference.
+ *
+ * `conversation-storage` is included ONLY as one-release legacy cleanup
+ * (四次复审 P0-R2): the current store no longer persists transcripts, so no
+ * new value is written, but an old browser may still hold one from a prior
+ * build and it should not survive an identity switch on disk.
  */
-const SESSION_SCOPED_STORAGE_KEYS = ['workspace-storage', 'organization-storage'] as const;
+const SESSION_SCOPED_STORAGE_KEYS = [
+  'workspace-storage',
+  'organization-storage',
+  // Legacy cleanup only: the current store never writes this key.
+  'conversation-storage',
+] as const;
 
 /**
  * Wipe every store whose contents belong to ONE identity — and the
@@ -75,6 +111,12 @@ const SESSION_SCOPED_STORAGE_KEYS = ['workspace-storage', 'organization-storage'
  * strictly better than an exception thrown from inside a logout.
  */
 export function resetSessionScopedState(): void {
+  // Bump the epoch FIRST (四次复审 P0-R1): every request still travelling
+  // when this identity ends must observe a stale generation the moment it
+  // settles, including the `.finally` / timer / SSE callbacks that do not go
+  // through a Store action.
+  sessionGeneration += 1;
+
   for (const reset of resetters) {
     try {
       reset();

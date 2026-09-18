@@ -705,6 +705,61 @@ func likePattern(search string) string {
 	return "%" + escaped + "%"
 }
 
+// mentionContains / mentionPrefix render the two LIKE shapes the dedicated
+// mention query needs. Both reuse the same escaping rule as `likePattern`, so
+// `%`, `_` and `\` are compared as LITERAL characters (四次复审 P1-R2).
+func mentionContains(q string) string {
+	return likePattern(q)
+}
+
+func mentionPrefix(q string) string {
+	if q == "" {
+		return "%"
+	}
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
+	return escaped + "%"
+}
+
+// ResolveMentionCandidates answers the `@` router with ONE ranked query.
+//
+// This is deliberately NOT ListApplicationPage: that search also matches
+// description / category name so a page of description-only noise could fill
+// the LIMIT before a real name/slug match. Here the LIMIT is applied AFTER
+// the exact / prefix / substring ranking, and only name/slug can match at
+// all (四次复审 P1-R2).
+func (r *Repo) ResolveMentionCandidates(
+	ctx context.Context,
+	q string,
+	isStaff bool,
+	limit int,
+) ([]MentionCandidate, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := r.q(ctx).ResolveMentionCandidates(ctx, db.ResolveMentionCandidatesParams{
+		ShowAll: boolArg(isStaff),
+		// narg-free by design: an empty query is rejected by the handler, so
+		// the two LIKE parameters are always real needles.
+		Contains: mentionContains(q),
+		Exact:    q,
+		Prefix:   mentionPrefix(q),
+		Limit:    int32(limit),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]MentionCandidate, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, MentionCandidate{
+			ID:   int64(row.ID),
+			Slug: row.Slug,
+			Name: row.Name,
+			Kind: row.Kind,
+		})
+	}
+	return out, nil
+}
+
 func max64(a, b int64) int64 {
 	if a > b {
 		return a

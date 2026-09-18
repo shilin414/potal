@@ -72,6 +72,7 @@ import './RunChatPanel.css';
 
 /** Stable empty list: `?? []` in render would churn every memo depending on it. */
 const NO_SKILLS: AgentSkill[] = [];
+const EMPTY_MESSAGES: ChatMessage[] = [];
 
 /**
  * What the ONE hidden file input accepts. Extensions AND mime types, because
@@ -217,7 +218,14 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
   const activeConversation = displayConversationId
     ? conversations[displayConversationId]
     : null;
-  const messages = activeConversation?.messages || [];
+  // Stable identity while the conversation is absent: `|| []` allocates a new
+  // array every render, which made the effects below re-run on each parent
+  // render. An empty-frozen fallback is enough; real message arrays are owned
+  // by the store and keep their identity until they change.
+  const messages = useMemo(
+    () => activeConversation?.messages ?? EMPTY_MESSAGES,
+    [activeConversation],
+  );
   const streaming = activeConversation?.activeRunId != null;
 
   // ── 转发/分享（多选模式）─────────────────────────────────────────────

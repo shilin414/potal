@@ -28,6 +28,11 @@ const mocks = vi.hoisted(() => ({
   bootstrap: vi.fn(),
   resolve: vi.fn(),
   favorite: vi.fn(),
+  conversationGet: vi.fn(),
+  runApiGet: vi.fn(),
+  runApiArtifacts: vi.fn(),
+  runApiCreate: vi.fn(),
+  runStream: vi.fn(),
 }));
 
 vi.mock('@/services/runApi', async (importOriginal) => {
@@ -37,8 +42,19 @@ vi.mock('@/services/runApi', async (importOriginal) => {
     fetchWorkspaceBootstrap: mocks.bootstrap,
     resolveApplication: mocks.resolve,
     setApplicationFavorite: mocks.favorite,
+    getRun: mocks.runApiGet,
+    fetchRunArtifacts: mocks.runApiArtifacts,
+    createRun: mocks.runApiCreate,
   };
 });
+
+vi.mock('@/services/axios', () => ({
+  default: { get: mocks.conversationGet },
+}));
+
+vi.mock('@/services/runStream', () => ({
+  openRunStream: mocks.runStream,
+}));
 
 import { resetSessionScopedState, isSameUser } from '@/stores/resetSessionState';
 import { useAuthStore } from '@/stores/useAuthStore';
@@ -47,6 +63,7 @@ import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import { useRunChatStore } from '@/stores/useRunChatStore';
 import { useOrganizationStore } from '@/stores/useOrganizationStore';
+import { useConversationStore } from '@/stores/useConversationStore';
 import type { ApplicationSummary, V2Application } from '@/services/runApi';
 
 const summary = (id: number, name: string): ApplicationSummary => ({
@@ -81,6 +98,11 @@ beforeEach(() => {
   mocks.bootstrap.mockReset().mockResolvedValue(BOOTSTRAP);
   mocks.resolve.mockReset();
   mocks.favorite.mockReset();
+  mocks.conversationGet.mockReset();
+  mocks.runApiGet.mockReset();
+  mocks.runApiArtifacts.mockReset();
+  mocks.runApiCreate.mockReset();
+  mocks.runStream.mockReset();
   resetSessionScopedState();
   useAuthStore.setState({ user: null, isAuthenticated: false });
 });
@@ -226,6 +248,22 @@ describe('organization session isolation (三次复审 P0-R2)', () => {
     expect(localStorage.getItem('workspace-storage')).toBeNull();
   });
 
+  it('drops an organization list that settles after the switch', async () => {
+    let release: (value: unknown) => void = () => {};
+    const { api } = await import('@/services/api');
+    const get = vi.spyOn(api, 'get').mockReturnValueOnce(
+      new Promise((resolve) => { release = resolve; }) as any);
+
+    const pending = useOrganizationStore.getState().loadOrganizations();
+    resetSessionScopedState();
+    release([{ id: 'org-a', name: 'A', slug: 'a', role: 'owner' }]);
+    await pending;
+
+    expect(useOrganizationStore.getState().currentOrganizationId).toBeNull();
+    expect(useOrganizationStore.getState().organizations).toEqual([]);
+    get.mockRestore();
+  });
+
   it('不清除真正跨用户的客户端偏好（主题）', () => {
     localStorage.setItem('theme-storage', JSON.stringify({ state: { theme: 'dark' }, version: 0 }));
 
@@ -248,5 +286,124 @@ describe('isSameUser', () => {
     expect(isSameUser({ id: 7 }, { id: 8 })).toBe(false);
     expect(isSameUser({ id: 7 }, null)).toBe(false);
     expect(isSameUser({ id: undefined }, { id: undefined })).toBe(false);
+  });
+});
+
+describe('session epoch -> legacy stores (四次复审 P0-R1/R3/R4)', () => {
+  it('ignores a conversation list response that settles after the switch', async () => {
+    let release: (value: unknown) => void = () => {};
+    mocks.conversationGet.mockReturnValueOnce(
+      new Promise((resolve) => { release = resolve; }));
+
+    const pending = useConversationStore.getState().fetchConversations();
+    resetSessionScopedState();
+    release([{ id: 'a-conversation', title: 'A 的对话' }]);
+    await pending;
+
+    expect(useConversationStore.getState().conversations).toEqual([]);
+    expect(localStorage.getItem('conversation-storage')).toBeNull();
+  });
+
+  it('ignores a conversation detail response that settles after the switch', async () => {
+    let release: (value: unknown) => void = () => {};
+    mocks.conversationGet.mockReturnValueOnce(
+      new Promise((resolve) => { release = resolve; }));
+
+    const pending = useConversationStore.getState().fetchConversationDetail('9');
+    resetSessionScopedState();
+    release({ id: 9, title: 'A 的对话', messages: [] });
+    await pending;
+
+    expect(useConversationStore.getState().currentConversation).toBeNull();
+  });
+
+  it('aborts a live legacy stream and drops an event already in flight', async () => {
+    let handlers: Record<string, (...args: any[]) => void> | undefined;
+    const abort = vi.fn();
+    const controller = { abort } as unknown as AbortController;
+
+    // Use the real streamChat mock through the module boundary: the store
+    // registers the controller it returns, so `reset` must abort it.
+    const sse = vi.spyOn(await import('@/services/sseClient'), 'streamChat');
+    sse.mockImplementation((_id, _content, value) => {
+      handlers = value as any;
+      return controller;
+    });
+    useConversationStore.setState({
+      currentConversation: {
+        id: 'a-conversation', title: 'A', created_at: '', updated_at: '', messages: [],
+      },
+    });
+    useConversationStore.getState().sendMessageStream('a-conversation', 'hello');
+
+    resetSessionScopedState();
+    handlers?.onEvent?.({
+      sequence: 1,
+      method: 'item/agentMessage/delta',
+      params: { itemId: 'm1', delta: 'late A text' },
+    });
+
+    expect(abort).toHaveBeenCalled();
+    expect(useConversationStore.getState().currentConversation).toBeNull();
+    expect(useConversationStore.getState().agentActivity).toBeNull();
+    expect(useConversationStore.getState().lastSequence).toBe(0);
+  });
+
+  it('closes a live Run stream and ignores an event queued before reset', async () => {
+    let handlers: Record<string, (...args: any[]) => void> | undefined;
+    const close = vi.fn();
+    mocks.runStream.mockImplementation((_runId, value) => {
+      handlers = value;
+      return { close };
+    });
+    mocks.runApiGet.mockResolvedValue({
+      id: 'run-a', conversation: 12, status: 'succeeded', output: { text: 'A' },
+    });
+    mocks.runApiArtifacts.mockResolvedValue([]);
+
+    useRunChatStore.setState({
+      conversations: {
+        12: {
+          id: 12,
+          title: 'A',
+          activeRunId: 'run-a',
+          messages: [{
+            id: 'run-run-a', role: 'assistant', content: '', created_at: '',
+            runId: 'run-a', status: 'streaming',
+          }],
+        },
+      },
+      activeConversationId: 12,
+    });
+    // Open the stream through the store's public send path so the registry
+    // has a real entry to close.
+    mocks.runApiGet.mockResolvedValueOnce({
+      id: 'run-a', conversation: 12, status: 'succeeded', output: { text: 'A' },
+    });
+    mocks.runApiCreate.mockResolvedValueOnce({
+      id: 'run-a', conversation: 12, status: 'running',
+    });
+    await useRunChatStore.getState().sendMessage({
+      applicationId: 1, conversationId: 12, content: 'A',
+    });
+    expect(handlers).toBeDefined();
+
+    resetSessionScopedState();
+    // B is now signed in and has their own empty conversation open. A late
+    // event must not re-seed A's run-... bubble into B's active conversation.
+    useRunChatStore.setState({
+      conversations: {
+        99: { id: 99, title: 'B', messages: [], activeRunId: null },
+      },
+      activeConversationId: 99,
+    });
+    handlers?.onEvent?.({
+      run_id: 'run-a', event_type: 'content.delta', sequence: 1,
+      payload: { text: 'A event after switch' },
+    });
+
+    expect(close).toHaveBeenCalled();
+    expect(useRunChatStore.getState().conversations[99].messages).toEqual([]);
+    expect(handlers).toBeDefined();
   });
 });

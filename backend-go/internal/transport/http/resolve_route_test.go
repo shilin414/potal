@@ -44,3 +44,44 @@ func TestStaticCatalogRoutesBeatTheIDParam(t *testing.T) {
 		}
 	}
 }
+
+// 四次复审 P2-R1: the metric label mapper must not fold the three static
+// catalog routes into /applications/{id}. Otherwise `page`, `resolve` and
+// `resolve-mention` share one request counter / error rate / latency
+// histogram with every single-row lookup.
+func TestNormalizeRouteKeepsStaticCatalogRoutesDistinct(t *testing.T) {
+	cases := map[string]string{
+		"/api/v2/applications/page":            "/api/v2/applications/page",
+		"/api/v2/applications/resolve":         "/api/v2/applications/resolve",
+		"/api/v2/applications/resolve-mention": "/api/v2/applications/resolve-mention",
+		"/api/v2/applications/42":              "/api/v2/applications/{id}",
+		"/api/v2/applications/42/avatar":       "/api/v2/applications/{id}/avatar",
+		"/api/v2/applications/42/favorite":     "/api/v2/applications/{id}/favorite",
+		"/api/v2/workspace/bootstrap":          "/api/v2/workspace/bootstrap",
+		"/api/v2/applications":                 "/api/v2/applications",
+	}
+	for path, want := range cases {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if got := normalizeRoute(req); got != want {
+			t.Fatalf("normalizeRoute(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+// 四次复审 P1-R3: the avatar response must be a per-Cookie cache variant.
+// `private, immutable` alone still lets the same browser answer user B from
+// user A's cached bytes without hitting the visibility check.
+func TestAvatarCacheHeadersVaryByCookie(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeAvatarCacheHeaders(rec, `"abc123"`)
+
+	if got := rec.Header().Get("Vary"); got != "Cookie" {
+		t.Fatalf("Vary = %q, want Cookie", got)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "private, max-age=31536000, immutable" {
+		t.Fatalf("Cache-Control = %q", got)
+	}
+	if got := rec.Header().Get("ETag"); got != `"abc123"` {
+		t.Fatalf("ETag = %q", got)
+	}
+}

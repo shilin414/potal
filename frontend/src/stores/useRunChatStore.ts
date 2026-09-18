@@ -11,7 +11,11 @@
  * this store only mirrors them for rendering.
  */
 import { create } from 'zustand';
-import { registerSessionReset } from '@/stores/resetSessionState';
+import {
+  captureSessionGeneration,
+  registerSessionReset,
+  sessionStillCurrent,
+} from '@/stores/resetSessionState';
 import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import axiosInstance from '@/services/axios';
 import {
@@ -36,10 +40,11 @@ import type {
  * run converges (title/preview/message_count change).
  */
 let sidebarRefreshTimer: ReturnType<typeof setTimeout> | null = null;
-function refreshSidebarDebounced() {
+function refreshSidebarDebounced(generation = captureSessionGeneration()) {
   if (sidebarRefreshTimer != null) return;
   sidebarRefreshTimer = setTimeout(() => {
     sidebarRefreshTimer = null;
+    if (!sessionStillCurrent(generation)) return;
     void useConversationStore.getState().fetchConversations();
   }, 1500);
 }
@@ -143,7 +148,7 @@ const CANCELLED_NOTICE = '应用或运行配置已停用，本次执行已取消
  */
 export function utf8ByteLength(text: string): number {
   let bytes = 0;
-  // eslint-disable-next-line no-restricted-syntax
+
   for (const ch of text) {
     const cp = ch.codePointAt(0) as number;
     bytes += cp < 0x80 ? 1 : cp < 0x800 ? 2 : cp < 0x10000 ? 3 : 4;
@@ -161,7 +166,7 @@ export function utf8SliceFromBytes(text: string, skip: number): string {
   if (skip <= 0) return text;
   let out = '';
   let pos = 0;
-  // eslint-disable-next-line no-restricted-syntax
+
   for (const ch of text) {
     if (pos >= skip) out += ch;
     const cp = ch.codePointAt(0) as number;
@@ -233,6 +238,7 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
   lastConversationId: null,
 
   loadConversation: async (id: number) => {
+    const generation = captureSessionGeneration();
     // Never overwrite a conversation with a live run: the server has only
     // the user message until reconciliation finishes, and any deltas we
     // receive during this fetch would be lost (they are not replayed).
@@ -241,6 +247,7 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
     set({ isLoading: true, error: null });
     try {
       const detail = await axiosInstance.get(`/conversations/${id}/`) as any;
+      if (!sessionStillCurrent(generation)) return;
       const existing = current;
       // History messages come from the backend source of truth. Messages
       // created by our own sends already exist server-side too, so a
@@ -271,6 +278,7 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
         isLoading: false,
       });
     } catch (error: any) {
+      if (!sessionStillCurrent(generation)) return;
       set({
         error: error?.response?.data?.detail || '获取对话详情失败',
         isLoading: false,
@@ -289,6 +297,23 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
     // action (第九轮 P0-1): reusing it after a switch would attach B's
     // message to A's idempotency key.
     pendingSend = null;
+    // A timer that fires AFTER the switch would refetch A's sidebar (and
+    // its callback is not covered by a store resetter).
+    if (sidebarRefreshTimer != null) {
+      clearTimeout(sidebarRefreshTimer);
+      sidebarRefreshTimer = null;
+    }
+    // Close every live Run stream and drop the registry in one synchronous
+    // step (四次复审 P0-R4). `close()` aborts the fetch; the epoch guard in
+    // consumeRunEvents additionally drops any callback already queued.
+    for (const stream of activeStreams.values()) {
+      try {
+        stream.close();
+      } catch {
+        // Best-effort: one dead stream must not leave the rest registered.
+      }
+    }
+    activeStreams.clear();
     set({
       conversations: {},
       activeConversationId: null,
@@ -301,6 +326,7 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
   sendMessage: async ({
     applicationId, conversationId, content, attachments, clientRequestId,
   }) => {
+    const generation = captureSessionGeneration();
     set({ error: null });
     const attachmentIds = attachments?.map((a) => a.id) || [];
     const fingerprint = sendFingerprint(applicationId, conversationId || null, content, attachmentIds);
@@ -317,6 +343,7 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
         attachmentIds,
         clientRequestId: requestId,
       });
+      if (!sessionStillCurrent(generation)) return null;
       pendingSend = null;
       // A new run moves `usage_count` / `last_used_at`, which is exactly what
       // 常用 / 最近使用 / 推荐 are ranked by (二次复审 P1-4). Mark the
@@ -324,6 +351,7 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
       // visit re-reads it once.
       useWorkspaceBootstrapStore.getState().invalidate();
     } catch (error: any) {
+      if (!sessionStillCurrent(generation)) return null;
       // Remember the identity so the retry replays instead of duplicating.
       pendingSend = { fingerprint, clientRequestId: requestId };
       const detail = error?.response?.data
@@ -376,8 +404,8 @@ export const useRunChatStore = create<RunChatState>()((set, get) => ({
       };
     });
 
-    refreshSidebarDebounced();
-    consumeRunEvents(run.id);
+    refreshSidebarDebounced(generation);
+    consumeRunEvents(run.id, generation);
     return cid;
   },
 }));
@@ -611,18 +639,27 @@ export function applyEvent(state: RunChatState, event: RunEventRecord): Partial<
     return { conversations };
   }
 
-function consumeRunEvents(runId: string) {
+function consumeRunEvents(runId: string, generation: number) {
   const stream = openRunStream(runId, {
     onEvent: (event) => {
+      if (!sessionStillCurrent(generation)) {
+        // Abort and unregister a stream whose session ended while an event
+        // was already queued. The guard is what covers the callback race;
+        // the abort is what stops the transport reading further.
+        stream.close();
+        if (activeStreams.get(runId) === stream) activeStreams.delete(runId);
+        return;
+      }
       const state = useRunChatStore.getState();
       const patch = applyEvent(state, event);
       if (Object.keys(patch).length) useRunChatStore.setState(patch);
       if (TERMINAL.has(event.event_type)) {
-        void finalizeRun(runId, event.payload?.text as string | undefined);
+        void finalizeRun(runId, event.payload?.text as string | undefined, generation);
       }
     },
     onError: () => {
       // Transport hiccup; the client auto-reconnects with full replay.
+      // Nothing to clear: a stale stream is dropped by the onEvent guard.
     },
   });
   // Track for cleanup elsewhere if the workspace unmounts mid-run.
@@ -644,7 +681,12 @@ export function closeRunStream(runId: string) {
 // 快照整体覆盖回来 —— 那会把 B 的消息抹掉、或把 B 的 activeRunId 清成
 // null。这里改为 functional setState：异步结束后基于**最新** store state
 // 只 merge 我自己的那条消息。
-export async function finalizeRun(runId: string, eventText?: string) {
+export async function finalizeRun(
+  runId: string,
+  eventText?: string,
+  generation = captureSessionGeneration(),
+) {
+  if (!sessionStillCurrent(generation)) return;
   closeRunStream(runId);
   let run: RunRecord;
   try {
@@ -652,6 +694,7 @@ export async function finalizeRun(runId: string, eventText?: string) {
   } catch {
     return;
   }
+  if (!sessionStillCurrent(generation)) return;
 
   // Attach artifact cards from the run's persisted artifacts (source of
   // truth; covers artifacts discovered before the stream was opened).
@@ -669,6 +712,7 @@ export async function finalizeRun(runId: string, eventText?: string) {
   } catch {
     fetchedArtifacts = null;
   }
+  if (!sessionStillCurrent(generation)) return;
 
   useRunChatStore.setState((current) => {
     const cid = run.conversation;
@@ -718,7 +762,7 @@ export async function finalizeRun(runId: string, eventText?: string) {
     };
   });
 
-  refreshSidebarDebounced();
+  refreshSidebarDebounced(generation);
 }
 
 // Live transcripts plus the pending-send idempotency identity, which belongs

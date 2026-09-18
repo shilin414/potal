@@ -91,11 +91,11 @@ func (a *itestAdapter) BuildAuth(context.Context, int64, string) (*catalog.Provi
 	return &catalog.ProviderAuthContext{}, nil
 }
 
-func (a *itestAdapter) DisplayLabel() string     { return "itest" }
-func (a *itestAdapter) ResourceIDLabel() string  { return "资源 ID" }
+func (a *itestAdapter) DisplayLabel() string      { return "itest" }
+func (a *itestAdapter) ResourceIDLabel() string   { return "资源 ID" }
 func (a *itestAdapter) ResourceIDPattern() string { return "" }
-func (a *itestAdapter) ResourceIDHint() string   { return "" }
-func (a *itestAdapter) ResourceIDRequired() bool { return false }
+func (a *itestAdapter) ResourceIDHint() string    { return "" }
+func (a *itestAdapter) ResourceIDRequired() bool  { return false }
 
 // invariantService is a service whose registry accepts bindings for the
 // given test provider key (runtime type `agent`).

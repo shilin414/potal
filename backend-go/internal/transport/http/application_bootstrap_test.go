@@ -153,55 +153,11 @@ func TestBootstrapCategoryRailOmitsOtherWhenEverythingIsCategorized(t *testing.T
 	}
 }
 
-func TestRankMentionCandidatesIgnoresDescriptionOnlyMatches(t *testing.T) {
-	pool := []mentionSource{
-		{ID: 1, Slug: "sales", Name: "销售助手"},
-		{ID: 2, Slug: "sales-daily", Name: "销售日报"},
-		{ID: 3, Slug: "it-ops", Name: "运维小安"}, // description mentions 销售 in SQL only
-	}
-	got := rankMentionCandidates(pool, "销售")
-	if len(got) != 2 || got[0].ID != 1 || got[1].ID != 2 {
-		t.Fatalf("expected the two name matches in order, got %+v", got)
-	}
-
-	// An exact slug beats a name prefix; an exact name beats both.
-	got = rankMentionCandidates(pool, "sales")
-	if len(got) == 0 || got[0].ID != 1 {
-		t.Fatalf("exact slug/name must rank first, got %+v", got)
-	}
-	got = rankMentionCandidates(pool, "销售日报")
-	if len(got) == 0 || got[0].ID != 2 {
-		t.Fatalf("exact name must rank first, got %+v", got)
-	}
-	// Case-insensitivity is the whole point for ASCII names.
-	got = rankMentionCandidates([]mentionSource{{ID: 9, Slug: "sales-agent", Name: "Sales Agent"}}, "sales")
-	if len(got) != 1 || got[0].ID != 9 {
-		t.Fatalf("mention matching must be case-insensitive, got %+v", got)
-	}
-	if out := rankMentionCandidates(pool, "zzz"); len(out) != 0 {
-		t.Fatalf("no match must answer an empty list, got %+v", out)
-	}
-}
-
-func TestRankMentionCandidatesCapsAndPrependsWithoutDuplicate(t *testing.T) {
-	pool := make([]mentionSource, 0, 25)
-	for i := 0; i < 25; i++ {
-		pool = append(pool, mentionSource{ID: int64(i + 1), Slug: "n", Name: "sales-agent"})
-	}
-	if got := rankMentionCandidates(pool, "sales"); len(got) != mentionCandidateLimit {
-		t.Fatalf("candidates must be capped at %d, got %d", mentionCandidateLimit, len(got))
-	}
-
-	list := []mentionCandidate{{ID: 1, Slug: "a", Name: "A", Kind: "chat"}}
-	out := prependMention(list, mentionCandidate{ID: 1, Slug: "a", Name: "A", Kind: "chat"})
-	if len(out) != 1 {
-		t.Fatalf("an exact slug hit already present must not be duplicated: %+v", out)
-	}
-	out = prependMention(list, mentionCandidate{ID: 2, Slug: "b", Name: "B", Kind: "chat"})
-	if len(out) != 2 || out[0].ID != 2 {
-		t.Fatalf("the exact slug hit must lead the list: %+v", out)
-	}
-}
+// The mention ranker moved into dedicated SQL (四次复审 P1-R2); its ordering
+// and noise-survival contract is pinned against a real database in
+// tests/integration/application_page_test.go. The pure tests that remained
+// here were coupled to the deleted pre-filter path and no longer describe
+// production behaviour.
 
 // The CONSUME predicate is what stops a staff caller from opening an
 // application the run API would refuse (二次复审 P0-5). It is the shared

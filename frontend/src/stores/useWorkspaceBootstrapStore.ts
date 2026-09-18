@@ -47,7 +47,11 @@ import {
   type ComposerApplication,
 } from '@/services/runApi';
 import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
-import { registerSessionReset } from '@/stores/resetSessionState';
+import {
+  captureSessionGeneration,
+  registerSessionReset,
+  sessionStillCurrent,
+} from '@/stores/resetSessionState';
 
 export interface BootstrapState {
   defaultApplication: ComposerApplication | null;
@@ -238,6 +242,21 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
           // the stale mark — the response is ALREADY older than it (P1-R2).
           dirty: invalidationRevision !== myRevision,
         });
+        // Bootstrap rows are consume-eligible (四次复审 P1-R1): refresh the
+        // freshness stamp for any row the entity cache already holds, so the
+        // next recent/shortcut click does not immediately re-resolve it.
+        const rows = [
+          payload.default_application,
+          ...(payload.favorites ?? []),
+          ...(payload.frequent ?? []),
+          ...(payload.recent ?? []),
+          ...(payload.recommended ?? []),
+          ...(payload.recent_fixed_apps ?? []),
+        ].filter((row): row is ApplicationSummary => row != null);
+        const ids = rows
+          .filter((row) => typeof row.id === 'number')
+          .map((row) => ({ id: row.id }));
+        useApplicationEntityStore.getState().markConsumeValidated(ids);
       })
       .catch((error: any) => {
         if (generation !== myGeneration) return;
@@ -285,6 +304,7 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
   })),
 
   toggleFavorite: async (applicationId, fallback) => {
+    const sessionGeneration = captureSessionGeneration();
     const state = get();
     const known = state.summaryById(applicationId) ?? fallback;
     // Nothing to flip and nothing to patch: the caller has no row at all.
@@ -320,10 +340,12 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
     write(next);
     try {
       const result = await setApplicationFavorite(applicationId, next);
+      if (!sessionStillCurrent(sessionGeneration)) return;
       // The server is authoritative about the flag it actually stored — but
       // only while no newer toggle for this application has taken over.
       if (result.is_favorite !== next && isLatestOperation()) write(result.is_favorite);
     } catch {
+      if (!sessionStillCurrent(sessionGeneration)) return;
       if (isLatestOperation()) {
         // Restore ONLY this application's own flag (三次复审 P1-R3): group
         // membership (Top-8, server-computed) is NOT rolled back locally.
@@ -367,6 +389,7 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
     // Bump FIRST: any request already in flight must see a stale generation
     // the moment it settles, not after the next statement.
     generation += 1;
+    favoriteVersions.clear();
     // Drop the pointer WITHOUT waiting for the old promise's `.finally` —
     // that finally still runs later, and the identity check inside it (`if
     // (inflight === request)`) is what keeps it from nulling the NEXT

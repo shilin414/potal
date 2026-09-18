@@ -108,3 +108,40 @@ describe('entity store session isolation', () => {
     expect(mocks.resolve).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('entity consume freshness (四次复审 P1-R1)', () => {
+  it('revalidates a stale cached row before a consumer surface trusts it', async () => {
+    mocks.resolve
+      .mockResolvedValueOnce(app(21, 'sales'))
+      .mockRejectedValueOnce(httpError(404));
+
+    await expect(useApplicationEntityStore.getState().ensure(21))
+      .resolves.toMatchObject({ id: 21 });
+    // Cache hit within the TTL: no second request.
+    await expect(useApplicationEntityStore.getState().ensure(21))
+      .resolves.toMatchObject({ id: 21 });
+    expect(mocks.resolve).toHaveBeenCalledTimes(1);
+
+    // An entry point asks for maxAgeMs: 0 → revalidate. The server now says
+    // 404 (disabled / provider killed): the stale row is removed.
+    await expect(useApplicationEntityStore.getState().ensure(21, { maxAgeMs: 0 }))
+      .resolves.toBeUndefined();
+    expect(mocks.resolve).toHaveBeenCalledTimes(2);
+    expect(useApplicationEntityStore.getState().byId[21]).toBeUndefined();
+    expect(useApplicationEntityStore.getState().bySlug.sales).toBeUndefined();
+  });
+
+  it('hides a cached row when a revalidation reports a transport failure', async () => {
+    mocks.resolve
+      .mockResolvedValueOnce(app(22, 'ops'))
+      .mockRejectedValueOnce(httpError(500));
+
+    await useApplicationEntityStore.getState().ensure(22);
+    await expect(useApplicationEntityStore.getState().ensure(22, { maxAgeMs: 0 }))
+      .rejects.toBeTruthy();
+
+    // 500 is not proof the app vanished, but it also is not proof it is
+    // consumable: keep it out of consumer surfaces until a retry succeeds.
+    expect(useApplicationEntityStore.getState().byId[22]).toBeUndefined();
+  });
+});

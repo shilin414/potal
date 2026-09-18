@@ -58,8 +58,11 @@ export const MarkdownWithArtifacts: React.FC<{
   /** Override the resolver target (public shares use the token-scoped one). */
   openArtifactUrl?: (artifactId: string) => string;
 }> = ({ content, artifacts, openArtifactUrl }) => {
-  const resolveUrl = openArtifactUrl
-    ?? useCallback((artifactId: string) => `${API_BASE}/v2/artifacts/${artifactId}/open`, []);
+  const defaultResolveUrl = useCallback(
+    (artifactId: string) => `${API_BASE}/v2/artifacts/${artifactId}/open`,
+    [],
+  );
+  const resolveUrl = openArtifactUrl ?? defaultResolveUrl;
 
   /**
    * Matched /open URL, or null when the ref is still unresolved. The matching

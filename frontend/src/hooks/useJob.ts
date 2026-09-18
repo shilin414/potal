@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '@/services/api';
-import { useAuthStore } from '@/stores/useAuthStore';
 import { createWsClient, type WsClient } from '@/services/wsClient';
 
 export interface JobItem { id: string; name: string; status: string; result: string; error: string; }

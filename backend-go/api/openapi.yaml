@@ -412,7 +412,7 @@ paths:
         - name: q
           in: query
           schema: { type: string }
-          description: Case-insensitive substring match on name / description.
+          description: Case-insensitive substring match on name / description / category name.
         - name: category_slug
           in: query
           schema: { type: string }
@@ -445,17 +445,14 @@ paths:
       summary: Resolve ONE application by slug or id (执行报告 §12)
       description: >
         Exact single-row resolution for deep links (/chat/:slug, /app/:slug) and
-        for the application entity cache. Applies EXACTLY the catalog list's
-        access policy (enabled + is_public for regular callers, everything for
-        staff) and answers 404 when the application does not exist OR is not
-        visible — existence is never leaked. This is what makes
+        for the application entity cache. Visibility is evaluated with the
+        management policy (enabled + is_public for regular callers, everything
+        for staff); then consumption eligibility is applied: the application
+        must be enabled and a chat application must have an enabled binding
+        backed by an active provider. It answers 404 when the application does
+        not exist OR is not visible/consumable — existence is never leaked. This is what makes
         "open /chat/sales" cost one small request instead of a catalog
         download plus Array.find().
-
-        Resolution is a CONSUMPTION entry point (二次复审 P0-5), so it also
-        requires `catalog.Usable`: `enabled = 1` and, for `kind = chat`, an
-        enabled runtime binding. Without that a staff caller could open
-        /chat/disabled-agent, type a message, and have the run API refuse it.
       parameters:
         - name: slug
           in: query

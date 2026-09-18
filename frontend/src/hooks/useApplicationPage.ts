@@ -22,6 +22,7 @@ import {
   fetchApplicationPage,
   type V2Application,
 } from '@/services/runApi';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 
 export interface UseApplicationPageOptions {
   kind: 'chat' | 'fixed' | 'all';
@@ -53,7 +54,6 @@ export interface UseApplicationPageOptions {
   enabled?: boolean;
 }
 
-const UNCATEGORIZED = '__uncategorized__';
 
 const dedupeById = (items: V2Application[]): V2Application[] => {
   const seen = new Set<number>();
@@ -110,7 +110,14 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
         limit,
       });
       if (requestIdRef.current !== requestId) return; // a newer query won
-      setItems(dedupeById(page.items));
+      const nextItems = dedupeById(page.items);
+      setItems(nextItems);
+      // A consume page is a consume-eligible validation (四次复审 P1-R1):
+      // anything already cached as an entity gets its freshness refreshed so
+      // clicking it does not immediately trigger a redundant /resolve.
+      if (mode === 'consume') {
+        useApplicationEntityStore.getState().markConsumeValidated(nextItems);
+      }
       setCursor(page.next_cursor);
       setHasMore(page.has_more);
     } catch (err: any) {
@@ -123,7 +130,6 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
     } finally {
       if (requestIdRef.current === requestId) setLoading(false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, kind, scope, mode, includeUnbound, debouncedQuery, category, limit]);
 
   useEffect(() => { void fetchFirstPage(); }, [fetchFirstPage]);
@@ -153,6 +159,9 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
         categorySlug: category || undefined, limit, cursor,
       });
       if (requestIdRef.current !== requestId) return; // filters changed mid-flight
+      if (mode === 'consume') {
+        useApplicationEntityStore.getState().markConsumeValidated(page.items);
+      }
       setItems((current) => dedupeById([...current, ...page.items]));
       setCursor(page.next_cursor);
       setHasMore(page.has_more);

@@ -893,6 +893,19 @@ type Querier interface {
 	// winning transaction commits or rolls back — if it rolled back, this
 	// INSERT simply succeeds and takes the identity over.
 	ReserveRunRequest(ctx context.Context, arg ReserveRunRequestParams) (sql.Result, error)
+	// 四次复审 P1-R2: `@mention` ranking happens IN SQL, before LIMIT.
+	//
+	// The previous implementation reused ListApplicationPage, whose search
+	// deliberately covers name + description + category name. With a small LIMIT
+	// a description-only noise pool could fill every slot before the real
+	// name/slug match (created later) was ever seen — `@销售助手` returned [] even
+	// though an exact agent existed. A larger pool only postponed the failure.
+	//
+	// This query matches ONLY the fields the mention router actually ranks on
+	// (name / slug), applies the SAME visibility + consumption predicates as the
+	// consume page, and orders by exact → name prefix → slug prefix → substring
+	// before taking the final candidate budget.
+	ResolveMentionCandidates(ctx context.Context, arg ResolveMentionCandidatesParams) ([]ResolveMentionCandidatesRow, error)
 	RevokeConversationShare(ctx context.Context, arg RevokeConversationShareParams) error
 	RotateRefreshToken(ctx context.Context, arg RotateRefreshTokenParams) error
 	SetApplicationEnabled(ctx context.Context, arg SetApplicationEnabledParams) error

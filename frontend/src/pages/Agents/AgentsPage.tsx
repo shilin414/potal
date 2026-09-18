@@ -14,7 +14,7 @@
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  Avatar, Button, Empty, Input, Popconfirm, Segmented, Spin, Tag, Tooltip, message,
+  Button, Empty, Input, Popconfirm, Segmented, Spin, Tag, Tooltip, message,
 } from 'antd';
 import {
   DeleteOutlined, EditOutlined, PictureOutlined, PlusOutlined,

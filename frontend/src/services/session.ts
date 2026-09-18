@@ -12,6 +12,10 @@
  */
 import axiosInstance from './axios';
 import { useAuthStore } from '@/stores/useAuthStore';
+import {
+  captureSessionGeneration,
+  sessionStillCurrent,
+} from '@/stores/resetSessionState';
 
 export interface SessionUser {
   id?: string | number;
@@ -38,19 +42,33 @@ export async function fetchSessionUser(): Promise<SessionUser | null> {
  * payload) survive.
  */
 export async function syncSessionUser(): Promise<SessionUser | null> {
-  const { user, isAuthenticated } = useAuthStore.getState();
-  if (!isAuthenticated) return null;
+  const initial = useAuthStore.getState();
+  if (!initial.isAuthenticated || !initial.user) return null;
+  // Both fences are required (四次复审 P0-R6): the epoch rejects a response
+  // from a session that ended, and the id comparison rejects a response that
+  // belongs to a DIFFERENT account installed in the same session slot.
+  const expectedUserId = String(initial.user.id);
+  const generation = captureSessionGeneration();
   const session = await fetchSessionUser();
-  if (!session?.username) return null;
+  if (!session?.username || !sessionStillCurrent(generation)) return null;
+  const current = useAuthStore.getState();
+  if (
+    !current.isAuthenticated
+    || !current.user
+    || String(current.user.id) !== expectedUserId
+    || (session.id != null && String(session.id) !== expectedUserId)
+  ) {
+    return null;
+  }
   // updateUser merges, but an explicit `undefined` would still clobber the
   // previous value — hence the `??` guards.
-  useAuthStore.getState().updateUser({
+  current.updateUser({
     username: session.username,
-    display_name: session.display_name ?? user?.display_name,
-    display_id: session.display_id ?? user?.display_id,
-    avatar_url: session.avatar_url || user?.avatar_url,
-    auth_source: session.auth_source ?? user?.auth_source,
-    is_staff: session.is_staff ?? user?.is_staff,
+    display_name: session.display_name ?? current.user.display_name,
+    display_id: session.display_id ?? current.user.display_id,
+    avatar_url: session.avatar_url || current.user.avatar_url,
+    auth_source: session.auth_source ?? current.user.auth_source,
+    is_staff: session.is_staff ?? current.user.is_staff,
   } as any);
   return session;
 }

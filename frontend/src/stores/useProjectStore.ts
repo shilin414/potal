@@ -1,5 +1,9 @@
 import { create } from 'zustand';
-import { registerSessionReset } from '@/stores/resetSessionState';
+import {
+  captureSessionGeneration,
+  registerSessionReset,
+  sessionStillCurrent,
+} from '@/stores/resetSessionState';
 import { api } from '@/services/api';
 
 export interface Project {
@@ -39,32 +43,38 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   reset: () => set({ projects: [], currentProject: null, isLoading: false }),
 
   loadProjects: async () => {
+    const generation = captureSessionGeneration();
     try {
       set({ isLoading: true });
       const response = await api.get<any>('/projects/');
+      if (!sessionStillCurrent(generation)) return;
       set({ projects: Array.isArray(response) ? response : response.results ?? [] });
     } catch (error) {
       console.error('Failed to load projects:', error);
     } finally {
-      set({ isLoading: false });
+      if (sessionStillCurrent(generation)) set({ isLoading: false });
     }
   },
 
   loadProject: async (id: number) => {
+    const generation = captureSessionGeneration();
     try {
       set({ isLoading: true });
       const response = await api.get(`/projects/${id}/`);
+      if (!sessionStillCurrent(generation)) return;
       set({ currentProject: response });
     } catch (error) {
       console.error('Failed to load project:', error);
     } finally {
-      set({ isLoading: false });
+      if (sessionStillCurrent(generation)) set({ isLoading: false });
     }
   },
 
   createProject: async (data) => {
+    const generation = captureSessionGeneration();
     try {
       const response = await api.post('/projects/', data);
+      if (!sessionStillCurrent(generation)) throw new Error('session changed');
       const { projects } = get();
       set({ projects: [response, ...projects] });
       return response;
@@ -75,8 +85,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   updateProject: async (id: number, data) => {
+    const generation = captureSessionGeneration();
     try {
       await api.put(`/projects/${id}/`, data);
+      if (!sessionStillCurrent(generation)) return;
       await get().loadProjects();
     } catch (error) {
       console.error('Failed to update project:', error);
@@ -85,8 +97,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   deleteProject: async (id: number) => {
+    const generation = captureSessionGeneration();
     try {
       await api.delete(`/projects/${id}/`);
+      if (!sessionStillCurrent(generation)) return;
       const { projects, currentProject } = get();
       set({
         projects: projects.filter(p => p.id !== id),

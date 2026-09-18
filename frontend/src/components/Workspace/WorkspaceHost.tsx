@@ -53,7 +53,10 @@ const WorkspaceHost: React.FC<Props> = ({ kind = 'home' }) => {
     setResolving(true);
     setResolveFailed(false);
     try {
-      await ensureBySlug(slug);
+      // Every ENTRY into a consumer route revalidates (四次复审 P1-R1): a
+      // cached row that predates an admin's disable / provider kill switch
+      // must not be trusted just because it is still in memory.
+      await ensureBySlug(slug, { maxAgeMs: 0 });
     } catch {
       // A 500 / timeout / offline backend. Deliberately NOT folded into
       // "not found": the slug is probably fine, so the user gets a retry

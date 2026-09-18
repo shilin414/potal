@@ -990,8 +990,7 @@ func (s *Server) GetApplicationAvatar(w http.ResponseWriter, r *http.Request, id
 	// version parameter (or a proxy stripping it) via If-None-Match → 304.
 	version := avatarVersion(app.AvatarKey)
 	etag := `"` + version + `"`
-	w.Header().Set("ETag", etag)
-	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
+	writeAvatarCacheHeaders(w, etag)
 	if matchesETag(r.Header.Get("If-None-Match"), etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
@@ -1008,6 +1007,21 @@ func (s *Server) GetApplicationAvatar(w http.ResponseWriter, r *http.Request, id
 	}
 	w.Header().Set("Content-Type", ct)
 	_, _ = io.Copy(w, rc)
+}
+
+// writeAvatarCacheHeaders centralizes the avatar cache contract.
+//
+// Vary by Cookie (四次复审 P1-R3): `private` keeps the image out of shared
+// caches, but it does NOT partition a browser cache by identity. Without the
+// Vary header, a fresh immutable response fetched while user A was signed in
+// can be served to user B in the same browser WITHOUT the handler running its
+// visibility check. Varying on the session cookie makes each signed-in
+// identity a separate cache variant while keeping the one-year immutable
+// caching this endpoint was built for.
+func writeAvatarCacheHeaders(w http.ResponseWriter, etag string) {
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Vary", "Cookie")
+	w.Header().Set("Cache-Control", "private, max-age=31536000, immutable")
 }
 
 // matchesETag reports whether an If-None-Match header covers the current

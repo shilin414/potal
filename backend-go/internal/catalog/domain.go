@@ -60,6 +60,16 @@ type Binding struct {
 	Enabled            bool
 }
 
+// MentionCandidate is one application the `@` router may select. Only the
+// identity fields are needed: the composer either sends to a chat app or
+// opens a non-chat one.
+type MentionCandidate struct {
+	ID   int64
+	Slug string
+	Name string
+	Kind string
+}
+
 // Snapshot is the frozen runtime configuration stored on each Run
 // (never contains secrets/tokens).
 func (b *Binding) Snapshot() map[string]any {

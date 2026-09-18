@@ -15,7 +15,7 @@
  * make it serve both a Dropdown and a Bottom Sheet (§7.3).
  */
 import React, { useEffect, useState } from 'react';
-import { Spin } from 'antd';
+import { Spin, message } from 'antd';
 import { DownOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
@@ -66,8 +66,20 @@ const MobileAgentSwitcher: React.FC<Props> = ({ activeApplicationId }) => {
   const loading = resolving && !active;
 
   const handleSelect = (application: ApplicationSummary) => {
-    openApplication(application.id);
-    navigate(routeForApplication(application));
+    void ensure(application.id, { maxAgeMs: 0 })
+      .then((current) => {
+        if (!current) {
+          message.error('应用当前不可用');
+          return;
+        }
+        openApplication(current.id);
+        navigate(routeForApplication(current));
+      })
+      .catch(() => {
+        // Transport failure: let WorkspaceHost own the retry state.
+        openApplication(application.id);
+        navigate(routeForApplication(application));
+      });
   };
 
   return (

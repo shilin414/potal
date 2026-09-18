@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -405,150 +404,26 @@ func (s *Server) ResolveApplicationMention(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	// One narrow search over the same SQL the catalog page uses: `q` is the
-	// token the user typed, so anything whose NAME could match is already in
-	// this page (name/description/category LIKE, case-insensitively).
-	//
-	// Mode=consume (二次复审 P0-5): `@` SWITCHES the composer, so a
-	// candidate must be runnable — offering a disabled or binding-less
-	// agent here would let the user select something the next send refuses.
-	// `IncludeUnbound` stays true only so the consume predicate itself
-	// decides (it drops unbound chat rows anyway).
-	pool, err := s.CatalogRepo.ListApplicationPage(ctx, catalog.ApplicationPageQuery{
-		Scope:          catalog.VisibleScopeManage,
-		Mode:           catalog.PageModeConsume,
-		Kind:           catalog.PageQueryKindAll,
-		IncludeUnbound: true,
-		Search:         q,
-		Limit:          mentionCandidateLimit * 2,
-		CallerID:       caller.ID,
-		IsStaff:        caller.IsStaff,
-	})
+	// Dedicated mention SQL (四次复审 P1-R2): rank name/slug matches IN SQL,
+	// THEN LIMIT. Reusing ListApplicationPage let description/category noise
+	// consume the whole pre-filter budget before the real candidate was seen.
+	// The query itself applies the same visibility + consumption predicates
+	// as the consume page, so a disabled / unbound / inactive-provider agent
+	// can never be offered here.
+	candidates, err := s.CatalogRepo.ResolveMentionCandidates(
+		ctx, q, caller.IsStaff, mentionCandidateLimit,
+	)
 	if err != nil {
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	out := rankMentionCandidates(s.mentionSources(pool), q)
-
-	// A slug mention (`@sales-agent`) is an EXACT identifier that the
-	// substring search above may miss when the display name is unrelated
-	// (e.g. slug `sales-agent`, name `销售助手`) — the client-side router
-	// accepted it, so the server side must too. The same consume gate
-	// applies (三次复审 P0-R3: provider included): an exact slug hit that
-	// cannot be run is not a candidate. The bundle read needs no error
-	// triage here — a miss or a lookup failure simply yields no candidate.
-	if app, err := s.CatalogRepo.ApplicationBySlug(ctx, q); err == nil &&
-		catalog.VisibleTo(app, catalog.VisibleScopeManage, caller.ID, caller.IsStaff) {
-		if bundle, err := s.CatalogRepo.ConsumptionBundleByID(ctx, app.ID); err == nil &&
-			catalog.Consumable(catalog.ConsumptionFacts{
-				Application:    app,
-				Binding:        bundle.Binding,
-				ProviderStatus: bundle.ProviderStatus,
-			}) {
-			out = prependMention(out, mentionCandidate{
-				ID: app.ID, Slug: app.Slug, Name: app.Name, Kind: app.Kind,
-			})
-		}
-	}
-	if out == nil {
-		out = []mentionCandidate{}
+	out := make([]mentionCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		out = append(out, mentionCandidate{
+			ID: candidate.ID, Slug: candidate.Slug,
+			Name: candidate.Name, Kind: candidate.Kind,
+		})
 	}
 	writeJSON(w, http.StatusOK, out)
-}
-
-// mentionSource is the only part of an application the `@` router needs.
-type mentionSource struct {
-	ID   int64
-	Slug string
-	Name string
-	Kind string
-}
-
-// mentionSources projects a catalog page onto the mention identity fields.
-func (s *Server) mentionSources(pool []catalog.ApplicationWithBinding) []mentionSource {
-	out := make([]mentionSource, 0, len(pool))
-	for _, entry := range pool {
-		if entry.App == nil {
-			continue
-		}
-		out = append(out, mentionSource{
-			ID: entry.App.ID, Slug: entry.App.Slug, Name: entry.App.Name, Kind: entry.App.Kind,
-		})
-	}
-	return out
-}
-
-// rankMentionCandidates orders the `@` candidates the way the composer's
-// router consumes them: an exact name/slug match first (so `@销售助手` cannot
-// be shadowed), then name prefixes (longest first is the router's job — it
-// only looks at the few rows returned here), then plain name substrings.
-//
-// Only NAME and SLUG matches count: the SQL pre-filter also matches the
-// description and the category name, and turning those into mention
-// candidates would make `@IT` open an unrelated agent that merely mentions IT.
-func rankMentionCandidates(pool []mentionSource, q string) []mentionCandidate {
-	needle := strings.ToLower(q)
-	type ranked struct {
-		candidate mentionCandidate
-		rank      int
-	}
-	matches := make([]ranked, 0, len(pool))
-	for _, item := range pool {
-		name := strings.ToLower(item.Name)
-		slug := strings.ToLower(item.Slug)
-		rank := -1
-		switch {
-		case slug == needle || name == needle:
-			rank = 0
-		case strings.HasPrefix(name, needle):
-			rank = 1
-		case strings.HasPrefix(slug, needle):
-			rank = 2
-		case strings.Contains(name, needle):
-			rank = 3
-		default:
-			continue
-		}
-		matches = append(matches, ranked{
-			candidate: mentionCandidate{ID: item.ID, Slug: item.Slug, Name: item.Name, Kind: item.Kind},
-			rank:      rank,
-		})
-	}
-	sort.SliceStable(matches, func(i, j int) bool {
-		if matches[i].rank != matches[j].rank {
-			return matches[i].rank < matches[j].rank
-		}
-		// Shorter names first: they are the more likely intent behind a
-		// partial token.
-		if a, b := len([]rune(matches[i].candidate.Name)), len([]rune(matches[j].candidate.Name)); a != b {
-			return a < b
-		}
-		return matches[i].candidate.Name < matches[j].candidate.Name
-	})
-	if len(matches) > mentionCandidateLimit {
-		matches = matches[:mentionCandidateLimit]
-	}
-	out := make([]mentionCandidate, 0, len(matches))
-	for _, m := range matches {
-		out = append(out, m.candidate)
-	}
-	return out
-}
-
-// prependMention puts an exact slug hit in front of the ranked list, without
-// duplicating it.
-func prependMention(list []mentionCandidate, head mentionCandidate) []mentionCandidate {
-	out := make([]mentionCandidate, 0, len(list)+1)
-	out = append(out, head)
-	for _, item := range list {
-		if item.ID == head.ID {
-			continue
-		}
-		out = append(out, item)
-	}
-	if len(out) > mentionCandidateLimit {
-		out = out[:mentionCandidateLimit]
-	}
-	return out
 }

@@ -1,7 +1,11 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { api } from '@/services/api';
-import { registerSessionReset } from '@/stores/resetSessionState';
+import {
+  captureSessionGeneration,
+  registerSessionReset,
+  sessionStillCurrent,
+} from '@/stores/resetSessionState';
 
 export interface Organization {
   id: string;
@@ -24,9 +28,11 @@ export const useOrganizationStore = create<OrganizationState>()(
       organizations: [],
       currentOrganizationId: null,
       loadOrganizations: async () => {
+        const generation = captureSessionGeneration();
         const response = await api.get<Organization[] | { results: Organization[] }>(
           '/enterprise/organizations/'
         );
+        if (!sessionStillCurrent(generation)) return;
         const organizations = Array.isArray(response) ? response : response.results;
         const selected = get().currentOrganizationId;
         set({

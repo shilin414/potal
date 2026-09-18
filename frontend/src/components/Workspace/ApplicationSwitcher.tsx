@@ -12,7 +12,7 @@
  * renders — and resolves the active agent from the entity cache.
  */
 import { useMemo } from 'react';
-import { Dropdown, Spin } from 'antd';
+import { Dropdown, Spin, message } from 'antd';
 import { DownOutlined } from '@ant-design/icons';
 import { useNavigate } from 'react-router-dom';
 import { useApplicationPage } from '@/hooks/useApplicationPage';
@@ -52,6 +52,7 @@ const ApplicationSwitcher: React.FC<Props> = ({ compact }) => {
   const activeApplicationId = useWorkspaceStore((state) => state.activeApplicationId);
   const recentApplicationIds = useWorkspaceStore((state) => state.recentApplicationIds);
   const openApplication = useWorkspaceStore((state) => state.openApplication);
+  const ensure = useApplicationEntityStore((state) => state.ensure);
 
   // The active agent may be off this page (unbound, or beyond row 50): the
   // entity cache still knows it because entering it is what resolved it.
@@ -59,9 +60,24 @@ const ApplicationSwitcher: React.FC<Props> = ({ compact }) => {
     || chats.find((app) => app.id === activeApplicationId)
     || null;
 
-  const open = (application: V2Application) => {
-    openApplication(application.id);
-    navigate(`/chat/${application.slug}`);
+  const open = async (application: V2Application) => {
+    try {
+      // 最近使用 may come from the entity cache, which can predate an admin
+      // disable (四次复审 P1-R1). Revalidate before navigating so the user
+      // gets "应用当前不可用" instead of entering a workspace whose Send fails.
+      const current = await ensure(application.id, { maxAgeMs: 0 });
+      if (!current) {
+        message.error('应用当前不可用');
+        return;
+      }
+      openApplication(application.id);
+      navigate(`/chat/${application.slug}`);
+    } catch {
+      // Transport failure: keep the route decision with WorkspaceHost, which
+      // renders its own retry state instead of pretending the agent vanished.
+      openApplication(application.id);
+      navigate(`/chat/${application.slug}`);
+    }
   };
 
   // 最近使用 and 全部智能体 render the SAME applications, so one shared key

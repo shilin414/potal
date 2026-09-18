@@ -46,7 +46,11 @@ const LegacyAppRunRedirect: React.FC = () => {
     }
     let live = true;
     setResolving(true);
-    const lookup = isNumeric ? ensure(numeric) : ensureBySlug(id);
+    // Deep links are consumer entry points: revalidate instead of trusting a
+    // maybe-stale entity cache (四次复审 P1-R1).
+    const lookup = isNumeric
+      ? ensure(numeric, { maxAgeMs: 0 })
+      : ensureBySlug(id, { maxAgeMs: 0 });
     void lookup.finally(() => { if (live) setResolving(false); });
     return () => { live = false; };
   }, [id, numeric, isNumeric, projectScoped, ensure, ensureBySlug]);

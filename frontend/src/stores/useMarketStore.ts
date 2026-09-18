@@ -1,5 +1,9 @@
 import { create } from 'zustand';
-import { registerSessionReset } from '@/stores/resetSessionState';
+import {
+  captureSessionGeneration,
+  registerSessionReset,
+  sessionStillCurrent,
+} from '@/stores/resetSessionState';
 import { api } from '@/services/api';
 
 interface MarketState {
@@ -24,20 +28,24 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   isLoading: false,
 
   loadTrending: async () => {
+    const generation = captureSessionGeneration();
     try {
       set({ isLoading: true });
       const response = await api.get<any>('/marketplace/trending/');
+      if (!sessionStillCurrent(generation)) return;
       set({ trending: Array.isArray(response) ? response : response.results ?? [] });
     } catch (error) {
       console.error('Failed to load trending:', error);
     } finally {
-      set({ isLoading: false });
+      if (sessionStillCurrent(generation)) set({ isLoading: false });
     }
   },
 
   loadRecommended: async () => {
+    const generation = captureSessionGeneration();
     try {
       const response = await api.get<any>('/marketplace/recommended/');
+      if (!sessionStillCurrent(generation)) return;
       set({ recommended: Array.isArray(response) ? response : response.results ?? [] });
     } catch (error) {
       console.error('Failed to load recommended:', error);
@@ -52,8 +60,10 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   }),
 
   loadFavorites: async () => {
+    const generation = captureSessionGeneration();
     try {
       const response = await api.get<any>('/marketplace/favorites/');
+      if (!sessionStillCurrent(generation)) return;
       set({ favorites: Array.isArray(response) ? response : response.results ?? [] });
     } catch (error) {
       console.error('Failed to load favorites:', error);
@@ -61,8 +71,10 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   },
 
   addFavorite: async (templateId: number) => {
+    const generation = captureSessionGeneration();
     try {
       const response = await api.post('/marketplace/favorites/', { template: templateId });
+      if (!sessionStillCurrent(generation)) return;
       set({ favorites: [...get().favorites, response] });
     } catch (error) {
       console.error('Failed to add favorite:', error);
@@ -71,8 +83,10 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   },
 
   removeFavorite: async (favoriteId: number) => {
+    const generation = captureSessionGeneration();
     try {
       await api.delete(`/marketplace/favorites/${favoriteId}/`);
+      if (!sessionStillCurrent(generation)) return;
       set({ favorites: get().favorites.filter(f => f.id !== favoriteId) });
     } catch (error) {
       console.error('Failed to remove favorite:', error);
@@ -81,8 +95,10 @@ export const useMarketStore = create<MarketState>((set, get) => ({
   },
 
   addReview: async (templateId: number, rating: number, comment: string) => {
+    const generation = captureSessionGeneration();
     try {
       await api.post('/marketplace/reviews/', { template: templateId, rating, comment });
+      if (!sessionStillCurrent(generation)) return;
     } catch (error) {
       console.error('Failed to add review:', error);
       throw error;

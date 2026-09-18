@@ -2086,6 +2086,106 @@ func (q *Queries) ListFavorites(ctx context.Context, userID uint64) ([]uint64, e
 	return items, nil
 }
 
+const resolveMentionCandidates = `-- name: ResolveMentionCandidates :many
+SELECT a.id, a.slug, a.name, a.kind
+FROM applications a
+LEFT JOIN runtime_bindings b
+  ON b.application_id = a.id
+ AND b.enabled = 1
+LEFT JOIN runtime_bindings newer_b
+  ON newer_b.application_id = b.application_id
+ AND newer_b.enabled = 1
+ AND newer_b.id > b.id
+LEFT JOIN providers p
+  ON p.provider_key = b.provider_key
+WHERE newer_b.id IS NULL
+  AND (? OR a.is_public = 1)
+  AND a.enabled = 1
+  AND (a.kind <> 'chat'
+       OR (b.id IS NOT NULL AND p.id IS NOT NULL AND p.status = 'active'))
+  AND (a.name COLLATE utf8mb4_unicode_ci LIKE ?
+       OR a.slug COLLATE utf8mb4_unicode_ci LIKE ?)
+ORDER BY
+  CASE
+    WHEN a.name COLLATE utf8mb4_unicode_ci = ?
+      OR a.slug COLLATE utf8mb4_unicode_ci = ?
+      THEN 0
+    WHEN a.name COLLATE utf8mb4_unicode_ci LIKE ?
+      THEN 1
+    WHEN a.slug COLLATE utf8mb4_unicode_ci LIKE ?
+      THEN 2
+    ELSE 3
+  END,
+  CHAR_LENGTH(a.name),
+  a.name,
+  a.id
+LIMIT ?
+`
+
+type ResolveMentionCandidatesParams struct {
+	ShowAll  interface{}
+	Contains interface{}
+	Exact    interface{}
+	Prefix   interface{}
+	Limit    int32
+}
+
+type ResolveMentionCandidatesRow struct {
+	ID   uint64
+	Slug string
+	Name string
+	Kind string
+}
+
+// 四次复审 P1-R2: `@mention` ranking happens IN SQL, before LIMIT.
+//
+// The previous implementation reused ListApplicationPage, whose search
+// deliberately covers name + description + category name. With a small LIMIT
+// a description-only noise pool could fill every slot before the real
+// name/slug match (created later) was ever seen — `@销售助手` returned [] even
+// though an exact agent existed. A larger pool only postponed the failure.
+//
+// This query matches ONLY the fields the mention router actually ranks on
+// (name / slug), applies the SAME visibility + consumption predicates as the
+// consume page, and orders by exact → name prefix → slug prefix → substring
+// before taking the final candidate budget.
+func (q *Queries) ResolveMentionCandidates(ctx context.Context, arg ResolveMentionCandidatesParams) ([]ResolveMentionCandidatesRow, error) {
+	rows, err := q.db.QueryContext(ctx, resolveMentionCandidates,
+		arg.ShowAll,
+		arg.Contains,
+		arg.Contains,
+		arg.Exact,
+		arg.Exact,
+		arg.Prefix,
+		arg.Prefix,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ResolveMentionCandidatesRow{}
+	for rows.Next() {
+		var i ResolveMentionCandidatesRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Slug,
+			&i.Name,
+			&i.Kind,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const setApplicationEnabled = `-- name: SetApplicationEnabled :exec
 UPDATE applications SET enabled = ? WHERE id = ?
 `

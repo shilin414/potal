@@ -24,7 +24,6 @@ import {
   updateAgentApplication,
   validateAgentRuntime,
   type AgentRuntimeDescriptor,
-  type AgentSkill,
   type AgentSkillInput,
   type RuntimeAgentDetail,
 } from '@/services/runApi';

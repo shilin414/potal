@@ -1,5 +1,9 @@
 import { create } from 'zustand';
-import { registerSessionReset } from '@/stores/resetSessionState';
+import {
+  captureSessionGeneration,
+  registerSessionReset,
+  sessionStillCurrent,
+} from '@/stores/resetSessionState';
 import type { AppItem, AppCategory } from '@/types';
 import { api } from '@/services/api';
 
@@ -67,8 +71,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   }),
 
   loadCategories: async () => {
+    const generation = captureSessionGeneration();
     try {
       const response = await api.get<any>('/apps/categories/');
+      if (!sessionStillCurrent(generation)) return;
       const categories = unwrap<AppCategory>(response);
       set({ categories });
     } catch (error) {
@@ -77,6 +83,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   loadApps: async (category?: string) => {
+    const generation = captureSessionGeneration();
     try {
       set({ isLoading: true });
       const { searchQuery } = get();
@@ -84,12 +91,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (category) params.category = category;
       if (searchQuery) params.search = searchQuery;
       const response = await api.get<any>('/apps/', { params });
+      if (!sessionStillCurrent(generation)) return;
       const apps = unwrap<any>(response).map(toAppItem);
       set({ apps });
     } catch (error) {
       console.error('Failed to load apps:', error);
     } finally {
-      set({ isLoading: false });
+      if (sessionStillCurrent(generation)) set({ isLoading: false });
     }
   },
 
@@ -97,14 +105,21 @@ export const useAppStore = create<AppState>((set, get) => ({
     const existing = inFlightAppRequests.get(slug);
     if (existing) return existing;
 
+    const generation = captureSessionGeneration();
     const request = api.get<any>(`/apps/${slug}/`)
-      .then(toAppItem)
+      .then((response) => {
+        if (!sessionStillCurrent(generation)) return null;
+        return toAppItem(response);
+      })
       .catch((error) => {
+        if (!sessionStillCurrent(generation)) return null;
         console.error('Failed to load app:', error);
         return null;
       })
       .finally(() => {
-        inFlightAppRequests.delete(slug);
+        if (inFlightAppRequests.get(slug) === request) {
+          inFlightAppRequests.delete(slug);
+        }
       });
     inFlightAppRequests.set(slug, request);
     return request;

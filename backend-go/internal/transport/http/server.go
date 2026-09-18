@@ -208,6 +208,20 @@ func normalizeRoute(r *http.Request) string {
 		p = p[i:]
 	}
 	switch {
+	// Static routes MUST precede the dynamic `/applications/{id}` prefix
+	// (四次复审 P2-R1): `/page`, `/resolve` and `/resolve-mention` would
+	// otherwise be labeled as an application id, polluting request counts,
+	// error rates and percentiles for the single-row endpoint.
+	case p == "/api/v2/applications/page":
+		return p
+	case p == "/api/v2/applications/resolve":
+		return p
+	case p == "/api/v2/applications/resolve-mention":
+		return p
+	case p == "/api/v2/workspace/bootstrap":
+		return p
+	case p == "/api/v2/applications":
+		return p
 	case strings.HasPrefix(p, "/api/v2/applications/"):
 		if strings.HasSuffix(p, "/avatar") {
 			return "/api/v2/applications/{id}/avatar"

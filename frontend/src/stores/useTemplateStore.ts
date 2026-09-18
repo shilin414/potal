@@ -1,5 +1,9 @@
 import { create } from 'zustand';
-import { registerSessionReset } from '@/stores/resetSessionState';
+import {
+  captureSessionGeneration,
+  registerSessionReset,
+  sessionStillCurrent,
+} from '@/stores/resetSessionState';
 import { api } from '@/services/api';
 import type {
   TemplateCategory,
@@ -48,10 +52,12 @@ export const useTemplateStore = create<TemplateState>((set, get) => ({
   }),
 
   loadCategories: async () => {
+    const generation = captureSessionGeneration();
     try {
       const response = await api.get<TemplateCategory[] | { results?: TemplateCategory[] }>(
         '/templates/categories/',
       );
+      if (!sessionStillCurrent(generation)) return;
       set({ categories: unwrap(response) });
     } catch (error) {
       console.error('Failed to load case categories:', error);
@@ -59,22 +65,26 @@ export const useTemplateStore = create<TemplateState>((set, get) => ({
   },
 
   loadTemplate: async (id: number) => {
+    const generation = captureSessionGeneration();
     set({ isLoadingTemplate: true });
     try {
       const response = await api.get<TemplateDetail>(`/templates/${id}/`);
+      if (!sessionStillCurrent(generation)) throw new Error('session changed');
       set({ currentTemplate: response });
       return response;
     } catch (error) {
+      if (!sessionStillCurrent(generation)) throw error;
       set({ currentTemplate: null });
       throw error;
     } finally {
-      set({ isLoadingTemplate: false });
+      if (sessionStillCurrent(generation)) set({ isLoadingTemplate: false });
     }
   },
 
   clearCurrentTemplate: () => set({ currentTemplate: null }),
 
   loadTemplates: async (category?: string) => {
+    const generation = captureSessionGeneration();
     set({ isLoading: true });
     try {
       const { searchQuery } = get();
@@ -85,12 +95,14 @@ export const useTemplateStore = create<TemplateState>((set, get) => ({
         '/templates/',
         { params },
       );
+      if (!sessionStillCurrent(generation)) return;
       set({ templates: unwrap(response) });
     } catch (error) {
+      if (!sessionStillCurrent(generation)) return;
       console.error('Failed to load cases:', error);
       set({ templates: [] });
     } finally {
-      set({ isLoading: false });
+      if (sessionStillCurrent(generation)) set({ isLoading: false });
     }
   },
 

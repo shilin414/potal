@@ -372,3 +372,122 @@ func sortedKeys(m map[string]bool) []string {
 	sort.Strings(out)
 	return out
 }
+
+// TestMentionCandidatesSurviveDescriptionNoise pins 四次复审 P1-R2. The old
+// mention endpoint reused the catalog page search, which also matches
+// description / category name; 25 description-only rows could consume the
+// entire pre-filter LIMIT before the real `name = Sales Agent` row (created
+// last) was ever seen. The dedicated query must rank on name/slug FIRST, then
+// LIMIT, and still return the true candidate.
+func TestMentionCandidatesSurviveDescriptionNoise(t *testing.T) {
+	svc, repo := pageFixtureEnv(t)
+	ctx := context.Background()
+	staff := int64(777021)
+	const noiseCount = 25
+	const providerKey = "itestprov_mention"
+	seedProvider(t, svc.DB, providerKey, "active")
+	svc = invariantService(svc.DB, providerKey)
+
+	runtime := func() *catalog.BindingInput {
+		return &catalog.BindingInput{
+			ProviderKey: providerKey, RuntimeType: "agent",
+			ExternalResourceID: "itest-mention-resource",
+		}
+	}
+
+	for i := 0; i < noiseCount; i++ {
+		name := fmt.Sprintf("itest_mention_noise_%02d", i)
+		app, _, err := svc.Create(ctx, &catalog.CreateInput{
+			Name: name, Kind: "chat", IsPublic: true,
+			Description: "负责销售数据、销售报表与销售分析",
+			Runtime:     runtime(),
+			CreatorID:   staff, IsStaff: true,
+		})
+		if err != nil {
+			t.Fatalf("seed noise %d: %v", i, err)
+		}
+		t.Cleanup(func() { _ = svc.Delete(ctx, app.ID, staff, true) })
+	}
+
+	real, _, err := svc.Create(ctx, &catalog.CreateInput{
+		Name: "itestSales Agent", Slug: "itest-sales-agent",
+		Kind: "chat", IsPublic: true,
+		Runtime:   runtime(),
+		CreatorID: staff, IsStaff: true,
+	})
+	if err != nil {
+		t.Fatalf("seed real agent: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Delete(ctx, real.ID, staff, true) })
+
+	got, err := repo.ResolveMentionCandidates(ctx, "itest", true, 10)
+	if err != nil {
+		t.Fatalf("resolve mention: %v", err)
+	}
+	found := false
+	for _, candidate := range got {
+		if candidate.ID == real.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the true name match must survive %d description-only noise rows; got %+v",
+			noiseCount, got)
+	}
+
+	// Exact name / slug ranking must still come first even when a prefix
+	// competitor exists and was created earlier.
+	exact, err := repo.ResolveMentionCandidates(ctx, "itestSales Agent", true, 10)
+	if err != nil {
+		t.Fatalf("resolve exact mention: %v", err)
+	}
+	if len(exact) == 0 || exact[0].ID != real.ID {
+		t.Fatalf("exact name must rank first, got %+v", exact)
+	}
+	exactSlug, err := repo.ResolveMentionCandidates(ctx, "itest-sales-agent", true, 10)
+	if err != nil {
+		t.Fatalf("resolve exact slug: %v", err)
+	}
+	if len(exactSlug) == 0 || exactSlug[0].ID != real.ID {
+		t.Fatalf("exact slug must rank first, got %+v", exactSlug)
+	}
+
+	// `%` and `_` are literal characters, never LIKE wildcards.
+	literalPercent, _, err := svc.Create(ctx, &catalog.CreateInput{
+		Name: "itestMention 100%_literal", Kind: "chat", IsPublic: true,
+		Runtime:   runtime(),
+		CreatorID: staff, IsStaff: true,
+	})
+	if err != nil {
+		t.Fatalf("seed literal agent: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Delete(ctx, literalPercent.ID, staff, true) })
+	literal, err := repo.ResolveMentionCandidates(ctx, "100%_literal", true, 10)
+	if err != nil {
+		t.Fatalf("resolve literal: %v", err)
+	}
+	if len(literal) != 1 || literal[0].ID != literalPercent.ID {
+		t.Fatalf("%% and _ must be literal in mention search, got %+v", literal)
+	}
+	if wildcard, err := repo.ResolveMentionCandidates(ctx, "100Xliteral", true, 10); err != nil {
+		t.Fatalf("resolve wildcard probe: %v", err)
+	} else if len(wildcard) != 0 {
+		t.Fatalf("_,%% must not widen into wildcards, got %+v", wildcard)
+	}
+
+	// Consume gates: a chat app with no active enabled binding must NOT be a
+	// candidate even when its NAME matches.
+	unbound, _, err := svc.Create(ctx, &catalog.CreateInput{
+		Name: "itestUnboundMention", Kind: "chat", IsPublic: true,
+		CreatorID: staff, IsStaff: true,
+	})
+	if err != nil {
+		t.Fatalf("seed unbound agent: %v", err)
+	}
+	t.Cleanup(func() { _ = svc.Delete(ctx, unbound.ID, staff, true) })
+	if got, err := repo.ResolveMentionCandidates(ctx, "itestUnboundMention", true, 10); err != nil {
+		t.Fatalf("resolve unbound: %v", err)
+	} else if len(got) != 0 {
+		t.Fatalf("an unbound chat app must never be a mention candidate, got %+v", got)
+	}
+}

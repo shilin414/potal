@@ -195,7 +195,6 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
       return paged.items;
     }
     return [activeApplication, ...paged.items];
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [paged.items, activeApplication, canPinActive]);
   const serverLoading = paged.loading || paged.loadingMore;
 
@@ -219,7 +218,6 @@ const MobileCatalogSheet: React.FC<MobileCatalogSheetProps> = ({
       return type === 'agent' ? split.agents : split.apps;
     }
     return serverPool;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [applications, type, serverPool]);
 
   const recent = useMemo<ApplicationSummary[]>(() => {

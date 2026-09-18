@@ -1,6 +1,10 @@
 import { create } from 'zustand';
 import { api } from '@/services/api';
-import { registerSessionReset } from '@/stores/resetSessionState';
+import {
+  captureSessionGeneration,
+  registerSessionReset,
+  sessionStillCurrent,
+} from '@/stores/resetSessionState';
 
 interface AgentCategory {
   id: number;
@@ -68,8 +72,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   }),
 
   loadCategories: async () => {
+    const generation = captureSessionGeneration();
     try {
       const response = await api.get<any>('/agents/categories/');
+      if (!sessionStillCurrent(generation)) return;
       set({ categories: Array.isArray(response) ? response : response.results ?? [] });
     } catch (error) {
       console.error('Failed to load categories:', error);
@@ -77,6 +83,7 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   },
 
   loadAgents: async (category?: string) => {
+    const generation = captureSessionGeneration();
     try {
       set({ isLoading: true });
       const { searchQuery } = get();
@@ -84,11 +91,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
       if (category) params.category = category;
       if (searchQuery) params.search = searchQuery;
       const response = await api.get<any>('/agents/', params);
+      if (!sessionStillCurrent(generation)) return;
       set({ agents: Array.isArray(response) ? response : response.results ?? [] });
     } catch (error) {
       console.error('Failed to load agents:', error);
     } finally {
-      set({ isLoading: false });
+      if (sessionStillCurrent(generation)) set({ isLoading: false });
     }
   },
 
@@ -101,10 +109,12 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   },
 
   executeAgent: async (agentId: number, inputData: any) => {
+    const generation = captureSessionGeneration();
     try {
       const response = await api.post(`/agents/${agentId}/execute/`, {
         input_data: inputData,
       });
+      if (!sessionStillCurrent(generation)) throw new Error('session changed');
       return response;
     } catch (error) {
       console.error('Failed to execute agent:', error);
@@ -113,8 +123,10 @@ export const useAgentStore = create<AgentState>((set, get) => ({
   },
 
   loadMyExecutions: async () => {
+    const generation = captureSessionGeneration();
     try {
       const response = await api.get<any>('/agents/my_executions/');
+      if (!sessionStillCurrent(generation)) return;
       set({ executions: Array.isArray(response) ? response : response.results ?? [] });
     } catch (error) {
       console.error('Failed to load executions:', error);
