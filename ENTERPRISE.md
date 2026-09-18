@@ -60,6 +60,7 @@ Employee fields:
 - `directory:employee.base.active_status:read`
 - `directory:employee.base.is_resigned:read`
 - `directory:employee.base.avatar:read`
+- `directory:employee.work.staff_status:read`
 
 The app's Contacts data range must cover every department Potal should manage.
 These are application-identity permissions and must not be added to the user
