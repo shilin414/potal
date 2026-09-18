@@ -1,9 +1,18 @@
 /**
  * MobileSyncPage — 移动端同步管理（开发执行报告 §47/§48）：
  * 最近同步状态卡 + 立即同步 + vertical 表单 + 同步记录列表。
+ *
+ * 状态机（二次复审 P1-3/P2-8）：
+ *   · config 与 runs 是独立失败域（Promise.allSettled）——历史记录接口
+ *     挂了不能连累同步配置管理；
+ *   · 配置未加载成功时绝不渲染可保存的 Form：initialValues 本身就是
+ *     前端默认值，允许保存等于把默认值写成真正的企业同步配置；
+ *   · 已有配置后的刷新失败 = stale warning（旧数据保留 + 提示），不是
+ *     无声吞掉。
  */
 import React, { useCallback, useEffect, useState } from 'react';
 import {
+  Alert,
   Button,
   Form,
   Input,
@@ -35,24 +44,31 @@ export default function MobileSyncPage() {
   const [cfg, setCfg] = useState<SyncConfig | null>(null);
   const [runs, setRuns] = useState<SyncRun[]>([]);
   const [syncing, setSyncing] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [runsError, setRunsError] = useState<string | null>(null);
   const [form] = Form.useForm();
   const [saving, setSaving] = useState(false);
 
-  // 失败保留旧数据（cfg/runs 不清空），显式错误态 + 重试（二次复审 P2-8）；
-  // 不再让 Promise 错误静默逃逸成 unhandled rejection。
+  // 失败保留旧数据（cfg/runs 不清空），显式错误态 + 重试；config 与 runs
+  // 独立失败域（P2-8）——syncRuns 挂了不能让配置管理整体不可用。
   const load = useCallback(async () => {
-    setLoadError(null);
-    try {
-      const [c, r] = await Promise.all([
-        enterpriseApi.syncConfig(),
-        enterpriseApi.syncRuns(),
-      ]);
-      setCfg(c);
-      setRuns(r);
-      form.setFieldsValue({ ...c, daily_time: dayjs(c.daily_time, 'HH:mm') });
-    } catch {
-      setLoadError('加载同步信息失败');
+    setConfigError(null);
+    setRunsError(null);
+    const [configResult, runsResult] = await Promise.allSettled([
+      enterpriseApi.syncConfig(),
+      enterpriseApi.syncRuns(),
+    ]);
+    if (configResult.status === 'fulfilled') {
+      const loaded = configResult.value;
+      setCfg(loaded);
+      form.setFieldsValue({ ...loaded, daily_time: dayjs(loaded.daily_time, 'HH:mm') });
+    } else {
+      setConfigError('加载同步配置失败');
+    }
+    if (runsResult.status === 'fulfilled') {
+      setRuns(runsResult.value);
+    } else {
+      setRunsError('加载同步记录失败');
     }
   }, [form]);
 
@@ -95,10 +111,10 @@ export default function MobileSyncPage() {
   return (
     <MobilePage>
       <MobileSection title="最近同步">
-        {cfg === null && loadError ? (
+        {cfg === null && configError ? (
           <div className="mobile-console-empty">
             <strong>加载失败</strong>
-            {loadError}
+            {configError}
             <Button onClick={() => void load()}>重试</Button>
           </div>
         ) : cfg === null ? (
@@ -135,79 +151,122 @@ export default function MobileSyncPage() {
       </MobileSection>
 
       <MobileSection title="自动同步">
-        {/* vertical，每字段一行（§48）——不用桌面 inline form */}
-        <Form
-          form={form}
-          layout="vertical"
-          initialValues={{
-            enabled: false,
-            schedule_type: 'interval',
-            interval_minutes: 360,
-            daily_time: dayjs('02:00', 'HH:mm'),
-            timezone: 'Asia/Shanghai',
-          }}
-        >
-          <Form.Item name="enabled" valuePropName="checked" label="启用">
-            <Switch />
-          </Form.Item>
-          <Form.Item name="schedule_type" label="同步方式">
-            <Select
-              options={[
-                { value: 'interval', label: '按间隔' },
-                { value: 'daily', label: '每天' },
-              ]}
-            />
-          </Form.Item>
-          <Form.Item noStyle shouldUpdate>
-            {({ getFieldValue }) => (
-              getFieldValue('schedule_type') === 'daily' ? (
-                <Form.Item name="daily_time" label="执行时间">
-                  <TimePicker format="HH:mm" style={{ width: '100%' }} />
-                </Form.Item>
-              ) : (
-                <Form.Item name="interval_minutes" label="间隔（分钟）">
-                  <InputNumber min={15} max={10080} style={{ width: '100%' }} />
-                </Form.Item>
-              )
+        {cfg === null ? (
+          // 配置没加载成功绝不渲染可保存的 Form（P1-3）：initialValues 是
+          // 前端默认值，不是服务端配置，允许保存就可能把默认值写回服务器。
+          configError ? (
+            <div className="mobile-console-empty">
+              <strong>无法加载同步配置</strong>
+              {configError}
+              <Button onClick={() => void load()}>重试</Button>
+            </div>
+          ) : (
+            <Skeleton active />
+          )
+        ) : (
+          <>
+            {/* 已有配置后的刷新失败 = stale warning，不是无声吞掉（P2-7）。 */}
+            {configError && (
+              <Alert
+                type="warning"
+                showIcon
+                message="刷新失败，当前显示的是上次已加载数据"
+                style={{ marginBottom: 12 }}
+                action={<Button size="small" onClick={() => void load()}>重试</Button>}
+              />
             )}
-          </Form.Item>
-          <Form.Item name="timezone" label="时区">
-            <Input />
-          </Form.Item>
-          <Button type="primary" block loading={saving} onClick={() => void save()}>
-            保存设置
-          </Button>
-        </Form>
+            {/* vertical，每字段一行（§48）——不用桌面 inline form */}
+            <Form
+              form={form}
+              layout="vertical"
+              initialValues={{
+                enabled: false,
+                schedule_type: 'interval',
+                interval_minutes: 360,
+                daily_time: dayjs('02:00', 'HH:mm'),
+                timezone: 'Asia/Shanghai',
+              }}
+            >
+              <Form.Item name="enabled" valuePropName="checked" label="启用">
+                <Switch />
+              </Form.Item>
+              <Form.Item name="schedule_type" label="同步方式">
+                <Select
+                  options={[
+                    { value: 'interval', label: '按间隔' },
+                    { value: 'daily', label: '每天' },
+                  ]}
+                />
+              </Form.Item>
+              <Form.Item noStyle shouldUpdate>
+                {({ getFieldValue }) => (
+                  getFieldValue('schedule_type') === 'daily' ? (
+                    <Form.Item name="daily_time" label="执行时间">
+                      <TimePicker format="HH:mm" style={{ width: '100%' }} />
+                    </Form.Item>
+                  ) : (
+                    <Form.Item name="interval_minutes" label="间隔（分钟）">
+                      <InputNumber min={15} max={10080} style={{ width: '100%' }} />
+                    </Form.Item>
+                  )
+                )}
+              </Form.Item>
+              <Form.Item name="timezone" label="时区">
+                <Input />
+              </Form.Item>
+              <Button type="primary" block loading={saving} onClick={() => void save()}>
+                保存设置
+              </Button>
+            </Form>
+          </>
+        )}
       </MobileSection>
 
       <MobileSection title="同步记录" flush>
         {runs.length === 0 ? (
-          <div className="mobile-console-empty">还没有同步记录</div>
-        ) : runs.map((run) => (
-          <div key={run.id} className="mobile-sync__run">
-            <div className="mobile-sync__run-head">
-              <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <Tag color={STATUS_TAG[run.status].color}>
-                  {STATUS_TAG[run.status].label}
-                </Tag>
-                <span style={{ fontSize: 13, color: 'var(--color-text-sec)' }}>
-                  {run.trigger_type === 'manual' ? '手动' : '自动'}
-                </span>
-              </span>
-              <time dateTime={run.created_at}>{fmt(run.created_at)}</time>
+          runsError ? (
+            <div className="mobile-console-empty">
+              {runsError}
+              <Button onClick={() => void load()}>重试</Button>
             </div>
-            <div className="mobile-sync__run-meta">
-              <span>部门 {run.departments_count}</span>
-              <span>员工 {run.active_users_count} / {run.users_count}</span>
-              <span>关系 {run.active_memberships_count} / {run.memberships_count}</span>
-            </div>
-            {run.status === 'failed' && run.error_message && (
-              <div className="mobile-sync__run-meta" style={{ color: 'var(--color-error)' }}>
-                {run.error_message}
+          ) : (
+            <div className="mobile-console-empty">还没有同步记录</div>
+          )
+        ) : (
+          <>
+            {runsError && (
+              <div className="mobile-console-empty">
+                刷新记录失败，以上为上次已加载数据
+                <Button size="small" onClick={() => void load()}>重试</Button>
               </div>
             )}
-          </div>
-        ))}
+            {runs.map((run) => (
+              <div key={run.id} className="mobile-sync__run">
+                <div className="mobile-sync__run-head">
+                  <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <Tag color={STATUS_TAG[run.status].color}>
+                      {STATUS_TAG[run.status].label}
+                    </Tag>
+                    <span style={{ fontSize: 13, color: 'var(--color-text-sec)' }}>
+                      {run.trigger_type === 'manual' ? '手动' : '自动'}
+                    </span>
+                  </span>
+                  <time dateTime={run.created_at}>{fmt(run.created_at)}</time>
+                </div>
+                <div className="mobile-sync__run-meta">
+                  <span>部门 {run.departments_count}</span>
+                  <span>员工 {run.active_users_count} / {run.users_count}</span>
+                  <span>关系 {run.active_memberships_count} / {run.memberships_count}</span>
+                </div>
+                {run.status === 'failed' && run.error_message && (
+                  <div className="mobile-sync__run-meta" style={{ color: 'var(--color-error)' }}>
+                    {run.error_message}
+                  </div>
+                )}
+              </div>
+            ))}
+          </>
+        )}
       </MobileSection>
     </MobilePage>
   );

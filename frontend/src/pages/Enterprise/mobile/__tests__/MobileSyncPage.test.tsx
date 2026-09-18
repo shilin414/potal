@@ -1,7 +1,10 @@
 /**
- * MobileSyncPage — 失败可见性回归（二次复审 P2-8）。
+ * MobileSyncPage — 配置写入守卫与失败可见性回归（二次复审 P1-3/P2-7/P2-8）。
  *
+ *   · 配置未加载成功 → 绝不存在“保存设置”按钮（前端默认值不得写回服务器）；
  *   · load 失败 → 显式错误态 + 重试（保留旧数据，不再 unhandled rejection）;
+ *   · 已加载后的刷新失败 → stale warning 可见 + 旧数据保留；
+ *   · config 与 runs 独立失败域：syncRuns 挂了不影响配置表单；
  *   · save 失败 → message.error('保存同步设置失败')；
  *   · trigger 失败 → message.error('发起同步失败')。
  */
@@ -51,6 +54,12 @@ vi.mock('antd', () => {
     validateFields: vi.fn(async () => ({ daily_time: { format: () => '02:00' } })),
   };
   return {
+    Alert: ({ message, action }: {
+      message?: React.ReactNode;
+      action?: React.ReactNode;
+    }) => (
+      <div role="alert">{message}{action}</div>
+    ),
     Button: ({ children, onClick, className }: React.ButtonHTMLAttributes<HTMLButtonElement> & { className?: string }) => (
       <button type="button" className={className} onClick={onClick}>{children}</button>
     ),
@@ -195,5 +204,47 @@ describe('MobileSyncPage — failure visibility (P2-8)', () => {
     await flush(20);
 
     expect(mocks.messageError).toHaveBeenCalledWith('发起同步失败');
+  });
+});
+
+describe('MobileSyncPage — config write guard (P1-3)', () => {
+  it('an initial config load failure renders NO 保存设置 button — defaults must not be savable', async () => {
+    mocks.syncConfig.mockRejectedValue(new Error('network down'));
+    mocks.syncRuns.mockResolvedValue([RUN(1, 'success')]);
+    await mountPage();
+
+    expect(document.body.textContent).toContain('无法加载同步配置');
+    const save = Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '保存设置');
+    expect(save).toBeUndefined();
+  });
+
+  it('a failed refresh AFTER a successful load shows the stale-data warning and keeps the form', async () => {
+    await mountPage();
+    // Loaded once (CFG). Now a trigger succeeds but the follow-up config
+    // refresh fails — the old cfg must survive with a visible warning.
+    mocks.triggerSync.mockResolvedValue(RUN(2, 'pending'));
+    mocks.syncConfig.mockRejectedValue(new Error('network down'));
+
+    const trigger = Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '立即同步');
+    await click(trigger!);
+    await flush(20);
+
+    expect(document.body.textContent).toContain('刷新失败，当前显示的是上次已加载数据');
+    // The stale form is still there (loaded config, not defaults).
+    const save = Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '保存设置');
+    expect(save).toBeTruthy();
+  });
+
+  it('syncRuns failing alone must not take down the config form (P2-8 independent failure domains)', async () => {
+    mocks.syncRuns.mockRejectedValue(new Error('network down'));
+    await mountPage();
+
+    const save = Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '保存设置');
+    expect(save).toBeTruthy();
+    expect(document.body.textContent).toContain('加载同步记录失败');
   });
 });
