@@ -100,8 +100,16 @@
 }
 
 .mobile-shell__history {
-  height: calc(100% - 340px);
+  flex: 1;
+  min-height: 160px;
   overflow: hidden;
+}
+
+.mobile-shell__theme {
+  flex: none;
+  padding: 14px 16px 16px;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg-surface);
 }
 
 .account-menu-panel {

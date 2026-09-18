@@ -34,7 +34,8 @@ const LoginPage: React.FC = () => {
         className="h-10 rounded-lg border-none font-medium"
         style={{
           background: 'var(--color-primary)',
-          boxShadow: '0 0 20px rgba(232, 168, 56, 0.3)',
+          color: 'var(--color-on-primary)',
+          boxShadow: '0 0 20px color-mix(in srgb, var(--color-primary) 30%, transparent)',
         }}
         onClick={() => { window.location.href = '/api/identity/oauth/start'; }}
       >

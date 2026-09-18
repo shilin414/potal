@@ -68,7 +68,7 @@
   flex: 0 0 auto;
   border: 1.5px solid var(--color-border-lit);
   border-radius: 50%;
-  color: #fff;
+  color: var(--color-on-primary);
   font-size: 10px;
 }
 
@@ -157,7 +157,7 @@
   gap: 6px;
   border: 1px solid var(--color-primary);
   background: var(--color-primary);
-  color: #fff;
+  color: var(--color-on-primary);
 }
 
 .ffm-send:disabled {
@@ -194,7 +194,7 @@
   border: 1px solid var(--color-primary);
   border-radius: 10px;
   background: var(--color-primary);
-  color: #fff;
+  color: var(--color-on-primary);
   font-size: 13px;
   font-family: inherit;
   cursor: pointer;

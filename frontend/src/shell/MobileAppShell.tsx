@@ -4,6 +4,7 @@ import { MenuOutlined, PlusOutlined } from '@ant-design/icons';
 import ConversationHistory from '@/components/ConversationHistory/ConversationHistory';
 import AccountMenu from '@/components/AccountMenu/AccountMenu';
 import MobileAgentSwitcher from '@/components/Mobile/MobileAgentSwitcher';
+import { ThemePicker } from '@/components/Theme';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
@@ -103,7 +104,7 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
         onClose={() => setMobileNavOpen(false)}
         width="82vw"
         title="Creation Studio"
-        styles={{ body: { padding: 0 } }}
+        styles={{ body: { padding: 0, display: 'flex', flexDirection: 'column' } }}
       >
         <nav className="mobile-shell__nav">
           {NAV_ITEMS.map((item) => (
@@ -123,6 +124,9 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
             onConversationSelect={(id) => go(id ? `/?conversation=${id}` : '/')}
             onNewConversation={handleNewConversation}
           />
+        </div>
+        <div className="mobile-shell__theme">
+          <ThemePicker />
         </div>
         <AccountMenu
           variant="panel"

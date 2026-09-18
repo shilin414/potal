@@ -42,7 +42,7 @@
 .run-chat-send:not(:disabled) {
   background: var(--color-primary);
   border-color: var(--color-primary);
-  color: #fff;
+  color: var(--color-on-primary);
 }
 
 .run-chat-textarea {
@@ -310,7 +310,7 @@
   border: 1.5px solid var(--color-border-lit);
   border-radius: 50%;
   background: var(--color-bg-card);
-  color: #fff;
+  color: var(--color-on-primary);
   font-size: 11px;
   transition: background 0.15s ease, border-color 0.15s ease;
 }
