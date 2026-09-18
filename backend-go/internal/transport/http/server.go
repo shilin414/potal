@@ -16,6 +16,8 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/automation/schedule"
 	"github.com/creation-agent-studio/backend-go/internal/automation/scheduler"
 	"github.com/creation-agent-studio/backend-go/internal/catalog"
+	"github.com/creation-agent-studio/backend-go/internal/directory"
+	"github.com/creation-agent-studio/backend-go/internal/enterpriseaccess"
 	"github.com/creation-agent-studio/backend-go/internal/execution"
 	genapi "github.com/creation-agent-studio/backend-go/internal/gen/api"
 	"github.com/creation-agent-studio/backend-go/internal/identity"
@@ -62,9 +64,12 @@ type Server struct {
 	// caller (implemented by aily.AuthResolver).
 	FeishuAuth FeishuUserTokenResolver
 
-	Catalog     *catalog.Service
-	CatalogRepo *catalog.Repo
-	Registry    *catalog.RuntimeRegistry
+	Catalog          *catalog.Service
+	CatalogRepo      *catalog.Repo
+	Registry         *catalog.RuntimeRegistry
+	Directory        *directory.Service
+	DirectoryRepo    *directory.Repo
+	EnterpriseAccess *enterpriseaccess.Service
 
 	Runs    *execution.Service
 	Storage storage.Storage

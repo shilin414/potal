@@ -15,10 +15,11 @@ import (
 
 // Repo persists users and Feishu identities through sqlc.
 type Repo struct {
-	q db.Querier
+	q  db.Querier
+	db db.DBTX
 }
 
-func NewRepo(dbtx db.DBTX) *Repo { return &Repo{q: db.New(dbtx)} }
+func NewRepo(dbtx db.DBTX) *Repo { return &Repo{q: db.New(dbtx), db: dbtx} }
 
 func (r *Repo) Querier() db.Querier { return r.q }
 
@@ -212,7 +213,7 @@ func (r *Repo) VerifyLocalAdmin(ctx context.Context, username, password string) 
 		return nil, err
 	}
 	u := userFromRow(row)
-	if !u.IsStaff {
+	if !u.IsStaff || !u.IsActive {
 		// Local password login is admin-only (staff); normal users are
 		// Feishu OAuth only — reject before touching the hash so timing
 		// also cannot distinguish staff from non-staff accounts.
@@ -298,4 +299,12 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b[pos:])
+}
+
+// LinkDirectoryUser associates an already-synced directory employee with the
+// local account created by OAuth. Missing directory rows are expected before
+// the first full sync and therefore are not an error.
+func (r *Repo) LinkDirectoryUser(ctx context.Context, userID int64, openID string) error {
+	_, err := r.db.ExecContext(ctx, `UPDATE directory_users SET local_user_id = ? WHERE open_id = ?`, userID, openID)
+	return err
 }

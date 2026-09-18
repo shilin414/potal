@@ -41,12 +41,23 @@ func pageFixtureEnv(t *testing.T) (*catalog.Service, *catalog.Repo) {
 // registers its deletion (admin cleanup) via t.Cleanup.
 func pageSeedApp(t *testing.T, svc *catalog.Service, creatorID int64, name, kind string, public bool) *catalog.Application {
 	t.Helper()
+	renderer := ""
+	if kind != "chat" {
+		renderer = "itest-" + kind
+	}
 	app, _, err := svc.Create(context.Background(), &catalog.CreateInput{
-		Name: name, Kind: kind, IsPublic: public,
+		Name: name, Kind: kind, RendererKey: renderer, IsPublic: public,
 		CreatorID: creatorID, IsStaff: true,
 	})
 	if err != nil {
 		t.Fatalf("seed app %s: %v", name, err)
+	}
+	mode := "admin_only"
+	if public {
+		mode = "all"
+	}
+	if _, err := svc.DB.ExecContext(context.Background(), `UPDATE applications SET is_public=?, access_mode=?, enabled=1 WHERE id=?`, public, mode, app.ID); err != nil {
+		t.Fatalf("publish fixture: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = svc.Delete(context.Background(), app.ID, creatorID, true)
@@ -420,7 +431,7 @@ func TestMentionCandidatesSurviveDescriptionNoise(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = svc.Delete(ctx, real.ID, staff, true) })
 
-	got, err := repo.ResolveMentionCandidates(ctx, "itest", true, 10)
+	got, err := repo.ResolveMentionCandidates(ctx, "itest", 0, true, 10)
 	if err != nil {
 		t.Fatalf("resolve mention: %v", err)
 	}
@@ -437,14 +448,14 @@ func TestMentionCandidatesSurviveDescriptionNoise(t *testing.T) {
 
 	// Exact name / slug ranking must still come first even when a prefix
 	// competitor exists and was created earlier.
-	exact, err := repo.ResolveMentionCandidates(ctx, "itestSales Agent", true, 10)
+	exact, err := repo.ResolveMentionCandidates(ctx, "itestSales Agent", 0, true, 10)
 	if err != nil {
 		t.Fatalf("resolve exact mention: %v", err)
 	}
 	if len(exact) == 0 || exact[0].ID != real.ID {
 		t.Fatalf("exact name must rank first, got %+v", exact)
 	}
-	exactSlug, err := repo.ResolveMentionCandidates(ctx, "itest-sales-agent", true, 10)
+	exactSlug, err := repo.ResolveMentionCandidates(ctx, "itest-sales-agent", 0, true, 10)
 	if err != nil {
 		t.Fatalf("resolve exact slug: %v", err)
 	}
@@ -462,14 +473,14 @@ func TestMentionCandidatesSurviveDescriptionNoise(t *testing.T) {
 		t.Fatalf("seed literal agent: %v", err)
 	}
 	t.Cleanup(func() { _ = svc.Delete(ctx, literalPercent.ID, staff, true) })
-	literal, err := repo.ResolveMentionCandidates(ctx, "100%_literal", true, 10)
+	literal, err := repo.ResolveMentionCandidates(ctx, "100%_literal", 0, true, 10)
 	if err != nil {
 		t.Fatalf("resolve literal: %v", err)
 	}
 	if len(literal) != 1 || literal[0].ID != literalPercent.ID {
 		t.Fatalf("%% and _ must be literal in mention search, got %+v", literal)
 	}
-	if wildcard, err := repo.ResolveMentionCandidates(ctx, "100Xliteral", true, 10); err != nil {
+	if wildcard, err := repo.ResolveMentionCandidates(ctx, "100Xliteral", 0, true, 10); err != nil {
 		t.Fatalf("resolve wildcard probe: %v", err)
 	} else if len(wildcard) != 0 {
 		t.Fatalf("_,%% must not widen into wildcards, got %+v", wildcard)
@@ -485,7 +496,7 @@ func TestMentionCandidatesSurviveDescriptionNoise(t *testing.T) {
 		t.Fatalf("seed unbound agent: %v", err)
 	}
 	t.Cleanup(func() { _ = svc.Delete(ctx, unbound.ID, staff, true) })
-	if got, err := repo.ResolveMentionCandidates(ctx, "itestUnboundMention", true, 10); err != nil {
+	if got, err := repo.ResolveMentionCandidates(ctx, "itestUnboundMention", 0, true, 10); err != nil {
 		t.Fatalf("resolve unbound: %v", err)
 	} else if len(got) != 0 {
 		t.Fatalf("an unbound chat app must never be a mention candidate, got %+v", got)

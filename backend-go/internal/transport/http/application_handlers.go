@@ -14,6 +14,7 @@ import (
 	"mime"
 	"net/http"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -232,13 +233,7 @@ func (s *Server) writeApplicationDetail(w http.ResponseWriter, status int, ctx c
 }
 
 func canManageCaller(app *catalog.Application, caller *AuthenticatedUser) bool {
-	if caller == nil {
-		return false
-	}
-	if caller.IsStaff {
-		return true
-	}
-	return app.CreatedBy != nil && *app.CreatedBy == caller.ID
+	return caller != nil && caller.IsStaff
 }
 
 // ListApplications implements the exact list semantics (scope/kind/
@@ -263,7 +258,7 @@ func (s *Server) ListApplications(w http.ResponseWriter, r *http.Request, params
 	if params.Scope != nil {
 		sc := string(*params.Scope)
 		switch sc {
-		case "public", "mine", "manage":
+		case "public", "accessible", "mine", "manage":
 			scope = sc
 		}
 	}
@@ -383,7 +378,7 @@ func (s *Server) ListApplicationPage(w http.ResponseWriter, r *http.Request, par
 	scope := "public"
 	if params.Scope != nil {
 		switch sc := string(*params.Scope); sc {
-		case "public", "mine", "manage":
+		case "public", "accessible", "mine", "manage":
 			scope = sc
 		}
 	}
@@ -397,6 +392,10 @@ func (s *Server) ListApplicationPage(w http.ResponseWriter, r *http.Request, par
 		case catalog.PageModeManage, catalog.PageModeConsume:
 			mode = m
 		}
+	}
+	if mode == catalog.PageModeManage && !caller.IsStaff {
+		writeDetail(w, http.StatusForbidden, "只有管理员可以使用管理目录。")
+		return
 	}
 	includeUnbound := params.IncludeUnbound != nil && isTruthy(*params.IncludeUnbound)
 	search := ""
@@ -659,7 +658,7 @@ func dispTime(s string) *string {
 // a public read. `VisibleTo` used to admit every logged-in caller for a
 // public application — which handed back exactly the authoring fields the
 // consumer DTO split had removed from every list/resolve response. The gate
-// is now `canManageCaller` (staff or the creator); consumers read through
+// is now `canManageCaller` (staff only); consumers read through
 // /applications/resolve, /applications/page and /workspace/bootstrap.
 //
 // "Does not exist" and "exists but you may not manage it" both answer 404 —
@@ -766,7 +765,7 @@ func (s *Server) CreateApplication(w http.ResponseWriter, r *http.Request) {
 		Name: body.Name, Slug: body.Slug, Description: body.Description,
 		Icon: body.Icon, Color: body.Color,
 		CategorySlug: body.CategorySlug, CategoryName: body.CategoryName,
-		IsPublic: body.IsPublic == nil || *body.IsPublic,
+		IsPublic: false,
 		Kind:     body.Kind, RendererKey: body.RendererKey,
 		SetDefaultAgent: body.SetDefaultAgent,
 		Skills:          body.Skills,
@@ -781,6 +780,7 @@ func (s *Server) CreateApplication(w http.ResponseWriter, r *http.Request) {
 		s.writeCatalogError(w, err)
 		return
 	}
+	s.IdentityRepo.WriteAuditLog(r.Context(), &caller.ID, "application.create", strconv.FormatInt(app.ID, 10), map[string]any{"kind": app.Kind, "slug": app.Slug})
 	s.writeApplicationDetail(w, http.StatusCreated, r.Context(), app, binding, caller)
 }
 
@@ -849,6 +849,7 @@ func (s *Server) UpdateApplication(w http.ResponseWriter, r *http.Request, id ge
 		s.writeCatalogError(w, err)
 		return
 	}
+	s.IdentityRepo.WriteAuditLog(r.Context(), &caller.ID, "application.update", strconv.FormatInt(app.ID, 10), map[string]any{"kind": app.Kind, "slug": app.Slug})
 	s.writeApplicationDetail(w, http.StatusOK, r.Context(), app, binding, caller)
 }
 
@@ -865,6 +866,7 @@ func (s *Server) DeleteApplication(w http.ResponseWriter, r *http.Request, id ge
 		s.writeCatalogError(w, err)
 		return
 	}
+	s.IdentityRepo.WriteAuditLog(r.Context(), &caller.ID, "application.delete", strconv.FormatInt(int64(id), 10), nil)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -876,8 +878,12 @@ func (s *Server) writeCatalogError(w http.ResponseWriter, err error) {
 		writeFieldErrors(w, map[string][]string{"slug": {err.Error()}})
 	case err == catalog.ErrSlugTaken:
 		writeFieldErrors(w, map[string][]string{"slug": {err.Error()}})
-	case err == catalog.ErrOnlyChatRenderer:
+	case err == catalog.ErrOnlyChatRenderer || err == catalog.ErrFixedRendererRequired:
 		writeFieldErrors(w, map[string][]string{"renderer_key": {err.Error()}})
+	case err == catalog.ErrFixedRuntimeForbidden:
+		writeFieldErrors(w, map[string][]string{"runtime": {err.Error()}})
+	case err == catalog.ErrApplicationKind:
+		writeFieldErrors(w, map[string][]string{"kind": {err.Error()}})
 	case err == catalog.ErrNotManageable:
 		writeDetail(w, http.StatusForbidden, err.Error())
 	case err == catalog.ErrNotDefaultable:
@@ -1059,7 +1065,12 @@ func (s *Server) GetApplicationAvatar(w http.ResponseWriter, r *http.Request, id
 		writeDetail(w, http.StatusNotFound, "avatar not set")
 		return
 	}
-	if !catalog.VisibleTo(app, catalog.VisibleScopeManage, caller.ID, caller.IsStaff) {
+	allowed, accessErr := s.CatalogRepo.AccessAllowed(r.Context(), app.ID, caller.ID, caller.IsStaff)
+	if accessErr != nil {
+		writeSimpleError(w, http.StatusInternalServerError, accessErr.Error())
+		return
+	}
+	if !allowed {
 		s.denyApplicationVisibility("avatar")
 		writeDetail(w, http.StatusNotFound, "avatar not set")
 		return

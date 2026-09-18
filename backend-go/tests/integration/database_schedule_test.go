@@ -45,6 +45,7 @@ func newScheduleEnv(t *testing.T) *scheduleEnv {
 		t.Fatalf("database: %v", err)
 	}
 	t.Cleanup(func() { _ = d.Close() })
+	ensureIntegrationUser(t, d, 42)
 	resolver := &fakeResolver{binding: &scheduler.BindingView{
 		ID: 1, ProviderKey: "feishu_aily", RuntimeType: "agent",
 		ExecutionMode: "interactive", Snapshot: map[string]any{},

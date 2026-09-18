@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/creation-agent-studio/backend-go/internal/platform/crypto"
@@ -138,6 +139,9 @@ func (o *ExchangeOrchestrator) Exchange(ctx context.Context, code string) (*OAut
 		return nil, nil, err
 	}
 
+	if linkErr := o.Repo.LinkDirectoryUser(ctx, userID, info.OpenID); linkErr != nil {
+		slog.Warn("link OAuth user to directory failed", "user_id", userID, "err", linkErr)
+	}
 	user, ident, err := o.Repo.UserWithIdentity(ctx, userID)
 	if err != nil {
 		return nil, nil, err

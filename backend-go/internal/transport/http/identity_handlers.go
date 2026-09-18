@@ -171,6 +171,10 @@ func (s *Server) OauthExchange(w http.ResponseWriter, r *http.Request, params ge
 		writeSimpleError(w, http.StatusBadGateway, "oauth exchange failed")
 		return
 	}
+	if result.User == nil || !result.User.IsActive {
+		writeDetail(w, http.StatusForbidden, "账号已停用，请联系管理员。")
+		return
+	}
 	// A re-authorization grants the scopes requested at authorize time; a
 	// cached user access token (2h TTL) predating it would keep failing with
 	// the old scope set — drop it so the next provider call re-refreshes.

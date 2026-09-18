@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -55,6 +56,10 @@ func main() {
 	runCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	a.Scheduler.Run(runCtx)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); a.Scheduler.Run(runCtx) }()
+	go func() { defer wg.Done(); a.DirectoryScheduler.Run(runCtx) }()
+	wg.Wait()
 	logger.Info("scheduler stopped")
 }

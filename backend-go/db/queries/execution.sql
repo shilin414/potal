@@ -94,12 +94,10 @@ WHERE id = ? AND status = 'running' AND lease_epoch = ?;
 SELECT lease_epoch FROM runs WHERE id = ?;
 
 -- name: GetRunGateState :one
--- Execution-time kill switch (复审 P1-2): the ONLY mutable facts re-checked
--- after the claim and before any provider interaction. Deliberately does
--- NOT read runtime_snapshot — the frozen snapshot stays authoritative for
--- HOW to execute; this only answers whether the run MAY still start.
--- Semantics: missing/disabled application or binding → kill (cancel);
--- missing or inactive provider → pause (requeue, keep waiting).
+-- Execution-time kill switch: mutable application/binding/provider state plus
+-- the current enterprise ACL. ACL denial intentionally produces no row; the
+-- catalog service maps only sql.ErrNoRows to GateKill, while real DB failures
+-- remain retryable infrastructure errors.
 SELECT a.enabled AS app_enabled,
        b.enabled AS binding_enabled,
        p.status  AS provider_status
@@ -107,7 +105,23 @@ FROM runs r
 LEFT JOIN applications a ON a.id = r.application_id
 LEFT JOIN runtime_bindings b ON b.id = r.runtime_binding_id
 LEFT JOIN providers p ON p.provider_key = b.provider_key
-WHERE r.id = ?;
+LEFT JOIN users gate_user ON gate_user.id = r.user_id
+WHERE r.id = ?
+  AND COALESCE(gate_user.is_active, 0) = 1
+  AND (sqlc.arg('acl_enabled') = 0 OR COALESCE(gate_user.is_staff, 0) = 1 OR EXISTS (
+    SELECT 1 FROM directory_users acl_du
+    WHERE acl_du.local_user_id = r.user_id
+      AND acl_du.is_active = 1 AND acl_du.is_resigned = 0 AND acl_du.active_status = 2
+      AND (a.access_mode = 'all' OR (a.access_mode = 'assigned' AND (
+        EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                WHERE acl_ug.application_id=a.id AND acl_ug.directory_user_id=acl_du.id)
+        OR EXISTS (SELECT 1 FROM directory_user_departments acl_dud
+                   JOIN directory_department_closure acl_dc ON acl_dc.descendant_id=acl_dud.department_id
+                   JOIN application_department_grants acl_dg ON acl_dg.department_id=acl_dc.ancestor_id
+                    AND (acl_dg.include_children=1 OR acl_dc.depth=0)
+                   WHERE acl_dud.directory_user_id=acl_du.id AND acl_dg.application_id=a.id)
+      )))
+  ));
 
 -- name: CASFinishRunFenced :execresult
 -- Fenced terminal transition: only the current lease epoch may finish a

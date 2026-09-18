@@ -18,7 +18,8 @@ var ErrNotFound = errors.New("catalog: not found")
 
 // Repo is the sqlc-backed catalog repository.
 type Repo struct {
-	DB *sql.DB
+	DB         *sql.DB
+	ACLEnabled bool
 }
 
 func (r *Repo) q(ctx context.Context) db.Querier { return db.New(r.DB) }
@@ -366,6 +367,33 @@ func nullInt64(v *int64) sql.NullInt64 {
 	return sql.NullInt64{Int64: *v, Valid: true}
 }
 
+// AccessAllowed is the single-row enterprise ACL predicate used by resolve,
+// avatar and favorite endpoints. Catalog list/bootstrap queries embed the same
+// predicate before LIMIT; this method covers surfaces that already target one
+// application.
+func (r *Repo) AccessAllowed(ctx context.Context, appID, userID int64, isStaff bool) (bool, error) {
+	if isStaff {
+		return true, nil
+	}
+	if !r.ACLEnabled {
+		var allowed bool
+		err := r.DB.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM applications WHERE id=? AND enabled=1 AND is_public=1)`, appID).Scan(&allowed)
+		return allowed, err
+	}
+	var allowed bool
+	err := r.DB.QueryRowContext(ctx, `SELECT EXISTS(
+		SELECT 1 FROM applications a
+		JOIN directory_users du ON du.local_user_id=? AND du.is_active=1 AND du.is_resigned=0 AND du.active_status=2
+		WHERE a.id=? AND a.enabled=1 AND (a.access_mode='all' OR (a.access_mode='assigned' AND (
+			EXISTS(SELECT 1 FROM application_user_grants ug WHERE ug.application_id=a.id AND ug.directory_user_id=du.id)
+			OR EXISTS(SELECT 1 FROM directory_user_departments dud
+			 JOIN directory_department_closure dc ON dc.descendant_id=dud.department_id
+			 JOIN application_department_grants dg ON dg.department_id=dc.ancestor_id AND (dg.include_children=1 OR dc.depth=0)
+			 WHERE dud.directory_user_id=du.id AND dg.application_id=a.id)
+		))))`, userID, appID).Scan(&allowed)
+	return allowed, err
+}
+
 // ApplicationWithBinding pairs an app with its first enabled binding.
 type ApplicationWithBinding struct {
 	App     *Application
@@ -393,7 +421,15 @@ func (r *Repo) ListApplicationsWithBindings(ctx context.Context, scope string, c
 		if err != nil {
 			continue
 		}
-		if !visible(app, scope, callerID, isStaff) {
+		if r.ACLEnabled {
+			allowed, accessErr := r.AccessAllowed(ctx, app.ID, callerID, isStaff)
+			if accessErr != nil {
+				return nil, accessErr
+			}
+			if !allowed {
+				continue
+			}
+		} else if !visible(app, scope, callerID, isStaff) {
 			continue
 		}
 		var binding *Binding
@@ -412,13 +448,8 @@ func (r *Repo) ListApplicationsWithBindings(ctx context.Context, scope string, c
 // ("extras" in the list semantics).
 func (r *Repo) ListUnboundApplications(ctx context.Context, scope, kind string, callerID int64, isStaff bool) ([]ApplicationWithBinding, error) {
 	rows, err := r.q(ctx).ListApplicationsByVisibility(ctx, db.ListApplicationsByVisibilityParams{
-		ShowAll: isStaff,
-		// The pre-filter must be a SUPERSET of what visible() accepts:
-		// manage scope includes other users' public applications, so the
-		// SQL side keeps is_public rows as well (visible() re-checks).
-		IsPublic:  scope == "public" || scope == "manage",
-		CreatedBy: sql.NullInt64{Int64: callerID, Valid: scope != "public"},
-		Limit:     1000,
+		ShowAll: boolArg(isStaff), AclEnabled: boolArg(r.ACLEnabled),
+		AclUserID: sql.NullInt64{Int64: callerID, Valid: true}, Limit: 1000,
 	})
 	if err != nil {
 		return nil, err
@@ -450,7 +481,7 @@ func (r *Repo) ListUnboundApplications(ctx context.Context, scope, kind string, 
 			v := int64(row.CreatedBy.Int64)
 			app.CreatedBy = &v
 		}
-		if !visible(app, scope, callerID, isStaff) {
+		if !r.ACLEnabled && !visible(app, scope, callerID, isStaff) {
 			continue
 		}
 		out = append(out, ApplicationWithBinding{App: app})
@@ -659,7 +690,6 @@ func boolArg(v bool) int {
 // binding wins — same choice GetEnabledBinding makes), so the page costs one
 // query instead of the legacy ListEnabledBindings + N×ApplicationByID.
 func (r *Repo) ListApplicationPage(ctx context.Context, q ApplicationPageQuery) ([]ApplicationWithBinding, error) {
-	mineOnly := !q.IsStaff && q.Scope == "mine"
 	search := strings.TrimSpace(q.Search)
 	uncategorized := q.CategorySlug == PageUncategorizedSlug
 	// consume mode applies `Usable` IN SQL, not in Go: filtering afterwards
@@ -675,9 +705,8 @@ func (r *Repo) ListApplicationPage(ctx context.Context, q ApplicationPageQuery) 
 
 	rows, err := r.q(ctx).ListApplicationPage(ctx, db.ListApplicationPageParams{
 		ShowAll:        boolArg(q.IsStaff),
-		MineOnly:       boolArg(mineOnly),
-		PageCallerID:   sql.NullInt64{Int64: q.CallerID, Valid: true},
-		PublicOnly:     boolArg(!q.IsStaff && !mineOnly),
+		AclEnabled:     boolArg(r.ACLEnabled),
+		AclUserID:      sql.NullInt64{Int64: q.CallerID, Valid: true},
 		ConsumeOnly:    boolArg(consumeOnly),
 		KindChatOnly:   boolArg(q.Kind == PageQueryKindChat),
 		KindFixedOnly:  boolArg(q.Kind == PageQueryKindFixed),
@@ -744,6 +773,7 @@ func mentionPrefix(q string) string {
 func (r *Repo) ResolveMentionCandidates(
 	ctx context.Context,
 	q string,
+	callerID int64,
 	isStaff bool,
 	limit int,
 ) ([]MentionCandidate, error) {
@@ -751,7 +781,8 @@ func (r *Repo) ResolveMentionCandidates(
 		limit = 10
 	}
 	rows, err := r.q(ctx).ResolveMentionCandidates(ctx, db.ResolveMentionCandidatesParams{
-		ShowAll: boolArg(isStaff),
+		ShowAll: boolArg(isStaff), AclEnabled: boolArg(r.ACLEnabled),
+		AclUserID: sql.NullInt64{Int64: callerID, Valid: true},
 		// narg-free by design: an empty query is rejected by the handler, so
 		// the two LIKE parameters are always real needles.
 		Contains: mentionContains(q),
@@ -1046,11 +1077,12 @@ func (r *Repo) BootstrapGroups(ctx context.Context, q BootstrapGroupQuery) (Boot
 	var out BootstrapGroups
 	caller := sql.NullInt64{Int64: q.CallerID, Valid: true}
 	showAll := boolArg(q.IsStaff)
+	aclEnabled := boolArg(r.ACLEnabled)
 	limit := int32(BootstrapGroupLimit)
 	favUser := uint64(max64(q.CallerID, 0))
 
 	def, err := r.q(ctx).BootstrapDefaultApplication(ctx, db.BootstrapDefaultApplicationParams{
-		CallerID: caller, ShowAll: showAll,
+		CallerID: caller, ShowAll: showAll, AclEnabled: aclEnabled, AclUserID: caller,
 	})
 	switch {
 	case err == nil:
@@ -1063,7 +1095,7 @@ func (r *Repo) BootstrapGroups(ctx context.Context, q BootstrapGroupQuery) (Boot
 	}
 
 	if rows, err := r.q(ctx).BootstrapFavoriteApplications(ctx, db.BootstrapFavoriteApplicationsParams{
-		CallerID: caller, FavUserID: favUser, ShowAll: showAll, Limit: limit,
+		CallerID: caller, FavUserID: favUser, ShowAll: showAll, AclEnabled: aclEnabled, AclUserID: caller, Limit: limit,
 	}); err != nil {
 		return out, err
 	} else {
@@ -1071,7 +1103,7 @@ func (r *Repo) BootstrapGroups(ctx context.Context, q BootstrapGroupQuery) (Boot
 	}
 
 	if rows, err := r.q(ctx).BootstrapFrequentApplications(ctx, db.BootstrapFrequentApplicationsParams{
-		CallerID: caller, ShowAll: showAll, Limit: limit,
+		CallerID: caller, ShowAll: showAll, AclEnabled: aclEnabled, AclUserID: caller, Limit: limit,
 	}); err != nil {
 		return out, err
 	} else {
@@ -1079,7 +1111,7 @@ func (r *Repo) BootstrapGroups(ctx context.Context, q BootstrapGroupQuery) (Boot
 	}
 
 	if rows, err := r.q(ctx).BootstrapRecentApplications(ctx, db.BootstrapRecentApplicationsParams{
-		CallerID: caller, ShowAll: showAll, Limit: limit,
+		CallerID: caller, ShowAll: showAll, AclEnabled: aclEnabled, AclUserID: caller, Limit: limit,
 	}); err != nil {
 		return out, err
 	} else {
@@ -1087,7 +1119,7 @@ func (r *Repo) BootstrapGroups(ctx context.Context, q BootstrapGroupQuery) (Boot
 	}
 
 	if rows, err := r.q(ctx).BootstrapRecommendedApplications(ctx, db.BootstrapRecommendedApplicationsParams{
-		CallerID: caller, ShowAll: showAll, FavUserID: favUser, Limit: limit,
+		CallerID: caller, ShowAll: showAll, AclEnabled: aclEnabled, AclUserID: caller, FavUserID: favUser, Limit: limit,
 	}); err != nil {
 		return out, err
 	} else {
@@ -1095,7 +1127,7 @@ func (r *Repo) BootstrapGroups(ctx context.Context, q BootstrapGroupQuery) (Boot
 	}
 
 	if rows, err := r.q(ctx).BootstrapRecentFixedApplications(ctx, db.BootstrapRecentFixedApplicationsParams{
-		CallerID: caller, ShowAll: showAll, Limit: limit,
+		CallerID: caller, ShowAll: showAll, AclEnabled: aclEnabled, AclUserID: caller, Limit: limit,
 	}); err != nil {
 		return out, err
 	} else {
@@ -1108,15 +1140,16 @@ func (r *Repo) BootstrapGroups(ctx context.Context, q BootstrapGroupQuery) (Boot
 // (二次复审 §17): one row per category, counted and ordered by first
 // appearance. Rows with no category come back with an empty slug, which the
 // HTTP layer renders as the `__uncategorized__` sentinel.
-func (r *Repo) BootstrapCategories(ctx context.Context, isStaff bool) (BootstrapCategories, error) {
+func (r *Repo) BootstrapCategories(ctx context.Context, callerID int64, isStaff bool) (BootstrapCategories, error) {
 	var out BootstrapCategories
 	showAll := boolArg(isStaff)
-	agents, err := r.q(ctx).BootstrapAgentCategories(ctx, showAll)
+	aclUser := sql.NullInt64{Int64: callerID, Valid: true}
+	agents, err := r.q(ctx).BootstrapAgentCategories(ctx, db.BootstrapAgentCategoriesParams{ShowAll: showAll, AclEnabled: boolArg(r.ACLEnabled), AclUserID: aclUser})
 	if err != nil {
 		return out, err
 	}
 	out.Agents = bootstrapAgentCategories(agents)
-	apps, err := r.q(ctx).BootstrapAppCategories(ctx, showAll)
+	apps, err := r.q(ctx).BootstrapAppCategories(ctx, db.BootstrapAppCategoriesParams{ShowAll: showAll, AclEnabled: boolArg(r.ACLEnabled), AclUserID: aclUser})
 	if err != nil {
 		return out, err
 	}
@@ -1128,14 +1161,14 @@ func (r *Repo) BootstrapCategories(ctx context.Context, isStaff bool) (Bootstrap
 // groups selected — bounded by the groups themselves (≤ ~40 rows), never by
 // the catalog. The visibility + consume predicates are applied again so this
 // fetch is safe on its own.
-func (r *Repo) ListApplicationRowsByIDs(ctx context.Context, appIDs []int64, isStaff bool) ([]ApplicationWithBinding, error) {
+func (r *Repo) ListApplicationRowsByIDs(ctx context.Context, appIDs []int64, callerID int64, isStaff bool) ([]ApplicationWithBinding, error) {
 	out := make([]ApplicationWithBinding, 0, len(appIDs))
 	if len(appIDs) == 0 {
 		return out, nil
 	}
 	rows, err := r.q(ctx).ListApplicationRowsByIDs(ctx, db.ListApplicationRowsByIDsParams{
-		AppIds:  favoriteIDs(appIDs),
-		ShowAll: boolArg(isStaff),
+		AppIds: favoriteIDs(appIDs), ShowAll: boolArg(isStaff),
+		AclEnabled: boolArg(r.ACLEnabled), AclUserID: sql.NullInt64{Int64: callerID, Valid: true},
 	})
 	if err != nil {
 		return nil, err

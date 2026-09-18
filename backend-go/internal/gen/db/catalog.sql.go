@@ -45,10 +45,45 @@ WHERE newer_b.id IS NULL
   AND b.id IS NOT NULL
   AND p.id IS NOT NULL
   AND p.status = 'active'
-  AND (? OR a.is_public = 1)
+  AND (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 GROUP BY a.category_id, c.slug, c.name
 ORDER BY MIN(a.created_at), category_slug
 `
+
+type BootstrapAgentCategoriesParams struct {
+	ShowAll    interface{}
+	AclEnabled interface{}
+	AclUserID  sql.NullInt64
+}
 
 type BootstrapAgentCategoriesRow struct {
 	CategorySlug  string
@@ -60,8 +95,13 @@ type BootstrapAgentCategoriesRow struct {
 // first appearance (MIN(created_at)) — the order the market itself lists
 // applications in. Rows with no category come back with an EMPTY slug and
 // are rendered as the `__uncategorized__` sentinel by the caller.
-func (q *Queries) BootstrapAgentCategories(ctx context.Context, showAll interface{}) ([]BootstrapAgentCategoriesRow, error) {
-	rows, err := q.db.QueryContext(ctx, bootstrapAgentCategories, showAll)
+func (q *Queries) BootstrapAgentCategories(ctx context.Context, arg BootstrapAgentCategoriesParams) ([]BootstrapAgentCategoriesRow, error) {
+	rows, err := q.db.QueryContext(ctx, bootstrapAgentCategories,
+		arg.ShowAll,
+		arg.AclEnabled,
+		arg.AclEnabled,
+		arg.AclUserID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -91,10 +131,45 @@ FROM applications a
 LEFT JOIN application_categories c ON c.id = a.category_id
 WHERE a.enabled = 1
   AND a.kind <> 'chat'
-  AND (? OR a.is_public = 1)
+  AND (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 GROUP BY a.category_id, c.slug, c.name
 ORDER BY MIN(a.created_at), category_slug
 `
+
+type BootstrapAppCategoriesParams struct {
+	ShowAll    interface{}
+	AclEnabled interface{}
+	AclUserID  sql.NullInt64
+}
 
 type BootstrapAppCategoriesRow struct {
 	CategorySlug  string
@@ -103,8 +178,13 @@ type BootstrapAppCategoriesRow struct {
 }
 
 // Same rail for 应用中心 (kind <> 'chat'), which needs no runtime binding.
-func (q *Queries) BootstrapAppCategories(ctx context.Context, showAll interface{}) ([]BootstrapAppCategoriesRow, error) {
-	rows, err := q.db.QueryContext(ctx, bootstrapAppCategories, showAll)
+func (q *Queries) BootstrapAppCategories(ctx context.Context, arg BootstrapAppCategoriesParams) ([]BootstrapAppCategoriesRow, error) {
+	rows, err := q.db.QueryContext(ctx, bootstrapAppCategories,
+		arg.ShowAll,
+		arg.AclEnabled,
+		arg.AclEnabled,
+		arg.AclUserID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -150,14 +230,45 @@ WHERE newer_b.id IS NULL
   AND b.id IS NOT NULL
   AND p.id IS NOT NULL
   AND p.status = 'active'
-  AND (? OR a.is_public = 1)
+  AND (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 ORDER BY a.is_default_agent DESC, a.created_at, a.id
 LIMIT 1
 `
 
 type BootstrapDefaultApplicationParams struct {
-	CallerID sql.NullInt64
-	ShowAll  interface{}
+	CallerID   sql.NullInt64
+	ShowAll    interface{}
+	AclEnabled interface{}
+	AclUserID  sql.NullInt64
 }
 
 type BootstrapDefaultApplicationRow struct {
@@ -185,7 +296,7 @@ type BootstrapDefaultApplicationRow struct {
 //
 // Every one of them applies, IN SQL:
 //
-//   - the visibility policy  — `show_all` (staff) OR `is_public = 1`;
+//   - the visibility policy  — staff bypass or feature-flagged enterprise ACL;
 //   - the CONSUME policy     — `enabled = 1` AND, for kind='chat', an
 //     enabled runtime binding whose provider exists
 //     and is active (P0-5 + 三次复审 P0-R3); a
@@ -208,7 +319,13 @@ type BootstrapDefaultApplicationRow struct {
 // the default if it was promoted before being switched off, which bound the
 // home composer to an agent that cannot execute.
 func (q *Queries) BootstrapDefaultApplication(ctx context.Context, arg BootstrapDefaultApplicationParams) (BootstrapDefaultApplicationRow, error) {
-	row := q.db.QueryRowContext(ctx, bootstrapDefaultApplication, arg.CallerID, arg.ShowAll)
+	row := q.db.QueryRowContext(ctx, bootstrapDefaultApplication,
+		arg.CallerID,
+		arg.ShowAll,
+		arg.AclEnabled,
+		arg.AclEnabled,
+		arg.AclUserID,
+	)
 	var i BootstrapDefaultApplicationRow
 	err := row.Scan(&i.ID, &i.PersonalUsageCount, &i.LastUsedAt)
 	return i, err
@@ -239,16 +356,47 @@ WHERE f.user_id = ?
   AND b.id IS NOT NULL
   AND p.id IS NOT NULL
   AND p.status = 'active'
-  AND (? OR a.is_public = 1)
+  AND (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 ORDER BY u.last_used_at DESC, a.name
 LIMIT ?
 `
 
 type BootstrapFavoriteApplicationsParams struct {
-	CallerID  sql.NullInt64
-	FavUserID uint64
-	ShowAll   interface{}
-	Limit     int32
+	CallerID   sql.NullInt64
+	FavUserID  uint64
+	ShowAll    interface{}
+	AclEnabled interface{}
+	AclUserID  sql.NullInt64
+	Limit      int32
 }
 
 type BootstrapFavoriteApplicationsRow struct {
@@ -265,6 +413,9 @@ func (q *Queries) BootstrapFavoriteApplications(ctx context.Context, arg Bootstr
 		arg.CallerID,
 		arg.FavUserID,
 		arg.ShowAll,
+		arg.AclEnabled,
+		arg.AclEnabled,
+		arg.AclUserID,
 		arg.Limit,
 	)
 	if err != nil {
@@ -311,15 +462,46 @@ WHERE newer_b.id IS NULL
   AND b.id IS NOT NULL
   AND p.id IS NOT NULL
   AND p.status = 'active'
-  AND (? OR a.is_public = 1)
+  AND (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 ORDER BY u.usage_count DESC, u.last_used_at DESC, a.name
 LIMIT ?
 `
 
 type BootstrapFrequentApplicationsParams struct {
-	CallerID sql.NullInt64
-	ShowAll  interface{}
-	Limit    int32
+	CallerID   sql.NullInt64
+	ShowAll    interface{}
+	AclEnabled interface{}
+	AclUserID  sql.NullInt64
+	Limit      int32
 }
 
 type BootstrapFrequentApplicationsRow struct {
@@ -330,7 +512,14 @@ type BootstrapFrequentApplicationsRow struct {
 
 // 常用智能体: chat applications this caller has actually run, most runs first.
 func (q *Queries) BootstrapFrequentApplications(ctx context.Context, arg BootstrapFrequentApplicationsParams) ([]BootstrapFrequentApplicationsRow, error) {
-	rows, err := q.db.QueryContext(ctx, bootstrapFrequentApplications, arg.CallerID, arg.ShowAll, arg.Limit)
+	rows, err := q.db.QueryContext(ctx, bootstrapFrequentApplications,
+		arg.CallerID,
+		arg.ShowAll,
+		arg.AclEnabled,
+		arg.AclEnabled,
+		arg.AclUserID,
+		arg.Limit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -375,15 +564,46 @@ WHERE newer_b.id IS NULL
   AND b.id IS NOT NULL
   AND p.id IS NOT NULL
   AND p.status = 'active'
-  AND (? OR a.is_public = 1)
+  AND (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 ORDER BY u.last_used_at DESC, a.created_at, a.id
 LIMIT ?
 `
 
 type BootstrapRecentApplicationsParams struct {
-	CallerID sql.NullInt64
-	ShowAll  interface{}
-	Limit    int32
+	CallerID   sql.NullInt64
+	ShowAll    interface{}
+	AclEnabled interface{}
+	AclUserID  sql.NullInt64
+	Limit      int32
 }
 
 type BootstrapRecentApplicationsRow struct {
@@ -395,7 +615,14 @@ type BootstrapRecentApplicationsRow struct {
 // 最近使用: chat applications this caller ran, most recent first (the pool's
 // created_at order breaks ties, reproducing the old stable Go sort).
 func (q *Queries) BootstrapRecentApplications(ctx context.Context, arg BootstrapRecentApplicationsParams) ([]BootstrapRecentApplicationsRow, error) {
-	rows, err := q.db.QueryContext(ctx, bootstrapRecentApplications, arg.CallerID, arg.ShowAll, arg.Limit)
+	rows, err := q.db.QueryContext(ctx, bootstrapRecentApplications,
+		arg.CallerID,
+		arg.ShowAll,
+		arg.AclEnabled,
+		arg.AclEnabled,
+		arg.AclUserID,
+		arg.Limit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -428,15 +655,46 @@ LEFT JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) A
   ON u.application_id = a.id
 WHERE a.enabled = 1
   AND a.kind <> 'chat'
-  AND (? OR a.is_public = 1)
+  AND (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 ORDER BY u.last_used_at DESC, a.created_at, a.id
 LIMIT ?
 `
 
 type BootstrapRecentFixedApplicationsParams struct {
-	CallerID sql.NullInt64
-	ShowAll  interface{}
-	Limit    int32
+	CallerID   sql.NullInt64
+	ShowAll    interface{}
+	AclEnabled interface{}
+	AclUserID  sql.NullInt64
+	Limit      int32
 }
 
 type BootstrapRecentFixedApplicationsRow struct {
@@ -453,7 +711,14 @@ type BootstrapRecentFixedApplicationsRow struct {
 // The group must still SHOW the fixed apps on a workspace nobody has used
 // yet, so `used` is an ORDERING key only, never a filter.
 func (q *Queries) BootstrapRecentFixedApplications(ctx context.Context, arg BootstrapRecentFixedApplicationsParams) ([]BootstrapRecentFixedApplicationsRow, error) {
-	rows, err := q.db.QueryContext(ctx, bootstrapRecentFixedApplications, arg.CallerID, arg.ShowAll, arg.Limit)
+	rows, err := q.db.QueryContext(ctx, bootstrapRecentFixedApplications,
+		arg.CallerID,
+		arg.ShowAll,
+		arg.AclEnabled,
+		arg.AclEnabled,
+		arg.AclUserID,
+		arg.Limit,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +763,36 @@ WHERE newer_b.id IS NULL
   AND b.id IS NOT NULL
   AND p.id IS NOT NULL
   AND p.status = 'active'
-  AND (? OR a.is_public = 1)
+  AND (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
   AND NOT EXISTS (SELECT 1 FROM runs r
                   WHERE r.user_id = ? AND r.application_id = a.id)
   AND NOT EXISTS (SELECT 1 FROM application_favorites f
@@ -508,10 +802,12 @@ LIMIT ?
 `
 
 type BootstrapRecommendedApplicationsParams struct {
-	CallerID  sql.NullInt64
-	ShowAll   interface{}
-	FavUserID uint64
-	Limit     int32
+	CallerID   sql.NullInt64
+	ShowAll    interface{}
+	AclEnabled interface{}
+	AclUserID  sql.NullInt64
+	FavUserID  uint64
+	Limit      int32
 }
 
 type BootstrapRecommendedApplicationsRow struct {
@@ -527,6 +823,9 @@ func (q *Queries) BootstrapRecommendedApplications(ctx context.Context, arg Boot
 	rows, err := q.db.QueryContext(ctx, bootstrapRecommendedApplications,
 		arg.CallerID,
 		arg.ShowAll,
+		arg.AclEnabled,
+		arg.AclEnabled,
+		arg.AclUserID,
 		arg.CallerID,
 		arg.FavUserID,
 		arg.Limit,
@@ -1283,14 +1582,45 @@ FROM applications a
 JOIN runtime_bindings b ON b.application_id = a.id AND b.enabled = 1
 LEFT JOIN providers p ON p.provider_key = b.provider_key
 WHERE a.id = ? AND a.enabled = 1 AND a.kind = 'chat'
-  AND (? OR a.is_public = 1)
+  AND (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 ORDER BY b.id DESC
 LIMIT 1
 `
 
 type GetExecutionAuthBundleParams struct {
-	ID      uint64
-	ShowAll interface{}
+	ID         uint64
+	ShowAll    interface{}
+	AclEnabled interface{}
+	AclUserID  sql.NullInt64
 }
 
 type GetExecutionAuthBundleRow struct {
@@ -1326,8 +1656,7 @@ type GetExecutionAuthBundleRow struct {
 // schedule admission must verify. Visibility is enforced server-side —
 // staff see everything; regular users only public, enabled applications.
 // The join itself cannot express the staff bypass, so the Go layer calls
-// it with show_all for staff and is_public=1 for regular users (mirrors
-// ListApplicationsByVisibility).
+// it with show_all for staff and the feature-flagged enterprise ACL for regular users.
 //
 // The provider is joined by provider_key, NOT provider_id (评测 P1):
 // provider_id is nullable and was left NULL by bindings created through
@@ -1335,7 +1664,13 @@ type GetExecutionAuthBundleRow struct {
 // is the business key that always exists. A missing/inactive provider row
 // fails the check closed in Go.
 func (q *Queries) GetExecutionAuthBundle(ctx context.Context, arg GetExecutionAuthBundleParams) (GetExecutionAuthBundleRow, error) {
-	row := q.db.QueryRowContext(ctx, getExecutionAuthBundle, arg.ID, arg.ShowAll)
+	row := q.db.QueryRowContext(ctx, getExecutionAuthBundle,
+		arg.ID,
+		arg.ShowAll,
+		arg.AclEnabled,
+		arg.AclEnabled,
+		arg.AclUserID,
+	)
 	var i GetExecutionAuthBundleRow
 	err := row.Scan(
 		&i.AppID,
@@ -1486,9 +1821,36 @@ LEFT JOIN runtime_bindings newer_b
 LEFT JOIN providers p
   ON p.provider_key = b.provider_key
 WHERE newer_b.id IS NULL
-  AND (? OR (a.enabled = 1 AND (
-        (? AND a.created_by = ?)
-        OR (? AND a.is_public = 1))))
+  AND (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
   AND (? = 0
        OR (a.enabled = 1 AND (a.kind <> 'chat'
            OR (b.id IS NOT NULL AND p.id IS NOT NULL AND p.status = 'active'))))
@@ -1520,9 +1882,8 @@ LIMIT ?
 
 type ListApplicationPageParams struct {
 	ShowAll         interface{}
-	MineOnly        interface{}
-	PageCallerID    sql.NullInt64
-	PublicOnly      interface{}
+	AclEnabled      interface{}
+	AclUserID       sql.NullInt64
 	ConsumeOnly     interface{}
 	KindChatOnly    interface{}
 	KindFixedOnly   interface{}
@@ -1591,9 +1952,8 @@ type ListApplicationPageRow struct {
 // cursor determinism):
 //
 //	staff            → everything (show_all);
-//	regular users    → enabled = 1, plus
-//	  scope=mine     → own rows (private included),
-//	  scope=public/manage → is_public = 1.
+//	regular users    → feature-flagged accessible policy (legacy is_public
+//	                   before rollout; Directory + grants after rollout).
 //
 // `mode` (二次复审 P0-5) is ORTHOGONAL to scope: scope is "who may SEE the
 // row" (a management concern), mode is "may anyone actually USE it"
@@ -1632,9 +1992,9 @@ type ListApplicationPageRow struct {
 func (q *Queries) ListApplicationPage(ctx context.Context, arg ListApplicationPageParams) ([]ListApplicationPageRow, error) {
 	rows, err := q.db.QueryContext(ctx, listApplicationPage,
 		arg.ShowAll,
-		arg.MineOnly,
-		arg.PageCallerID,
-		arg.PublicOnly,
+		arg.AclEnabled,
+		arg.AclEnabled,
+		arg.AclUserID,
 		arg.ConsumeOnly,
 		arg.KindChatOnly,
 		arg.KindFixedOnly,
@@ -1735,15 +2095,46 @@ LEFT JOIN providers p
 WHERE newer_b.id IS NULL
   AND a.id IN (/*SLICE:app_ids*/?)
   AND a.enabled = 1
-  AND (? OR a.is_public = 1)
+  AND (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
   AND (a.kind <> 'chat'
        OR (b.id IS NOT NULL AND p.id IS NOT NULL AND p.status = 'active'))
 ORDER BY a.created_at, a.id
 `
 
 type ListApplicationRowsByIDsParams struct {
-	AppIds  []uint64
-	ShowAll interface{}
+	AppIds     []uint64
+	ShowAll    interface{}
+	AclEnabled interface{}
+	AclUserID  sql.NullInt64
 }
 
 type ListApplicationRowsByIDsRow struct {
@@ -1803,6 +2194,9 @@ func (q *Queries) ListApplicationRowsByIDs(ctx context.Context, arg ListApplicat
 		query = strings.Replace(query, "/*SLICE:app_ids*/?", "NULL", 1)
 	}
 	queryParams = append(queryParams, arg.ShowAll)
+	queryParams = append(queryParams, arg.AclEnabled)
+	queryParams = append(queryParams, arg.AclEnabled)
+	queryParams = append(queryParams, arg.AclUserID)
 	rows, err := q.db.QueryContext(ctx, query, queryParams...)
 	if err != nil {
 		return nil, err
@@ -1869,16 +2263,46 @@ SELECT a.id, a.slug, a.name, a.description, a.icon, a.avatar_key, a.color, a.kin
        c.slug AS category_slug, c.name AS category_name
 FROM applications a
 LEFT JOIN application_categories c ON c.id = a.category_id
-WHERE (? OR a.is_public = ? OR a.created_by = ?)
+WHERE (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
+  AND (? OR a.enabled = 1)
 ORDER BY a.created_at
 LIMIT ?
 `
 
 type ListApplicationsByVisibilityParams struct {
-	ShowAll   interface{}
-	IsPublic  bool
-	CreatedBy sql.NullInt64
-	Limit     int32
+	ShowAll    interface{}
+	AclEnabled interface{}
+	AclUserID  sql.NullInt64
+	Limit      int32
 }
 
 type ListApplicationsByVisibilityRow struct {
@@ -1912,8 +2336,10 @@ type ListApplicationsByVisibilityRow struct {
 func (q *Queries) ListApplicationsByVisibility(ctx context.Context, arg ListApplicationsByVisibilityParams) ([]ListApplicationsByVisibilityRow, error) {
 	rows, err := q.db.QueryContext(ctx, listApplicationsByVisibility,
 		arg.ShowAll,
-		arg.IsPublic,
-		arg.CreatedBy,
+		arg.AclEnabled,
+		arg.AclEnabled,
+		arg.AclUserID,
+		arg.ShowAll,
 		arg.Limit,
 	)
 	if err != nil {
@@ -2105,7 +2531,36 @@ LEFT JOIN runtime_bindings newer_b
 LEFT JOIN providers p
   ON p.provider_key = b.provider_key
 WHERE newer_b.id IS NULL
-  AND (? OR a.is_public = 1)
+  AND (? OR (
+    (? = 0 AND a.is_public = 1)
+    OR (? AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = ?
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
   AND a.enabled = 1
   AND (a.kind <> 'chat'
        OR (b.id IS NOT NULL AND p.id IS NOT NULL AND p.status = 'active'))
@@ -2129,11 +2584,13 @@ LIMIT ?
 `
 
 type ResolveMentionCandidatesParams struct {
-	ShowAll  interface{}
-	Contains interface{}
-	Exact    interface{}
-	Prefix   interface{}
-	Limit    int32
+	ShowAll    interface{}
+	AclEnabled interface{}
+	AclUserID  sql.NullInt64
+	Contains   interface{}
+	Exact      interface{}
+	Prefix     interface{}
+	Limit      int32
 }
 
 type ResolveMentionCandidatesRow struct {
@@ -2158,6 +2615,9 @@ type ResolveMentionCandidatesRow struct {
 func (q *Queries) ResolveMentionCandidates(ctx context.Context, arg ResolveMentionCandidatesParams) ([]ResolveMentionCandidatesRow, error) {
 	rows, err := q.db.QueryContext(ctx, resolveMentionCandidates,
 		arg.ShowAll,
+		arg.AclEnabled,
+		arg.AclEnabled,
+		arg.AclUserID,
 		arg.Contains,
 		arg.Contains,
 		arg.Exact,

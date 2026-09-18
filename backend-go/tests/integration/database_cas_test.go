@@ -7,6 +7,8 @@ package integration
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -24,6 +26,27 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/platform/telemetry"
 )
 
+func ensureIntegrationUser(t *testing.T, db *sql.DB, id int64) {
+	t.Helper()
+	var active bool
+	err := db.QueryRow(`SELECT is_active FROM users WHERE id=?`, id).Scan(&active)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		username := fmt.Sprintf("itest_fixture_user_%d", id)
+		if _, err = db.Exec(`INSERT INTO users(id,username,password_hash,display_name,display_id,email,role,auth_source,is_staff,is_active) VALUES(?,?,'',?,'','', 'creator','local',0,1)`, id, username, username); err != nil {
+			t.Fatalf("seed integration user: %v", err)
+		}
+		t.Cleanup(func() { _, _ = db.Exec(`DELETE FROM users WHERE id=? AND username=?`, id, username) })
+	case err != nil:
+		t.Fatalf("read integration user: %v", err)
+	case !active:
+		if _, err = db.Exec(`UPDATE users SET is_active=1 WHERE id=?`, id); err != nil {
+			t.Fatalf("activate integration user: %v", err)
+		}
+		t.Cleanup(func() { _, _ = db.Exec(`UPDATE users SET is_active=0 WHERE id=?`, id) })
+	}
+}
+
 func testEnv(t *testing.T) (*execution.Service, *redisx.Client) {
 	t.Helper()
 	if os.Getenv("STUDIO_TEST_DB") != "1" {
@@ -38,6 +61,7 @@ func testEnv(t *testing.T) (*execution.Service, *redisx.Client) {
 		t.Fatalf("database: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	ensureIntegrationUser(t, db, 42)
 	var rdb *redisx.Client
 	if os.Getenv("STUDIO_TEST_REDIS") == "1" {
 		rdb, err = redisx.Open(context.Background(), cfg.Redis)

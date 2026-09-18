@@ -15,9 +15,10 @@ import (
 
 // Service implements the agent-marketplace authoring behavior.
 type Service struct {
-	DB       *sql.DB
-	Registry *RuntimeRegistry
-	Storage  StorageForAvatar
+	DB         *sql.DB
+	Registry   *RuntimeRegistry
+	Storage    StorageForAvatar
+	ACLEnabled bool
 }
 
 // StorageForAvatar is the storage boundary needed by the service
@@ -39,19 +40,22 @@ func (s *Service) EnabledBinding(ctx context.Context, appID int64) (*Binding, er
 func (s *Service) BindingsByApplication(ctx context.Context, appID int64) ([]*Binding, error) {
 	return s.repo().BindingsByApplication(ctx, appID)
 }
-func (s *Service) repo() *Repo { return &Repo{DB: s.DB} }
+func (s *Service) repo() *Repo { return &Repo{DB: s.DB, ACLEnabled: s.ACLEnabled} }
 
 // Slug regex from the validated contract.
 var slugPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
 // Business errors (transport maps them to the exact HTTP envelopes).
 var (
-	ErrNameRequired     = errors.New("请输入智能体名称")
-	ErrBadSlug          = errors.New("标识仅支持小写字母、数字和连字符")
-	ErrSlugTaken        = errors.New("该标识已被占用")
-	ErrNotManageable    = errors.New("只有应用创建者或管理员可以修改该智能体。")
-	ErrOnlyChatRenderer = errors.New("智能体市场目前只创建 chat renderer 的应用")
-	ErrNoBinding        = errors.New("application has no runtime binding")
+	ErrNameRequired          = errors.New("请输入智能体名称")
+	ErrBadSlug               = errors.New("标识仅支持小写字母、数字和连字符")
+	ErrSlugTaken             = errors.New("该标识已被占用")
+	ErrNotManageable         = errors.New("只有管理员可以管理该资源。")
+	ErrOnlyChatRenderer      = errors.New("智能体必须使用 chat renderer")
+	ErrFixedRendererRequired = errors.New("固定应用必须提供 renderer_key")
+	ErrFixedRuntimeForbidden = errors.New("固定应用不能配置 RuntimeBinding")
+	ErrApplicationKind       = errors.New("不支持的应用类型")
+	ErrNoBinding             = errors.New("application has no runtime binding")
 	// ErrNotDefaultable (二次复审 P0-6) now also covers a DISABLED
 	// application: the default agent is the one the home composer binds to,
 	// and a disabled application can never execute, so promoting it would
@@ -99,6 +103,9 @@ type BindingInput struct {
 
 // Create creates Application (+binding) in one transaction.
 func (s *Service) Create(ctx context.Context, in *CreateInput) (*Application, *Binding, error) {
+	if in == nil || !in.IsStaff {
+		return nil, nil, ErrNotManageable
+	}
 	name := strings.TrimSpace(in.Name)
 	if name == "" {
 		return nil, nil, ErrNameRequired
@@ -110,12 +117,28 @@ func (s *Service) Create(ctx context.Context, in *CreateInput) (*Application, *B
 	if !slugPattern.MatchString(slug) {
 		return nil, nil, ErrBadSlug
 	}
-	if in.RendererKey != "" && in.RendererKey != "chat" {
-		return nil, nil, ErrOnlyChatRenderer
-	}
-	renderer := "chat"
-	if in.RendererKey != "" {
-		renderer = in.RendererKey
+	kind := defaultStr(strings.TrimSpace(in.Kind), "chat")
+	var renderer string
+	switch kind {
+	case "chat":
+		if in.RendererKey != "" && in.RendererKey != "chat" {
+			return nil, nil, ErrOnlyChatRenderer
+		}
+		renderer = "chat"
+	case "page", "form", "dashboard", "custom", "task":
+		renderer = strings.TrimSpace(in.RendererKey)
+		if renderer == "" {
+			return nil, nil, ErrFixedRendererRequired
+		}
+		if in.Runtime != nil {
+			return nil, nil, ErrFixedRuntimeForbidden
+		}
+		if in.SetDefaultAgent {
+			return nil, nil, ErrNotDefaultable
+		}
+		in.Skills = nil
+	default:
+		return nil, nil, ErrApplicationKind
 	}
 
 	// 技能配置 is validated up front, like the runtime below: an invalid skill
@@ -157,11 +180,11 @@ func (s *Service) Create(ctx context.Context, in *CreateInput) (*Application, *B
 		Description: nullText(in.Description),
 		Icon:        in.Icon,
 		Color:       in.Color,
-		Kind:        defaultStr(in.Kind, "chat"),
+		Kind:        kind,
 		RendererKey: renderer,
 		ExecutorKey: "",
 		CategoryID:  nullInt64(categoryID),
-		IsPublic:    in.IsPublic,
+		IsPublic:    false,
 		CreatedBy:   nullInt64(&in.CreatorID),
 	})
 	if err != nil {
@@ -176,6 +199,12 @@ func (s *Service) Create(ctx context.Context, in *CreateInput) (*Application, *B
 	// agent keeps a NULL column instead of an empty JSON document.
 	if len(skills) > 0 {
 		if err := s.applySkillsTx(ctx, tx, id, skills); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	if kind != "chat" {
+		if _, err := tx.ExecContext(ctx, "UPDATE applications SET enabled = 0 WHERE id = ?", id); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -453,6 +482,12 @@ func (s *Service) Delete(ctx context.Context, appID, callerID int64, isStaff boo
 	if _, err := tx.ExecContext(ctx, `DELETE FROM application_favorites WHERE application_id = ?`, appID); err != nil {
 		return err
 	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM application_department_grants WHERE application_id = ?`, appID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM application_user_grants WHERE application_id = ?`, appID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM applications WHERE id = ?`, appID); err != nil {
 		return err
 	}
@@ -516,11 +551,11 @@ func (s *Service) UnsetDefaultAgent(ctx context.Context, appID, callerID int64, 
 // A fixed application keeps its favorite relation: the ✩ flip is a real
 // user-facing feature (P1-5), it just never enters the 收藏智能体 group.
 func (s *Service) Favorite(ctx context.Context, appID, userID int64, isStaff bool) error {
-	app, err := s.ApplicationByID(ctx, appID)
+	allowed, err := s.repo().AccessAllowed(ctx, appID, userID, isStaff)
 	if err != nil {
 		return err
 	}
-	if !VisibleTo(app, VisibleScopeManage, userID, isStaff) {
+	if !allowed {
 		return ErrNotFound
 	}
 	_, err = s.DB.ExecContext(ctx, `INSERT IGNORE INTO application_favorites (user_id, application_id) VALUES (?, ?)`, userID, appID)
@@ -528,11 +563,11 @@ func (s *Service) Favorite(ctx context.Context, appID, userID int64, isStaff boo
 }
 
 func (s *Service) Unfavorite(ctx context.Context, appID, userID int64, isStaff bool) error {
-	app, err := s.ApplicationByID(ctx, appID)
+	allowed, err := s.repo().AccessAllowed(ctx, appID, userID, isStaff)
 	if err != nil {
 		return err
 	}
-	if !VisibleTo(app, VisibleScopeManage, userID, isStaff) {
+	if !allowed {
 		return ErrNotFound
 	}
 	_, err = s.DB.ExecContext(ctx, `DELETE FROM application_favorites WHERE user_id = ? AND application_id = ?`, userID, appID)
@@ -681,10 +716,7 @@ func promoteDefaultIfEligibleTx(ctx context.Context, tx *sql.Tx, appID int64) er
 }
 
 func canManage(app *Application, callerID int64, isStaff bool) bool {
-	if isStaff {
-		return true
-	}
-	return app.CreatedBy != nil && *app.CreatedBy == callerID
+	return isStaff
 }
 
 func bindingFromInput(appID int64, in *BindingInput) *Binding {

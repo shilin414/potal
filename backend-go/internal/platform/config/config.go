@@ -27,16 +27,17 @@ type Config struct {
 	MetricsAddr  string
 	PPROFEnabled bool
 
-	Database DatabaseConfig
-	Redis    RedisConfig
-	Feishu   FeishuConfig
-	Aily     AilyConfig
-	Runner   RunnerConfig
-	Session  SessionConfig
-	Storage  StorageConfig
-	Auth     AuthConfig
-	OTel     OTelConfig
-	SSE      SSEConfig
+	Database   DatabaseConfig
+	Redis      RedisConfig
+	Feishu     FeishuConfig
+	Aily       AilyConfig
+	Runner     RunnerConfig
+	Session    SessionConfig
+	Storage    StorageConfig
+	Auth       AuthConfig
+	OTel       OTelConfig
+	SSE        SSEConfig
+	Enterprise EnterpriseConfig
 }
 
 type DatabaseConfig struct {
@@ -82,6 +83,10 @@ func (r RedisConfig) Addr() string { return fmt.Sprintf("%s:%d", r.Host, r.Port)
 
 func (r RedisConfig) Key(parts ...string) string {
 	return r.KeyPrefix + ":" + strings.Join(parts, ":")
+}
+
+type EnterpriseConfig struct {
+	ACLEnabled bool
 }
 
 type FeishuConfig struct {
@@ -287,6 +292,7 @@ func Load(searchPaths ...string) (*Config, error) {
 			ServiceName:  getEnv("OTEL_SERVICE_NAME", "studio-backend"),
 			SamplingRate: getEnvFloat("OTEL_SAMPLING_RATE", 0.1),
 		},
+		Enterprise: EnterpriseConfig{ACLEnabled: getEnvBool("ENTERPRISE_ACL_ENABLED", false)},
 		SSE: SSEConfig{
 			HubCacheEvents:   getEnvPositiveInt("SSE_HUB_CACHE_EVENTS", 2048),
 			HubCacheBytes:    getEnvPositiveInt64("SSE_HUB_CACHE_BYTES", 8<<20),

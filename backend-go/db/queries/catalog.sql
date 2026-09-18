@@ -12,8 +12,7 @@ FROM providers WHERE provider_key = ?;
 -- schedule admission must verify. Visibility is enforced server-side —
 -- staff see everything; regular users only public, enabled applications.
 -- The join itself cannot express the staff bypass, so the Go layer calls
--- it with show_all for staff and is_public=1 for regular users (mirrors
--- ListApplicationsByVisibility).
+-- it with show_all for staff and the feature-flagged enterprise ACL for regular users.
 --
 -- The provider is joined by provider_key, NOT provider_id (评测 P1):
 -- provider_id is nullable and was left NULL by bindings created through
@@ -36,7 +35,36 @@ FROM applications a
 JOIN runtime_bindings b ON b.application_id = a.id AND b.enabled = 1
 LEFT JOIN providers p ON p.provider_key = b.provider_key
 WHERE a.id = ? AND a.enabled = 1 AND a.kind = 'chat'
-  AND (sqlc.arg('show_all') OR a.is_public = 1)
+  AND (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 ORDER BY b.id DESC
 LIMIT 1;
 
@@ -216,7 +244,37 @@ SELECT a.id, a.slug, a.name, a.description, a.icon, a.avatar_key, a.color, a.kin
        c.slug AS category_slug, c.name AS category_name
 FROM applications a
 LEFT JOIN application_categories c ON c.id = a.category_id
-WHERE (sqlc.arg('show_all') OR a.is_public = ? OR a.created_by = ?)
+WHERE (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
+  AND (sqlc.arg('show_all') OR a.enabled = 1)
 ORDER BY a.created_at
 LIMIT ?;
 
@@ -233,9 +291,8 @@ LIMIT ?;
 -- layer does NOT re-filter (re-filtering would under-fill pages and break
 -- cursor determinism):
 --   staff            → everything (show_all);
---   regular users    → enabled = 1, plus
---     scope=mine     → own rows (private included),
---     scope=public/manage → is_public = 1.
+--   regular users    → feature-flagged accessible policy (legacy is_public
+--                      before rollout; Directory + grants after rollout).
 -- `mode` (二次复审 P0-5) is ORTHOGONAL to scope: scope is "who may SEE the
 -- row" (a management concern), mode is "may anyone actually USE it"
 -- (consumption).
@@ -290,9 +347,36 @@ LEFT JOIN runtime_bindings newer_b
 LEFT JOIN providers p
   ON p.provider_key = b.provider_key
 WHERE newer_b.id IS NULL
-  AND (sqlc.arg('show_all') OR (a.enabled = 1 AND (
-        (sqlc.arg('mine_only') AND a.created_by = sqlc.arg('page_caller_id'))
-        OR (sqlc.arg('public_only') AND a.is_public = 1))))
+  AND (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
   AND (sqlc.arg('consume_only') = 0
        OR (a.enabled = 1 AND (a.kind <> 'chat'
            OR (b.id IS NOT NULL AND p.id IS NOT NULL AND p.status = 'active'))))
@@ -354,7 +438,7 @@ WHERE user_id = ? AND application_id IN (sqlc.slice('favorite_app_ids'));
 --
 -- Every one of them applies, IN SQL:
 --
---   * the visibility policy  — `show_all` (staff) OR `is_public = 1`;
+--   * the visibility policy  — staff bypass or feature-flagged enterprise ACL;
 --   * the CONSUME policy     — `enabled = 1` AND, for kind='chat', an
 --                              enabled runtime binding whose provider exists
 --                              and is active (P0-5 + 三次复审 P0-R3); a
@@ -400,7 +484,36 @@ WHERE newer_b.id IS NULL
   AND b.id IS NOT NULL
   AND p.id IS NOT NULL
   AND p.status = 'active'
-  AND (sqlc.arg('show_all') OR a.is_public = 1)
+  AND (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 ORDER BY a.is_default_agent DESC, a.created_at, a.id
 LIMIT 1;
 
@@ -432,7 +545,36 @@ WHERE f.user_id = sqlc.arg('fav_user_id')
   AND b.id IS NOT NULL
   AND p.id IS NOT NULL
   AND p.status = 'active'
-  AND (sqlc.arg('show_all') OR a.is_public = 1)
+  AND (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 ORDER BY u.last_used_at DESC, a.name
 LIMIT ?;
 
@@ -460,7 +602,36 @@ WHERE newer_b.id IS NULL
   AND b.id IS NOT NULL
   AND p.id IS NOT NULL
   AND p.status = 'active'
-  AND (sqlc.arg('show_all') OR a.is_public = 1)
+  AND (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 ORDER BY u.usage_count DESC, u.last_used_at DESC, a.name
 LIMIT ?;
 
@@ -489,7 +660,36 @@ WHERE newer_b.id IS NULL
   AND b.id IS NOT NULL
   AND p.id IS NOT NULL
   AND p.status = 'active'
-  AND (sqlc.arg('show_all') OR a.is_public = 1)
+  AND (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 ORDER BY u.last_used_at DESC, a.created_at, a.id
 LIMIT ?;
 
@@ -519,7 +719,36 @@ WHERE newer_b.id IS NULL
   AND b.id IS NOT NULL
   AND p.id IS NOT NULL
   AND p.status = 'active'
-  AND (sqlc.arg('show_all') OR a.is_public = 1)
+  AND (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
   AND NOT EXISTS (SELECT 1 FROM runs r
                   WHERE r.user_id = sqlc.arg('caller_id') AND r.application_id = a.id)
   AND NOT EXISTS (SELECT 1 FROM application_favorites f
@@ -545,7 +774,36 @@ LEFT JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) A
   ON u.application_id = a.id
 WHERE a.enabled = 1
   AND a.kind <> 'chat'
-  AND (sqlc.arg('show_all') OR a.is_public = 1)
+  AND (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 ORDER BY u.last_used_at DESC, a.created_at, a.id
 LIMIT ?;
 
@@ -573,7 +831,36 @@ WHERE newer_b.id IS NULL
   AND b.id IS NOT NULL
   AND p.id IS NOT NULL
   AND p.status = 'active'
-  AND (sqlc.arg('show_all') OR a.is_public = 1)
+  AND (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 GROUP BY a.category_id, c.slug, c.name
 ORDER BY MIN(a.created_at), category_slug;
 
@@ -586,7 +873,36 @@ FROM applications a
 LEFT JOIN application_categories c ON c.id = a.category_id
 WHERE a.enabled = 1
   AND a.kind <> 'chat'
-  AND (sqlc.arg('show_all') OR a.is_public = 1)
+  AND (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
 GROUP BY a.category_id, c.slug, c.name
 ORDER BY MIN(a.created_at), category_slug;
 
@@ -621,7 +937,36 @@ LEFT JOIN providers p
 WHERE newer_b.id IS NULL
   AND a.id IN (sqlc.slice('app_ids'))
   AND a.enabled = 1
-  AND (sqlc.arg('show_all') OR a.is_public = 1)
+  AND (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
   AND (a.kind <> 'chat'
        OR (b.id IS NOT NULL AND p.id IS NOT NULL AND p.status = 'active'))
 ORDER BY a.created_at, a.id;
@@ -690,7 +1035,36 @@ LEFT JOIN runtime_bindings newer_b
 LEFT JOIN providers p
   ON p.provider_key = b.provider_key
 WHERE newer_b.id IS NULL
-  AND (sqlc.arg('show_all') OR a.is_public = 1)
+  AND (sqlc.arg('show_all') OR (
+    (sqlc.arg('acl_enabled') = 0 AND a.is_public = 1)
+    OR (sqlc.arg('acl_enabled') AND EXISTS (
+      SELECT 1
+      FROM directory_users acl_du
+      WHERE acl_du.local_user_id = sqlc.arg('acl_user_id')
+        AND acl_du.is_active = 1
+        AND acl_du.is_resigned = 0
+        AND acl_du.active_status = 2
+        AND (
+          a.access_mode = 'all'
+          OR (a.access_mode = 'assigned' AND (
+            EXISTS (SELECT 1 FROM application_user_grants acl_ug
+                    WHERE acl_ug.application_id = a.id
+                      AND acl_ug.directory_user_id = acl_du.id)
+            OR EXISTS (
+              SELECT 1
+              FROM directory_user_departments acl_dud
+              JOIN directory_department_closure acl_dc
+                ON acl_dc.descendant_id = acl_dud.department_id
+              JOIN application_department_grants acl_dg
+                ON acl_dg.department_id = acl_dc.ancestor_id
+               AND (acl_dg.include_children = 1 OR acl_dc.depth = 0)
+              WHERE acl_dud.directory_user_id = acl_du.id
+                AND acl_dg.application_id = a.id
+            )
+          ))
+        )
+    ))
+  ))
   AND a.enabled = 1
   AND (a.kind <> 'chat'
        OR (b.id IS NOT NULL AND p.id IS NOT NULL AND p.status = 'active'))

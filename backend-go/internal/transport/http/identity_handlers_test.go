@@ -89,7 +89,7 @@ func TestCSRFSameOriginLogoutFallback(t *testing.T) {
 
 func TestSessionAuthDoesNotRefreshLogoutSession(t *testing.T) {
 	store := &fakeSessionStore{session: &identity.Session{UserID: 7}}
-	repo := fakeIdentityUserResolver{user: &identity.User{ID: 7, Username: "admin"}}
+	repo := fakeIdentityUserResolver{user: &identity.User{ID: 7, Username: "admin", IsActive: true}}
 	handler := SessionAuth(store, repo)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if userFrom(r.Context()) == nil {
 			t.Fatal("session was not resolved")
@@ -106,13 +106,31 @@ func TestSessionAuthDoesNotRefreshLogoutSession(t *testing.T) {
 
 func TestSessionAuthRefreshesOrdinaryAuthenticatedRequest(t *testing.T) {
 	store := &fakeSessionStore{session: &identity.Session{UserID: 7}}
-	repo := fakeIdentityUserResolver{user: &identity.User{ID: 7, Username: "admin"}}
+	repo := fakeIdentityUserResolver{user: &identity.User{ID: 7, Username: "admin", IsActive: true}}
 	handler := SessionAuth(store, repo)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	request := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
 	request.AddCookie(&http.Cookie{Name: "studio_session", Value: "token"})
 	handler.ServeHTTP(httptest.NewRecorder(), request)
 	if store.refreshCount != 1 {
 		t.Fatalf("ordinary request refreshed session %d time(s), want 1", store.refreshCount)
+	}
+}
+
+func TestSessionAuthRevokesInactiveUserSession(t *testing.T) {
+	store := &fakeSessionStore{session: &identity.Session{UserID: 7}}
+	repo := fakeIdentityUserResolver{user: &identity.User{ID: 7, Username: "disabled", IsStaff: true, IsActive: false}}
+	reached := false
+	handler := SessionAuth(store, repo)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		if userFrom(r.Context()) != nil {
+			t.Fatal("inactive user authenticated")
+		}
+	}))
+	request := httptest.NewRequest(http.MethodGet, "/api/auth/session", nil)
+	request.AddCookie(&http.Cookie{Name: "studio_session", Value: "token"})
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+	if !reached || store.revokedToken != "token" || store.refreshCount != 0 {
+		t.Fatalf("reached=%v revoked=%q refresh=%d", reached, store.revokedToken, store.refreshCount)
 	}
 }
 

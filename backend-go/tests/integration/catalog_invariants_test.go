@@ -176,6 +176,13 @@ func seedChatAppWithRuntime(t *testing.T, svc *catalog.Service, creator int64, n
 	if err != nil {
 		t.Fatalf("seed chat app %s: %v", name, err)
 	}
+	mode := "admin_only"
+	if public {
+		mode = "all"
+	}
+	if _, err := svc.DB.ExecContext(context.Background(), `UPDATE applications SET is_public=?, access_mode=? WHERE id=?`, public, mode, app.ID); err != nil {
+		t.Fatalf("publish chat fixture: %v", err)
+	}
 	t.Cleanup(func() { _ = svc.Delete(context.Background(), app.ID, creator, true) })
 	return app
 }
@@ -252,7 +259,7 @@ func TestDefaultAgentFixedKindRefused(t *testing.T) {
 	prior := currentDefaultID(t, db)
 	staff := int64(777103)
 	_, _, err := svc.Create(context.Background(), &catalog.CreateInput{
-		Name: "itest_default_fixed", Kind: "task", IsPublic: true,
+		Name: "itest_default_fixed", Kind: "task", RendererKey: "itest-task", IsPublic: true,
 		SetDefaultAgent: true, CreatorID: staff, IsStaff: true,
 	})
 	if !errors.Is(err, catalog.ErrNotDefaultable) {
@@ -480,11 +487,14 @@ func TestSequentialIDSurfacesStayOpaqueAndFavoritesWork(t *testing.T) {
 	t.Cleanup(func() { _ = svc.Delete(ctx, private.ID, staff, true) })
 
 	fixed, _, err := svc.Create(ctx, &catalog.CreateInput{
-		Name: "itest_opaque_fixed", Kind: "task", IsPublic: true,
+		Name: "itest_opaque_fixed", Kind: "task", RendererKey: "itest-task", IsPublic: true,
 		CreatorID: staff, IsStaff: true,
 	})
 	if err != nil {
 		t.Fatalf("seed fixed app: %v", err)
+	}
+	if _, err := svc.DB.ExecContext(ctx, `UPDATE applications SET enabled=1,is_public=1,access_mode='all' WHERE id=?`, fixed.ID); err != nil {
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = svc.Delete(ctx, fixed.ID, staff, true) })
 
@@ -529,11 +539,14 @@ func TestFixedConsumeDoesNotNeedIncludeUnbound(t *testing.T) {
 	ctx := context.Background()
 
 	fixed, _, err := svc.Create(ctx, &catalog.CreateInput{
-		Name: "itest_fixed_unbound", Kind: "task", IsPublic: true,
+		Name: "itest_fixed_unbound", Kind: "task", RendererKey: "itest-task", IsPublic: true,
 		CreatorID: staff, IsStaff: true,
 	})
 	if err != nil {
 		t.Fatalf("seed unbound fixed app: %v", err)
+	}
+	if _, err := svc.DB.ExecContext(ctx, `UPDATE applications SET enabled=1,is_public=1,access_mode='all' WHERE id=?`, fixed.ID); err != nil {
+		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = svc.Delete(ctx, fixed.ID, staff, true) })
 

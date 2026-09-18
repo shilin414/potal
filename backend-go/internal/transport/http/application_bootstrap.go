@@ -99,7 +99,7 @@ func (s *Server) GetWorkspaceBootstrap(w http.ResponseWriter, r *http.Request) {
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	categories, err := s.CatalogRepo.BootstrapCategories(ctx, caller.IsStaff)
+	categories, err := s.CatalogRepo.BootstrapCategories(ctx, caller.ID, caller.IsStaff)
 	if err != nil {
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -109,7 +109,7 @@ func (s *Server) GetWorkspaceBootstrap(w http.ResponseWriter, r *http.Request) {
 	// group slices, not in the `IN (...)`, so rows are indexed by id and
 	// re-emitted in group order below.
 	ids := bootstrapGroupIDs(groups)
-	rows, err := s.CatalogRepo.ListApplicationRowsByIDs(ctx, ids, caller.IsStaff)
+	rows, err := s.CatalogRepo.ListApplicationRowsByIDs(ctx, ids, caller.ID, caller.IsStaff)
 	if err != nil {
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -347,7 +347,12 @@ func (s *Server) ResolveApplication(w http.ResponseWriter, r *http.Request, para
 		return
 	}
 	app := bundle.Application
-	if !catalog.VisibleTo(app, catalog.VisibleScopeManage, caller.ID, caller.IsStaff) {
+	allowed, accessErr := s.CatalogRepo.AccessAllowed(ctx, app.ID, caller.ID, caller.IsStaff)
+	if accessErr != nil {
+		writeSimpleError(w, http.StatusInternalServerError, accessErr.Error())
+		return
+	}
+	if !allowed {
 		writeDetail(w, http.StatusNotFound, "application not found")
 		return
 	}
@@ -414,7 +419,7 @@ func (s *Server) ResolveApplicationMention(w http.ResponseWriter, r *http.Reques
 	// as the consume page, so a disabled / unbound / inactive-provider agent
 	// can never be offered here.
 	candidates, err := s.CatalogRepo.ResolveMentionCandidates(
-		ctx, q, caller.IsStaff, mentionCandidateLimit,
+		ctx, q, caller.ID, caller.IsStaff, mentionCandidateLimit,
 	)
 	if err != nil {
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())

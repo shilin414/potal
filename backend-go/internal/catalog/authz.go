@@ -32,7 +32,8 @@ var (
 	ErrExecutionProviderInactive = errors.New("provider is not active")
 	// ErrExecutionProviderMissing is returned to staff callers when the
 	// binding's provider_key has no providers row at all.
-	ErrExecutionProviderMissing = errors.New("provider is not registered")
+	ErrExecutionProviderMissing   = errors.New("provider is not registered")
+	ErrApplicationAccessForbidden = errors.New("application access is forbidden")
 )
 
 // Executable is the result of a successful AuthorizeExecution: the
@@ -56,7 +57,7 @@ type Executable struct {
 //	application exists
 //	application.enabled = 1        disabled apps NEVER execute (any caller)
 //	application.kind = 'chat'
-//	regular caller → is_public = 1 visibility == execution right
+//	regular caller → legacy is_public (flag off) or enterprise ACL (flag on)
 //	runtime binding enabled = 1
 //	provider ACTIVE                matched by provider_key (fail closed)
 //
@@ -70,8 +71,8 @@ type Executable struct {
 // executing. provider_key is the business key that is always present.
 func (s *Service) AuthorizeExecution(ctx context.Context, applicationID, userID int64, isStaff bool) (*Executable, error) {
 	row, err := s.repo().q(ctx).GetExecutionAuthBundle(ctx, db.GetExecutionAuthBundleParams{
-		ID:      uint64(applicationID),
-		ShowAll: isStaff,
+		ID: uint64(applicationID), ShowAll: boolArg(isStaff),
+		AclEnabled: boolArg(s.ACLEnabled), AclUserID: sql.NullInt64{Int64: userID, Valid: true},
 	})
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, s.explainRejection(ctx, applicationID, isStaff)
@@ -106,6 +107,27 @@ func (s *Service) AuthorizeExecution(ctx context.Context, applicationID, userID 
 	}, nil
 }
 
+// AuthorizeApplicationAccess is the mandatory gate for fixed-application
+// business APIs. It shares the same enterprise policy as catalog discovery;
+// callers must invoke it before entering application-specific logic.
+func (s *Service) AuthorizeApplicationAccess(ctx context.Context, applicationID, userID int64, isStaff bool) error {
+	app, err := s.ApplicationByID(ctx, applicationID)
+	if err != nil {
+		return err
+	}
+	if !app.Enabled {
+		return ErrApplicationAccessForbidden
+	}
+	allowed, err := s.repo().AccessAllowed(ctx, applicationID, userID, isStaff)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return ErrApplicationAccessForbidden
+	}
+	return nil
+}
+
 // RunGateState is the mutable execution-permission state of one run,
 // read by the worker's execution-time kill switch (复审 P1-2). NULL
 // joined rows mean the referenced application/binding/provider no longer
@@ -114,6 +136,7 @@ type RunGateState struct {
 	AppEnabled     sql.NullBool
 	BindingEnabled sql.NullBool
 	ProviderStatus sql.NullString
+	ACLAllowed     sql.NullBool
 }
 
 // RunGateState loads the gate facts for one run (by raw BINARY(16) id).
@@ -121,7 +144,10 @@ type RunGateState struct {
 // snapshot decides HOW a run executes; this decides only whether it may
 // still start.
 func (s *Service) RunGateState(ctx context.Context, runID []byte) (*RunGateState, error) {
-	row, err := s.repo().q(ctx).GetRunGateState(ctx, runID)
+	row, err := s.repo().q(ctx).GetRunGateState(ctx, db.GetRunGateStateParams{ID: runID, AclEnabled: boolArg(s.ACLEnabled)})
+	if errors.Is(err, sql.ErrNoRows) {
+		return &RunGateState{ACLAllowed: sql.NullBool{Bool: false, Valid: true}}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -129,6 +155,7 @@ func (s *Service) RunGateState(ctx context.Context, runID []byte) (*RunGateState
 		AppEnabled:     row.AppEnabled,
 		BindingEnabled: row.BindingEnabled,
 		ProviderStatus: row.ProviderStatus,
+		ACLAllowed:     sql.NullBool{Bool: true, Valid: true},
 	}, nil
 }
 

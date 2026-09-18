@@ -47,6 +47,7 @@ type Application struct {
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	Enabled        bool
+	AccessMode     string
 }
 
 type ApplicationCategory struct {
@@ -60,11 +61,26 @@ type ApplicationCategory struct {
 	UpdatedAt   time.Time
 }
 
+type ApplicationDepartmentGrant struct {
+	ApplicationID   uint64
+	DepartmentID    uint64
+	IncludeChildren bool
+	CreatedBy       sql.NullInt64
+	CreatedAt       time.Time
+}
+
 type ApplicationFavorite struct {
 	ID            uint64
 	UserID        uint64
 	ApplicationID uint64
 	CreatedAt     time.Time
+}
+
+type ApplicationUserGrant struct {
+	ApplicationID   uint64
+	DirectoryUserID uint64
+	CreatedBy       sql.NullInt64
+	CreatedAt       time.Time
 }
 
 type AuditLog struct {
@@ -115,6 +131,105 @@ type DeliveryExecution struct {
 	CreatedAt          time.Time
 	SentAt             sql.NullTime
 	UpdatedAt          time.Time
+}
+
+type DirectoryDepartment struct {
+	ID                     uint64
+	OpenDepartmentID       string
+	Name                   string
+	ParentID               sql.NullInt64
+	ParentOpenDepartmentID string
+	OrderWeight            string
+	IsActive               bool
+	SyncGeneration         sql.NullInt64
+	LastSyncedAt           sql.NullTime
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
+}
+
+type DirectoryDepartmentClosure struct {
+	AncestorID   uint64
+	DescendantID uint64
+	Depth        uint32
+}
+
+type DirectorySyncConfig struct {
+	ID              uint64
+	Enabled         bool
+	ScheduleType    string
+	IntervalMinutes uint32
+	DailyTime       string
+	Timezone        string
+	NextRunAt       sql.NullTime
+	LastRunAt       sql.NullTime
+	LastSuccessAt   sql.NullTime
+	LeaseOwner      sql.NullString
+	LeaseUntil      sql.NullTime
+	UpdatedBy       sql.NullInt64
+	UpdatedAt       time.Time
+}
+
+type DirectorySyncDepartmentStage struct {
+	RunID                  uint64
+	OpenDepartmentID       string
+	Name                   string
+	ParentOpenDepartmentID string
+	OrderWeight            string
+}
+
+type DirectorySyncRun struct {
+	ID                     uint64
+	TriggerType            string
+	Status                 string
+	DepartmentsCount       uint32
+	UsersCount             uint32
+	MembershipsCount       uint32
+	StartedAt              sql.NullTime
+	FinishedAt             sql.NullTime
+	ErrorCode              string
+	ErrorMessage           string
+	CreatedBy              sql.NullInt64
+	CreatedAt              time.Time
+	ActiveUsersCount       uint32
+	ActiveMembershipsCount uint32
+}
+
+type DirectorySyncUserDepartmentStage struct {
+	RunID            uint64
+	UserOpenID       string
+	DepartmentOpenID string
+	IsPrimary        bool
+}
+
+type DirectorySyncUserStage struct {
+	RunID        uint64
+	OpenID       string
+	Name         string
+	AvatarUrl    string
+	ActiveStatus int32
+	IsResigned   bool
+}
+
+type DirectoryUser struct {
+	ID             uint64
+	OpenID         string
+	Name           string
+	AvatarUrl      string
+	ActiveStatus   int32
+	IsResigned     bool
+	LocalUserID    sql.NullInt64
+	IsActive       bool
+	SyncGeneration sql.NullInt64
+	LastSyncedAt   sql.NullTime
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+type DirectoryUserDepartment struct {
+	DirectoryUserID uint64
+	DepartmentID    uint64
+	IsPrimary       bool
+	CreatedAt       time.Time
 }
 
 type FeishuIdentity struct {

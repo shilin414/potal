@@ -50,6 +50,11 @@ func SessionAuth(store IdentitySessionStore, repo identityUserResolver) func(htt
 			if err == nil && c.Value != "" {
 				if sess, err := store.Get(r.Context(), c.Value); err == nil {
 					if user, ident, err := repo.UserWithIdentity(r.Context(), sess.UserID); err == nil {
+						if user == nil || !user.IsActive {
+							_ = store.Revoke(r.Context(), c.Value)
+							next.ServeHTTP(w, r)
+							return
+						}
 						ctx := context.WithValue(r.Context(), userCtxKey, &AuthenticatedUser{User: user, Identity: ident})
 						ctx = context.WithValue(ctx, sessionCtxKey, c.Value)
 						// Logout must never extend the token immediately before a

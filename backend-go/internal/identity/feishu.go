@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -409,4 +410,213 @@ func (c *FeishuClient) SendIMMessage(ctx context.Context, token, receiveIDType, 
 		return fmt.Errorf("feishu: send im: code %d: %s", env.Code, env.Msg)
 	}
 	return nil
+}
+
+// FeishuAPIError is a structured Open Platform business error. Directory
+// synchronization keeps the code so the admin console can distinguish missing
+// permissions from transient transport failures without parsing strings.
+type FeishuAPIError struct {
+	Path string
+	Code int
+	Msg  string
+}
+
+func (e *FeishuAPIError) Error() string {
+	return fmt.Sprintf("feishu: %s: code %d: %s", e.Path, e.Code, e.Msg)
+}
+
+// authorizedPOST issues an app/user-authorized JSON POST. Directory pages can
+// be large, so the response is bounded at 8 MiB instead of using an unlimited
+// ReadAll.
+func (c *FeishuClient) authorizedPOST(ctx context.Context, token, path string, body any) (json.RawMessage, error) {
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	for attempt := 0; attempt < 6; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(buf))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("feishu: %s: %w", path, err)
+		}
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("feishu: %s read: %w", path, readErr)
+		}
+		var env feishuEnvelope
+		decodeErr := json.Unmarshal(raw, &env)
+		rateLimited := resp.StatusCode == http.StatusTooManyRequests || (decodeErr == nil && env.Code == 99991400)
+		if rateLimited && attempt < 5 {
+			delay := time.Duration(250*(1<<attempt)) * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+			continue
+		}
+		if decodeErr != nil {
+			if resp.StatusCode >= 400 {
+				return nil, fmt.Errorf("feishu: %s: HTTP %d: %s", path, resp.StatusCode, strings.TrimSpace(string(raw)))
+			}
+			return nil, fmt.Errorf("feishu: %s decode: %w", path, decodeErr)
+		}
+		if env.Code != 0 {
+			return nil, &FeishuAPIError{Path: path, Code: env.Code, Msg: env.Msg}
+		}
+		if resp.StatusCode >= 400 {
+			return nil, fmt.Errorf("feishu: %s: HTTP %d", path, resp.StatusCode)
+		}
+		return env.Data, nil
+	}
+	return nil, fmt.Errorf("feishu: %s: retry exhausted", path)
+}
+
+type DirectoryI18nText struct {
+	DefaultValue string            `json:"default_value"`
+	I18nValue    map[string]string `json:"i18n_value"`
+}
+
+func (t DirectoryI18nText) Display() string {
+	if strings.TrimSpace(t.DefaultValue) != "" {
+		return strings.TrimSpace(t.DefaultValue)
+	}
+	for _, key := range []string{"zh_cn", "en_us", "ja_jp"} {
+		if v := strings.TrimSpace(t.I18nValue[key]); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+type DirectoryDepartment struct {
+	DepartmentID       string            `json:"department_id"`
+	Name               DirectoryI18nText `json:"name"`
+	ParentDepartmentID string            `json:"parent_department_id"`
+	OrderWeight        string            `json:"order_weight"`
+	EnabledStatus      *bool             `json:"enabled_status"`
+}
+
+type DirectoryDepartmentPage struct {
+	Departments []DirectoryDepartment
+	HasMore     bool
+	PageToken   string
+	Abnormals   []DirectoryAbnormal
+}
+
+type DirectoryAbnormal struct {
+	ID          string         `json:"id"`
+	RowError    int            `json:"row_error"`
+	FieldErrors map[string]int `json:"field_errors"`
+}
+
+type DirectoryEmployeeDepartment struct {
+	DepartmentID string `json:"department_id"`
+}
+
+type DirectoryEmployeeName struct {
+	Name DirectoryI18nText `json:"name"`
+}
+
+type DirectoryEmployeeBaseInfo struct {
+	EmployeeID   string                        `json:"employee_id"`
+	Name         DirectoryEmployeeName         `json:"name"`
+	Avatar       json.RawMessage               `json:"avatar"`
+	Departments  []DirectoryEmployeeDepartment `json:"departments"`
+	ActiveStatus int                           `json:"active_status"`
+	IsResigned   *bool                         `json:"is_resigned"`
+}
+
+type DirectoryEmployee struct {
+	BaseInfo DirectoryEmployeeBaseInfo `json:"base_info"`
+}
+
+type DirectoryEmployeePage struct {
+	Employees []DirectoryEmployee
+	HasMore   bool
+	PageToken string
+	Abnormals []DirectoryAbnormal
+}
+
+func (e DirectoryEmployee) OpenID() string      { return e.BaseInfo.EmployeeID }
+func (e DirectoryEmployee) DisplayName() string { return e.BaseInfo.Name.Name.Display() }
+func (e DirectoryEmployee) AvatarURL() string   { return avatarFromRaw(e.BaseInfo.Avatar) }
+
+func quoteDirectoryFilterValue(value string) string {
+	raw, _ := json.Marshal(value)
+	return string(raw)
+}
+func jsonDirectoryFilterValue(values []string) string {
+	raw, _ := json.Marshal(values)
+	return string(raw)
+}
+
+func directoryPageRequest(pageToken string) map[string]any {
+	return map[string]any{"page_size": 100, "page_token": pageToken}
+}
+
+// ListDirectoryDepartments reads one full-directory page with application
+// identity. Empty filter conditions mean "all departments" per directory/v1.
+func (c *FeishuClient) ListDirectoryDepartments(ctx context.Context, token, parentOpenID, pageToken string) (*DirectoryDepartmentPage, error) {
+	const path = "/open-apis/directory/v1/departments/filter?employee_id_type=open_id&department_id_type=open_department_id"
+	data, err := c.authorizedPOST(ctx, token, path, map[string]any{
+		"filter": map[string]any{"conditions": []any{map[string]any{
+			"field": "parent_department_id", "operator": "eq", "value": quoteDirectoryFilterValue(parentOpenID),
+		}}},
+		"required_fields": []string{"department_id", "name", "parent_department_id", "order_weight"},
+		"page_request":    directoryPageRequest(pageToken),
+	})
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Departments  []DirectoryDepartment `json:"departments"`
+		PageResponse struct {
+			HasMore   bool   `json:"has_more"`
+			PageToken string `json:"page_token"`
+		} `json:"page_response"`
+		Abnormals []DirectoryAbnormal `json:"abnormals"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("feishu: directory departments decode: %w", err)
+	}
+	return &DirectoryDepartmentPage{Departments: payload.Departments, HasMore: payload.PageResponse.HasMore, PageToken: payload.PageResponse.PageToken, Abnormals: payload.Abnormals}, nil
+}
+
+// ListDirectoryEmployees reads one employee page using open_id, matching the
+// identifier stored by Feishu OAuth in feishu_identities.open_id.
+func (c *FeishuClient) ListDirectoryEmployees(ctx context.Context, token string, departmentIDs []string, staffStatus int, pageToken string) (*DirectoryEmployeePage, error) {
+	const path = "/open-apis/directory/v1/employees/filter?employee_id_type=open_id&department_id_type=open_department_id"
+	data, err := c.authorizedPOST(ctx, token, path, map[string]any{
+		"filter": map[string]any{"conditions": []any{
+			map[string]any{"field": "base_info.departments.department_id", "operator": "in", "value": jsonDirectoryFilterValue(departmentIDs)},
+			map[string]any{"field": "work_info.staff_status", "operator": "eq", "value": strconv.Itoa(staffStatus)},
+		}},
+		"required_fields": []string{
+			"base_info.employee_id", "base_info.name", "base_info.avatar",
+			"base_info.departments.department_id", "base_info.active_status", "base_info.is_resigned",
+		},
+		"page_request": directoryPageRequest(pageToken),
+	})
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Employees    []DirectoryEmployee `json:"employees"`
+		PageResponse struct {
+			HasMore   bool   `json:"has_more"`
+			PageToken string `json:"page_token"`
+		} `json:"page_response"`
+		Abnormals []DirectoryAbnormal `json:"abnormals"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("feishu: directory employees decode: %w", err)
+	}
+	return &DirectoryEmployeePage{Employees: payload.Employees, HasMore: payload.PageResponse.HasMore, PageToken: payload.PageResponse.PageToken, Abnormals: payload.Abnormals}, nil
 }

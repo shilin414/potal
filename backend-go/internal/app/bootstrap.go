@@ -25,9 +25,12 @@ func NewServer(cfg *config.Config, a *App) *transporthttp.Server {
 		Feishu:       a.Feishu,
 		FeishuAuth:   a.AilyExecutor.Auth,
 
-		Catalog:     a.Catalog,
-		CatalogRepo: a.CatalogRepo,
-		Registry:    a.Registry,
+		Catalog:          a.Catalog,
+		CatalogRepo:      a.CatalogRepo,
+		Registry:         a.Registry,
+		Directory:        a.Directory,
+		DirectoryRepo:    a.DirectoryRepo,
+		EnterpriseAccess: a.EnterpriseAccess,
 
 		Runs:               a.Runs,
 		Storage:            a.Storage,

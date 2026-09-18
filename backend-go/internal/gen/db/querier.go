@@ -70,9 +70,9 @@ type Querier interface {
 	// first appearance (MIN(created_at)) — the order the market itself lists
 	// applications in. Rows with no category come back with an EMPTY slug and
 	// are rendered as the `__uncategorized__` sentinel by the caller.
-	BootstrapAgentCategories(ctx context.Context, showAll interface{}) ([]BootstrapAgentCategoriesRow, error)
+	BootstrapAgentCategories(ctx context.Context, arg BootstrapAgentCategoriesParams) ([]BootstrapAgentCategoriesRow, error)
 	// Same rail for 应用中心 (kind <> 'chat'), which needs no runtime binding.
-	BootstrapAppCategories(ctx context.Context, showAll interface{}) ([]BootstrapAppCategoriesRow, error)
+	BootstrapAppCategories(ctx context.Context, arg BootstrapAppCategoriesParams) ([]BootstrapAppCategoriesRow, error)
 	// ─────────────────────────────────────────────────────────────────────────
 	// Workspace bootstrap groups (二次复审 P1-1)
 	//
@@ -92,7 +92,7 @@ type Querier interface {
 	//
 	// Every one of them applies, IN SQL:
 	//
-	//   * the visibility policy  — `show_all` (staff) OR `is_public = 1`;
+	//   * the visibility policy  — staff bypass or feature-flagged enterprise ACL;
 	//   * the CONSUME policy     — `enabled = 1` AND, for kind='chat', an
 	//                              enabled runtime binding whose provider exists
 	//                              and is active (P0-5 + 三次复审 P0-R3); a
@@ -552,8 +552,7 @@ type Querier interface {
 	// schedule admission must verify. Visibility is enforced server-side —
 	// staff see everything; regular users only public, enabled applications.
 	// The join itself cannot express the staff bypass, so the Go layer calls
-	// it with show_all for staff and is_public=1 for regular users (mirrors
-	// ListApplicationsByVisibility).
+	// it with show_all for staff and the feature-flagged enterprise ACL for regular users.
 	//
 	// The provider is joined by provider_key, NOT provider_id (评测 P1):
 	// provider_id is nullable and was left NULL by bindings created through
@@ -588,13 +587,11 @@ type Querier interface {
 	// authority (第六轮 P2: started_at is written by MySQL, so measuring it
 	// against the worker host clock skews or even negates the duration).
 	GetRunForUpdate(ctx context.Context, id []byte) (GetRunForUpdateRow, error)
-	// Execution-time kill switch (复审 P1-2): the ONLY mutable facts re-checked
-	// after the claim and before any provider interaction. Deliberately does
-	// NOT read runtime_snapshot — the frozen snapshot stays authoritative for
-	// HOW to execute; this only answers whether the run MAY still start.
-	// Semantics: missing/disabled application or binding → kill (cancel);
-	// missing or inactive provider → pause (requeue, keep waiting).
-	GetRunGateState(ctx context.Context, id []byte) (GetRunGateStateRow, error)
+	// Execution-time kill switch: mutable application/binding/provider state plus
+	// the current enterprise ACL. ACL denial intentionally produces no row; the
+	// catalog service maps only sql.ErrNoRows to GateKill, while real DB failures
+	// remain retryable infrastructure errors.
+	GetRunGateState(ctx context.Context, arg GetRunGateStateParams) (GetRunGateStateRow, error)
 	GetRunLeaseEpoch(ctx context.Context, id []byte) (uint64, error)
 	// Replay lookup. request_hash is returned so the caller can distinguish
 	// "same request" (replay) from "same key, different payload" (409).
@@ -683,9 +680,8 @@ type Querier interface {
 	// layer does NOT re-filter (re-filtering would under-fill pages and break
 	// cursor determinism):
 	//   staff            → everything (show_all);
-	//   regular users    → enabled = 1, plus
-	//     scope=mine     → own rows (private included),
-	//     scope=public/manage → is_public = 1.
+	//   regular users    → feature-flagged accessible policy (legacy is_public
+	//                      before rollout; Directory + grants after rollout).
 	// `mode` (二次复审 P0-5) is ORTHOGONAL to scope: scope is "who may SEE the
 	// row" (a management concern), mode is "may anyone actually USE it"
 	// (consumption).

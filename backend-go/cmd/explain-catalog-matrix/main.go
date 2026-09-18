@@ -291,12 +291,12 @@ func runSyntheticRepositoryBenchmarks(ctx context.Context, db *sql.DB, callerID 
 		if err != nil {
 			return err
 		}
-		categories, err := repo.BootstrapCategories(ctx, false)
+		categories, err := repo.BootstrapCategories(ctx, callerID, false)
 		if err != nil {
 			return err
 		}
 		ids := bootstrapIDs(groups)
-		rows, err := repo.ListApplicationRowsByIDs(ctx, ids, false)
+		rows, err := repo.ListApplicationRowsByIDs(ctx, ids, callerID, false)
 		if err != nil {
 			return err
 		}
@@ -339,7 +339,7 @@ func runSyntheticRepositoryBenchmarks(ctx context.Context, db *sql.DB, callerID 
 	}
 
 	return runTimedBenchmark("resolve-mention", iterations, func() error {
-		rows, err := repo.ResolveMentionCandidates(ctx, search, false, 10)
+		rows, err := repo.ResolveMentionCandidates(ctx, search, callerID, false, 10)
 		if err != nil {
 			return err
 		}

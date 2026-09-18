@@ -17,6 +17,8 @@ import (
 	"github.com/creation-agent-studio/backend-go/internal/automation/scheduler"
 	"github.com/creation-agent-studio/backend-go/internal/catalog"
 	"github.com/creation-agent-studio/backend-go/internal/delivery"
+	"github.com/creation-agent-studio/backend-go/internal/directory"
+	"github.com/creation-agent-studio/backend-go/internal/enterpriseaccess"
 	"github.com/creation-agent-studio/backend-go/internal/execution"
 	"github.com/creation-agent-studio/backend-go/internal/identity"
 	aily "github.com/creation-agent-studio/backend-go/internal/integrations/aily"
@@ -49,6 +51,11 @@ type App struct {
 	Catalog     *catalog.Service
 	CatalogRepo *catalog.Repo
 	Registry    *catalog.RuntimeRegistry
+
+	Directory          *directory.Service
+	DirectoryRepo      *directory.Repo
+	DirectoryScheduler *directory.Scheduler
+	EnterpriseAccess   *enterpriseaccess.Service
 
 	Runs         *execution.Service
 	ArtifactsRL  *execution.RateLimiter
@@ -136,11 +143,10 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 	}
 
 	registry := catalog.NewRuntimeRegistry()
-	catalogRepo := &catalog.Repo{DB: dbh}
+	catalogRepo := &catalog.Repo{DB: dbh, ACLEnabled: cfg.Enterprise.ACLEnabled}
 	catalogSvc := &catalog.Service{
-		DB:       dbh,
-		Registry: registry,
-		Storage:  st,
+		DB: dbh, Registry: registry, Storage: st,
+		ACLEnabled: cfg.Enterprise.ACLEnabled,
 	}
 
 	runs := execution.NewService(dbh, rdb, log, metrics)
@@ -188,6 +194,11 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 		Log:         log,
 		Metrics:     metrics,
 	}
+
+	directoryRepo := &directory.Repo{DB: dbh}
+	directorySvc := directory.NewService(directoryRepo, feishu, log)
+	directoryScheduler := directory.NewScheduler(directoryRepo, directorySvc, cfg.Runner.WorkerID, log)
+	accessSvc := &enterpriseaccess.Service{DB: dbh}
 
 	// Schedule automation wiring: scheduler domain + delivery fan-out.
 	// The Aily auth resolver doubles as the delivery UAT source — both
@@ -251,7 +262,9 @@ func Build(ctx context.Context, cfg *config.Config) (*App, error) {
 		IdentityRepo: identityRepo, Sessions: sessions, StateCodec: stateCodec,
 		Oauth: oauth, Feishu: feishu,
 		Catalog: catalogSvc, CatalogRepo: catalogRepo, Registry: registry,
-		Runs: runs, ArtifactsRL: ailyExecutor.ArtifactsL, AilyExecutor: ailyExecutor,
+		Directory: directorySvc, DirectoryRepo: directoryRepo, DirectoryScheduler: directoryScheduler,
+		EnterpriseAccess: accessSvc,
+		Runs:             runs, ArtifactsRL: ailyExecutor.ArtifactsL, AilyExecutor: ailyExecutor,
 		RunAdmissionRL: execution.NewRateLimiter(rdb, rdb.Key("rate", "runs", "user"),
 			cfg.Runner.UserRunQPS, time.Second),
 		Schedules: schedSvc, Scheduler: schedJob,
@@ -399,6 +412,8 @@ func authorizeForOwner(ctx context.Context, svc *catalog.Service, users *identit
 			// Owner gone → strictest non-staff rules (policy, not failure).
 		case err != nil:
 			return nil, err
+		case u != nil && !u.IsActive:
+			return nil, catalog.ErrExecutionForbidden
 		case u != nil:
 			isStaff = u.IsStaff
 		}
@@ -443,6 +458,9 @@ func (g *ExecutionGate) CheckRun(ctx context.Context, run *execution.Run) (execu
 		return execution.GateKill, nil
 	}
 	if !st.BindingEnabled.Valid || !st.BindingEnabled.Bool {
+		return execution.GateKill, nil
+	}
+	if !st.ACLAllowed.Valid || !st.ACLAllowed.Bool {
 		return execution.GateKill, nil
 	}
 	if !st.ProviderStatus.Valid || st.ProviderStatus.String != "active" {
