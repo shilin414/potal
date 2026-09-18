@@ -4,6 +4,18 @@
    这里只放业务特有样式。
    ============================================ */
 
+/* 企业控制台中间容器（二次复审 P2-14）：Enterprise 比其他三个中心多一层
+   wrapper，必须显式接住高度链 MobileAppShell main → 本容器 → MobilePage
+   （min-height:0 允许子页面的 overflow-y:auto 生效），否则在飞书 WebView
+   里 Page height:auto + parent overflow:hidden 会截断内容。 */
+.enterprise-console-mobile {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
+}
+
 /* 权限编辑器 (§41) */
 
 .mobile-permission__mode {
@@ -177,7 +189,9 @@
   border: none;
   border-radius: 999px;
   background: var(--color-primary);
-  color: var(--color-bg-card);
+  /* 主按钮前景色用 on-primary token（二次复审 P2-7）：--color-bg-card 在深色
+     主题下是深色，压在 primary 上对比度不够。 */
+  color: var(--color-on-primary);
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;

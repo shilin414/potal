@@ -37,15 +37,20 @@ export default function MobilePermissionEditor({
   const [depPickerOpen, setDepPickerOpen] = useState(false);
   const [userPickerOpen, setUserPickerOpen] = useState(false);
 
-  // 与桌面 AccessPage.open 相同的加载契约：权限 + 部门 + 人员。
+  // 与桌面 AccessPage 相同的加载契约：权限 + 部门。人员列表不再预取
+  // （二次复审 P2-4）——MobileUserPicker 打开时自己查询 users，这里取回的
+  // 第三份数据从未被使用，纯浪费一次 /users 请求。
+  // 依赖 applicationId 而非 application 对象（P2-5）：父组件每次 render 都会
+  // 产生新的 { id, name } 字面量，effect 若依赖对象 identity，编辑过程中父
+  // 级任何重渲染都会重置 policy 并丢掉用户未保存的修改；名称只用于标题显示。
+  const applicationId = application?.id;
   useEffect(() => {
-    if (!open || !application) return;
+    if (!open || !applicationId) return;
     let stale = false;
     setPolicy(null);
     Promise.all([
-      enterpriseApi.access(application.id),
+      enterpriseApi.access(applicationId),
       enterpriseApi.departments(),
-      enterpriseApi.users({ limit: 100 }),
     ])
       .then(([p, d]) => {
         if (stale) return;
@@ -54,13 +59,13 @@ export default function MobilePermissionEditor({
       })
       .catch(() => message.error('加载权限失败'));
     return () => { stale = true; };
-  }, [open, application]);
+  }, [open, applicationId]);
 
   const save = useCallback(async () => {
-    if (!application || !policy) return;
+    if (!applicationId || !policy) return;
     setSaving(true);
     try {
-      const next = await enterpriseApi.updateAccess(application.id, {
+      const next = await enterpriseApi.updateAccess(applicationId, {
         access_mode: policy.access_mode,
         department_grants: policy.departments.map((d) => ({
           department_id: d.department_id,
@@ -76,7 +81,7 @@ export default function MobilePermissionEditor({
     } finally {
       setSaving(false);
     }
-  }, [application, policy, onClose]);
+  }, [applicationId, policy, onClose]);
 
   const setDepIds = (ids: number[]) => {
     if (!policy) return;

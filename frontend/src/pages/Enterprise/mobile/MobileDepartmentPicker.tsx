@@ -37,9 +37,14 @@ export default function MobileDepartmentPicker({
   const [query, setQuery] = useState('');
   const [picked, setPicked] = useState<number[]>(selectedIds);
 
-  // Re-seed the local selection each time the sheet opens.
+  // Re-seed the local selection each time the sheet opens — and clear the
+  // search so a reopen starts from the full flat list (P2-6), matching
+  // MobileUserPicker's behaviour.
   React.useEffect(() => {
-    if (open) setPicked(selectedIds);
+    if (open) {
+      setPicked(selectedIds);
+      setQuery('');
+    }
   }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const byId = useMemo(
