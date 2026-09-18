@@ -212,9 +212,12 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
   const summaryById = useWorkspaceBootstrapStore((state) => state.summaryById);
   const entities = useApplicationEntityStore((state) => state.byId);
 
+  // Bootstrap only serves server mode (categories / server recency) — a
+  // legacy local pool derives everything from the pool itself and must stay
+  // fully offline (二次复审 P2-4).
   useEffect(() => {
-    if (active) void loadBootstrap();
-  }, [active, loadBootstrap]);
+    if (active && serverMode) void loadBootstrap();
+  }, [active, serverMode, loadBootstrap]);
 
   // The active row is injected only in the unfiltered view (§4.3).
   const canPinActive = serverMode

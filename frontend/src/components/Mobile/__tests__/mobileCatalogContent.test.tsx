@@ -225,7 +225,11 @@ describe('MobileCatalogContent — data boundary hardening (二次复审 P1-3/P2
         onSelect={() => {}}
       />,
     );
+    // The test name must cover BOTH server surfaces: the paged catalog AND
+    // the workspace bootstrap (P2-4) — a local pool derives categories and
+    // recency from the pool itself.
     expect(mocks.fetchApplicationPage).not.toHaveBeenCalled();
+    expect(mocks.fetchWorkspaceBootstrap).not.toHaveBeenCalled();
   });
 
   it('a first-page request failure is an error state, not an empty catalog (P1-3)', async () => {
