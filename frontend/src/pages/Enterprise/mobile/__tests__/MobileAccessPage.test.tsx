@@ -51,8 +51,11 @@ vi.mock('@/components/Agents/AgentAvatar', () => ({
 }));
 
 vi.mock('antd', () => ({
-  Alert: ({ message }: { message?: React.ReactNode }) => (
-    <div role="alert">{message}</div>
+  Alert: ({ message, action }: {
+    message?: React.ReactNode;
+    action?: React.ReactNode;
+  }) => (
+    <div role="alert">{message}{action}</div>
   ),
   Button: ({ children, onClick }: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
     <button type="button" onClick={onClick}>{children}</button>
@@ -182,17 +185,57 @@ describe('MobileAccessPage — ?app= deep link resolve (P1-1)', () => {
       .toBe('1:财务助手');
   });
 
-  it('a failed resolve surfaces 资源不存在或无权限 instead of a silent plain list', async () => {
+  it('a 404 resolve surfaces 资源不存在或无权限 instead of a silent plain list', async () => {
     routerSearch = '?app=999';
     pageState.items = [row(1, '财务助手')];
-    mocks.fetchApplicationDetail.mockRejectedValue(new Error('404'));
+    mocks.fetchApplicationDetail.mockRejectedValue({ response: { status: 404 } });
     await mountPage();
     await flush(20);
 
     expect(document.querySelector('[data-testid="permission-editor"]')).toBeNull();
     expect(document.body.textContent).toContain('资源不存在或无权限');
+    // A 403/404 is terminal — no retry action is offered.
+    expect(document.body.textContent).not.toContain('重新加载目标资源');
     // The plain list is still usable.
     expect(document.body.textContent).toContain('财务助手');
+  });
+
+  it('a TRANSIENT resolve failure is retryable and the retry resolves (P2-6)', async () => {
+    routerSearch = '?app=999';
+    pageState.items = [row(1, '财务助手')];
+    mocks.fetchApplicationDetail.mockRejectedValueOnce(new Error('network down'));
+    await mountPage();
+    await flush(20);
+
+    // A network failure is NOT framed as a permission problem…
+    expect(document.body.textContent).toContain('加载目标资源失败');
+    expect(document.body.textContent).not.toContain('资源不存在或无权限');
+    // …and comes with a retry action.
+    const retry = Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '重新加载目标资源');
+    expect(retry).toBeTruthy();
+
+    mocks.fetchApplicationDetail.mockResolvedValueOnce({ name: '恢复后的智能体' });
+    await click(retry!);
+    await flush(20);
+    expect(mocks.fetchApplicationDetail).toHaveBeenCalledTimes(2);
+    expect(document.querySelector('[data-testid="permission-editor"]')!.textContent)
+      .toBe('999:恢复后的智能体');
+  });
+
+  it('opening a plain list row clears a lingering deep-link error (P2-6)', async () => {
+    routerSearch = '?app=999';
+    pageState.items = [row(1, '财务助手')];
+    mocks.fetchApplicationDetail.mockRejectedValue({ response: { status: 404 } });
+    await mountPage();
+    await flush(20);
+    expect(document.body.textContent).toContain('资源不存在或无权限');
+
+    await click(document.querySelector('.mobile-console-row__main')!);
+    await flush(20);
+    expect(document.body.textContent).not.toContain('资源不存在或无权限');
+    expect(document.querySelector('[data-testid="permission-editor"]')!.textContent)
+      .toBe('1:财务助手');
   });
 });
 
