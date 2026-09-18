@@ -81,6 +81,9 @@ export default function MobileUserPicker({
   // A first-page failure is a full error state; a failed loadMore keeps the
   // rows and swaps the 加载更多 CTA for a retry (ERROR != EMPTY, P2-5).
   const fatalError = Boolean(error) && results.length === 0;
+  // A failed loadMore keeps its cursor (retry = loadMore); a failed search /
+  // first page clears it (retry = refresh) — pick by what the hook still offers.
+  const retryPartial = () => (hasMore ? void loadMore() : void refresh());
 
   return (
     <Drawer
@@ -153,7 +156,7 @@ export default function MobileUserPicker({
                   <button
                     type="button"
                     className="mobile-console-more"
-                    onClick={() => void loadMore()}
+                    onClick={retryPartial}
                   >
                     加载失败，点击重试
                   </button>

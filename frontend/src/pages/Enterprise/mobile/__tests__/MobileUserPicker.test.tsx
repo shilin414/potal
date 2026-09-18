@@ -201,6 +201,32 @@ describe('MobileUserPicker — cursor pagination (P2-5)', () => {
     expect(ctaTexts).not.toContain('加载更多');
     expect(document.body.textContent).toContain('张三');
   });
+
+  it('a failed SEARCH keeps the rows and the retry refreshes page one — not a dead loadMore', async () => {
+    await mountPicker();
+    const input = document.querySelector<HTMLInputElement>('.mobile-picker__search input')!;
+    await act(async () => { setNativeValue(input, '陈'); });
+    // The debounced search request fails — old rows survive, cursor is cleared.
+    mocks.users.mockRejectedValueOnce(new Error('network down'));
+    await flush(400);
+
+    const cta = Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '加载失败，点击重试');
+    expect(cta).toBeTruthy();
+    expect(document.body.textContent).toContain('张三');
+
+    // The retry must go through refresh (hasMore=false, no cursor left) and
+    // re-run the search server-side.
+    mocks.users.mockResolvedValueOnce({ results: [user(5, '陈皮')], next_cursor: null });
+    await click(cta!);
+    await flush(20);
+
+    expect(mocks.users).toHaveBeenLastCalledWith(
+      expect.objectContaining({ q: '陈' }),
+    );
+    expect(document.body.textContent).toContain('陈皮');
+    expect(document.body.textContent).not.toContain('张三');
+  });
 });
 
 describe('MobileUserPicker — error states (P2-5)', () => {
