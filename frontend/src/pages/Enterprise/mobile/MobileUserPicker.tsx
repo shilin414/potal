@@ -103,7 +103,7 @@ export default function MobileUserPicker({
             <Input
               allowClear
               value={query}
-              placeholder="搜索姓名 / 工号"
+              placeholder="搜索姓名"
               prefix={<SearchOutlined style={{ color: 'var(--color-text-dim)' }} />}
               onChange={(e) => setQuery(e.target.value)}
             />
