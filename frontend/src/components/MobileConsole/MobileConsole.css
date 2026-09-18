@@ -207,12 +207,14 @@
 
 /* Native <button> since P2-1: reset the UA padding/font so the icon stays
    centred exactly like the old span-based version. */
+/* Secondary icon actions keep a small VISUAL glyph but a 44×44 tap target
+   (MobileConsole design rule, 二次复审 P3-3). */
 .mobile-console-row__star {
   display: grid;
   flex: none;
   place-items: center;
-  width: 40px;
-  height: 40px;
+  width: 44px;
+  height: 44px;
   border: none;
   border-radius: 999px;
   padding: 0;
@@ -232,6 +234,8 @@
   color: #f59e0b; /* the one sanctioned literal: the favorite gold (§66 特殊图形) */
 }
 
+/* The chevron sits INSIDE the main button (P3-2): tapping “>” is tapping the
+   row — the whole trailing area is the primary tap target. */
 .mobile-console-row__chevron {
   flex: none;
   color: var(--color-text-dim);

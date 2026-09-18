@@ -73,6 +73,16 @@ describe('MobileEntityRow', () => {
     expect(onClick).toHaveBeenCalledTimes(1);
   });
 
+  it('tapping the chevron opens the row — it lives inside the main button (P3-2)', async () => {
+    const onClick = vi.fn();
+    await mount(<MobileEntityRow {...base} onClick={onClick} />);
+    const chevron = document.querySelector('.mobile-console-row__chevron')!;
+    // The chevron is part of the main tap target, not a dead sibling area.
+    expect(chevron.closest('button')).toBe(document.querySelector('.mobile-console-row__main'));
+    await click(chevron);
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
+
   it('favorite is a real button and never leaks to the row (§15/§65/P2-1)', async () => {
     const onClick = vi.fn();
     const onFavorite = vi.fn();

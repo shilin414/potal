@@ -53,12 +53,13 @@
   font-size: 12px;
 }
 
+/* 44×44 tap target — the visual glyph stays small (二次复审 P3-3). */
 .mobile-permission__grant-remove {
   display: grid;
   flex: none;
   place-items: center;
-  width: 36px;
-  height: 36px;
+  width: 44px;
+  height: 44px;
   border: none;
   border-radius: 999px;
   background: transparent;
@@ -184,7 +185,7 @@
 }
 
 .mobile-picker__done {
-  min-height: 40px;
+  min-height: 44px; /* 44px tap target (二次复审 P3-3) */
   padding: 8px 22px;
   border: none;
   border-radius: 999px;

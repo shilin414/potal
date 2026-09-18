@@ -1,6 +1,6 @@
 /**
  * MobileEntityRow — the rich list row every mobile centre shares
- * (开发执行报告 §14, 二次复审 P2-1).
+ * (开发执行报告 §14, 二次复审 P2-1/P3-2).
  *
  * Wrapper / Main Button / Favorite Button / More Button — every independent
  * action is a REAL native <button> (no span role="button", no button nested
@@ -8,6 +8,10 @@
  * and screen-reader semantics, and stopPropagation hacks disappear.
  * The wrapper keeps the hairline-divider look; `.mobile-console-row__main`
  * owns avatar / title / description / meta.
+ *
+ * The trailing chevron lives INSIDE the main button (P3-2): it is a plain
+ * icon (not a nested interactive element), and users read tapping “>” as
+ * entering the row — the chevron area must be part of the main tap target.
  */
 import React from 'react';
 import { RightOutlined, StarFilled, StarOutlined } from '@ant-design/icons';
@@ -58,6 +62,9 @@ const MobileEntityRow: React.FC<MobileEntityRowProps> = ({
           {statusLabel}
         </span>
       )}
+      {!onMore && (
+        <RightOutlined className="mobile-console-row__chevron" aria-hidden />
+      )}
     </button>
     {typeof favorite === 'boolean' && onFavorite && (
       <button
@@ -69,7 +76,7 @@ const MobileEntityRow: React.FC<MobileEntityRowProps> = ({
         {favorite ? <StarFilled /> : <StarOutlined />}
       </button>
     )}
-    {onMore ? (
+    {onMore && (
       <button
         type="button"
         className="mobile-console-row__more"
@@ -78,8 +85,6 @@ const MobileEntityRow: React.FC<MobileEntityRowProps> = ({
       >
         •••
       </button>
-    ) : (
-      <RightOutlined className="mobile-console-row__chevron" />
     )}
   </div>
 );
