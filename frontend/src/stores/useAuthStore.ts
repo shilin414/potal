@@ -28,6 +28,8 @@ interface User {
 interface AuthState {
   user: User | null;
   isAuthenticated: boolean;
+  isLoggingOut: boolean;
+  explicitlyLoggedOut: boolean;
   login: (username: string, password: string) => Promise<void>;
   /** /login/admin 入口：POST /api/identity/admin/login（本地管理员）。 */
   adminLogin: (username: string, password: string) => Promise<void>;
@@ -61,6 +63,8 @@ export const useAuthStore = create<AuthState>()(
     (set, get) => ({
       user: null,
       isAuthenticated: false,
+      isLoggingOut: false,
+      explicitlyLoggedOut: false,
 
       login: async (username: string, password: string) => {
         // Cookie session: the HttpOnly `studio_session` cookie is set by the
@@ -99,7 +103,12 @@ export const useAuthStore = create<AuthState>()(
         // Synchronously wipe local auth state AND every session-scoped store.
         // Used right before a full-page redirect to login.
         resetSessionScopedState();
-        set({ user: null, isAuthenticated: false });
+        set({
+          user: null,
+          isAuthenticated: false,
+          isLoggingOut: false,
+          explicitlyLoggedOut: false,
+        });
       },
 
       acceptAuthenticatedUser: (user) => {
@@ -110,16 +119,35 @@ export const useAuthStore = create<AuthState>()(
         if (!isSameUser(get().user, user)) {
           resetSessionScopedState();
         }
-        set({ user, isAuthenticated: true });
+        set({
+          user,
+          isAuthenticated: true,
+          isLoggingOut: false,
+          explicitlyLoggedOut: false,
+        });
       },
 
       logout: async () => {
-        get().clearAuth();
+        if (get().isLoggingOut) return;
+        // Keep the authenticated shell mounted while the cookie revoke is in
+        // flight. Clearing auth first lets ProtectedRoute mount /login, whose
+        // auto-OAuth navigation can abort this request and immediately log the
+        // user back in.
+        set({ isLoggingOut: true });
         try {
-          // Clears the studio_session cookie server-side (immediate revoke).
-          await axiosInstance.post('/auth/logout/', {});
+          await axiosInstance.post('/auth/logout/', {}, { timeout: 5000 });
         } catch (error) {
+          // A transport failure must not trap the user in the old local
+          // session. We still finish the local boundary in finally.
           console.error('Logout error:', error);
+        } finally {
+          resetSessionScopedState();
+          set({
+            user: null,
+            isAuthenticated: false,
+            isLoggingOut: false,
+            explicitlyLoggedOut: true,
+          });
         }
       },
 

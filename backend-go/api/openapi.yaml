@@ -493,8 +493,8 @@ paths:
         Server-side replacement for the client-side @mention candidate array
         (which was built by downloading every application). Matching is
         case-insensitive on the application name and slug; the response is
-        ranked (exact name/slug first, then name prefixes, then name
-        substrings) and capped, so the composer never needs the whole catalog
+        ranked (exact name/slug first, then name prefix, then slug prefix,
+        then substring) and capped, so the composer never needs the whole catalog
         to route `@销售助手 帮我查一下`.
 
         Like `resolve`, this is a CONSUMPTION entry point (二次复审 P0-5): only

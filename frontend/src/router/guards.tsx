@@ -12,9 +12,15 @@ interface ProtectedRouteProps {
  */
 export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
+  const explicitlyLoggedOut = useAuthStore((state) => state.explicitlyLoggedOut);
 
   if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
+    return (
+      <Navigate
+        to={explicitlyLoggedOut ? '/auth/login?logged_out=1' : '/login'}
+        replace
+      />
+    );
   }
 
   return <>{children}</>;

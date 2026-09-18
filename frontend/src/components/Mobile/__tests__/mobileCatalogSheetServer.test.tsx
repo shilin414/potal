@@ -253,7 +253,7 @@ describe('MobileCatalogSheet, server-paged mode', () => {
   });
 
   it('resolves a local recent id through the entity cache', async () => {
-    useApplicationEntityStore.getState().upsert(
+    useApplicationEntityStore.getState().upsertManage(
       app({ id: 77, slug: 'local', name: '刚用过的智能体' }));
 
     await mountTracked(

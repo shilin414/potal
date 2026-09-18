@@ -4,7 +4,7 @@
  * The workspace is a SPA, and every login path ends in an in-app
  * `navigate('/')`, not in a document load:
  *
- *   logout()                 → clearAuth() + navigate('/auth/login')
+ *   explicit logout          → server revoke + reset + logged-out page
  *   login() / adminLogin()   → set({ user }) + navigate('/')
  *   completeSso()            → set({ user })
  *   completeFeishuLogin()    → useAuthStore.setState({ user })
@@ -24,6 +24,11 @@
  *
  *   EVERY path that ends one identity and begins another MUST call
  *   `resetSessionScopedState()` between the two.
+ *
+ * Session state is not limited to Zustand fields. A module-level Map, Set,
+ * timer, AbortController, SSE handle or in-flight Promise registry can also
+ * belong to the previous identity. Each registered resetter must clear those
+ * side registries as well as returning its visible store fields to defaults.
  *
  * ── Why a REGISTRY and not an import list ────────────────────────────────
  *

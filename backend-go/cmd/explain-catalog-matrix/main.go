@@ -14,10 +14,10 @@
 //
 //	go run ./cmd/explain-catalog-matrix
 //	go run ./cmd/explain-catalog-matrix -synthetic \
-//	    -applications 5000 -bindings 10000 -runs 100000
+//	    -applications 5000 -bindings 5000 -runs 100000
 //
 // Synthetic mode (四次复审 P2-R3) is opt-in and creates ONLY rows whose
-// slug/provider/name carry the `expsyn_` prefix, in the configured database,
+// slug/provider keys carry a unique `expsyn_` run prefix in the configured database,
 // then deletes them in FK order at the end. It exists so the scale thresholds
 // already recorded in the review docs can be re-measured on an isolated test
 // database instead of waiting for shared dev data to grow naturally. NEVER
@@ -27,37 +27,47 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/creation-agent-studio/backend-go/internal/catalog"
 	"github.com/creation-agent-studio/backend-go/internal/platform/config"
 	"github.com/creation-agent-studio/backend-go/internal/platform/database"
 )
 
-const syntheticPrefix = "expsyn_"
+const syntheticPrefixBase = "expsyn_"
 
-// syntheticConfig is the fixture size requested on the command line. The
-// values are deliberately explicit so a run is reproducible from its command
-// line alone.
+// syntheticConfig is the fixture size requested on the command line. One
+// application can own only one synthetic active binding in this fixture, so
+// Bindings must never exceed Applications.
 type syntheticConfig struct {
 	Applications int
 	Bindings     int
 	RunsPerUser  int
 	Users        int
 	// IsolatedDB is the explicit "yes, this database is disposable" switch.
-	// The name check below is deliberately strict: a typo like `xiaoan` must
-	// never seed 100k runs into a shared dev database.
 	IsolatedDB string
 }
 
+type syntheticFixture struct {
+	Prefix       string
+	ProviderKey  string
+	Applications int
+	Bindings     int
+	Runs         int
+	Users        int
+}
+
 func syntheticFixtureEnabled(fs *flag.FlagSet, args []string) (bool, syntheticConfig) {
-	enabled := fs.Bool("synthetic", false, "seed an isolated expsyn_ fixture, run bootstrap timing, then clean it up")
+	enabled := fs.Bool("synthetic", false, "seed an isolated fixture, time bootstrap/page/mention repository paths, then clean it up")
 	applications := fs.Int("applications", 5000, "synthetic applications to seed")
-	bindings := fs.Int("bindings", 10000, "synthetic bindings to seed")
+	bindings := fs.Int("bindings", 5000, "synthetic applications with one active binding")
 	runsPerUser := fs.Int("runs", 100000, "synthetic runs per user to seed")
 	users := fs.Int("users", 1, "synthetic users to seed")
 	isolatedDB := fs.String("isolated-db", "", "REQUIRED confirmation: exact database name reserved for this benchmark")
@@ -71,82 +81,115 @@ func syntheticFixtureEnabled(fs *flag.FlagSet, args []string) (bool, syntheticCo
 	}
 }
 
-// seedSyntheticFixture writes ONLY expsyn_-prefixed rows and returns a
-// cleanup function that removes them in FK order. It refuses to run unless
-// the caller confirms the EXACT disposable database name, so a typo can never
-// seed 100k runs into a shared dev database.
-func seedSyntheticFixture(ctx context.Context, db *sql.DB, cfg syntheticConfig) (func(), error) {
+func validateSyntheticConfig(cfg syntheticConfig) error {
+	if cfg.Applications <= 0 || cfg.Bindings <= 0 || cfg.RunsPerUser < 0 || cfg.Users <= 0 {
+		return fmt.Errorf("synthetic sizes must be positive (runs may be 0)")
+	}
+	if cfg.Bindings > cfg.Applications {
+		return fmt.Errorf(
+			"requested bindings (%d) exceed applications (%d): this fixture supports one active binding per application",
+			cfg.Bindings, cfg.Applications,
+		)
+	}
+	return nil
+}
+
+func newSyntheticFixture(cfg syntheticConfig) syntheticFixture {
+	token := strconv.FormatInt(time.Now().UTC().UnixNano(), 36)
+	prefix := syntheticPrefixBase + token + "_"
+	return syntheticFixture{
+		Prefix:       prefix,
+		ProviderKey:  prefix + "provider",
+		Applications: cfg.Applications,
+		Bindings:     cfg.Bindings,
+		Runs:         cfg.RunsPerUser * cfg.Users,
+		Users:        cfg.Users,
+	}
+}
+
+// seedSyntheticFixture owns a unique run-token prefix. Partial failures clean
+// only that token, so concurrent benchmark runs cannot delete each other's
+// rows and a literal underscore can never widen cleanup like SQL LIKE `_`.
+func seedSyntheticFixture(
+	ctx context.Context,
+	db *sql.DB,
+	cfg syntheticConfig,
+) (fixture syntheticFixture, cleanup func(), err error) {
 	var dbName string
-	if err := db.QueryRowContext(ctx, `SELECT DATABASE()`).Scan(&dbName); err != nil {
-		return nil, err
+	if err = db.QueryRowContext(ctx, `SELECT DATABASE()`).Scan(&dbName); err != nil {
+		return fixture, nil, err
 	}
 	if dbName == "" {
-		return nil, fmt.Errorf("synthetic mode needs an explicit database")
+		return fixture, nil, fmt.Errorf("synthetic mode needs an explicit database")
 	}
 	if cfg.IsolatedDB == "" || cfg.IsolatedDB != dbName {
-		return nil, fmt.Errorf(
+		return fixture, nil, fmt.Errorf(
 			"synthetic mode refused: pass -isolated-db=%s to confirm this disposable database (got %q)",
 			dbName, cfg.IsolatedDB)
 	}
-	if cfg.Applications <= 0 || cfg.Bindings <= 0 || cfg.RunsPerUser < 0 || cfg.Users <= 0 {
-		return nil, fmt.Errorf("synthetic sizes must be positive (runs may be 0)")
+	if err = validateSyntheticConfig(cfg); err != nil {
+		return fixture, nil, err
 	}
-	cleanup := func() {}
-	// Providers first: one active provider backs every synthetic binding.
-	if _, err := db.ExecContext(ctx, `
+
+	fixture = newSyntheticFixture(cfg)
+	cleanup = func() { cleanupSyntheticFixture(ctx, db, fixture) }
+	seedComplete := false
+	defer func() {
+		if !seedComplete {
+			cleanup()
+		}
+	}()
+
+	if _, err = db.ExecContext(ctx, `
 INSERT INTO providers (provider_key, name, supported_runtime_types, status)
-VALUES (?, ?, '["agent"]', 'active')
-ON DUPLICATE KEY UPDATE status = 'active'`,
-		syntheticPrefix+"provider", "synthetic benchmark provider"); err != nil {
-		return nil, fmt.Errorf("seed provider: %w", err)
+VALUES (?, ?, '["agent"]', 'active')`,
+		fixture.ProviderKey, "synthetic benchmark provider "+fixture.Prefix); err != nil {
+		return fixture, cleanup, fmt.Errorf("seed provider: %w", err)
 	}
 	providerID := int64(0)
-	if err := db.QueryRowContext(ctx,
+	if err = db.QueryRowContext(ctx,
 		`SELECT id FROM providers WHERE provider_key = ?`,
-		syntheticPrefix+"provider").Scan(&providerID); err != nil {
-		return nil, fmt.Errorf("load provider: %w", err)
+		fixture.ProviderKey).Scan(&providerID); err != nil {
+		return fixture, cleanup, fmt.Errorf("load provider: %w", err)
 	}
 
 	appIDs := make([]int64, 0, cfg.Applications)
 	for i := 0; i < cfg.Applications; i++ {
-		slug := fmt.Sprintf("%sapp_%06d", syntheticPrefix, i)
-		res, err := db.ExecContext(ctx, `
+		slug := fmt.Sprintf("%sapp_%06d", fixture.Prefix, i)
+		var res sql.Result
+		res, err = db.ExecContext(ctx, `
 INSERT INTO applications (slug, name, description, kind, renderer_key, is_public, enabled, created_by, created_at)
 VALUES (?, ?, ?, 'chat', 'chat', 1, 1, 424242, FROM_UNIXTIME(?))`,
 			slug, fmt.Sprintf("Synthetic Agent %06d", i),
 			"synthetic benchmark fixture", time.Now().Add(-time.Duration(i)*time.Second).Unix())
 		if err != nil {
-			return nil, fmt.Errorf("seed application %d: %w", i, err)
+			return fixture, cleanup, fmt.Errorf("seed application %d: %w", i, err)
 		}
-		id, err := res.LastInsertId()
+		var id int64
+		id, err = res.LastInsertId()
 		if err != nil {
-			return nil, err
+			return fixture, cleanup, err
 		}
 		appIDs = append(appIDs, id)
 	}
-	// One binding per (application, runtime_type, provider_key) by schema; the
-	// requested binding count is therefore capped at one per application.
-	bindingCount := cfg.Bindings
-	if bindingCount > len(appIDs) {
-		bindingCount = len(appIDs)
-	}
-	for i := 0; i < bindingCount; i++ {
-		appID := appIDs[i%len(appIDs)]
-		if _, err := db.ExecContext(ctx, `
+
+	for i := 0; i < cfg.Bindings; i++ {
+		if _, err = db.ExecContext(ctx, `
 INSERT INTO runtime_bindings (application_id, provider_id, provider_key, runtime_type,
   external_resource_id, identity_mode, execution_mode, session_policy, artifact_policy,
   timeout_seconds, enabled)
 VALUES (?, ?, ?, 'agent', ?, 'per_user', 'sync', 'per_conversation', 'none', 300, 1)`,
-			appID, providerID, syntheticPrefix+"provider",
-			fmt.Sprintf("%sresource_%06d", syntheticPrefix, i)); err != nil {
-			return nil, fmt.Errorf("seed binding %d: %w", i, err)
+			appIDs[i], providerID, fixture.ProviderKey,
+			fmt.Sprintf("%sresource_%06d", fixture.Prefix, i)); err != nil {
+			return fixture, cleanup, fmt.Errorf("seed binding %d: %w", i, err)
 		}
 	}
-	// Runs are the expensive dimension: generate them in bounded batches.
-	runBatch := 2000
+
+	const runBatch = 2000
 	for userOffset := 0; userOffset < cfg.Users; userOffset++ {
 		userID := int64(424242 + userOffset)
 		remaining := cfg.RunsPerUser
+		sequence := 0
 		for remaining > 0 {
 			n := runBatch
 			if n > remaining {
@@ -156,90 +199,151 @@ VALUES (?, ?, ?, 'agent', ?, 'per_user', 'sync', 'per_conversation', 'none', 300
 			args := make([]any, 0, n*4)
 			for i := 0; i < n; i++ {
 				values = append(values, "(UNHEX(REPLACE(UUID(), '-', '')), ?, ?, 'succeeded', '{}', FROM_UNIXTIME(?))")
-				args = append(args, userID, appIDs[(i+userOffset)%len(appIDs)],
-					time.Now().Add(-time.Duration(i)*time.Second).Unix())
+				args = append(args, userID, appIDs[(sequence+i+userOffset)%len(appIDs)],
+					time.Now().Add(-time.Duration(sequence+i)*time.Second).Unix())
 			}
 			query := `INSERT INTO runs (id, user_id, application_id, status, output, created_at) VALUES ` + strings.Join(values, ",")
-			if _, err := db.ExecContext(ctx, query, args...); err != nil {
-				return nil, fmt.Errorf("seed runs user=%d remaining=%d: %w", userID, remaining, err)
+			if _, err = db.ExecContext(ctx, query, args...); err != nil {
+				return fixture, cleanup, fmt.Errorf("seed runs user=%d remaining=%d: %w", userID, remaining, err)
 			}
 			remaining -= n
+			sequence += n
 		}
 	}
-	cleanup = func() { cleanupSyntheticFixture(ctx, db) }
-	return cleanup, nil
+
+	seedComplete = true
+	return fixture, cleanup, nil
 }
 
-// cleanupSyntheticFixture is idempotent and safe to call both after a
-// successful run and after a partial seed failure.
-func cleanupSyntheticFixture(ctx context.Context, db *sql.DB) {
+const cleanupRunsByPrefixSQL = `
+DELETE FROM runs
+WHERE application_id IN (
+  SELECT id FROM applications WHERE LEFT(slug, CHAR_LENGTH(?)) = ?
+)`
+const cleanupApplicationsByPrefixSQL = `
+DELETE FROM applications WHERE LEFT(slug, CHAR_LENGTH(?)) = ?`
+
+func cleanupSyntheticFixture(ctx context.Context, db *sql.DB, fixture syntheticFixture) {
+	_, _ = db.ExecContext(ctx, cleanupRunsByPrefixSQL, fixture.Prefix, fixture.Prefix)
 	_, _ = db.ExecContext(ctx,
-		`DELETE FROM runs WHERE application_id IN (SELECT id FROM applications WHERE slug LIKE ?)`,
-		syntheticPrefix+"%")
+		`DELETE FROM runtime_bindings WHERE provider_key = ?`, fixture.ProviderKey)
+	_, _ = db.ExecContext(ctx, cleanupApplicationsByPrefixSQL, fixture.Prefix, fixture.Prefix)
 	_, _ = db.ExecContext(ctx,
-		`DELETE FROM runtime_bindings WHERE provider_key = ?`, syntheticPrefix+"provider")
-	_, _ = db.ExecContext(ctx,
-		`DELETE FROM applications WHERE slug LIKE ?`, syntheticPrefix+"%")
-	_, _ = db.ExecContext(ctx,
-		`DELETE FROM providers WHERE provider_key = ?`, syntheticPrefix+"provider")
+		`DELETE FROM providers WHERE provider_key = ?`, fixture.ProviderKey)
 }
 
-// bootstrapQuery is the same shape the EXPLAIN matrix records for the default
-// group. Timing it over the synthetic fixture is what turns the review's
-// threshold table into an executable gate.
-const bootstrapQuery = `
-SELECT a.id, COALESCE(u.usage_count,0) AS personal_usage_count, u.last_used_at
-FROM applications a
-LEFT JOIN runtime_bindings b
-  ON b.application_id = a.id AND b.enabled = 1
-LEFT JOIN runtime_bindings newer_b
-  ON newer_b.application_id = b.application_id
- AND newer_b.enabled = 1
- AND newer_b.id > b.id
-LEFT JOIN providers p ON p.provider_key = b.provider_key
-LEFT JOIN (SELECT r.application_id, COUNT(*) AS usage_count, MAX(r.created_at) AS last_used_at
-           FROM runs r WHERE r.user_id = ? GROUP BY r.application_id) u
-  ON u.application_id = a.id
-WHERE newer_b.id IS NULL AND a.enabled = 1 AND a.kind = 'chat'
-  AND b.id IS NOT NULL AND p.id IS NOT NULL AND p.status = 'active'
-  AND a.is_public = 1
-ORDER BY a.is_default_agent DESC, a.created_at, a.id LIMIT 8`
+func bootstrapIDs(groups catalog.BootstrapGroups) []int64 {
+	seen := make(map[int64]struct{})
+	ids := make([]int64, 0, 1+len(groups.Favorites)+len(groups.Frequent)+
+		len(groups.Recent)+len(groups.Recommended)+len(groups.RecentFixedApps))
+	add := func(id int64) {
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if groups.Default != nil {
+		add(groups.Default.ApplicationID)
+	}
+	for _, rows := range [][]catalog.BootstrapGroupRow{
+		groups.Favorites, groups.Frequent, groups.Recent,
+		groups.Recommended, groups.RecentFixedApps,
+	} {
+		for _, row := range rows {
+			add(row.ApplicationID)
+		}
+	}
+	return ids
+}
 
-func runSyntheticBootstrap(ctx context.Context, db *sql.DB, callerID int64) error {
-	const iterations = 40
+func runTimedBenchmark(name string, iterations int, operation func() error) error {
+	if iterations <= 0 {
+		return fmt.Errorf("%s: iterations must be positive", name)
+	}
 	durations := make([]time.Duration, 0, iterations)
 	for i := 0; i < iterations; i++ {
 		start := time.Now()
-		rows, err := db.QueryContext(ctx, bootstrapQuery, callerID)
-		if err != nil {
-			return fmt.Errorf("synthetic bootstrap query %d: %w", i, err)
-		}
-		for rows.Next() {
-			var id int64
-			var usage int64
-			var last sql.NullTime
-			if err := rows.Scan(&id, &usage, &last); err != nil {
-				_ = rows.Close()
-				return fmt.Errorf("scan synthetic bootstrap: %w", err)
-			}
-		}
-		if err := rows.Err(); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("iterate synthetic bootstrap: %w", err)
-		}
-		if err := rows.Close(); err != nil {
-			return fmt.Errorf("close synthetic bootstrap: %w", err)
+		if err := operation(); err != nil {
+			return fmt.Errorf("%s iteration %d: %w", name, i, err)
 		}
 		durations = append(durations, time.Since(start))
 	}
 	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
 	pick := func(p float64) time.Duration {
-		idx := int(float64(len(durations)-1) * p)
-		return durations[idx]
+		return durations[int(float64(len(durations)-1)*p)]
 	}
-	fmt.Printf("synthetic bootstrap p50=%s p95=%s p99=%s (n=%d)\n",
-		pick(0.50), pick(0.95), pick(0.99), len(durations))
+	fmt.Printf("synthetic %s p50=%s p95=%s p99=%s (n=%d)\n",
+		name, pick(0.50), pick(0.95), pick(0.99), len(durations))
 	return nil
+}
+
+func runSyntheticRepositoryBenchmarks(ctx context.Context, db *sql.DB, callerID int64) error {
+	repo := &catalog.Repo{DB: db}
+	const iterations = 40
+
+	if err := runTimedBenchmark("workspace-bootstrap-repository", iterations, func() error {
+		groups, err := repo.BootstrapGroups(ctx, catalog.BootstrapGroupQuery{
+			CallerID: callerID,
+		})
+		if err != nil {
+			return err
+		}
+		categories, err := repo.BootstrapCategories(ctx, false)
+		if err != nil {
+			return err
+		}
+		ids := bootstrapIDs(groups)
+		rows, err := repo.ListApplicationRowsByIDs(ctx, ids, false)
+		if err != nil {
+			return err
+		}
+		favorites, err := repo.FavoritesByApplications(ctx, callerID, ids)
+		if err != nil {
+			return err
+		}
+		providers, err := repo.ListActiveProviders(ctx)
+		if err != nil {
+			return err
+		}
+		_, err = json.Marshal(struct {
+			Groups     catalog.BootstrapGroups
+			Categories catalog.BootstrapCategories
+			Rows       []catalog.ApplicationWithBinding
+			Favorites  map[int64]bool
+			Providers  []catalog.Provider
+		}{groups, categories, rows, favorites, providers})
+		return err
+	}); err != nil {
+		return err
+	}
+
+	if err := runTimedBenchmark("applications-page-consume", iterations, func() error {
+		rows, err := repo.ListApplicationPage(ctx, catalog.ApplicationPageQuery{
+			Scope:           "public",
+			Mode:            catalog.PageModeConsume,
+			Kind:            catalog.PageQueryKindChat,
+			Limit:           25,
+			CallerID:        callerID,
+			CursorCreatedAt: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
+		})
+		if err != nil {
+			return err
+		}
+		_, err = json.Marshal(rows)
+		return err
+	}); err != nil {
+		return err
+	}
+
+	return runTimedBenchmark("resolve-mention", iterations, func() error {
+		rows, err := repo.ResolveMentionCandidates(ctx, "synthetic", false, 10)
+		if err != nil {
+			return err
+		}
+		_, err = json.Marshal(rows)
+		return err
+	})
 }
 
 // page builds the ListApplicationPage query (db/queries/catalog.sql) with
@@ -366,22 +470,20 @@ func main() {
 	_ = cfg
 	if synthetic {
 		ctx := context.Background()
-		cleanup, err := seedSyntheticFixture(ctx, db, syntheticCfg)
+		fixture, cleanup, err := seedSyntheticFixture(ctx, db, syntheticCfg)
 		if err != nil {
-			// A partial seed must not leave expsyn_ rows behind even when it
-			// fails before returning the cleanup closure.
-			cleanupSyntheticFixture(ctx, db)
 			fmt.Println("synthetic:", err)
 			os.Exit(1)
 		}
 		defer cleanup()
-		fmt.Printf("synthetic fixture ready: apps=%d bindings=%d users=%d runs/user=%d\n",
-			syntheticCfg.Applications, syntheticCfg.Bindings, syntheticCfg.Users, syntheticCfg.RunsPerUser)
-		if err := runSyntheticBootstrap(ctx, db, 424242); err != nil {
+		fmt.Printf("synthetic fixture ready: prefix=%s applications=%d bindings=%d users=%d runs=%d\n",
+			fixture.Prefix, fixture.Applications, fixture.Bindings, fixture.Users, fixture.Runs)
+		if err := runSyntheticRepositoryBenchmarks(ctx, db, 424242); err != nil {
+			cleanup()
 			fmt.Println("synthetic:", err)
 			os.Exit(1)
 		}
-		return
+		fmt.Println("synthetic EXPLAIN matrix follows")
 	}
 
 	// ── page scenarios (P2-R1 matrix) ──

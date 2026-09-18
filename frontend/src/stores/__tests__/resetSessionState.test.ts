@@ -104,13 +104,15 @@ beforeEach(() => {
   mocks.runApiCreate.mockReset();
   mocks.runStream.mockReset();
   resetSessionScopedState();
-  useAuthStore.setState({ user: null, isAuthenticated: false });
+  useAuthStore.setState({
+    user: null, isAuthenticated: false, isLoggingOut: false, explicitlyLoggedOut: false,
+  });
 });
 
 describe('resetSessionScopedState', () => {
   it('forgets the previous user in every session-scoped store', async () => {
     await useWorkspaceBootstrapStore.getState().load(true);
-    useApplicationEntityStore.getState().upsert(app(7, 'A解析过的应用'));
+    useApplicationEntityStore.getState().upsertManage(app(7, 'A解析过的应用'));
     useWorkspaceStore.getState().setDraft(7, 'A还没发出去的草稿');
     useWorkspaceStore.setState({ activeApplicationId: 7, recentApplicationIds: [7, 8] });
     useRunChatStore.setState({

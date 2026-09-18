@@ -71,7 +71,7 @@ const AppsPage: React.FC = () => {
 
   // Browsed rows seed the entity cache, so opening a card resolves from memory
   // instead of issuing a resolve request (执行报告 §10-B).
-  const upsertEntities = useApplicationEntityStore((state) => state.upsertMany);
+  const upsertEntities = useApplicationEntityStore((state) => state.upsertManyManage);
   useEffect(() => { upsertEntities(apps); }, [apps, upsertEntities]);
 
   /**

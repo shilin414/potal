@@ -14,6 +14,7 @@ import { act } from 'react-dom/test-utils';
 import { useApplicationPage } from '../useApplicationPage';
 import { fetchApplicationPage } from '@/services/runApi';
 import type { ApplicationPage, V2Application } from '@/services/runApi';
+import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 
 vi.mock('@/services/runApi', async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -59,6 +60,7 @@ let roots: Root[];
 
 beforeEach(() => {
   mockPage.mockReset();
+  useApplicationEntityStore.getState().clear();
   hosts = [];
   roots = [];
 });
@@ -84,6 +86,22 @@ describe('useApplicationPage', () => {
     }));
     // The FIRST request carries no cursor.
     expect(mockPage.mock.calls[0][0]?.cursor).toBeUndefined();
+  });
+
+  it('atomically refreshes the shared entity cache for consume pages', async () => {
+    useApplicationEntityStore.getState().upsertManage(app(1, 'old'));
+    mockPage.mockResolvedValue({
+      items: [app(1, 'new')], next_cursor: '', has_more: false,
+    });
+    const latest: Probe<ReturnType<typeof useApplicationPage>> = { current: null };
+    const { root, element } = mountProbe({ kind: 'chat', mode: 'consume' }, latest);
+    roots.push(root);
+    await act(async () => { root.render(element); });
+    await flush(10);
+
+    expect(useApplicationEntityStore.getState().get(1)?.name).toBe('new');
+    expect(useApplicationEntityStore.getState().validatedAtById[1])
+      .toEqual(expect.any(Number));
   });
 
   it('appends the next page deduplicated and stops at the tail', async () => {

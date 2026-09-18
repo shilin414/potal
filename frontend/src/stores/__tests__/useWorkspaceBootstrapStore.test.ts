@@ -18,12 +18,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   fetchWorkspaceBootstrap: vi.fn(),
   setApplicationFavorite: vi.fn(),
+  resolveApplication: vi.fn(),
 }));
 
 vi.mock('@/services/runApi', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/services/runApi')>()),
   fetchWorkspaceBootstrap: mocks.fetchWorkspaceBootstrap,
   setApplicationFavorite: mocks.setApplicationFavorite,
+  resolveApplication: mocks.resolveApplication,
 }));
 
 import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
@@ -54,6 +56,7 @@ beforeEach(() => {
   mocks.setApplicationFavorite.mockReset().mockResolvedValue({
     application_id: 2, is_favorite: true,
   });
+  mocks.resolveApplication.mockReset();
   useWorkspaceBootstrapStore.getState().clear();
   useApplicationEntityStore.getState().clear();
 });
@@ -69,6 +72,23 @@ describe('load', () => {
     expect(state.recentFixedApps.map((a) => a.id)).toEqual([10]);
     expect(state.agentCategories).toEqual([{ slug: 'it', name: 'IT运维', count: 2 }]);
     expect(state.appCategories).toEqual([{ slug: 'office', name: '办公', count: 1 }]);
+  });
+
+  it('does not let summary-only bootstrap data freshen a full entity', async () => {
+    useApplicationEntityStore.getState().upsertManage({
+      id: 2, slug: 'slug-2', name: '旧实体', description: '', icon: '', kind: 'chat',
+      runtime_type: 'agent', provider_key: 'feishu_aily', capabilities: {},
+    });
+    mocks.resolveApplication.mockResolvedValueOnce({
+      id: 2, slug: 'slug-2', name: 'resolve 新实体', description: '', icon: '', kind: 'chat',
+      runtime_type: 'agent', provider_key: 'feishu_aily', capabilities: {},
+    });
+
+    await useWorkspaceBootstrapStore.getState().load();
+    await expect(useApplicationEntityStore.getState().ensure(2))
+      .resolves.toMatchObject({ name: 'resolve 新实体' });
+
+    expect(mocks.resolveApplication).toHaveBeenCalledTimes(1);
   });
 
   it('fetches once, and shares one request between concurrent callers', async () => {
@@ -197,7 +217,7 @@ describe('lookups', () => {
 describe('toggleFavorite', () => {
   it('adds the row to 收藏 and patches it everywhere else', async () => {
     await useWorkspaceBootstrapStore.getState().load();
-    useApplicationEntityStore.getState().upsert({
+    useApplicationEntityStore.getState().upsertManage({
       ...(payload().frequent[0] as any),
       runtime_type: 'agent', provider_key: 'feishu_aily',
       identity_mode: 'user', execution_mode: 'interactive', capabilities: {},
@@ -251,7 +271,7 @@ describe('toggleFavorite', () => {
   it('keeps a successful toggle intact when a slower toggle for another app fails', async () => {
     await useWorkspaceBootstrapStore.getState().load();
     const state = useWorkspaceBootstrapStore.getState();
-    useApplicationEntityStore.getState().upsert({
+    useApplicationEntityStore.getState().upsertManage({
       ...(state.frequent[0] as any),
       runtime_type: 'agent', provider_key: 'feishu_aily',
       identity_mode: 'user', execution_mode: 'interactive', capabilities: {},

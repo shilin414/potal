@@ -31,7 +31,7 @@ const Header: React.FC = () => {
 
   const handleLogout = async () => {
     await logout();
-    navigate('/auth/login');
+    navigate('/auth/login?logged_out=1', { replace: true });
   };
 
   const handleNav = (key: string) => {

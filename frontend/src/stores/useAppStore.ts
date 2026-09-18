@@ -55,6 +55,10 @@ function toAppItem(app: any): AppItem {
 // concurrent detail requests so page effects do not consume API quota twice.
 const inFlightAppRequests = new Map<string, Promise<AppItem | null>>();
 
+function resetAppRequestRegistry(): void {
+  inFlightAppRequests.clear();
+}
+
 export const useAppStore = create<AppState>((set, get) => ({
   apps: [],
   categories: [],
@@ -62,13 +66,16 @@ export const useAppStore = create<AppState>((set, get) => ({
   searchQuery: '',
   isLoading: false,
 
-  reset: () => set({
-    apps: [],
-    categories: [],
-    selectedCategory: null,
-    searchQuery: '',
-    isLoading: false,
-  }),
+  reset: () => {
+    resetAppRequestRegistry();
+    set({
+      apps: [],
+      categories: [],
+      selectedCategory: null,
+      searchQuery: '',
+      isLoading: false,
+    });
+  },
 
   loadCategories: async () => {
     const generation = captureSessionGeneration();

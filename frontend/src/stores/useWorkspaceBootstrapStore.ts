@@ -242,21 +242,6 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
           // the stale mark — the response is ALREADY older than it (P1-R2).
           dirty: invalidationRevision !== myRevision,
         });
-        // Bootstrap rows are consume-eligible (四次复审 P1-R1): refresh the
-        // freshness stamp for any row the entity cache already holds, so the
-        // next recent/shortcut click does not immediately re-resolve it.
-        const rows = [
-          payload.default_application,
-          ...(payload.favorites ?? []),
-          ...(payload.frequent ?? []),
-          ...(payload.recent ?? []),
-          ...(payload.recommended ?? []),
-          ...(payload.recent_fixed_apps ?? []),
-        ].filter((row): row is ApplicationSummary => row != null);
-        const ids = rows
-          .filter((row) => typeof row.id === 'number')
-          .map((row) => ({ id: row.id }));
-        useApplicationEntityStore.getState().markConsumeValidated(ids);
       })
       .catch((error: any) => {
         if (generation !== myGeneration) return;

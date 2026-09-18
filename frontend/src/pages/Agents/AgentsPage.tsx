@@ -126,7 +126,7 @@ const AgentsPage: React.FC = () => {
   // Rows the user has SEEN are entities the workspace may be asked to open, so
   // every fetched page seeds the entity cache: clicking a card then costs no
   // resolve request at all (执行报告 §10-B).
-  const upsertEntities = useApplicationEntityStore((state) => state.upsertMany);
+  const upsertEntities = useApplicationEntityStore((state) => state.upsertManyManage);
   useEffect(() => { upsertEntities(appAgents); }, [appAgents, upsertEntities]);
 
   const [selectedAgentId, setSelectedAgentId] = useState<number | null>(null);
@@ -145,7 +145,7 @@ const AgentsPage: React.FC = () => {
   // them needs the whole catalog back. The page row is the authority for the
   // grid; the other two keep the shell (switcher, home shortcuts, deep links)
   // consistent with it.
-  const upsertEntity = useApplicationEntityStore((state) => state.upsert);
+  const upsertEntity = useApplicationEntityStore((state) => state.upsertManage);
   const removeEntity = useApplicationEntityStore((state) => state.remove);
   const patchBootstrap = useWorkspaceBootstrapStore((state) => state.patch);
   const removeFromBootstrap = useWorkspaceBootstrapStore((state) => state.remove);

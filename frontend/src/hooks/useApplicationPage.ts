@@ -112,11 +112,11 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
       if (requestIdRef.current !== requestId) return; // a newer query won
       const nextItems = dedupeById(page.items);
       setItems(nextItems);
-      // A consume page is a consume-eligible validation (四次复审 P1-R1):
-      // anything already cached as an entity gets its freshness refreshed so
-      // clicking it does not immediately trigger a redundant /resolve.
+      // A consume page returns complete entities: write the snapshot and
+      // its consume trust stamp atomically so freshness can never bless older
+      // data already present in the shared entity cache.
       if (mode === 'consume') {
-        useApplicationEntityStore.getState().markConsumeValidated(nextItems);
+        useApplicationEntityStore.getState().upsertManyConsume(nextItems);
       }
       setCursor(page.next_cursor);
       setHasMore(page.has_more);
@@ -160,7 +160,7 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
       });
       if (requestIdRef.current !== requestId) return; // filters changed mid-flight
       if (mode === 'consume') {
-        useApplicationEntityStore.getState().markConsumeValidated(page.items);
+        useApplicationEntityStore.getState().upsertManyConsume(page.items);
       }
       setItems((current) => dedupeById([...current, ...page.items]));
       setCursor(page.next_cursor);
