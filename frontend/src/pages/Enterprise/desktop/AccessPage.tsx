@@ -48,13 +48,15 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
   const location = useLocation();
   const initial = Number(new URLSearchParams(location.search).get("app") || 0);
   const [q, setQ] = useState("");
-  const { items, loading } = useApplicationPage({
+  const {
+    items, loading, loadingMore, hasMore, loadMore,
+  } = useApplicationPage({
     kind,
     scope: "manage",
     mode: "manage",
     includeUnbound: true,
     query: q,
-    limit: 100,
+    limit: 50,
   });
   const [selected, setSelected] = useState<V2Application | null>(null);
   const [policy, setPolicy] = useState<AccessPolicy | null>(null);
@@ -175,6 +177,13 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
         columns={columns}
         pagination={false}
       />
+      {hasMore && (
+        <div style={{ textAlign: "center", marginTop: 16 }}>
+          <Button loading={loadingMore} onClick={() => void loadMore()}>
+            加载更多
+          </Button>
+        </div>
+      )}
       <Drawer
         title={`访问权限 · ${selected?.name || ""}`}
         open={Boolean(selected)}
