@@ -1,0 +1,327 @@
+/* ============================================
+   Enterprise Mobile — 企业控制台移动端样式（开发执行报告 §31–§50）。
+   基础 Row/Section/Sheet 全部复用 MobileConsole.css 与 MobileSheets.css，
+   这里只放业务特有样式。
+   ============================================ */
+
+/* 权限编辑器 (§41) */
+
+.mobile-permission__mode {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mobile-permission__grant {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+}
+
+.mobile-permission__grant-body {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mobile-permission__grant-name {
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-permission__grant-meta {
+  color: var(--color-text-dim);
+  font-size: 12px;
+}
+
+.mobile-permission__grant-remove {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-dim);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-permission__grant-remove:active {
+  background: var(--color-bg-elevated);
+  color: var(--color-error);
+}
+
+.mobile-permission__add {
+  display: block;
+  width: 100%;
+  min-height: 44px;
+  margin-top: 10px;
+  padding: 10px 0;
+  border: 1px dashed var(--color-border);
+  border-radius: 12px;
+  background: transparent;
+  color: var(--color-primary);
+  font-size: 14px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Picker Bottom Sheets (§42/§43) */
+
+.mobile-picker {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.mobile-picker__search {
+  flex: none;
+  padding: 0 16px 8px;
+}
+
+.mobile-picker__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+
+.mobile-picker__row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 60px;
+  padding: 8px 16px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-picker__row:active {
+  background: var(--color-bg-elevated);
+}
+
+.mobile-picker__row-body {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mobile-picker__row-name {
+  color: var(--color-text);
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.mobile-picker__row-meta {
+  overflow: hidden;
+  color: var(--color-text-dim);
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-picker__check {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 1.5px solid var(--color-border-lit);
+  border-radius: 999px;
+  color: transparent;
+  font-size: 12px;
+}
+
+.mobile-picker__check--on {
+  border-color: var(--color-primary);
+  background: var(--color-primary);
+  color: var(--color-on-primary);
+}
+
+.mobile-picker__footer {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--color-border);
+  background: var(--color-bg-card);
+}
+
+.mobile-picker__footer-count {
+  color: var(--color-text-sec);
+  font-size: 13px;
+}
+
+.mobile-picker__done {
+  min-height: 40px;
+  padding: 8px 22px;
+  border: none;
+  border-radius: 999px;
+  background: var(--color-primary);
+  color: var(--color-bg-card);
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* 同步管理 (§47) */
+
+.mobile-sync__status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  background: var(--color-bg-card);
+}
+
+.mobile-sync__status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-text);
+  font-size: 14px;
+}
+
+.mobile-sync__status-line--dim {
+  color: var(--color-text-sec);
+  font-size: 13px;
+}
+
+.mobile-sync__trigger {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.mobile-sync__run {
+  padding: 12px 16px;
+}
+
+.mobile-sync__run-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mobile-sync__run-head time {
+  color: var(--color-text-dim);
+  font-size: 12px;
+}
+
+.mobile-sync__run-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 4px;
+  color: var(--color-text-dim);
+  font-size: 12px;
+}
+
+/* Provider 卡片 (§49) */
+
+.mobile-provider-card {
+  padding: 14px 16px;
+  margin-bottom: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  background: var(--color-bg-card);
+}
+
+.mobile-provider-card__name {
+  color: var(--color-text);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.mobile-provider-card__rows {
+  margin-top: 8px;
+}
+
+.mobile-provider-card__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 0;
+  font-size: 13px;
+}
+
+.mobile-provider-card__row dt {
+  flex: none;
+  color: var(--color-text-dim);
+}
+
+.mobile-provider-card__row dd {
+  margin: 0;
+  overflow: hidden;
+  color: var(--color-text-sec);
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 审计日志 (§50) */
+
+.mobile-audit__item {
+  padding: 12px 16px;
+}
+
+.mobile-audit__item-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mobile-audit__item-action {
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.mobile-audit__item-time {
+  flex: none;
+  color: var(--color-text-dim);
+  font-size: 12px;
+}
+
+.mobile-audit__item-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+  color: var(--color-text-sec);
+  font-size: 12px;
+}
+
+.mobile-audit__detail {
+  padding: 16px;
+  overflow-x: auto;
+  color: var(--color-text-sec);
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
