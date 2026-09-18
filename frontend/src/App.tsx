@@ -4,6 +4,7 @@ import router from './router';
 import {
   bootstrapPersistedSession,
   bootstrapPersistedSessionOnce,
+  syncSessionUser,
 } from '@/services/session';
 import { subscribeIdentityChange } from '@/stores/authBoundary';
 import { useAuthStore } from '@/stores/useAuthStore';
@@ -18,6 +19,9 @@ function App() {
     return auth.isAuthenticated && Boolean(auth.user);
   })());
   const verificationVersion = useRef(0);
+  const verificationPending = useRef(false);
+  const foregroundRefreshRunning = useRef(false);
+  const foregroundRefreshQueued = useRef(false);
   const [sessionReady, setSessionReady] = useState(
     () => !needsInitialVerification.current,
   );
@@ -26,10 +30,12 @@ function App() {
     let active = true;
     const settle = (verification: Promise<void>) => {
       const version = ++verificationVersion.current;
+      verificationPending.current = true;
       setSessionReady(false);
       void verification.finally(() => {
-        if (active && verificationVersion.current === version) {
-          setSessionReady(true);
+        if (verificationVersion.current === version) {
+          verificationPending.current = false;
+          if (active) setSessionReady(true);
         }
       });
     };
@@ -45,9 +51,38 @@ function App() {
       }
       settle(bootstrapPersistedSession());
     });
+    const refreshCurrentSession = () => {
+      if (verificationPending.current) return;
+      if (foregroundRefreshRunning.current) {
+        foregroundRefreshQueued.current = true;
+        return;
+      }
+      const run = async () => {
+        foregroundRefreshRunning.current = true;
+        try {
+          do {
+            foregroundRefreshQueued.current = false;
+            await syncSessionUser();
+          } while (
+            foregroundRefreshQueued.current
+            && !verificationPending.current
+          );
+        } finally {
+          foregroundRefreshRunning.current = false;
+        }
+      };
+      void run();
+    };
+    const refreshVisibleSession = () => {
+      if (document.visibilityState === 'visible') refreshCurrentSession();
+    };
+    window.addEventListener('focus', refreshCurrentSession);
+    document.addEventListener('visibilitychange', refreshVisibleSession);
     return () => {
       active = false;
       unsubscribe();
+      window.removeEventListener('focus', refreshCurrentSession);
+      document.removeEventListener('visibilitychange', refreshVisibleSession);
     };
   }, []);
 

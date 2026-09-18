@@ -24,6 +24,9 @@ import {
   workspaceStateOf,
 } from '@/stores/useWorkspaceStore';
 
+(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean })
+  .IS_REACT_ACT_ENVIRONMENT = true;
+
 const roots: Root[] = [];
 const admin = {
   id: '3', username: 'demo', email: '', role: 'admin',
@@ -108,6 +111,52 @@ describe('App session boundary', () => {
     expect(workspaceStateOf(useWorkspaceStore.getState().workspaces, 42).draft)
       .toBe('');
     expect(host.textContent).toContain('private-router');
+  });
+
+  it('refreshes the staff flag when an existing tab regains focus', async () => {
+    mocks.get
+      .mockResolvedValueOnce({ id: 3, username: 'demo', is_staff: true })
+      .mockResolvedValueOnce({ id: 3, username: 'demo', is_staff: false });
+    await renderApp();
+    expect((useAuthStore.getState().user as any).is_staff).toBe(true);
+
+    await act(async () => {
+      window.dispatchEvent(new Event('focus'));
+      await Promise.resolve();
+    });
+
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+    expect((useAuthStore.getState().user as any).is_staff).toBe(false);
+  });
+
+  it('serializes paired visibility and focus refreshes with a trailing check', async () => {
+    let releaseFirst: (value: unknown) => void = () => {};
+    let releaseTrailing: (value: unknown) => void = () => {};
+    mocks.get
+      .mockResolvedValueOnce({ id: 3, username: 'demo', is_staff: true })
+      .mockReturnValueOnce(new Promise((resolve) => { releaseFirst = resolve; }))
+      .mockReturnValueOnce(new Promise((resolve) => { releaseTrailing = resolve; }));
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible');
+    await renderApp();
+
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      window.dispatchEvent(new Event('focus'));
+      await Promise.resolve();
+    });
+    expect(mocks.get).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      releaseFirst({ id: 3, username: 'demo', is_staff: true });
+      await Promise.resolve();
+    });
+    expect(mocks.get).toHaveBeenCalledTimes(3);
+
+    await act(async () => {
+      releaseTrailing({ id: 3, username: 'demo', is_staff: false });
+      await Promise.resolve();
+    });
+    expect((useAuthStore.getState().user as any).is_staff).toBe(false);
   });
 
   it('ignores a rebroadcast for the identity already installed', async () => {
