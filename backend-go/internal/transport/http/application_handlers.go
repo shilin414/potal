@@ -183,7 +183,7 @@ func avatarURL(app *catalog.Application) string {
 	return fmt.Sprintf("/api/v2/applications/%d/avatar?v=%s", app.ID, avatarVersion(app.AvatarKey))
 }
 
-func (s *Server) appDetail(ctx context.Context, app *catalog.Application, binding *catalog.Binding, caller *AuthenticatedUser) applicationDetail {
+func (s *Server) appDetail(ctx context.Context, app *catalog.Application, binding *catalog.Binding, caller *AuthenticatedUser) (applicationDetail, error) {
 	manage := canManageCaller(app, caller)
 	d := applicationDetail{
 		ID:             app.ID,
@@ -205,16 +205,30 @@ func (s *Server) appDetail(ctx context.Context, app *catalog.Application, bindin
 	}
 	var provider *catalog.Provider
 	if binding != nil && binding.Enabled {
+		providers, err := s.activeProviderIndex(ctx)
+		if err != nil {
+			return applicationDetail{}, err
+		}
 		d.IsBound = true
 		d.RuntimeType = binding.RuntimeType
 		d.ProviderKey = binding.ProviderKey
 		d.ExternalResourceID = binding.ExternalResourceID
 		d.IdentityMode = binding.IdentityMode
 		d.ExecutionMode = binding.ExecutionMode
-		provider = activeProviderForBinding(binding, s.activeProviders(ctx))
+		provider = providers.activeForBinding(binding)
 	}
 	d.IsConsumable, d.ConsumeBlockReason = consumptionStatus(app, binding, provider)
-	return d
+	return d, nil
+}
+
+func (s *Server) writeApplicationDetail(w http.ResponseWriter, status int, ctx context.Context,
+	app *catalog.Application, binding *catalog.Binding, caller *AuthenticatedUser) {
+	detail, err := s.appDetail(ctx, app, binding, caller)
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, status, detail)
 }
 
 func canManageCaller(app *catalog.Application, caller *AuthenticatedUser) bool {
@@ -263,7 +277,11 @@ func (s *Server) ListApplications(w http.ResponseWriter, r *http.Request, params
 		s.Metric.LegacyApplicationListRequestsTotal.Inc()
 	}
 
-	providers := s.activeProviders(ctx)
+	providers, err := s.activeProviderIndex(ctx)
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	// The legacy whole-list endpoint keeps its user-wide aggregation until
 	// callers migrate to the paged endpoint (which aggregates only the page
 	// ids, §20).
@@ -451,7 +469,11 @@ func (s *Server) ListApplicationPage(w http.ResponseWriter, r *http.Request, par
 		return
 	}
 
-	providers := s.activeProviders(ctx)
+	providers, err := s.activeProviderIndex(ctx)
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 
 	items := make([]applicationListItem, 0, len(page))
 	for _, item := range page {
@@ -468,17 +490,46 @@ func (s *Server) ListApplicationPage(w http.ResponseWriter, r *http.Request, par
 
 // ────────────────────────────────────────────── shared list ingredients ──
 
-// activeProviders indexes the active providers by id — the capability lookup
-// `buildListItem` needs. Best-effort: an empty map simply means no
-// capabilities are reported.
-func (s *Server) activeProviders(ctx context.Context) map[int64]*catalog.Provider {
-	providers := map[int64]*catalog.Provider{}
-	if provs, err := s.CatalogRepo.ListActiveProviders(ctx); err == nil {
-		for i := range provs {
-			providers[provs[i].ID] = &provs[i]
-		}
+// providerIndex keys providers by provider_key, the business identity shared
+// with AuthorizeExecution. provider_id is only a nullable derived cache and
+// must never override a conflicting provider_key.
+type providerIndex struct {
+	byKey map[string]*catalog.Provider
+}
+
+func newProviderIndex(providers []catalog.Provider) providerIndex {
+	byKey := make(map[string]*catalog.Provider, len(providers))
+	for i := range providers {
+		provider := &providers[i]
+		byKey[provider.Key] = provider
 	}
-	return providers
+	return providerIndex{byKey: byKey}
+}
+
+func providerIndexOf(provider *catalog.Provider) providerIndex {
+	index := providerIndex{byKey: map[string]*catalog.Provider{}}
+	if provider != nil && provider.Key != "" {
+		index.byKey[provider.Key] = provider
+	}
+	return index
+}
+
+func (index providerIndex) activeForBinding(binding *catalog.Binding) *catalog.Provider {
+	if binding == nil || binding.ProviderKey == "" {
+		return nil
+	}
+	return index.byKey[binding.ProviderKey]
+}
+
+// activeProviderIndex is authoritative input to management consumability and
+// capabilities. A query failure is infrastructure failure and must propagate;
+// returning an empty index would misreport every chat agent as unavailable.
+func (s *Server) activeProviderIndex(ctx context.Context) (providerIndex, error) {
+	providers, err := s.CatalogRepo.ListActiveProviders(ctx)
+	if err != nil {
+		return providerIndex{}, err
+	}
+	return newProviderIndex(providers), nil
 }
 
 // personalUsage aggregates the CALLER's own runs per application.
@@ -531,23 +582,6 @@ func (s *Server) personalFavorites(ctx context.Context, userID int64) map[int64]
 	return favorites
 }
 
-func activeProviderForBinding(binding *catalog.Binding, providers map[int64]*catalog.Provider) *catalog.Provider {
-	if binding == nil {
-		return nil
-	}
-	if binding.ProviderID != nil {
-		if provider := providers[*binding.ProviderID]; provider != nil {
-			return provider
-		}
-	}
-	for _, provider := range providers {
-		if provider.Key == binding.ProviderKey {
-			return provider
-		}
-	}
-	return nil
-}
-
 func consumptionStatus(app *catalog.Application, binding *catalog.Binding, provider *catalog.Provider) (bool, string) {
 	var providerStatus *string
 	if provider != nil {
@@ -567,7 +601,7 @@ func consumptionStatus(app *catalog.Application, binding *catalog.Binding, provi
 	return false, "runtime_unavailable"
 }
 
-func (s *Server) buildListItem(item catalog.ApplicationWithBinding, providers map[int64]*catalog.Provider,
+func (s *Server) buildListItem(item catalog.ApplicationWithBinding, providers providerIndex,
 	favorites map[int64]bool, usage map[int64]pageUsage, caller *AuthenticatedUser) applicationListItem {
 	app := item.App
 	capsAny := map[string]any{}
@@ -578,7 +612,7 @@ func (s *Server) buildListItem(item catalog.ApplicationWithBinding, providers ma
 		isBound = true
 		rt = item.Binding.RuntimeType
 		pk = item.Binding.ProviderKey
-		provider = activeProviderForBinding(item.Binding, providers)
+		provider = providers.activeForBinding(item.Binding)
 		boolCaps := item.Binding.EffectiveCapabilities(provider)
 		capsAny = map[string]any{}
 		for k, v := range boolCaps {
@@ -661,7 +695,7 @@ func (s *Server) GetApplication(w http.ResponseWriter, r *http.Request, id genap
 	if errors.Is(err, catalog.ErrNotFound) {
 		binding = nil
 	}
-	writeJSON(w, http.StatusOK, s.appDetail(r.Context(), app, binding, caller))
+	s.writeApplicationDetail(w, http.StatusOK, r.Context(), app, binding, caller)
 }
 
 // denyApplicationVisibility records a visibility refusal. The response is
@@ -747,7 +781,7 @@ func (s *Server) CreateApplication(w http.ResponseWriter, r *http.Request) {
 		s.writeCatalogError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, s.appDetail(r.Context(), app, binding, caller))
+	s.writeApplicationDetail(w, http.StatusCreated, r.Context(), app, binding, caller)
 }
 
 type runtimeInput struct {
@@ -815,7 +849,7 @@ func (s *Server) UpdateApplication(w http.ResponseWriter, r *http.Request, id ge
 		s.writeCatalogError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, s.appDetail(r.Context(), app, binding, caller))
+	s.writeApplicationDetail(w, http.StatusOK, r.Context(), app, binding, caller)
 }
 
 func (s *Server) DeleteApplication(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
@@ -947,7 +981,7 @@ func (s *Server) SetDefaultAgent(w http.ResponseWriter, r *http.Request, id gena
 	if errors.Is(err, catalog.ErrNotFound) {
 		binding = nil
 	}
-	writeJSON(w, http.StatusOK, s.appDetail(r.Context(), app, binding, caller))
+	s.writeApplicationDetail(w, http.StatusOK, r.Context(), app, binding, caller)
 }
 
 func (s *Server) UnsetDefaultAgent(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
@@ -980,7 +1014,7 @@ func (s *Server) UnsetDefaultAgent(w http.ResponseWriter, r *http.Request, id ge
 	if errors.Is(err, catalog.ErrNotFound) {
 		binding = nil
 	}
-	writeJSON(w, http.StatusOK, s.appDetail(r.Context(), app, binding, caller))
+	s.writeApplicationDetail(w, http.StatusOK, r.Context(), app, binding, caller)
 }
 
 // ───────────────────────────────────────────────────────────── avatar ──
@@ -1166,7 +1200,7 @@ func (s *Server) UploadApplicationAvatar(w http.ResponseWriter, r *http.Request,
 	if errors.Is(err, catalog.ErrNotFound) {
 		binding = nil
 	}
-	writeJSON(w, http.StatusOK, s.appDetail(r.Context(), updated, binding, caller))
+	s.writeApplicationDetail(w, http.StatusOK, r.Context(), updated, binding, caller)
 }
 
 func (s *Server) ClearApplicationAvatar(w http.ResponseWriter, r *http.Request, id genapi.ApplicationId) {
@@ -1214,7 +1248,7 @@ func (s *Server) ClearApplicationAvatar(w http.ResponseWriter, r *http.Request, 
 	if errors.Is(err, catalog.ErrNotFound) {
 		binding = nil
 	}
-	writeJSON(w, http.StatusOK, s.appDetail(r.Context(), updated, binding, caller))
+	s.writeApplicationDetail(w, http.StatusOK, r.Context(), updated, binding, caller)
 }
 
 // helpers

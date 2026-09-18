@@ -29,19 +29,20 @@ import (
 type Metrics struct {
 	Registry *prometheus.Registry
 
-	HTTPDuration  *prometheus.HistogramVec
-	HTTPRequests  *prometheus.CounterVec
-	SSEActive     prometheus.Gauge
-	QueueDepth    *prometheus.GaugeVec
-	RunDuration   *prometheus.HistogramVec
-	RunTotal      *prometheus.CounterVec
-	LeaseExpired  prometheus.Counter
-	OutboxBacklog prometheus.Gauge
-	ProviderCalls *prometheus.CounterVec
-	Provider429   *prometheus.CounterVec
-	Reconciles    prometheus.Counter
-	DBLatency     *prometheus.HistogramVec
-	RedisLatency  *prometheus.HistogramVec
+	HTTPDuration               *prometheus.HistogramVec
+	HTTPRequests               *prometheus.CounterVec
+	SessionRevokeFailuresTotal prometheus.Counter
+	SSEActive                  prometheus.Gauge
+	QueueDepth                 *prometheus.GaugeVec
+	RunDuration                *prometheus.HistogramVec
+	RunTotal                   *prometheus.CounterVec
+	LeaseExpired               prometheus.Counter
+	OutboxBacklog              prometheus.Gauge
+	ProviderCalls              *prometheus.CounterVec
+	Provider429                *prometheus.CounterVec
+	Reconciles                 prometheus.Counter
+	DBLatency                  *prometheus.HistogramVec
+	RedisLatency               *prometheus.HistogramVec
 
 	ScheduleTriggerDelay  *prometheus.HistogramVec
 	ScheduleQueueDelay    *prometheus.HistogramVec
@@ -274,6 +275,10 @@ func NewMetrics(service string) *Metrics {
 			Name: "studio_http_requests_total",
 			Help: "HTTP requests processed.",
 		}, []string{"route", "method", "status"}),
+		SessionRevokeFailuresTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "studio_session_revoke_failures_total",
+			Help: "Logout requests whose server-side session token could not be revoked.",
+		}),
 		SSEActive: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "studio_sse_active_connections",
 			Help: "Currently open SSE streams.",
@@ -514,7 +519,8 @@ func NewMetrics(service string) *Metrics {
 		}, []string{"result"}),
 	}
 	reg.MustRegister(
-		m.HTTPDuration, m.HTTPRequests, m.SSEActive, m.QueueDepth,
+		m.HTTPDuration, m.HTTPRequests, m.SessionRevokeFailuresTotal,
+		m.SSEActive, m.QueueDepth,
 		m.RunDuration, m.RunTotal, m.LeaseExpired, m.OutboxBacklog,
 		m.ProviderCalls, m.Provider429, m.Reconciles, m.DBLatency, m.RedisLatency,
 		m.ScheduleTriggerDelay, m.ScheduleQueueDelay, m.ScheduleMisfireTotal,

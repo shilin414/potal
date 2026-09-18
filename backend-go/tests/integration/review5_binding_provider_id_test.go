@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/creation-agent-studio/backend-go/internal/catalog"
 )
 
 func applyMigrationFile(t *testing.T, d *sql.DB, file string) {
@@ -115,6 +117,66 @@ func TestMigration0019ClearsProviderIDForOrphanProviderKey(t *testing.T) {
 		t.Fatalf("after 0019 provider_id = %d, want NULL: the key %q resolves to "+
 			"no provider, so the derived column must be cleared, not left stale",
 			got.Int64, ghostKey)
+	}
+}
+
+// Management DTOs and resolve must use the provider selected by provider_key,
+// even while a historical provider_id cache points at another active row.
+func TestConsumptionBundleUsesProviderKeyWhenProviderIDIsWrong(t *testing.T) {
+	env := newScheduleEnv(t)
+	providerKey, providerID, appID, bindingID := seedBindingFixture(t, env.db, "bundle-ssot")
+	wrongKey := fmt.Sprintf("itest_bind_wrong_%d", time.Now().UnixNano())
+	wrongID := seedAuthzProvider(t, env.db, wrongKey, "active")
+	t.Cleanup(func() {
+		cleanupBindingFixture(env.db, appID, wrongID)
+		_, _ = env.db.ExecContext(context.Background(), `DELETE FROM providers WHERE id = ?`, providerID)
+	})
+	if _, err := env.db.ExecContext(context.Background(),
+		`UPDATE providers SET capabilities = ? WHERE id = ?`,
+		`{"attachments":true}`, providerID); err != nil {
+		t.Fatalf("set provider capabilities: %v", err)
+	}
+	setBindingProvider(t, env.db, bindingID, providerKey, wrongID)
+
+	repo := &catalog.Repo{DB: env.db}
+	bundle, err := repo.ConsumptionBundleByID(context.Background(), appID)
+	if err != nil {
+		t.Fatalf("load consumption bundle: %v", err)
+	}
+	if bundle.Provider == nil || bundle.Provider.Key != providerKey {
+		t.Fatalf("bundle provider = %#v, want key %q rather than provider_id key %q",
+			bundle.Provider, providerKey, wrongKey)
+	}
+	if got, _ := bundle.Provider.Capabilities["attachments"].(bool); !got {
+		t.Fatalf("bundle capabilities came from the wrong provider: %#v", bundle.Provider.Capabilities)
+	}
+
+	if _, err := env.db.ExecContext(context.Background(),
+		`UPDATE providers SET status = 'inactive' WHERE id = ?`, providerID); err != nil {
+		t.Fatalf("deactivate key provider: %v", err)
+	}
+	bundle, err = repo.ConsumptionBundleByID(context.Background(), appID)
+	if err != nil {
+		t.Fatalf("reload consumption bundle: %v", err)
+	}
+	if bundle.ProviderStatus == nil || *bundle.ProviderStatus != "inactive" {
+		t.Fatalf("bundle status = %v, want inactive from provider_key row", bundle.ProviderStatus)
+	}
+	if catalog.Consumable(catalog.ConsumptionFacts{
+		Application: bundle.Application, Binding: bundle.Binding, ProviderStatus: bundle.ProviderStatus,
+	}) {
+		t.Fatal("active wrong provider_id incorrectly made an inactive provider_key consumable")
+	}
+
+	ghostKey := fmt.Sprintf("ghost_bundle_%d", time.Now().UnixNano())
+	setBindingProvider(t, env.db, bindingID, ghostKey, wrongID)
+	bundle, err = repo.ConsumptionBundleByID(context.Background(), appID)
+	if err != nil {
+		t.Fatalf("load missing-key bundle: %v", err)
+	}
+	if bundle.Provider != nil || bundle.ProviderStatus != nil {
+		t.Fatalf("missing provider_key fell back to provider_id: provider=%#v status=%v",
+			bundle.Provider, bundle.ProviderStatus)
 	}
 }
 

@@ -26,32 +26,25 @@ func silentLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
-// recoverRun drives the reaper until the given run is no longer running, i.e.
-// until the expired lease that belongs to it has been recovered. The reaper
-// works in bounded batches and the shared dev database accumulates expired
-// leases from earlier runs, so a single RecoverExpiredLeases call does not
-// deterministically reach one specific run. Returns the total number of runs
-// recovered along the way.
+// recoverRun targets only the fixture run. Shared development databases can
+// contain unrelated expired leases; a test must never mutate them merely to
+// reach its own row.
 func recoverRun(t *testing.T, svc *execution.Service, runID ids.ID) int {
 	t.Helper()
-	ctx := context.Background()
-	recovered := 0
-	for i := 0; i < 20; i++ {
-		n, err := svc.RecoverExpiredLeases(ctx, 100)
-		if err != nil {
-			t.Fatalf("reaper: %v", err)
+	ok, err := svc.RecoverExpiredLease(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("recover run %s: %v", runID, err)
+	}
+	if !ok {
+		run, loadErr := svc.GetRun(context.Background(), runID)
+		if loadErr != nil {
+			t.Fatalf("load concurrently recovered run %s: %v", runID, loadErr)
 		}
-		recovered += n
-		run, err := svc.GetRun(ctx, runID)
-		if err != nil {
-			t.Fatalf("load run %s: %v", runID, err)
-		}
-		if run.Status != execution.StatusRunning {
-			return recovered
+		if run.Status == execution.StatusRunning {
+			t.Fatalf("run %s was not recovered; status=%s", runID, run.Status)
 		}
 	}
-	t.Fatalf("run %s was never recovered by the reaper", runID)
-	return recovered
+	return 1
 }
 
 // seedRun inserts a queued run directly (test fixture).

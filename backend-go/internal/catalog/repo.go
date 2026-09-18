@@ -125,11 +125,13 @@ func (r *Repo) ApplicationBySlug(ctx context.Context, slug string) (*Application
 
 // ConsumptionBundle is the single-object read `Consumable` decides on: the
 // application, its current enabled binding (nil when the application has
-// none) and that binding's provider status (nil when the provider row is
-// missing — the same fail-closed shape AuthorizeExecution reads).
+// none) and the provider row selected by binding.provider_key (nil when the
+// provider row is missing — the same fail-closed shape AuthorizeExecution
+// reads). ProviderStatus is retained as the direct Consumable input.
 type ConsumptionBundle struct {
 	Application    *Application
 	Binding        *Binding
+	Provider       *Provider
 	ProviderStatus *string
 }
 
@@ -206,6 +208,18 @@ func (r *Repo) ConsumptionBundleByID(ctx context.Context, id int64) (*Consumptio
 		b.Config = map[string]any{}
 	}
 	out.Binding = b
+	if row.ResolvedProviderKey.Valid {
+		provider := &Provider{
+			Key:          row.ResolvedProviderKey.String,
+			Status:       row.ProviderStatus.String,
+			Capabilities: map[string]any{},
+		}
+		_ = json.Unmarshal(row.ProviderCapabilities, &provider.Capabilities)
+		if provider.Capabilities == nil {
+			provider.Capabilities = map[string]any{}
+		}
+		out.Provider = provider
+	}
 	if row.ProviderStatus.Valid {
 		v := row.ProviderStatus.String
 		out.ProviderStatus = &v

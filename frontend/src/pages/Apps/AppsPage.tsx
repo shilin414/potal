@@ -70,8 +70,9 @@ const AppsPage: React.FC = () => {
     limit: 24,
   });
 
-  // Browsed rows seed the entity cache, so opening a card resolves from memory
-  // instead of issuing a resolve request (执行报告 §10-B).
+  // Management rows seed the shared entity cache for display/update
+  // coherence. They never admit a consumer route: WorkspaceHost always
+  // performs a forced consume resolve before mounting the renderer.
   const upsertEntities = useApplicationEntityStore((state) => state.upsertManyManage);
   useEffect(() => { upsertEntities(apps); }, [apps, upsertEntities]);
 
@@ -79,8 +80,8 @@ const AppsPage: React.FC = () => {
    * One mutation, THREE writes (二次复审 P1-3).
    *
    * A row this page has rendered is known in three places: the paged list,
-   * the entity cache (a card click resolves `/app/:slug` from it without a
-   * request), and the workspace bootstrap (首页 固定应用 + the category
+   * the entity cache (display/update coherence only; consumer admission still
+   * forces `/applications/resolve`), and the workspace bootstrap (首页 固定应用 + the category
    * rails). Writing only the first used to leave the other two stale: the
    * switch showed 停用 while the cached entity — the one a deep link opens —
    * still said enabled, and 首页 kept offering the app.

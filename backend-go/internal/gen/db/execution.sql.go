@@ -1993,6 +1993,7 @@ func (q *Queries) ListClaimedAttachmentsByRun(ctx context.Context, runID []byte)
 const listExpiredLeaseRunIDs = `-- name: ListExpiredLeaseRunIDs :many
 SELECT run_id FROM run_leases
 WHERE expires_at <= CURRENT_TIMESTAMP(3)
+ORDER BY expires_at, run_id
 LIMIT ?
 `
 

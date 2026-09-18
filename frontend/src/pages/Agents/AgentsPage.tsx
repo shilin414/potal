@@ -124,9 +124,9 @@ const AgentsPage: React.FC = () => {
   // How many legacy rows are MOUNTED (二次复审 P2-2). Grown by 显示更多.
   const [localRenderLimit, setLocalRenderLimit] = useState(LOCAL_AGENT_PAGE);
 
-  // Rows the user has SEEN are entities the workspace may be asked to open, so
-  // every fetched page seeds the entity cache: clicking a card then costs no
-  // resolve request at all (执行报告 §10-B).
+  // Management rows seed the shared entity cache for display/update
+  // coherence. They never admit a consumer route: WorkspaceHost always
+  // performs a forced consume resolve before mounting the renderer.
   const upsertEntities = useApplicationEntityStore((state) => state.upsertManyManage);
   useEffect(() => { upsertEntities(appAgents); }, [appAgents, upsertEntities]);
 
@@ -235,9 +235,9 @@ const AgentsPage: React.FC = () => {
       message.warning(consumeBlock);
       return;
     }
-    // The workspace resolves the slug from the ENTITY cache (`/applications/
-    // resolve`), so "open" seeds that cache instead of reloading the catalog
-    // — opening an agent costs no list request at all (执行报告 §15).
+    // Keep management and workspace displays coherent, but do not treat this
+    // cache write as route admission. WorkspaceHost still forces a consume
+    // resolve before it mounts the chat renderer.
     upsertEntity(agent);
     openApplication(agent.id);
     navigate(`/chat/${agent.slug}`);

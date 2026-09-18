@@ -5,12 +5,15 @@ import (
 )
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/creation-agent-studio/backend-go/internal/identity"
 )
@@ -21,30 +24,107 @@ import (
 // entry point; a distributed limiter is unnecessary for staff-only
 // low-volume traffic.
 type loginAttemptLimiter struct {
-	mu       sync.Mutex
-	attempts map[string][]time.Time
-	window   time.Duration
-	max      int
+	mu         sync.Mutex
+	attempts   map[string][]time.Time
+	window     time.Duration
+	max        int
+	maxKeys    int
+	sweepEvery uint64
+	calls      uint64
+	now        func() time.Time
+	overflow   [][]time.Time
 }
 
 func newLoginAttemptLimiter(max int, window time.Duration) *loginAttemptLimiter {
-	return &loginAttemptLimiter{attempts: map[string][]time.Time{}, window: window, max: max}
+	return &loginAttemptLimiter{
+		attempts:   map[string][]time.Time{},
+		window:     window,
+		max:        max,
+		maxKeys:    adminLoginMaxKeys,
+		sweepEvery: adminLoginSweepEvery,
+		now:        time.Now,
+		overflow:   make([][]time.Time, adminLoginOverflowBuckets),
+	}
+}
+
+func (l *loginAttemptLimiter) prune(hist []time.Time, now time.Time) []time.Time {
+	kept := hist[:0]
+	for _, attemptedAt := range hist {
+		if now.Sub(attemptedAt) < l.window {
+			kept = append(kept, attemptedAt)
+		}
+	}
+	return kept
+}
+
+func (l *loginAttemptLimiter) sweepExpiredLocked(now time.Time) {
+	for key, hist := range l.attempts {
+		kept := l.prune(hist, now)
+		if len(kept) == 0 {
+			delete(l.attempts, key)
+			continue
+		}
+		l.attempts[key] = kept
+	}
+	for i, hist := range l.overflow {
+		l.overflow[i] = l.prune(hist, now)
+	}
+}
+
+func limiterOverflowBucket(key string, buckets int) int {
+	if buckets <= 0 {
+		return -1
+	}
+	const offset64 = uint64(1469598103934665603)
+	const prime64 = uint64(1099511628211)
+	hash := offset64
+	for i := 0; i < len(key); i++ {
+		hash ^= uint64(key[i])
+		hash *= prime64
+	}
+	return int(hash % uint64(buckets))
+}
+
+func (l *loginAttemptLimiter) allowOverflowLocked(key string, now time.Time) bool {
+	bucket := limiterOverflowBucket(key, len(l.overflow))
+	if bucket < 0 {
+		return false
+	}
+	kept := l.prune(l.overflow[bucket], now)
+	if len(kept) >= l.max {
+		l.overflow[bucket] = kept
+		return false
+	}
+	l.overflow[bucket] = append(kept, now)
+	return true
 }
 
 func (l *loginAttemptLimiter) allow(key string) bool {
-	now := time.Now()
+	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	hist := l.attempts[key]
-	kept := hist[:0]
-	for _, t := range hist {
-		if now.Sub(t) < l.window {
-			kept = append(kept, t)
-		}
+
+	l.calls++
+	if l.sweepEvery > 0 && l.calls%l.sweepEvery == 0 {
+		l.sweepExpiredLocked(now)
+	}
+
+	hist, exists := l.attempts[key]
+	kept := l.prune(hist, now)
+	if len(kept) == 0 && exists {
+		delete(l.attempts, key)
+		exists = false
 	}
 	if len(kept) >= l.max {
 		l.attempts[key] = kept
 		return false
+	}
+	if !exists && l.maxKeys > 0 && len(l.attempts) >= l.maxKeys {
+		// Periodic sweeps above reclaim expired entries. A fixed hash-bucket
+		// overflow keeps memory and lookup time bounded while preserving the
+		// same attempt budget for identities that cannot receive a dedicated
+		// map entry. Collisions fail closed rather than weaken the limit.
+		return l.allowOverflowLocked(key, now)
 	}
 	l.attempts[key] = append(kept, now)
 	return true
@@ -55,6 +135,9 @@ func (l *loginAttemptLimiter) reset(key string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	delete(l.attempts, key)
+	if bucket := limiterOverflowBucket(key, len(l.overflow)); bucket >= 0 {
+		l.overflow[bucket] = nil
+	}
 }
 
 // ──────────────────────────────────────────────────── OAuth endpoints ──
@@ -115,35 +198,99 @@ func (s *Server) GetSession(w http.ResponseWriter, r *http.Request) {
 // adminLoginMaxAttempts / adminLoginWindow: 5 failed attempts per
 // username+IP within 5 minutes lock that combination out (修复计划 §41).
 const (
-	adminLoginMaxAttempts = 5
-	adminLoginWindow      = 5 * time.Minute
+	adminLoginMaxAttempts             = 5
+	adminLoginMaxPeerAttempts         = 100
+	adminLoginWindow                  = 5 * time.Minute
+	adminLoginMaxKeys                 = 10_000
+	adminLoginOverflowBuckets         = 2_048
+	adminLoginSweepEvery       uint64 = 100
+	adminLoginUsernameMaxRunes        = 150
+	adminLoginBodyMaxBytes            = 16 * 1024
+	sessionRevokeTimeout              = 3 * time.Second
 )
 
-// clientIP extracts the peer address for login throttling (proxy headers
-// are NOT trusted — this is a throttle key, not an identity claim).
-func clientIP(r *http.Request) string {
-	host := r.RemoteAddr
-	if i := strings.LastIndex(host, ":"); i > 0 {
-		host = host[:i]
+// clientIP returns the socket peer unless that peer is an explicitly trusted
+// reverse proxy. Trusted proxies may supply X-Real-IP, which the shipped Nginx
+// configuration overwrites from its own socket peer; arbitrary forwarding
+// headers from direct clients are never accepted.
+func (s *Server) clientIP(r *http.Request) string {
+	peer := remoteIP(r.RemoteAddr)
+	if peer == nil {
+		return r.RemoteAddr
 	}
-	return host
+	if !s.isTrustedProxy(peer) {
+		return peer.String()
+	}
+	if forwarded := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); forwarded != nil {
+		return forwarded.String()
+	}
+	return peer.String()
 }
 
-// allowAdminLogin enforces the per username+IP attempt budget. The
-// limiter initializes lazily so every Server construction path gets it.
-func adminLoginKey(username string, r *http.Request) string {
-	return username + "|" + clientIP(r)
+func remoteIP(remoteAddr string) net.IP {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		host = strings.Trim(remoteAddr, "[]")
+	}
+	return net.ParseIP(host)
+}
+
+func (s *Server) isTrustedProxy(peer net.IP) bool {
+	s.trustedProxyOnce.Do(func() {
+		if s.Config == nil {
+			return
+		}
+		for _, raw := range s.Config.Auth.TrustedProxyCIDRs {
+			_, network, err := net.ParseCIDR(raw)
+			if err == nil {
+				s.trustedProxyNets = append(s.trustedProxyNets, network)
+			}
+		}
+	})
+	for _, network := range s.trustedProxyNets {
+		if network.Contains(peer) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) adminLoginKey(username string, r *http.Request) string {
+	return username + "|" + s.clientIP(r)
 }
 
 func (s *Server) adminLoginAttempts() *loginAttemptLimiter {
 	s.adminLimiterOnce.Do(func() {
 		s.adminLoginLimiter = newLoginAttemptLimiter(adminLoginMaxAttempts, adminLoginWindow)
+		s.adminLoginPeerLimiter = newLoginAttemptLimiter(adminLoginMaxPeerAttempts, adminLoginWindow)
 	})
 	return s.adminLoginLimiter
 }
 
+func (s *Server) adminLoginPeerAttempts() *loginAttemptLimiter {
+	s.adminLoginAttempts()
+	return s.adminLoginPeerLimiter
+}
+
 func (s *Server) allowAdminLogin(username string, r *http.Request) bool {
-	return s.adminLoginAttempts().allow(adminLoginKey(username, r))
+	peer := s.clientIP(r)
+	if !s.adminLoginPeerAttempts().allow(peer) {
+		return false
+	}
+	return s.adminLoginAttempts().allow(s.adminLoginKey(username, r))
+}
+
+func (s *Server) resetAdminLogin(username string, r *http.Request) {
+	s.adminLoginAttempts().reset(s.adminLoginKey(username, r))
+	s.adminLoginPeerAttempts().reset(s.clientIP(r))
+}
+
+func normalizeAdminUsername(raw string) (string, bool) {
+	username := strings.TrimSpace(raw)
+	if username == "" || utf8.RuneCountInString(username) > adminLoginUsernameMaxRunes {
+		return "", false
+	}
+	return username, true
 }
 
 func (s *Server) AdminLogin(w http.ResponseWriter, r *http.Request) {
@@ -155,10 +302,17 @@ func (s *Server) AdminLogin(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, adminLoginBodyMaxBytes)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeSimpleError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
+	username, ok := normalizeAdminUsername(body.Username)
+	if !ok {
+		writeSimpleError(w, http.StatusBadRequest, "invalid username")
+		return
+	}
+	body.Username = username
 	if !s.allowAdminLogin(body.Username, r) {
 		w.Header().Set("Retry-After", "300")
 		writeSimpleError(w, http.StatusTooManyRequests, "too many failed attempts, retry later")
@@ -168,14 +322,14 @@ func (s *Server) AdminLogin(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Audit failure (never credentials) + throttle accounting.
 		s.IdentityRepo.WriteAuditLog(r.Context(), nil, "admin.login.failed", body.Username, map[string]any{
-			"ip": clientIP(r),
+			"ip": s.clientIP(r),
 		})
 		writeSimpleError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
-	s.adminLoginAttempts().reset(adminLoginKey(body.Username, r))
+	s.resetAdminLogin(body.Username, r)
 	s.IdentityRepo.WriteAuditLog(r.Context(), &user.ID, "admin.login.success", body.Username, map[string]any{
-		"ip": clientIP(r),
+		"ip": s.clientIP(r),
 	})
 	s.setSessionCookie(w, r, user)
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -204,10 +358,17 @@ func (s *Server) AuthLogin(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, adminLoginBodyMaxBytes)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeDetail(w, http.StatusBadRequest, "invalid body")
 		return
 	}
+	username, ok := normalizeAdminUsername(body.Username)
+	if !ok {
+		writeDetail(w, http.StatusBadRequest, "invalid username")
+		return
+	}
+	body.Username = username
 	if !s.allowAdminLogin(body.Username, r) {
 		w.Header().Set("Retry-After", "300")
 		writeDetail(w, http.StatusTooManyRequests, "尝试过于频繁，请稍后再试")
@@ -216,15 +377,15 @@ func (s *Server) AuthLogin(w http.ResponseWriter, r *http.Request) {
 	user, err := s.IdentityRepo.VerifyLocalAdmin(r.Context(), body.Username, body.Password)
 	if err != nil {
 		s.IdentityRepo.WriteAuditLog(r.Context(), nil, "admin.login.failed", body.Username, map[string]any{
-			"ip":     clientIP(r),
+			"ip":     s.clientIP(r),
 			"legacy": true,
 		})
 		writeDetail(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
-	s.adminLoginAttempts().reset(adminLoginKey(body.Username, r))
+	s.resetAdminLogin(body.Username, r)
 	s.IdentityRepo.WriteAuditLog(r.Context(), &user.ID, "admin.login.success", body.Username, map[string]any{
-		"ip":     clientIP(r),
+		"ip":     s.clientIP(r),
 		"legacy": true,
 	})
 	s.setSessionCookie(w, r, user)
@@ -235,10 +396,28 @@ func (s *Server) AuthLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) AuthLogout(w http.ResponseWriter, r *http.Request) {
+	var revokeErr error
 	if c, err := r.Cookie(s.Store.CookieName()); err == nil {
-		_ = s.Store.Revoke(r.Context(), c.Value)
+		// Revocation is security-critical and must not be canceled merely
+		// because the browser navigated away or its request timeout elapsed.
+		revokeCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), sessionRevokeTimeout)
+		revokeErr = s.Store.Revoke(revokeCtx, c.Value)
+		cancel()
 	}
+	// The browser boundary closes even when Redis cannot revoke the server
+	// token. The non-200 response preserves that security distinction while
+	// the frontend's finally block still completes local logout.
 	s.clearSessionCookies(w)
+	if revokeErr != nil {
+		if s.Log != nil {
+			s.Log.Error("session revoke failed", "err", revokeErr)
+		}
+		if s.Metric != nil && s.Metric.SessionRevokeFailuresTotal != nil {
+			s.Metric.SessionRevokeFailuresTotal.Inc()
+		}
+		writeSimpleError(w, http.StatusServiceUnavailable, "session revoke failed")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"detail": "登出成功"})
 }
 

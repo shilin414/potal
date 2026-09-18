@@ -2,6 +2,10 @@ import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import axiosInstance from '@/services/axios';
 import {
+  broadcastExplicitLogout,
+  subscribeExplicitLogout,
+} from '@/stores/authBoundary';
+import {
   isSameUser,
   resetSessionScopedState,
 } from '@/stores/resetSessionState';
@@ -134,6 +138,9 @@ export const useAuthStore = create<AuthState>()(
         // auto-OAuth navigation can abort this request and immediately log the
         // user back in.
         set({ isLoggingOut: true });
+        // Notify sibling tabs before the revoke request can invalidate the
+        // shared cookie and make their in-flight requests return 401.
+        broadcastExplicitLogout();
         try {
           await axiosInstance.post('/auth/logout/', {}, { timeout: 5000 });
         } catch (error) {
@@ -141,13 +148,7 @@ export const useAuthStore = create<AuthState>()(
           // session. We still finish the local boundary in finally.
           console.error('Logout error:', error);
         } finally {
-          resetSessionScopedState();
-          set({
-            user: null,
-            isAuthenticated: false,
-            isLoggingOut: false,
-            explicitlyLoggedOut: true,
-          });
+          completeExplicitLogout();
         }
       },
 
@@ -167,3 +168,22 @@ export const useAuthStore = create<AuthState>()(
     }
   )
 );
+
+function completeExplicitLogout(): void {
+  resetSessionScopedState();
+  useAuthStore.setState({
+    user: null,
+    isAuthenticated: false,
+    isLoggingOut: false,
+    explicitlyLoggedOut: true,
+  });
+}
+
+// Active tabs share the browser cookie but not Zustand memory. A transient
+// BroadcastChannel boundary prevents a sibling tab from treating the next 401
+// as session expiry and immediately recreating the just-revoked session.
+const unsubscribeExplicitLogout = subscribeExplicitLogout(completeExplicitLogout);
+const hot = (import.meta as ImportMeta & {
+  hot?: { dispose: (callback: () => void) => void };
+}).hot;
+hot?.dispose(unsubscribeExplicitLogout);

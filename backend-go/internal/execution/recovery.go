@@ -38,20 +38,31 @@ func (s *Service) RecoverExpiredLeases(ctx context.Context, limit int) (int, err
 	recovered := 0
 	for _, raw := range runIDs {
 		runID := mustID(raw)
-		ok, err := s.recoverExpiredLeaseTx(ctx, runID)
+		ok, err := s.RecoverExpiredLease(ctx, runID)
 		if err != nil {
 			s.Log.Error("reaper recovery failed", "run_id", runID.String(), slogKey("err"), err)
 			continue
 		}
 		if ok {
 			recovered++
-			if s.Metrics != nil {
-				s.Metrics.LeaseExpired.Inc()
-				s.Metrics.RunReaperTotal.Inc()
-			}
 		}
 	}
 	return recovered, nil
+}
+
+// RecoverExpiredLease applies the same atomic recovery transaction to one
+// known run. It is useful for targeted operational repair and lets integration
+// tests prove recovery without sweeping unrelated rows in a shared database.
+func (s *Service) RecoverExpiredLease(ctx context.Context, runID ids.ID) (bool, error) {
+	ok, err := s.recoverExpiredLeaseTx(ctx, runID)
+	if err != nil || !ok {
+		return ok, err
+	}
+	if s.Metrics != nil {
+		s.Metrics.LeaseExpired.Inc()
+		s.Metrics.RunReaperTotal.Inc()
+	}
+	return true, nil
 }
 
 // recoverExpiredLeaseTx recovers one expired lease atomically. It

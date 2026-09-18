@@ -530,13 +530,13 @@ type Querier interface {
 	// ONE joined read of everything a SINGLE-application consumption decision
 	// needs (三次复审 P0-R3): the application row, its CURRENT enabled binding
 	// (the newest one wins — the same choice GetEnabledBinding and the catalog
-	// page's anti-join make) and the binding's provider status. It replaces the
+	// page's anti-join make) and the binding's provider row. It replaces the
 	// ApplicationByID → EnabledBinding → ProviderByKey serial walk, and it is
 	// what lets `Consumable` see the same provider fact `AuthorizeExecution`
 	// sees, so resolve / @mention can never open an application the run API
 	// would refuse because the admin switched the PROVIDER off.
 	//
-	// `b.*` / `p.status` are NULL when the application has no enabled binding /
+	// `b.*` / `p.*` are NULL when the application has no enabled binding /
 	// the binding has no providers row — the Go layer fails closed on both.
 	GetConsumptionBundle(ctx context.Context, id uint64) (GetConsumptionBundleRow, error)
 	GetConversationByID(ctx context.Context, id uint64) (Conversation, error)

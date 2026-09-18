@@ -157,6 +157,7 @@ type AuthConfig struct {
 	AdminBootstrapUsername string
 	AdminBootstrapPassword string
 	CSRFCookieName         string
+	TrustedProxyCIDRs      []string
 }
 
 type OTelConfig struct {
@@ -277,6 +278,8 @@ func Load(searchPaths ...string) (*Config, error) {
 			AdminBootstrapUsername: getEnv("ADMIN_BOOTSTRAP_USERNAME", "admin"),
 			AdminBootstrapPassword: getEnv("ADMIN_BOOTSTRAP_PASSWORD", ""),
 			CSRFCookieName:         getEnv("CSRF_COOKIE_NAME", "studio_csrf"),
+			TrustedProxyCIDRs: parseCSV(getEnv("TRUSTED_PROXY_CIDRS",
+				"127.0.0.1/32,::1/128,172.16.0.0/12")),
 		},
 		OTel: OTelConfig{
 			Endpoint:     getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
@@ -459,6 +462,16 @@ func getEnvPositiveDuration(key string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+func parseCSV(s string) []string {
+	out := make([]string, 0)
+	for _, part := range strings.Split(s, ",") {
+		if value := strings.TrimSpace(part); value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func parseBackoff(s string) []time.Duration {

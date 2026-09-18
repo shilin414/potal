@@ -378,6 +378,7 @@ DELETE FROM run_leases WHERE run_id = ? AND expires_at <= CURRENT_TIMESTAMP(3);
 -- name: ListExpiredLeaseRunIDs :many
 SELECT run_id FROM run_leases
 WHERE expires_at <= CURRENT_TIMESTAMP(3)
+ORDER BY expires_at, run_id
 LIMIT ?;
 
 -- ───────────────────────────────────────── provider execution slots ──

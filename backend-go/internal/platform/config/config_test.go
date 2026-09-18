@@ -38,6 +38,18 @@ func TestParseWeights(t *testing.T) {
 	}
 }
 
+func TestTrustedProxyCIDRsConfig(t *testing.T) {
+	t.Setenv("TRUSTED_PROXY_CIDRS", "10.0.0.0/8, 192.168.0.0/16")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	want := []string{"10.0.0.0/8", "192.168.0.0/16"}
+	if !reflect.DeepEqual(cfg.Auth.TrustedProxyCIDRs, want) {
+		t.Fatalf("trusted proxies = %v, want %v", cfg.Auth.TrustedProxyCIDRs, want)
+	}
+}
+
 // sseEnvKeys are the Batch 4 hub bounds. Tests neutralize them by setting an
 // EMPTY value rather than unsetting them: getEnv* treats "" as absent, and an
 // empty-but-present variable also stops loadDotEnv from filling it in from a

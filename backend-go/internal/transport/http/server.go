@@ -4,13 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 
 	"github.com/creation-agent-studio/backend-go/internal/automation/schedule"
@@ -32,6 +32,18 @@ type FeishuUserTokenResolver interface {
 	UserAccessToken(ctx context.Context, userID int64) (string, error)
 }
 
+// IdentitySessionStore is the session-store surface used by HTTP handlers.
+// The interface keeps logout failure handling testable without weakening the
+// concrete Redis-backed implementation used by middleware and production.
+type IdentitySessionStore interface {
+	CookieName() string
+	CSRFName() string
+	Create(ctx context.Context, sess identity.Session) (token, csrf string, err error)
+	Get(ctx context.Context, token string) (*identity.Session, error)
+	Revoke(ctx context.Context, token string) error
+	Refresh(ctx context.Context, token string)
+}
+
 // Server implements genapi.ServerInterface. Every dependency is injected;
 // no globals.
 type Server struct {
@@ -42,7 +54,7 @@ type Server struct {
 	Redis  *redisx.Client
 
 	IdentityRepo *identity.Repo
-	Store        *identity.SessionStore
+	Store        IdentitySessionStore
 	StateCodec   *identity.StateCodec
 	Oauth        *identity.ExchangeOrchestrator
 	Feishu       *identity.FeishuClient
@@ -72,8 +84,11 @@ type Server struct {
 
 	// adminLoginLimiter throttles local admin logins (username+IP,
 	// 修复计划 §41); initialized lazily on first admin login.
-	adminLoginLimiter *loginAttemptLimiter
-	adminLimiterOnce  sync.Once
+	adminLoginLimiter     *loginAttemptLimiter
+	adminLoginPeerLimiter *loginAttemptLimiter
+	adminLimiterOnce      sync.Once
+	trustedProxyOnce      sync.Once
+	trustedProxyNets      []*net.IPNet
 
 	router chi.Router
 }
@@ -154,7 +169,6 @@ func (s *Server) Router() http.Handler {
 		return s.router
 	}
 	r := chi.NewRouter()
-	r.Use(chimw.RealIP)
 	r.Use(Recovery())
 	r.Use(RequestInfo())
 	r.Use(Metrics(s.Metric, normalizeRoute))

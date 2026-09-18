@@ -38,6 +38,17 @@ func idempotentInput(clientRequestID, content string, convID int64) *execution.C
 	return idempotentInputFor(42, clientRequestID, content, convID)
 }
 
+func countRunRequestIdentity(t *testing.T, svc *execution.Service, userID int64, clientRequestID string) int64 {
+	t.Helper()
+	var n int64
+	if err := svc.DB.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM run_requests WHERE user_id = ? AND client_request_id = ?`,
+		userID, clientRequestID).Scan(&n); err != nil {
+		t.Fatalf("count run-request identity: %v", err)
+	}
+	return n
+}
+
 // idempotentInputFor is the same submit for a specific user. The per-user
 // OUTSTANDING cap is a whole-user count, so a test that exercises it must own
 // its user outright — user 42 is shared by every fixture in this package.
@@ -254,20 +265,18 @@ func TestCreateRunIdempotentResolveIsReadOnly(t *testing.T) {
 	convID := seedConversation(t, svc)
 	cleanupConversation(t, svc, convID)
 
-	const reqID = "review9-resolve"
+	reqID := fmt.Sprintf("review9-resolve-%d", time.Now().UnixNano())
+	const userID = int64(42)
+	if before := countRunRequestIdentity(t, svc, userID, reqID); before != 0 {
+		t.Fatalf("unique fixture unexpectedly existed before resolve: %d row(s)", before)
+	}
 	hash := execution.RunRequestHash(1, convID, "payload", nil)
-	run, found, err := svc.ResolveRunRequest(ctx, 42, reqID, hash)
+	run, found, err := svc.ResolveRunRequest(ctx, userID, reqID, hash)
 	if err != nil || found || run != nil {
 		t.Fatalf("resolve of an unknown request: run=%v found=%v err=%v, want nil/false/nil", run, found, err)
 	}
-	var n int64
-	if err := svc.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM run_requests`).Scan(&n); err != nil {
-		t.Fatalf("count reservations: %v", err)
-	}
-	// Only the fixtures deliberately created above may exist; this test
-	// created none.
-	if n != 0 {
-		t.Fatalf("a read-only resolve inserted %d reservation(s)", n)
+	if after := countRunRequestIdentity(t, svc, userID, reqID); after != 0 {
+		t.Fatalf("a read-only resolve inserted %d reservation(s) for its fixture identity", after)
 	}
 }
 

@@ -182,6 +182,55 @@ func TestReaperRecoveryAtomicFail(t *testing.T) {
 	}
 }
 
+func TestRecoverExpiredLeasesBatchPathIsBoundedAndDeterministic(t *testing.T) {
+	svc, _ := testEnv(t)
+	ctx := context.Background()
+	const provider = "itest_closure_batch_reaper"
+
+	convA := seedConversation(t, svc)
+	cleanupConversation(t, svc, convA)
+	runA := seedRunWithConversation(t, svc, provider, convA)
+	convB := seedConversation(t, svc)
+	cleanupConversation(t, svc, convB)
+	runB := seedRunWithConversation(t, svc, provider, convB)
+
+	for _, fixture := range []struct {
+		runID    ids.ID
+		workerID string
+		expires  string
+	}{
+		{runID: runA, workerID: "batch-a", expires: "1000-01-01 00:00:00.000"},
+		{runID: runB, workerID: "batch-b", expires: "1000-01-01 00:00:01.000"},
+	} {
+		if _, won, err := svc.ClaimRun(ctx, fixture.runID, fixture.workerID, time.Minute); err != nil || !won {
+			t.Fatalf("claim %s: won=%v err=%v", fixture.runID, won, err)
+		}
+		if _, err := svc.DB.ExecContext(ctx,
+			`UPDATE run_leases SET expires_at = ? WHERE run_id = ?`, fixture.expires, fixture.runID.Bytes()); err != nil {
+			t.Fatalf("expire %s: %v", fixture.runID, err)
+		}
+	}
+
+	recovered, err := svc.RecoverExpiredLeases(ctx, 1)
+	if err != nil {
+		t.Fatalf("batch recover: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("batch recovered %d runs, want limit 1", recovered)
+	}
+	first, err := svc.GetRun(ctx, runA)
+	if err != nil {
+		t.Fatalf("load first run: %v", err)
+	}
+	second, err := svc.GetRun(ctx, runB)
+	if err != nil {
+		t.Fatalf("load second run: %v", err)
+	}
+	if first.Status != execution.StatusQueued || second.Status != execution.StatusRunning {
+		t.Fatalf("ordered batch statuses = %s/%s, want queued/running", first.Status, second.Status)
+	}
+}
+
 // ── T2: stale worker retry fenced ──
 
 func TestStaleWorkerRetryFenced(t *testing.T) {
@@ -387,20 +436,23 @@ func TestProviderSessionFence(t *testing.T) {
 	svc, _ := testEnv(t)
 	ctx := context.Background()
 	convID := seedConversation(t, svc)
-	runID := seedRunWithConversation(t, svc, "feishu_aily", convID)
+	cleanupConversation(t, svc, convID)
+	const provider = "itest_closure_session_fence"
+	runID := seedRunWithConversation(t, svc, provider, convID)
 
-	// Thread for the conversation.
+	// Thread for the conversation. A test-only provider keeps the requeued run
+	// away from any live development worker sharing this database and Redis.
 	threadID := ids.New()
 	if _, err := svc.Querier().CreateAgentThread(ctx, db.CreateAgentThreadParams{
 		ID: threadID.Bytes(), ConversationID: uint64(convID),
-		Provider: "feishu_aily", AuthMode: "user", AuthSubjectKey: "42",
+		Provider: provider, AuthMode: "user", AuthSubjectKey: "42",
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	claimedA, _, err := svc.ClaimRun(ctx, runID, "worker-a", time.Minute)
-	if err != nil {
-		t.Fatal(err)
+	claimedA, won, err := svc.ClaimRun(ctx, runID, "worker-a", time.Minute)
+	if err != nil || !won {
+		t.Fatalf("worker A claim: won=%v err=%v", won, err)
 	}
 	// A binds session_A first (as the owner).
 	if err := svc.BindProviderSessionOwned(ctx, claimedA.Ownership, threadID, "session_A"); err != nil {
@@ -414,9 +466,9 @@ func TestProviderSessionFence(t *testing.T) {
 	// A loses the run; B takes over and binds session_B.
 	expireLease(t, svc, runID, "worker-a")
 	recoverRun(t, svc, runID)
-	claimedB, _, err := svc.ClaimRun(ctx, runID, "worker-b", time.Minute)
-	if err != nil {
-		t.Fatal(err)
+	claimedB, won, err := svc.ClaimRun(ctx, runID, "worker-b", time.Minute)
+	if err != nil || !won {
+		t.Fatalf("worker B claim: won=%v err=%v", won, err)
 	}
 	if err := svc.BindProviderSessionOwned(ctx, claimedB.Ownership, threadID, "session_B"); err != nil {
 		t.Fatalf("new owner bind: %v", err)

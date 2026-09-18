@@ -122,7 +122,11 @@ func (s *Server) GetWorkspaceBootstrap(w http.ResponseWriter, r *http.Request) {
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	providers := s.activeProviders(ctx)
+	providers, err := s.activeProviderIndex(ctx)
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 
 	items := make(map[int64]applicationListItem, len(rows))
 	for _, row := range rows {
@@ -371,10 +375,9 @@ func (s *Server) ResolveApplication(w http.ResponseWriter, r *http.Request, para
 		writeSimpleError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	providers := s.activeProviders(ctx)
 	item := s.buildListItem(
 		catalog.ApplicationWithBinding{App: app, Binding: bundle.Binding},
-		providers, favorites, usageMapOf(usage), caller)
+		providerIndexOf(bundle.Provider), favorites, usageMapOf(usage), caller)
 	writeJSON(w, http.StatusOK, item)
 }
 

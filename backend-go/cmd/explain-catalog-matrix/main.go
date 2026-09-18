@@ -448,6 +448,9 @@ func explain(db *sql.DB, explainParams explainScenario, scenario, sql string) {
 			strings.ReplaceAll(pick["possible_keys"], ",", "+"), strings.ReplaceAll(pick["key"], ",", "+"),
 			pick["key_len"], pick["rows"], pick["filtered"], pick["Extra"])
 	}
+	if err := rows.Err(); err != nil {
+		fmt.Println("  rows:", err)
+	}
 }
 
 func main() {

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -37,8 +38,12 @@ func sessionTokenFrom(ctx context.Context) string {
 	return s
 }
 
+type identityUserResolver interface {
+	UserWithIdentity(ctx context.Context, id int64) (*identity.User, *identity.FeishuIdentity, error)
+}
+
 // SessionAuth resolves the opaque session cookie to a user.
-func SessionAuth(store *identity.SessionStore, repo *identity.Repo) func(http.Handler) http.Handler {
+func SessionAuth(store IdentitySessionStore, repo identityUserResolver) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			c, err := r.Cookie(store.CookieName())
@@ -47,7 +52,12 @@ func SessionAuth(store *identity.SessionStore, repo *identity.Repo) func(http.Ha
 					if user, ident, err := repo.UserWithIdentity(r.Context(), sess.UserID); err == nil {
 						ctx := context.WithValue(r.Context(), userCtxKey, &AuthenticatedUser{User: user, Identity: ident})
 						ctx = context.WithValue(ctx, sessionCtxKey, c.Value)
-						store.Refresh(r.Context(), c.Value) // sliding TTL
+						// Logout must never extend the token immediately before a
+						// best-effort revoke; a revoke failure should leave only the
+						// pre-existing TTL, not refresh it to a full session window.
+						if r.URL.Path != "/api/auth/logout/" {
+							store.Refresh(r.Context(), c.Value) // sliding TTL
+						}
 						next.ServeHTTP(w, r.WithContext(ctx))
 						return
 					}
@@ -69,9 +79,35 @@ func RequireAuth(next http.Handler) http.Handler {
 	})
 }
 
+func logoutOriginAllowed(r *http.Request, devMode bool) bool {
+	if strings.EqualFold(r.Header.Get("Sec-Fetch-Site"), "same-origin") {
+		return true
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return false
+	}
+	if strings.EqualFold(parsed.Host, r.Host) {
+		return true
+	}
+	if !devMode {
+		return false
+	}
+	switch strings.ToLower(origin) {
+	case "http://localhost:3030", "http://localhost:3031", "http://localhost:3032", "http://127.0.0.1:3030":
+		return true
+	default:
+		return false
+	}
+}
+
 // CSRF guards every state-changing request via double-submit cookie
 // (X-CSRF-Token header vs studio_csrf cookie) plus Origin checking.
-func CSRF(store *identity.SessionStore, devMode bool) func(http.Handler) http.Handler {
+func CSRF(store IdentitySessionStore, devMode bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
@@ -86,17 +122,26 @@ func CSRF(store *identity.SessionStore, devMode bool) func(http.Handler) http.Ha
 				next.ServeHTTP(w, r)
 				return
 			}
-			c, err := r.Cookie(store.CSRFName())
-			if err != nil || c.Value == "" {
-				// Dev without a CSRF cookie yet: reject with a precise error.
+			c, cookieErr := r.Cookie(store.CSRFName())
+			csrfValid := cookieErr == nil && c.Value != "" &&
+				identity.ValidateCSRF(r.Header.Get("X-CSRF-Token"), c.Value)
+			if csrfValid {
+				next.ServeHTTP(w, r)
+				return
+			}
+			// Logout is a session-destroying operation. If the readable CSRF
+			// cookie was independently evicted, still allow a browser request
+			// whose Origin / Fetch Metadata proves it is same-origin; otherwise
+			// the HttpOnly session cookie could survive while the UI logs out.
+			if r.URL.Path == "/api/auth/logout/" && logoutOriginAllowed(r, devMode) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if cookieErr != nil || c.Value == "" {
 				writeSimpleError(w, http.StatusForbidden, "CSRF cookie missing")
 				return
 			}
-			if !identity.ValidateCSRF(r.Header.Get("X-CSRF-Token"), c.Value) {
-				writeSimpleError(w, http.StatusForbidden, "CSRF verification failed")
-				return
-			}
-			next.ServeHTTP(w, r)
+			writeSimpleError(w, http.StatusForbidden, "CSRF verification failed")
 		})
 	}
 }

@@ -11,10 +11,22 @@ import {
 } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const mocks = vi.hoisted(() => ({ post: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  post: vi.fn(),
+  broadcastExplicitLogout: vi.fn(),
+  explicitLogoutListener: undefined as undefined | (() => void),
+}));
 
 vi.mock('@/services/axios', () => ({
   default: { post: mocks.post },
+}));
+
+vi.mock('@/stores/authBoundary', () => ({
+  broadcastExplicitLogout: mocks.broadcastExplicitLogout,
+  subscribeExplicitLogout: (listener: () => void) => {
+    mocks.explicitLogoutListener = listener;
+    return () => { mocks.explicitLogoutListener = undefined; };
+  },
 }));
 
 import { ProtectedRoute } from '@/router/guards';
@@ -34,6 +46,7 @@ function LocationProbe() {
 
 beforeEach(() => {
   mocks.post.mockReset();
+  mocks.broadcastExplicitLogout.mockReset();
   useAuthStore.setState({
     user,
     isAuthenticated: true,
@@ -62,6 +75,7 @@ describe('explicit logout lifecycle', () => {
     expect(mocks.post).toHaveBeenCalledWith(
       '/auth/logout/', {}, { timeout: 5000 },
     );
+    expect(mocks.broadcastExplicitLogout).toHaveBeenCalledTimes(1);
 
     settle?.({});
     await pending;
@@ -71,6 +85,7 @@ describe('explicit logout lifecycle', () => {
       isLoggingOut: false,
       explicitlyLoggedOut: true,
     });
+    expect(mocks.broadcastExplicitLogout).toHaveBeenCalledTimes(1);
   });
 
   it('still completes the explicit local logout after a transport failure', async () => {
@@ -85,6 +100,20 @@ describe('explicit logout lifecycle', () => {
       isLoggingOut: false,
       explicitlyLoggedOut: true,
     });
+  });
+
+  it('applies an explicit logout broadcast received from another tab', () => {
+    expect(mocks.explicitLogoutListener).toBeTypeOf('function');
+
+    mocks.explicitLogoutListener?.();
+
+    expect(useAuthStore.getState()).toMatchObject({
+      user: null,
+      isAuthenticated: false,
+      isLoggingOut: false,
+      explicitlyLoggedOut: true,
+    });
+    expect(mocks.broadcastExplicitLogout).not.toHaveBeenCalled();
   });
 
   it('routes explicit logout to the manual page, but session expiry to auto OAuth', async () => {

@@ -630,13 +630,13 @@ ORDER BY a.created_at, a.id;
 -- ONE joined read of everything a SINGLE-application consumption decision
 -- needs (三次复审 P0-R3): the application row, its CURRENT enabled binding
 -- (the newest one wins — the same choice GetEnabledBinding and the catalog
--- page's anti-join make) and the binding's provider status. It replaces the
+-- page's anti-join make) and the binding's provider row. It replaces the
 -- ApplicationByID → EnabledBinding → ProviderByKey serial walk, and it is
 -- what lets `Consumable` see the same provider fact `AuthorizeExecution`
 -- sees, so resolve / @mention can never open an application the run API
 -- would refuse because the admin switched the PROVIDER off.
 --
--- `b.*` / `p.status` are NULL when the application has no enabled binding /
+-- `b.*` / `p.*` are NULL when the application has no enabled binding /
 -- the binding has no providers row — the Go layer fails closed on both.
 SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon, a.avatar_key, a.color,
        a.kind, a.renderer_key, a.executor_key, a.category_id, a.is_public, a.is_default_agent, a.enabled,
@@ -649,6 +649,8 @@ SELECT a.id, a.slug, a.name, COALESCE(a.description, '') AS description, a.icon,
        b.session_policy AS binding_session_policy, b.artifact_policy AS binding_artifact_policy,
        b.capabilities AS binding_capabilities, b.config AS binding_config,
        b.timeout_seconds AS binding_timeout_seconds, b.enabled AS binding_enabled,
+       p.provider_key AS resolved_provider_key,
+       p.capabilities AS provider_capabilities,
        p.status AS provider_status
 FROM applications a
 LEFT JOIN application_categories c ON c.id = a.category_id

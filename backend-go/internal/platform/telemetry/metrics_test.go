@@ -23,6 +23,15 @@ func gatherNames(t *testing.T, m *Metrics) map[string]*dto.MetricFamily {
 // TestProductionAlertingMetricsAreExported pins the P3 surface of the
 // remaining-issues report: the alert rules are defined on these series, so a
 // silent rename/removal must fail here instead of in production.
+
+func TestSessionRevokeFailureMetricIsExported(t *testing.T) {
+	m := NewMetrics("test")
+	m.SessionRevokeFailuresTotal.Add(0)
+	if gatherNames(t, m)["studio_session_revoke_failures_total"] == nil {
+		t.Fatal("studio_session_revoke_failures_total is not exported")
+	}
+}
+
 func TestProductionAlertingMetricsAreExported(t *testing.T) {
 	m := NewMetrics("test")
 
