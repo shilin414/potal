@@ -7,6 +7,8 @@ import { useApplicationPage } from "@/hooks/useApplicationPage";
 import { useCatalogUiStore } from "@/stores/useCatalogUiStore";
 import { applicationConsumeBlock } from "@/lib/applicationConsumability";
 import { setApplicationFavorite, type V2Application } from "@/services/runApi";
+import { useIsMobile } from "@/shell/useIsMobile";
+import MobileAgentCenter from "./MobileAgentCenter";
 import "./AgentsPage.css";
 
 const { Search } = Input;
@@ -15,7 +17,8 @@ const cardDelay = (index: number): React.CSSProperties => ({
   animationDelay: `${Math.min(index, 8) * 40}ms`,
 });
 
-const AgentsPage: React.FC = () => {
+/** Desktop grid — unchanged (开发执行报告 §54: Desktop 不允许回归). */
+const DesktopAgentCenter: React.FC = () => {
   const navigate = useNavigate();
   const category = useCatalogUiStore((state) => state.agentCategory);
   const [query, setQuery] = useState("");
@@ -143,5 +146,15 @@ const AgentsPage: React.FC = () => {
       )}
     </div>
   );
+};
+
+/**
+ * Router adapter (开发执行报告 §11): React-level switch, never CSS hiding —
+ * the two centres are different information architectures, not two sizes of
+ * the same grid.
+ */
+const AgentsPage: React.FC = () => {
+  const isMobile = useIsMobile();
+  return isMobile ? <MobileAgentCenter /> : <DesktopAgentCenter />;
 };
 export default AgentsPage;
