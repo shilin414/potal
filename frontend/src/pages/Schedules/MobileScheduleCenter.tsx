@@ -157,40 +157,34 @@ export function MobileScheduleCenter() {
       ) : (
         <div className="mobile-schedule-list">
           {data.map((s) => (
-            <div
-              key={s.id}
-              className="mobile-schedule-card"
-              role="button"
-              tabIndex={0}
-              onClick={() => setDetailId(s.id)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  setDetailId(s.id);
-                }
-              }}
-            >
-              <div className="mobile-schedule-card__row">
-                <span className="mobile-schedule-card__name">{s.name}</span>
-                <ScheduleStatusTag schedule={s} compact />
-              </div>
-              <div className="mobile-schedule-card__meta">
-                <span>{describeSchedulePlan(s)}</span>
-                <span>
-                  下次执行：
-                  <time dateTime={s.next_run_at ?? undefined}>
-                    {formatDateTime(s.next_run_at)}
-                  </time>
-                </span>
-              </div>
+            <div key={s.id} className="mobile-schedule-card">
+              {/* Wrapper / Main / ••• — 全部原生 button，浏览器接管焦点树与
+                  Enter/Space 激活（二次复审 P2-2，不再用 role=button 容器）。 */}
+              <button
+                type="button"
+                className="mobile-schedule-card__main"
+                aria-label={`查看任务详情：${s.name}`}
+                onClick={() => setDetailId(s.id)}
+              >
+                <div className="mobile-schedule-card__row">
+                  <span className="mobile-schedule-card__name">{s.name}</span>
+                  <ScheduleStatusTag schedule={s} compact />
+                </div>
+                <div className="mobile-schedule-card__meta">
+                  <span>{describeSchedulePlan(s)}</span>
+                  <span>
+                    下次执行：
+                    <time dateTime={s.next_run_at ?? undefined}>
+                      {formatDateTime(s.next_run_at)}
+                    </time>
+                  </span>
+                </div>
+              </button>
               <button
                 type="button"
                 className="mobile-schedule-card__more"
                 aria-label={`更多操作：${s.name}`}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setSheetFor(s);
-                }}
+                onClick={() => setSheetFor(s)}
               >
                 •••
               </button>

@@ -117,8 +117,11 @@
   font-weight: 600;
 }
 
-/* ── MobileEntityRow (§14) ───────────────────────────────────────────── */
+/* ── MobileEntityRow (§14, 二次复审 P2-1) ─────────────────────────────── */
 
+/* The wrapper only owns layout / divider / padding — the interactive
+   surface moved to .mobile-console-row__main so no button is ever nested
+   inside another interactive element. */
 .mobile-console-row {
   display: flex;
   align-items: center;
@@ -126,15 +129,25 @@
   width: 100%;
   min-height: 72px;
   padding: 10px 16px;
-  border: none;
-  background: transparent;
-  text-align: left;
-  cursor: pointer;
-  -webkit-tap-highlight-color: transparent;
 }
 
 .mobile-console-row:active {
   background: var(--color-bg-elevated);
+}
+
+/* The main tap target: avatar + body (+ optional status dot). */
+.mobile-console-row__main {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+  border: none;
+  padding: 0;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .mobile-console-row__avatar {
@@ -192,6 +205,8 @@
   text-overflow: ellipsis;
 }
 
+/* Native <button> since P2-1: reset the UA padding/font so the icon stays
+   centred exactly like the old span-based version. */
 .mobile-console-row__star {
   display: grid;
   flex: none;
@@ -200,6 +215,7 @@
   height: 40px;
   border: none;
   border-radius: 999px;
+  padding: 0;
   background: transparent;
   color: var(--color-text-dim);
   font-size: 16px;
@@ -249,14 +265,18 @@
   background: var(--color-border-lit);
 }
 
-/* ••• trailing action (§37): 44px tap target instead of the chevron. */
+/* ••• trailing action (§37): 44px tap target instead of the chevron.
+   Native <button> since P2-1 — same UA reset as the star. */
 .mobile-console-row__more {
   display: grid;
   flex: none;
   place-items: center;
   width: 44px;
   height: 44px;
+  border: none;
   border-radius: 999px;
+  padding: 0;
+  background: transparent;
   color: var(--color-text-sec);
   font-size: 18px;
   letter-spacing: 1px;

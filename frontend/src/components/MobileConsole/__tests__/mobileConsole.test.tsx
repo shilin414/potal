@@ -45,12 +45,6 @@ function click(el: Element) {
   });
 }
 
-function keyDown(el: Element, key: string) {
-  return act(async () => {
-    el.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true }));
-  });
-}
-
 afterEach(() => {
   document.body.innerHTML = '';
 });
@@ -63,7 +57,7 @@ describe('MobileEntityRow', () => {
     meta: '财务 · Aily',
   };
 
-  it('fires onClick and renders the info hierarchy (§14)', async () => {
+  it('fires onClick from the main button and renders the info hierarchy (§14)', async () => {
     const onClick = vi.fn();
     await mount(<MobileEntityRow {...base} onClick={onClick} />);
     const row = document.querySelector('.mobile-console-row')!;
@@ -71,46 +65,70 @@ describe('MobileEntityRow', () => {
     expect(row.textContent).toContain('财务数据查询');
     expect(row.textContent).toContain('财务 · Aily');
     expect(document.querySelector('.mobile-console-row__chevron')).toBeTruthy();
-    await click(row);
+    // The wrapper is a plain div; the interactive surface is the main button.
+    expect(row.tagName).toBe('DIV');
+    const main = document.querySelector<HTMLButtonElement>('.mobile-console-row__main')!;
+    expect(main.tagName).toBe('BUTTON');
+    await click(main);
     expect(onClick).toHaveBeenCalledTimes(1);
   });
 
-  it('favorite click stops propagation and keeps its own aria-label (§15/§65)', async () => {
+  it('favorite is a real button and never leaks to the row (§15/§65/P2-1)', async () => {
     const onClick = vi.fn();
     const onFavorite = vi.fn();
     await mount(
       <MobileEntityRow {...base} favorite onClick={onClick} onFavorite={onFavorite} />,
     );
-    const star = document.querySelector('.mobile-console-row__star')!;
+    const star = document.querySelector<HTMLButtonElement>('.mobile-console-row__star')!;
+    // P2-1: a native button — no span role="button", no nesting inside the
+    // row's main button. Enter/Space activation comes from the browser.
+    expect(star.tagName).toBe('BUTTON');
     expect(star.getAttribute('aria-label')).toBe('取消收藏：财务助手');
+    expect(document.querySelector('.mobile-console-row__main .mobile-console-row__star'))
+      .toBeNull();
     await click(star);
     expect(onFavorite).toHaveBeenCalledTimes(1);
     expect(onClick).not.toHaveBeenCalled();
   });
 
-  it('favorite supports keyboard activation without leaking to the row', async () => {
-    const onClick = vi.fn();
-    const onFavorite = vi.fn();
+  it('favorite aria-label flips when not yet favorited', async () => {
     await mount(
-      <MobileEntityRow {...base} favorite={false} onClick={onClick} onFavorite={onFavorite} />,
+      <MobileEntityRow {...base} favorite={false} onClick={() => {}} onFavorite={() => {}} />,
     );
-    const star = document.querySelector('.mobile-console-row__star')!;
-    expect(star.getAttribute('aria-label')).toBe('收藏：财务助手');
-    await keyDown(star, 'Enter');
-    expect(onFavorite).toHaveBeenCalledTimes(1);
-    expect(onClick).not.toHaveBeenCalled();
+    expect(document.querySelector('.mobile-console-row__star')!.getAttribute('aria-label'))
+      .toBe('收藏：财务助手');
   });
 
-  it('••• replaces the chevron and stops propagation (§37)', async () => {
+  it('••• replaces the chevron and is an independent button (§37/P2-1)', async () => {
     const onClick = vi.fn();
     const onMore = vi.fn();
     await mount(<MobileEntityRow {...base} onMore={onMore} onClick={onClick} />);
-    const more = document.querySelector('.mobile-console-row__more')!;
+    const more = document.querySelector<HTMLButtonElement>('.mobile-console-row__more')!;
+    expect(more.tagName).toBe('BUTTON');
     expect(more.getAttribute('aria-label')).toBe('更多操作：财务助手');
     expect(document.querySelector('.mobile-console-row__chevron')).toBeNull();
     await click(more);
     expect(onMore).toHaveBeenCalledTimes(1);
     expect(onClick).not.toHaveBeenCalled();
+  });
+
+  it('no interactive element is ever nested inside another one (P2-1)', async () => {
+    await mount(
+      <MobileEntityRow
+        {...base}
+        favorite
+        onFavorite={() => {}}
+        onMore={() => {}}
+        onClick={() => {}}
+      />,
+    );
+    const row = document.querySelector('.mobile-console-row')!;
+    // main / star / more are sibling native buttons DIRECTLY under the wrapper.
+    expect(row.querySelector('button button')).toBeNull();
+    const buttons = Array.from(row.querySelectorAll('button'));
+    expect(buttons).toHaveLength(3);
+    for (const b of buttons) expect(b.parentElement).toBe(row);
+    expect(document.querySelector('[role="button"]')).toBeNull();
   });
 
   it('status dot + label renders the enterprise variant (§36)', async () => {

@@ -1,8 +1,13 @@
 /**
  * MobileEntityRow — the rich list row every mobile centre shares
- * (开发执行报告 §14). A real <button> (§65) with avatar / title / description /
- * meta, an optional favorite star that stops propagation (§15), an optional
- * badge (默认智能体), and a trailing chevron.
+ * (开发执行报告 §14, 二次复审 P2-1).
+ *
+ * Wrapper / Main Button / Favorite Button / More Button — every independent
+ * action is a REAL native <button> (no span role="button", no button nested
+ * inside a button): the browser owns the focus tree, Enter/Space activation
+ * and screen-reader semantics, and stopPropagation hacks disappear.
+ * The wrapper keeps the hairline-divider look; `.mobile-console-row__main`
+ * owns avatar / title / description / meta.
  */
 import React from 'react';
 import { RightOutlined, StarFilled, StarOutlined } from '@ant-design/icons';
@@ -28,75 +33,55 @@ const MobileEntityRow: React.FC<MobileEntityRowProps> = ({
   avatar, title, description, meta, badge, favorite, statusDot, statusLabel,
   onMore, onClick, onFavorite, 'aria-label': ariaLabel,
 }) => (
-  <button
-    type="button"
-    className="mobile-console-row"
-    aria-label={ariaLabel ?? title}
-    onClick={onClick}
-  >
-    <span className="mobile-console-row__avatar">{avatar}</span>
-    <span className="mobile-console-row__body">
-      <span className="mobile-console-row__title">
-        <span>{title}</span>
-        {badge && <span className="mobile-console-row__title-badge">{badge}</span>}
+  <div className="mobile-console-row">
+    <button
+      type="button"
+      className="mobile-console-row__main"
+      aria-label={ariaLabel ?? title}
+      onClick={onClick}
+    >
+      <span className="mobile-console-row__avatar">{avatar}</span>
+      <span className="mobile-console-row__body">
+        <span className="mobile-console-row__title">
+          <span>{title}</span>
+          {badge && <span className="mobile-console-row__title-badge">{badge}</span>}
+        </span>
+        {description && <span className="mobile-console-row__desc">{description}</span>}
+        {meta && <span className="mobile-console-row__meta">{meta}</span>}
       </span>
-      {description && <span className="mobile-console-row__desc">{description}</span>}
-      {meta && <span className="mobile-console-row__meta">{meta}</span>}
-    </span>
+      {statusDot && (
+        <span className={`mobile-console-row__status${statusDot === 'on' ? ' mobile-console-row__status--on' : ' mobile-console-row__status--off'}`}>
+          <span
+            className={`mobile-console-row__dot${statusDot === 'on' ? ' mobile-console-row__dot--on' : ' mobile-console-row__dot--off'}`}
+            aria-hidden
+          />
+          {statusLabel}
+        </span>
+      )}
+    </button>
     {typeof favorite === 'boolean' && onFavorite && (
-      <span
-        role="button"
-        tabIndex={0}
+      <button
+        type="button"
         className={`mobile-console-row__star${favorite ? ' mobile-console-row__star--on' : ''}`}
         aria-label={favorite ? `取消收藏：${title}` : `收藏：${title}`}
-        onClick={(e) => {
-          e.stopPropagation();
-          onFavorite();
-        }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            e.stopPropagation();
-            onFavorite();
-          }
-        }}
+        onClick={onFavorite}
       >
         {favorite ? <StarFilled /> : <StarOutlined />}
-      </span>
-    )}
-    {statusDot && (
-      <span className={`mobile-console-row__status${statusDot === 'on' ? ' mobile-console-row__status--on' : ' mobile-console-row__status--off'}`}>
-        <span
-          className={`mobile-console-row__dot${statusDot === 'on' ? ' mobile-console-row__dot--on' : ' mobile-console-row__dot--off'}`}
-          aria-hidden
-        />
-        {statusLabel}
-      </span>
+      </button>
     )}
     {onMore ? (
-      <span
-        role="button"
-        tabIndex={0}
+      <button
+        type="button"
         className="mobile-console-row__more"
         aria-label={`更多操作：${title}`}
-        onClick={(e) => {
-          e.stopPropagation();
-          onMore();
-        }}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' || e.key === ' ') {
-            e.preventDefault();
-            e.stopPropagation();
-            onMore();
-          }
-        }}
+        onClick={onMore}
       >
         •••
-      </span>
+      </button>
     ) : (
       <RightOutlined className="mobile-console-row__chevron" />
     )}
-  </button>
+  </div>
 );
 
 export default MobileEntityRow;

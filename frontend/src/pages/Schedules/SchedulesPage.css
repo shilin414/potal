@@ -168,12 +168,24 @@
   border: 1px solid var(--color-border);
   border-radius: 14px;
   background: var(--color-bg-card);
-  cursor: pointer;
   -webkit-tap-highlight-color: transparent;
 }
 
 .mobile-schedule-card:active {
   border-color: var(--color-border-lit);
+}
+
+/* Main tap target (二次复审 P2-2): the card body is a native button; the
+   wrapper keeps the card chrome (padding / border / radius). */
+.mobile-schedule-card__main {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .mobile-schedule-card__row {
