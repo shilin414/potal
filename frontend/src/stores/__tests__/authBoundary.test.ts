@@ -64,6 +64,38 @@ describe('auth boundary transport', () => {
     expect(channel.close).toHaveBeenCalledTimes(1);
   });
 
+  it('broadcasts identity changes to their own subscribers', async () => {
+    vi.stubGlobal('BroadcastChannel', FakeBroadcastChannel);
+    const boundary = await import('@/stores/authBoundary');
+    const logoutListener = vi.fn();
+    const identityListener = vi.fn();
+    const unsubscribeLogout = boundary.subscribeExplicitLogout(logoutListener);
+    const unsubscribeIdentity = boundary.subscribeIdentityChange(identityListener);
+    const channel = FakeBroadcastChannel.instances[0];
+
+    boundary.broadcastIdentityChange('7');
+    const message = channel.postMessage.mock.calls[0][0];
+    expect(message).toEqual(expect.objectContaining({
+      type: 'identity-changed',
+      nonce: expect.any(String),
+      user_id: '7',
+    }));
+
+    channel.emit(message);
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'studio-auth-event',
+      newValue: JSON.stringify(message),
+    }));
+    expect(identityListener).toHaveBeenCalledOnce();
+    expect(identityListener).toHaveBeenCalledWith('7');
+    expect(logoutListener).not.toHaveBeenCalled();
+
+    unsubscribeLogout();
+    expect(channel.close).not.toHaveBeenCalled();
+    unsubscribeIdentity();
+    expect(channel.close).toHaveBeenCalledTimes(1);
+  });
+
   it('uses storage when BroadcastChannel is unavailable', async () => {
     vi.stubGlobal('BroadcastChannel', undefined);
     const setItem = vi.spyOn(Storage.prototype, 'setItem');

@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   post: vi.fn(),
   broadcastExplicitLogout: vi.fn(),
+  broadcastIdentityChange: vi.fn(),
   explicitLogoutListener: undefined as undefined | (() => void),
 }));
 
@@ -23,6 +24,7 @@ vi.mock('@/services/axios', () => ({
 
 vi.mock('@/stores/authBoundary', () => ({
   broadcastExplicitLogout: mocks.broadcastExplicitLogout,
+  broadcastIdentityChange: mocks.broadcastIdentityChange,
   subscribeExplicitLogout: (listener: () => void) => {
     mocks.explicitLogoutListener = listener;
     return () => { mocks.explicitLogoutListener = undefined; };
@@ -47,6 +49,7 @@ function LocationProbe() {
 beforeEach(() => {
   mocks.post.mockReset();
   mocks.broadcastExplicitLogout.mockReset();
+  mocks.broadcastIdentityChange.mockReset();
   useAuthStore.setState({
     user,
     isAuthenticated: true,
@@ -190,5 +193,6 @@ describe('explicit logout lifecycle', () => {
       isAuthenticated: true,
       explicitlyLoggedOut: false,
     });
+    expect(mocks.broadcastIdentityChange).toHaveBeenCalledWith('7');
   });
 });

@@ -11,7 +11,12 @@ const mocks = vi.hoisted(() => ({ get: vi.fn() }));
 
 vi.mock('@/services/axios', () => ({ default: { get: mocks.get } }));
 
-import { fetchSessionUser, syncSessionUser } from '@/services/session';
+import {
+  bootstrapPersistedSession,
+  bootstrapPersistedSessionOnce,
+  fetchSessionUser,
+  syncSessionUser,
+} from '@/services/session';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { resetSessionScopedState } from '@/stores/resetSessionState';
 
@@ -121,5 +126,97 @@ describe('syncSessionUser', () => {
 
     await expect(syncSessionUser()).resolves.toBeNull();
     expect((useAuthStore.getState().user as any).display_name).toBe('B');
+  });
+});
+
+describe('bootstrapPersistedSession', () => {
+  it('removes cached staff authority before the session request resolves', async () => {
+    setSignedIn({
+      id: '3', username: 'demo', display_name: 'demo',
+      is_staff: true, created_at: '',
+    });
+    let release: (value: unknown) => void = () => {};
+    mocks.get.mockReturnValueOnce(new Promise((resolve) => { release = resolve; }));
+
+    const pending = bootstrapPersistedSession();
+
+    expect((useAuthStore.getState().user as any).is_staff).toBe(false);
+    release({
+      id: 3, username: 'demo', display_name: 'demo', is_staff: true,
+    });
+    await pending;
+    expect((useAuthStore.getState().user as any).is_staff).toBe(true);
+  });
+
+  it('replaces a cached administrator with the cookie session identity', async () => {
+    setSignedIn({
+      id: '3', username: 'demo', email: 'demo@local.test', role: 'admin',
+      display_name: 'demo', is_staff: true, created_at: 'old',
+    });
+    mocks.get.mockResolvedValueOnce({
+      id: 1, username: 'system', role: 'creator', display_name: 'System User',
+      display_id: '1', auth_source: 'feishu', is_staff: false,
+    });
+
+    await bootstrapPersistedSession();
+
+    expect(useAuthStore.getState().user).toMatchObject({
+      id: '1', username: 'system', email: '', role: 'creator',
+      display_name: 'System User', is_staff: false, created_at: '',
+    });
+  });
+
+  it('clears auth and private state when the server identity cannot be verified', async () => {
+    setSignedIn({
+      id: '3', username: 'demo', display_name: 'demo',
+      is_staff: true, created_at: '',
+    });
+    mocks.get.mockRejectedValueOnce(new Error('network down'));
+
+    await bootstrapPersistedSession();
+
+    expect(useAuthStore.getState()).toMatchObject({
+      user: null,
+      isAuthenticated: false,
+    });
+  });
+
+  it('shares one initial request across duplicate StrictMode effects', async () => {
+    setSignedIn({
+      id: '3', username: 'demo', display_name: 'demo',
+      is_staff: true, created_at: '',
+    });
+    let release: (value: unknown) => void = () => {};
+    mocks.get.mockReturnValueOnce(new Promise((resolve) => { release = resolve; }));
+
+    const first = bootstrapPersistedSessionOnce();
+    const second = bootstrapPersistedSessionOnce();
+
+    expect(mocks.get).toHaveBeenCalledTimes(1);
+    release({ id: 3, username: 'demo', is_staff: true });
+    await Promise.all([first, second]);
+    expect((useAuthStore.getState().user as any).is_staff).toBe(true);
+  });
+
+  it('ignores a superseded administrator response after a newer check fails', async () => {
+    setSignedIn({
+      id: '3', username: 'demo', display_name: 'demo',
+      is_staff: true, created_at: '',
+    });
+    let releaseOld: (value: unknown) => void = () => {};
+    mocks.get
+      .mockReturnValueOnce(new Promise((resolve) => { releaseOld = resolve; }))
+      .mockRejectedValueOnce(new Error('new request failed'));
+
+    const oldRequest = bootstrapPersistedSession();
+    const newRequest = bootstrapPersistedSession();
+    await newRequest;
+    releaseOld({ id: 3, username: 'demo', is_staff: true });
+    await oldRequest;
+
+    expect(useAuthStore.getState()).toMatchObject({
+      user: null,
+      isAuthenticated: false,
+    });
   });
 });

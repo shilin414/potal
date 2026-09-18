@@ -1,23 +1,28 @@
 const AUTH_CHANNEL_NAME = 'studio-auth';
 const AUTH_STORAGE_KEY = 'studio-auth-event';
 const EXPLICIT_LOGOUT = 'explicit-logout';
+const IDENTITY_CHANGED = 'identity-changed';
 const MAX_SEEN_NONCES = 64;
 
-type ExplicitLogoutListener = () => void;
+type AuthBoundaryListener = () => void;
+type IdentityChangeListener = (userId?: string) => void;
+type AuthBoundaryMessageType = typeof EXPLICIT_LOGOUT | typeof IDENTITY_CHANGED;
 
 type AuthBoundaryMessage = {
-  type: typeof EXPLICIT_LOGOUT;
+  type: AuthBoundaryMessageType;
   nonce?: string;
+  user_id?: string;
 };
 
-const listeners = new Set<ExplicitLogoutListener>();
+const logoutListeners = new Set<AuthBoundaryListener>();
+const identityListeners = new Set<IdentityChangeListener>();
 const seenNonces = new Set<string>();
 let authChannel: BroadcastChannel | null | undefined;
 let storageListening = false;
 
 function dispatch(message: unknown): void {
   const authMessage = message as Partial<AuthBoundaryMessage> | null;
-  if (authMessage?.type !== EXPLICIT_LOGOUT) return;
+  if (authMessage?.type !== EXPLICIT_LOGOUT && authMessage?.type !== IDENTITY_CHANGED) return;
   if (authMessage.nonce) {
     if (seenNonces.has(authMessage.nonce)) return;
     seenNonces.add(authMessage.nonce);
@@ -26,7 +31,11 @@ function dispatch(message: unknown): void {
       if (oldest) seenNonces.delete(oldest);
     }
   }
-  listeners.forEach((listener) => listener());
+  if (authMessage.type === EXPLICIT_LOGOUT) {
+    logoutListeners.forEach((listener) => listener());
+    return;
+  }
+  identityListeners.forEach((listener) => listener(authMessage.user_id));
 }
 
 function onStorage(event: StorageEvent): void {
@@ -62,7 +71,7 @@ function ensureTransport(): BroadcastChannel | null {
 }
 
 function closeTransportIfUnused(): void {
-  if (listeners.size !== 0) return;
+  if (logoutListeners.size !== 0 || identityListeners.size !== 0) return;
   authChannel?.close();
   authChannel = undefined;
   seenNonces.clear();
@@ -72,7 +81,10 @@ function closeTransportIfUnused(): void {
   }
 }
 
-export function subscribeExplicitLogout(listener: ExplicitLogoutListener): () => void {
+function subscribe(
+  listeners: Set<AuthBoundaryListener>,
+  listener: AuthBoundaryListener,
+): () => void {
   listeners.add(listener);
   ensureTransport();
   return () => {
@@ -81,10 +93,24 @@ export function subscribeExplicitLogout(listener: ExplicitLogoutListener): () =>
   };
 }
 
-export function broadcastExplicitLogout(): void {
+export function subscribeExplicitLogout(listener: AuthBoundaryListener): () => void {
+  return subscribe(logoutListeners, listener);
+}
+
+export function subscribeIdentityChange(listener: IdentityChangeListener): () => void {
+  identityListeners.add(listener);
+  ensureTransport();
+  return () => {
+    identityListeners.delete(listener);
+    closeTransportIfUnused();
+  };
+}
+
+function broadcast(type: AuthBoundaryMessageType, userId?: string): void {
   const message: AuthBoundaryMessage = {
-    type: EXPLICIT_LOGOUT,
+    type,
     nonce: `${Date.now()}-${Math.random()}`,
+    user_id: userId,
   };
   const channel = ensureTransport();
   if (channel) {
@@ -97,10 +123,18 @@ export function broadcastExplicitLogout(): void {
   if (typeof window === 'undefined') return;
   try {
     // The value is removed immediately: this is a storage-event transport for
-    // active tabs, not a persistent "logged out" marker that survives reload.
+    // active tabs, not a persistent marker that survives reload.
     window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(message));
     window.localStorage.removeItem(AUTH_STORAGE_KEY);
   } catch {
-    // Single-tab logout remains correct when browser storage is unavailable.
+    // Single-tab auth remains correct when browser storage is unavailable.
   }
+}
+
+export function broadcastExplicitLogout(): void {
+  broadcast(EXPLICIT_LOGOUT);
+}
+
+export function broadcastIdentityChange(userId: string): void {
+  broadcast(IDENTITY_CHANGED, userId);
 }

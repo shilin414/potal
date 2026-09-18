@@ -3,6 +3,7 @@ import { persist } from 'zustand/middleware';
 import axiosInstance from '@/services/axios';
 import {
   broadcastExplicitLogout,
+  broadcastIdentityChange,
   subscribeExplicitLogout,
 } from '@/stores/authBoundary';
 import {
@@ -120,7 +121,8 @@ export const useAuthStore = create<AuthState>()(
         // (二次复审 P0-2). Same identity (a re-login, a token refresh that
         // re-installs the snapshot) must NOT: that would throw away the
         // user's own composer draft and open conversation.
-        if (!isSameUser(get().user, user)) {
+        const identityChanged = !isSameUser(get().user, user);
+        if (identityChanged) {
           resetSessionScopedState();
         }
         set({
@@ -129,6 +131,9 @@ export const useAuthStore = create<AuthState>()(
           isLoggingOut: false,
           explicitlyLoggedOut: false,
         });
+        // Other tabs share the HttpOnly cookie but keep separate in-memory
+        // stores. Make them fail closed and revalidate immediately.
+        if (identityChanged) broadcastIdentityChange(String(user.id));
       },
 
       logout: async () => {
