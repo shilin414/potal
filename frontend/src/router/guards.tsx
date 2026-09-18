@@ -1,5 +1,5 @@
-import { Navigate } from 'react-router-dom';
-import { useAuthStore } from '@/stores/useAuthStore';
+import { Navigate } from "react-router-dom";
+import { useAuthStore } from "@/stores/useAuthStore";
 
 interface ProtectedRouteProps {
   children: React.ReactNode;
@@ -12,17 +12,25 @@ interface ProtectedRouteProps {
  */
 export const ProtectedRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
-  const explicitlyLoggedOut = useAuthStore((state) => state.explicitlyLoggedOut);
+  const explicitlyLoggedOut = useAuthStore(
+    (state) => state.explicitlyLoggedOut,
+  );
 
   if (!isAuthenticated) {
     return (
       <Navigate
-        to={explicitlyLoggedOut ? '/auth/login?logged_out=1' : '/login'}
+        to={explicitlyLoggedOut ? "/auth/login?logged_out=1" : "/login"}
         replace
       />
     );
   }
 
+  return <>{children}</>;
+};
+
+export const AdminRoute: React.FC<ProtectedRouteProps> = ({ children }) => {
+  const user = useAuthStore((state) => state.user);
+  if (!user?.is_staff) return <Navigate to="/" replace />;
   return <>{children}</>;
 };
 

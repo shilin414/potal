@@ -26,7 +26,7 @@ import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 
 export interface UseApplicationPageOptions {
   kind: 'chat' | 'fixed' | 'all';
-  scope?: 'public' | 'manage' | 'mine';
+  scope?: 'accessible' | 'public' | 'manage' | 'mine';
   /**
    * `manage` (default) lists what the caller may ADMINISTER — including
    * disabled, private and binding-less rows, which is what 智能体市场 and

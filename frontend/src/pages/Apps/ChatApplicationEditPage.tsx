@@ -241,7 +241,7 @@ const ChatApplicationEditPage = () => {
     return <Result status="warning" title="只有聊天应用支持此配置页" />;
   }
   if (!application.can_edit) {
-    return <Result status="403" title="只有应用所有者可以编辑配置" />;
+    return <Result status="403" title="只有管理员可以编辑应用配置" />;
   }
 
   return (

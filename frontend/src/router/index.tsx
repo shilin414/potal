@@ -3,7 +3,7 @@ import { createBrowserRouter, Navigate } from 'react-router-dom';
 import { AuthLayout } from '@/layouts';
 import AppShell from '@/shell/AppShell';
 import WorkspaceHost from '@/components/Workspace/WorkspaceHost';
-import { ProtectedRoute, PublicRoute } from './guards';
+import { AdminRoute, ProtectedRoute, PublicRoute } from './guards';
 import LegacyAppRunRedirect from './LegacyAppRunRedirect';
 
 // Console pages (application management).
@@ -37,7 +37,7 @@ const EnterprisePage = lazy(() => import('@/pages/Enterprise/EnterprisePage'));
 
 const enterpriseElement = (
   <Suspense fallback={<div style={{ padding: 32 }}>正在加载企业控制台…</div>}>
-    <EnterprisePage />
+    <AdminRoute><EnterprisePage /></AdminRoute>
   </Suspense>
 );
 
@@ -83,12 +83,12 @@ const router = createBrowserRouter([
         handle: consolePage,
       },
       { path: 'apps', element: <AppsPage />, handle: consolePage },
-      { path: 'apps/:id', element: <AppDetailPage />, handle: consolePage },
+      { path: 'apps/:id', element: <AdminRoute><AppDetailPage /></AdminRoute>, handle: consolePage },
       // Launched apps now live in the shell's application workspace (§32).
       { path: 'apps/:id/run', element: <LegacyAppRunRedirect /> },
       {
         path: 'apps/:id/edit',
-        element: <ChatApplicationEditPage />,
+        element: <AdminRoute><ChatApplicationEditPage /></AdminRoute>,
         handle: consolePage,
       },
       { path: 'skills', element: <SkillsPage />, handle: fullWidthConsole },
@@ -111,7 +111,7 @@ const router = createBrowserRouter([
         element: <WorkspacePage />,
         handle: fullWidthConsole,
       },
-      { path: 'enterprise', element: enterpriseElement, handle: consolePage },
+      { path: 'enterprise/*', element: enterpriseElement, handle: fullWidthConsole },
 
       { path: '*', element: <Navigate to="/" replace /> },
     ],

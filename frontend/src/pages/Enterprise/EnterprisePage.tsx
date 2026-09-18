@@ -1,173 +1,1060 @@
-import { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  Alert, Button, Card, Descriptions, Drawer, Empty, Form, Input, InputNumber,
-  Modal, Popconfirm, Select, Space, Statistic, Switch, Table, Tabs, Tag,
-  Typography, message,
-} from 'antd';
-import type { ColumnsType } from 'antd/es/table';
-import { api } from '@/services/api';
-import { useOrganizationStore } from '@/stores/useOrganizationStore';
-import AgentLifecyclePanel from './AgentLifecyclePanel';
-import OrganizationGovernancePanel from './OrganizationGovernancePanel';
-import './EnterprisePage.css';
+  Alert,
+  Avatar,
+  Button,
+  Card,
+  Col,
+  Drawer,
+  Empty,
+  Form,
+  Input,
+  InputNumber,
+  Layout,
+  Menu,
+  Modal,
+  Popconfirm,
+  Radio,
+  Row,
+  Select,
+  Space,
+  Statistic,
+  Switch,
+  Table,
+  Tag,
+  TimePicker,
+  TreeSelect,
+  Typography,
+  message,
+} from "antd";
+import type { ColumnsType } from "antd/es/table";
+import {
+  ApartmentOutlined,
+  AppstoreOutlined,
+  AuditOutlined,
+  CloudSyncOutlined,
+  ControlOutlined,
+  RobotOutlined,
+  SafetyCertificateOutlined,
+  TeamOutlined,
+} from "@ant-design/icons";
+import dayjs from "dayjs";
+import { useLocation, useNavigate } from "react-router-dom";
+import AgentEditorModal from "@/components/Agents/AgentEditorModal";
+import { useApplicationPage } from "@/hooks/useApplicationPage";
+import {
+  createFixedApplication,
+  deleteAgentApplication,
+  fetchAgentRuntimes,
+  updateAgentApplication,
+  updateFixedApplication,
+  type V2Application,
+} from "@/services/runApi";
+import {
+  enterpriseApi,
+  type AccessMode,
+  type AccessPolicy,
+  type AuditLog,
+  type DirectoryDepartment,
+  type DirectoryUser,
+  type SyncConfig,
+  type SyncRun,
+} from "./enterpriseApi";
+import "./EnterprisePage.css";
 
-type Row = Record<string, any>;
-type Field = { name: string; label: string; kind?: 'text' | 'textarea' | 'number' | 'select' | 'switch' | 'json'; required?: boolean; options?: Array<{ value: string; label?: string }>; initialValue?: any };
+const { Sider, Content } = Layout;
+const pagePath = (key: string) => `/enterprise/${key}`;
+const menuItems = [
+  { key: "overview", icon: <ControlOutlined />, label: "概览" },
+  {
+    type: "group" as const,
+    label: "资源管理",
+    children: [
+      { key: "resources/agents", icon: <RobotOutlined />, label: "智能体管理" },
+      { key: "resources/apps", icon: <AppstoreOutlined />, label: "应用管理" },
+    ],
+  },
+  {
+    type: "group" as const,
+    label: "权限管理",
+    children: [
+      {
+        key: "access/agents",
+        icon: <SafetyCertificateOutlined />,
+        label: "智能体授权",
+      },
+      {
+        key: "access/apps",
+        icon: <SafetyCertificateOutlined />,
+        label: "应用授权",
+      },
+    ],
+  },
+  {
+    type: "group" as const,
+    label: "组织架构",
+    children: [
+      { key: "directory", icon: <TeamOutlined />, label: "部门与人员" },
+      { key: "directory/sync", icon: <CloudSyncOutlined />, label: "同步管理" },
+    ],
+  },
+  {
+    type: "group" as const,
+    label: "平台管理",
+    children: [
+      { key: "providers", icon: <ApartmentOutlined />, label: "Provider" },
+      { key: "audit", icon: <AuditOutlined />, label: "审计日志" },
+    ],
+  },
+];
+const currentKey = (pathname: string) =>
+  pathname.replace(/^\/enterprise\/?/, "") || "overview";
+const fmt = (v?: string | null) => (v ? new Date(v).toLocaleString() : "—");
 
-const normalize = (value: any): Row[] => Array.isArray(value) ? value : value?.results ?? [];
-const parseJson = (value: any, fallback: any) => {
-  if (value === undefined || value === null || value === '') return fallback;
-  if (typeof value !== 'string') return value;
-  try { return JSON.parse(value); } catch { throw new Error('JSON 配置格式不正确'); }
-};
+function ResourcePage({ kind }: { kind: "chat" | "fixed" }) {
+  const navigate = useNavigate();
+  const [q, setQ] = useState("");
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [fixedOpen, setFixedOpen] = useState(false);
+  const [fixedEditing, setFixedEditing] = useState<V2Application | null>(null);
+  const [form] = Form.useForm();
+  const { items, loading, loadingMore, hasMore, loadMore, refresh, patchItem } =
+    useApplicationPage({
+      kind,
+      scope: "manage",
+      mode: "manage",
+      includeUnbound: true,
+      query: q,
+      limit: 50,
+    });
+  const toggle = async (app: V2Application, enabled: boolean) => {
+    try {
+      await updateAgentApplication(app.id, { enabled });
+      patchItem(app.id, { enabled });
+      message.success(enabled ? "已启用" : "已停用");
+    } catch {
+      message.error("更新失败");
+    }
+  };
+  const remove = async (id: number) => {
+    try {
+      await deleteAgentApplication(id);
+      await refresh();
+      message.success("已删除");
+    } catch {
+      message.error("删除失败或资源已被引用");
+    }
+  };
+  const saveFixed = async () => {
+    try {
+      const v = await form.validateFields();
+      if (fixedEditing) {
+        await updateFixedApplication(fixedEditing.id, {
+          name: v.name,
+          description: v.description,
+          icon: v.icon,
+          color: v.color,
+        });
+        message.success("应用已更新");
+      } else {
+        await createFixedApplication({
+          ...v,
+          kind: v.kind,
+          renderer_key: v.renderer_key,
+        });
+        message.success("应用已注册，默认停用且仅管理员可见");
+      }
+      setFixedOpen(false);
+      setFixedEditing(null);
+      form.resetFields();
+      await refresh();
+    } catch {
+      /* form or request */
+    }
+  };
+  const cols: ColumnsType<V2Application> = [
+    {
+      title: "名称",
+      dataIndex: "name",
+      render: (v, app) => (
+        <Space>
+          {app.icon || "🧩"}
+          <strong>{v}</strong>
+          {app.is_default_agent && <Tag color="gold">默认</Tag>}
+        </Space>
+      ),
+    },
+    { title: "Slug", dataIndex: "slug" },
+    { title: "类型", dataIndex: "kind" },
+    { title: "Renderer", dataIndex: "renderer_key" },
+    ...(kind === "chat"
+      ? ([
+          { title: "Provider", dataIndex: "provider_key" },
+          { title: "Runtime", dataIndex: "runtime_type" },
+        ] as ColumnsType<V2Application>)
+      : []),
+    {
+      title: "状态",
+      dataIndex: "enabled",
+      render: (v, app) => (
+        <Switch checked={v !== false} onChange={(x) => void toggle(app, x)} />
+      ),
+    },
+    {
+      title: "操作",
+      key: "actions",
+      render: (_, app) => (
+        <Space>
+          {kind === "chat" ? (
+            <Button
+              size="small"
+              onClick={() => {
+                setEditingId(app.id);
+                setEditorOpen(true);
+              }}
+            >
+              编辑
+            </Button>
+          ) : (
+            <Button
+              size="small"
+              onClick={() => {
+                setFixedEditing(app);
+                form.setFieldsValue(app);
+                setFixedOpen(true);
+              }}
+            >
+              编辑
+            </Button>
+          )}
+          <Button
+            size="small"
+            onClick={() =>
+              navigate(
+                pagePath(
+                  `${kind === "chat" ? "access/agents" : "access/apps"}?app=${app.id}`,
+                ),
+              )
+            }
+          >
+            权限
+          </Button>
+          <Popconfirm title="确认删除？" onConfirm={() => void remove(app.id)}>
+            <Button size="small" danger>
+              删除
+            </Button>
+          </Popconfirm>
+        </Space>
+      ),
+    },
+  ];
+  return (
+    <section className="enterprise-section">
+      <div className="enterprise-section__head">
+        <div>
+          <h2>{kind === "chat" ? "智能体管理" : "应用管理"}</h2>
+          <p>
+            {kind === "chat"
+              ? "统一维护智能体、运行时和启停状态"
+              : "注册随版本发布的固定应用 renderer"}
+          </p>
+        </div>
+        <Space>
+          <Input.Search
+            placeholder="搜索资源"
+            allowClear
+            onSearch={setQ}
+            onChange={(e) => setQ(e.target.value)}
+          />
+          <Button
+            type="primary"
+            onClick={() =>
+              kind === "chat"
+                ? (setEditingId(null), setEditorOpen(true))
+                : (setFixedEditing(null),
+                  form.resetFields(),
+                  setFixedOpen(true))
+            }
+          >
+            {kind === "chat" ? "新建智能体" : "注册应用"}
+          </Button>
+        </Space>
+      </div>
+      <Table
+        rowKey="id"
+        loading={loading}
+        dataSource={items}
+        columns={cols}
+        pagination={false}
+        scroll={{ x: 1000 }}
+      />
+      {hasMore && (
+        <div className="enterprise-more">
+          <Button loading={loadingMore} onClick={() => void loadMore()}>
+            加载更多
+          </Button>
+        </div>
+      )}
+      {kind === "chat" && (
+        <AgentEditorModal
+          agentId={editingId}
+          mode="runtime"
+          open={editorOpen}
+          onClose={() => setEditorOpen(false)}
+          onSaved={async () => {
+            setEditorOpen(false);
+            await refresh();
+          }}
+        />
+      )}
+      <Modal
+        title={fixedEditing ? "编辑固定应用" : "注册固定应用"}
+        open={fixedOpen}
+        onCancel={() => {
+          setFixedOpen(false);
+          setFixedEditing(null);
+        }}
+        onOk={() => void saveFixed()}
+      >
+        <Alert
+          type="info"
+          showIcon
+          message="renderer_key 必须对应已随前端版本发布的渲染器。新应用默认停用、仅管理员可见。"
+        />
+        <Form
+          form={form}
+          layout="vertical"
+          style={{ marginTop: 16 }}
+          initialValues={{ kind: "page", icon: "🧩" }}
+        >
+          <Form.Item name="name" label="名称" rules={[{ required: true }]}>
+            <Input />
+          </Form.Item>
+          <Form.Item
+            name="slug"
+            label="Slug"
+            hidden={Boolean(fixedEditing)}
+            rules={[{ required: true, pattern: /^[a-z0-9]+(?:-[a-z0-9]+)*$/ }]}
+          >
+            <Input />
+          </Form.Item>
+          <Form.Item name="kind" label="类型" hidden={Boolean(fixedEditing)}>
+            <Select
+              options={["page", "form", "dashboard", "custom", "task"].map(
+                (value) => ({ value, label: value }),
+              )}
+            />
+          </Form.Item>
+          <Form.Item
+            name="renderer_key"
+            label="Renderer Key"
+            hidden={Boolean(fixedEditing)}
+            rules={[{ required: true }]}
+          >
+            <Input />
+          </Form.Item>
+          <Form.Item name="description" label="描述">
+            <Input.TextArea />
+          </Form.Item>
+          <Form.Item name="icon" label="图标">
+            <Input />
+          </Form.Item>
+          <Form.Item name="color" label="主题色">
+            <Input placeholder="#2563eb" />
+          </Form.Item>
+        </Form>
+      </Modal>
+    </section>
+  );
+}
 
-const sections: Record<string, { title: string; endpoint: string; fields?: Field[]; readOnly?: boolean }> = {
-  organization: { title: '组织治理', endpoint: '' },
-  lifecycle: { title: '智能体发布', endpoint: '' },
-  traces: { title: '运行追踪', endpoint: '/enterprise/traces/', readOnly: true },
-  providers: { title: '模型供应商', endpoint: '/enterprise/providers/', fields: [
-    { name: 'name', label: '名称', required: true }, { name: 'base_url', label: 'Base URL', required: true },
-    { name: 'provider_type', label: '类型', initialValue: 'openai_compatible' }, { name: 'secret_ref', label: '密钥引用' },
-    { name: 'available_models', label: '模型列表（JSON）', kind: 'json', initialValue: '[]' }, { name: 'routing_weight', label: '路由权重', kind: 'number', initialValue: 100 },
-  ] },
-  secrets: { title: '密钥引用', endpoint: '/enterprise/secrets/', fields: [
-    { name: 'name', label: '名称', required: true }, { name: 'backend', label: '后端', kind: 'select', initialValue: 'environment', options: [{ value: 'environment', label: '环境变量' }] },
-    { name: 'reference', label: '引用名称', required: true }, { name: 'description', label: '说明', kind: 'textarea' },
-  ] },
-  knowledge: { title: '知识库', endpoint: '/enterprise/knowledge-bases/', fields: [
-    { name: 'name', label: '名称', required: true }, { name: 'description', label: '描述', kind: 'textarea' },
-    { name: 'chunk_size', label: '分块大小', kind: 'number', initialValue: 800 }, { name: 'chunk_overlap', label: '重叠字符', kind: 'number', initialValue: 100 },
-  ] },
-  evaluations: { title: '评测', endpoint: '/enterprise/evaluations/', fields: [
-    { name: 'name', label: '名称', required: true }, { name: 'target_type', label: '目标类型', kind: 'select', initialValue: 'agent', options: [{ value: 'agent' }, { value: 'application' }] },
-    { name: 'target_id', label: '目标 ID' }, { name: 'evaluators', label: '评测器（JSON）', kind: 'json', initialValue: '[{"type":"exact"}]' },
-    { name: 'quality_gate', label: '质量门禁（JSON）', kind: 'json', initialValue: '{"minimum_score":1}' },
-  ] },
-  connectors: { title: '连接器', endpoint: '/enterprise/connectors/', fields: [
-    { name: 'name', label: '名称', required: true }, { name: 'connector_type', label: '类型', initialValue: 'webhook', required: true },
-    { name: 'endpoint', label: 'Endpoint', required: true }, { name: 'secret_ref', label: '密钥引用' },
-    { name: 'config', label: '配置（JSON）', kind: 'json', initialValue: '{"method":"POST","timeout":10}' },
-  ] },
-  automations: { title: '自动化', endpoint: '/enterprise/automations/', fields: [
-    { name: 'name', label: '名称', required: true }, { name: 'trigger_type', label: '触发类型', kind: 'select', initialValue: 'webhook', options: [{ value: 'webhook' }, { value: 'schedule' }, { value: 'event' }] },
-    { name: 'target_type', label: '目标类型', kind: 'select', initialValue: 'agent', options: [{ value: 'agent' }, { value: 'application' }] }, { name: 'target_id', label: '目标 ID', required: true },
-    { name: 'schedule', label: 'Cron（计划任务）' }, { name: 'event_name', label: '事件名称' }, { name: 'input_mapping', label: '输入映射（JSON）', kind: 'json', initialValue: '{}' },
-  ] },
-  identity: { title: '身份提供商', endpoint: '/enterprise/identity-providers/', fields: [
-    { name: 'name', label: '名称', required: true }, { name: 'protocol', label: '协议', kind: 'select', initialValue: 'oidc', options: [{ value: 'oidc', label: 'OpenID Connect' }, { value: 'saml', label: 'SAML 2.0' }] },
-    { name: 'issuer', label: 'Issuer', required: true }, { name: 'client_id', label: 'Client ID' }, { name: 'secret_ref', label: '密钥引用' },
-    { name: 'metadata_url', label: 'Metadata URL' }, { name: 'domains', label: '企业域名（JSON）', kind: 'json', initialValue: '[]' }, { name: 'enforce_sso', label: '强制 SSO', kind: 'switch' },
-  ] },
-  audit: { title: '审计日志', endpoint: '/enterprise/audit-logs/', readOnly: true },
-};
+function buildTree(deps: DirectoryDepartment[]) {
+  const nodes = new Map<number, any>();
+  deps.forEach((d) =>
+    nodes.set(d.id, { title: d.name, value: d.id, key: d.id, children: [] }),
+  );
+  const roots: any[] = [];
+  deps.forEach((d) => {
+    const n = nodes.get(d.id);
+    if (d.parent_id && nodes.has(d.parent_id))
+      nodes.get(d.parent_id).children.push(n);
+    else roots.push(n);
+  });
+  return roots;
+}
+function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
+  const location = useLocation();
+  const initial = Number(new URLSearchParams(location.search).get("app") || 0);
+  const [q, setQ] = useState("");
+  const { items, loading } = useApplicationPage({
+    kind,
+    scope: "manage",
+    mode: "manage",
+    includeUnbound: true,
+    query: q,
+    limit: 100,
+  });
+  const [selected, setSelected] = useState<V2Application | null>(null);
+  const [policy, setPolicy] = useState<AccessPolicy | null>(null);
+  const [deps, setDeps] = useState<DirectoryDepartment[]>([]);
+  const [users, setUsers] = useState<DirectoryUser[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [includeChildren, setIncludeChildren] = useState(true);
+  const open = useCallback(async (app: V2Application) => {
+    setSelected(app);
+    try {
+      const [p, d, u] = await Promise.all([
+        enterpriseApi.access(app.id),
+        enterpriseApi.departments(),
+        enterpriseApi.users({ limit: 100 }),
+      ]);
+      setPolicy(p);
+      setDeps(d);
+      setUsers(u.results);
+    } catch {
+      message.error("加载权限失败");
+    }
+  }, []);
+  useEffect(() => {
+    if (initial && items.length) {
+      const app = items.find((x) => x.id === initial);
+      if (app && !selected) void open(app);
+    }
+  }, [initial, items, open, selected]);
+  const save = async () => {
+    if (!selected || !policy) return;
+    setSaving(true);
+    try {
+      const next = await enterpriseApi.updateAccess(selected.id, {
+        access_mode: policy.access_mode,
+        department_grants: policy.departments.map((d) => ({
+          department_id: d.department_id,
+          include_children: d.include_children,
+        })),
+        user_grants: policy.users.map((u) => u.directory_user_id),
+      });
+      setPolicy(next);
+      message.success("访问权限已保存");
+    } catch {
+      message.error("保存失败，请检查部门和人员是否仍有效");
+    } finally {
+      setSaving(false);
+    }
+  };
+  const setDepIds = (ids: number[]) => {
+    if (!policy) return;
+    const old = new Map(policy.departments.map((d) => [d.department_id, d]));
+    setPolicy({
+      ...policy,
+      departments: ids.map(
+        (id) =>
+          old.get(id) || {
+            department_id: id,
+            name: deps.find((d) => d.id === id)?.name || "",
+            include_children: includeChildren,
+            covered_users: 0,
+          },
+      ),
+    });
+  };
+  const searchUsers = async (value: string) => {
+    try {
+      const result = await enterpriseApi.users({ q: value, limit: 100 });
+      setUsers(result.results);
+    } catch {
+      /* keep current options */
+    }
+  };
+  const setUserIds = (ids: number[]) => {
+    if (!policy) return;
+    const old = new Map(policy.users.map((u) => [u.directory_user_id, u]));
+    setPolicy({
+      ...policy,
+      users: ids.map(
+        (id) =>
+          old.get(id) || {
+            directory_user_id: id,
+            name: users.find((u) => u.id === id)?.name || "",
+            avatar_url: users.find((u) => u.id === id)?.avatar_url || "",
+            departments: (
+              users.find((u) => u.id === id)?.departments || []
+            ).map((d) => d.name),
+          },
+      ),
+    });
+  };
+  const columns: ColumnsType<V2Application> = [
+    { title: "资源", dataIndex: "name" },
+    { title: "Slug", dataIndex: "slug" },
+    {
+      title: "操作",
+      render: (_, app) => (
+        <Button onClick={() => void open(app)}>设置权限</Button>
+      ),
+    },
+  ];
+  return (
+    <section className="enterprise-section">
+      <div className="enterprise-section__head">
+        <div>
+          <h2>{kind === "chat" ? "智能体授权" : "应用授权"}</h2>
+          <p>资源配置与访问范围分离，部门和人员授权按 OR 计算</p>
+        </div>
+        <Input.Search
+          placeholder="搜索资源"
+          allowClear
+          onChange={(e) => setQ(e.target.value)}
+        />
+      </div>
+      <Table
+        rowKey="id"
+        loading={loading}
+        dataSource={items}
+        columns={columns}
+        pagination={false}
+      />
+      <Drawer
+        title={`访问权限 · ${selected?.name || ""}`}
+        open={Boolean(selected)}
+        onClose={() => {
+          setSelected(null);
+          setPolicy(null);
+        }}
+        width={620}
+        extra={
+          <Button type="primary" loading={saving} onClick={() => void save()}>
+            保存
+          </Button>
+        }
+      >
+        {!policy ? (
+          <Empty />
+        ) : (
+          <Space direction="vertical" size="large" style={{ width: "100%" }}>
+            <div>
+              <Typography.Title level={5}>访问范围</Typography.Title>
+              <Radio.Group
+                value={policy.access_mode}
+                onChange={(e) =>
+                  setPolicy({
+                    ...policy,
+                    access_mode: e.target.value as AccessMode,
+                  })
+                }
+              >
+                <Radio value="all">全体有效员工</Radio>
+                <Radio value="assigned">指定范围</Radio>
+                <Radio value="admin_only">仅管理员</Radio>
+              </Radio.Group>
+            </div>
+            {policy.access_mode === "assigned" && (
+              <>
+                <div>
+                  <Space>
+                    <Typography.Title level={5} style={{ margin: 0 }}>
+                      授权部门
+                    </Typography.Title>
+                    <Switch
+                      checked={includeChildren}
+                      onChange={setIncludeChildren}
+                      checkedChildren="含子部门"
+                      unCheckedChildren="仅本部门"
+                    />
+                  </Space>
+                  <TreeSelect
+                    treeData={buildTree(deps)}
+                    treeCheckable
+                    showCheckedStrategy={TreeSelect.SHOW_PARENT}
+                    value={policy.departments.map((d) => d.department_id)}
+                    onChange={setDepIds}
+                    style={{ width: "100%", marginTop: 10 }}
+                    placeholder="选择部门"
+                  />
+                  <Space
+                    direction="vertical"
+                    style={{ width: "100%", marginTop: 10 }}
+                  >
+                    {policy.departments.map((grant) => (
+                      <Card size="small" key={grant.department_id}>
+                        <Space
+                          style={{
+                            width: "100%",
+                            justifyContent: "space-between",
+                          }}
+                        >
+                          <span>
+                            {grant.name ||
+                              deps.find((d) => d.id === grant.department_id)
+                                ?.name}{" "}
+                            · 预计覆盖 {grant.covered_users || 0} 人
+                          </span>
+                          <Switch
+                            checked={grant.include_children}
+                            checkedChildren="含子部门"
+                            unCheckedChildren="仅本部门"
+                            onChange={(checked) =>
+                              setPolicy({
+                                ...policy,
+                                departments: policy.departments.map((d) =>
+                                  d.department_id === grant.department_id
+                                    ? { ...d, include_children: checked }
+                                    : d,
+                                ),
+                              })
+                            }
+                          />
+                        </Space>
+                      </Card>
+                    ))}
+                  </Space>
+                </div>
+                <div>
+                  <Typography.Title level={5}>授权人员</Typography.Title>
+                  <Select
+                    mode="multiple"
+                    showSearch
+                    filterOption={false}
+                    onSearch={(value) => void searchUsers(value)}
+                    value={policy.users.map((u) => u.directory_user_id)}
+                    onChange={setUserIds}
+                    style={{ width: "100%" }}
+                    options={users.map((u) => ({
+                      value: u.id,
+                      label: `${u.name} · ${u.departments.map((d) => d.name).join(" / ")}`,
+                    }))}
+                    placeholder="搜索并选择人员"
+                  />
+                </div>
+              </>
+            )}
+          </Space>
+        )}
+      </Drawer>
+    </section>
+  );
+}
 
-function DynamicField({ field }: { field: Field }) {
-  const rules = field.required ? [{ required: true, message: `请输入${field.label}` }] : undefined;
-  if (field.kind === 'textarea' || field.kind === 'json') return <Form.Item name={field.name} label={field.label} rules={rules} initialValue={field.initialValue}><Input.TextArea rows={field.kind === 'json' ? 4 : 3} /></Form.Item>;
-  if (field.kind === 'number') return <Form.Item name={field.name} label={field.label} rules={rules} initialValue={field.initialValue}><InputNumber style={{ width: '100%' }} min={0} /></Form.Item>;
-  if (field.kind === 'select') return <Form.Item name={field.name} label={field.label} rules={rules} initialValue={field.initialValue}><Select options={field.options?.map(o => ({ ...o, label: o.label || o.value }))} /></Form.Item>;
-  if (field.kind === 'switch') return <Form.Item name={field.name} label={field.label} valuePropName="checked" initialValue={false}><Switch /></Form.Item>;
-  return <Form.Item name={field.name} label={field.label} rules={rules} initialValue={field.initialValue}><Input /></Form.Item>;
+function DirectoryPage() {
+  const [deps, setDeps] = useState<DirectoryDepartment[]>([]);
+  const [users, setUsers] = useState<DirectoryUser[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [q, setQ] = useState("");
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [d, u] = await Promise.all([
+        enterpriseApi.departments({ include_inactive: true }),
+        enterpriseApi.users({ q, include_inactive: true, limit: 100 }),
+      ]);
+      setDeps(d);
+      setUsers(u.results);
+    } finally {
+      setLoading(false);
+    }
+  }, [q]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+  return (
+    <section className="enterprise-section">
+      <div className="enterprise-section__head">
+        <div>
+          <h2>部门与人员</h2>
+          <p>来自飞书 Directory 的只读企业目录快照</p>
+        </div>
+        <Input.Search allowClear placeholder="搜索人员" onSearch={setQ} />
+      </div>
+      <Row gutter={16}>
+        <Col span={10}>
+          <Card title={`部门 ${deps.length}`}>
+            <Table
+              size="small"
+              rowKey="id"
+              loading={loading}
+              dataSource={deps}
+              pagination={false}
+              scroll={{ y: 560 }}
+              columns={[
+                { title: "部门", dataIndex: "name" },
+                {
+                  title: "状态",
+                  render: (_, d) => (
+                    <Tag color={d.is_active ? "green" : "default"}>
+                      {d.is_active ? "有效" : "停用"}
+                    </Tag>
+                  ),
+                },
+              ]}
+            />
+          </Card>
+        </Col>
+        <Col span={14}>
+          <Card title={`人员 ${users.length}`}>
+            <Table
+              size="small"
+              rowKey="id"
+              loading={loading}
+              dataSource={users}
+              pagination={false}
+              scroll={{ y: 560 }}
+              columns={[
+                {
+                  title: "人员",
+                  render: (_, u) => (
+                    <Space>
+                      <Avatar src={u.avatar_url}>{u.name.slice(0, 1)}</Avatar>
+                      {u.name}
+                    </Space>
+                  ),
+                },
+                {
+                  title: "部门",
+                  render: (_, u) =>
+                    u.departments.map((d) => d.name).join(" / ") || "—",
+                },
+                {
+                  title: "状态",
+                  render: (_, u) => (
+                    <Tag color={u.is_active ? "green" : "red"}>
+                      {u.is_active ? "在职有效" : "无效/离职"}
+                    </Tag>
+                  ),
+                },
+                {
+                  title: "已关联",
+                  render: (_, u) =>
+                    u.local_user_id ? (
+                      <Tag color="blue">Potal 用户</Tag>
+                    ) : (
+                      "未登录"
+                    ),
+                },
+              ]}
+            />
+          </Card>
+        </Col>
+      </Row>
+    </section>
+  );
+}
+
+function SyncPage() {
+  const [cfg, setCfg] = useState<SyncConfig | null>(null);
+  const [runs, setRuns] = useState<SyncRun[]>([]);
+  const [form] = Form.useForm();
+  const load = useCallback(async () => {
+    const [c, r] = await Promise.all([
+      enterpriseApi.syncConfig(),
+      enterpriseApi.syncRuns(),
+    ]);
+    setCfg(c);
+    setRuns(r);
+    form.setFieldsValue({ ...c, daily_time: dayjs(c.daily_time, "HH:mm") });
+  }, [form]);
+  useEffect(() => {
+    void load();
+  }, [load]);
+  const save = async () => {
+    const v = await form.validateFields();
+    const next = await enterpriseApi.updateSyncConfig({
+      ...v,
+      daily_time: v.daily_time.format("HH:mm"),
+    });
+    setCfg(next);
+    message.success("同步设置已保存");
+  };
+  const trigger = async () => {
+    await enterpriseApi.triggerSync();
+    message.success("同步任务已进入队列");
+    await load();
+  };
+  return (
+    <section className="enterprise-section">
+      <div className="enterprise-section__head">
+        <div>
+          <h2>同步管理</h2>
+          <p>tenant_access_token + directory/v1，完整拉取后原子发布</p>
+        </div>
+        <Space>
+          <Button onClick={() => void load()}>刷新</Button>
+          <Button type="primary" onClick={() => void trigger()}>
+            立即同步
+          </Button>
+        </Space>
+      </div>
+      {cfg && (
+        <Alert
+          type={runs[0]?.status === "failed" ? "error" : "info"}
+          showIcon
+          message={`最近成功：${fmt(cfg.last_success_at)} · 下次执行：${fmt(cfg.next_run_at)}`}
+          description={
+            runs[0]?.status === "failed" ? runs[0].error_message : undefined
+          }
+          style={{ marginBottom: 16 }}
+        />
+      )}
+      <Card title="自动同步设置">
+        <Form
+          form={form}
+          layout="inline"
+          initialValues={{
+            enabled: false,
+            schedule_type: "interval",
+            interval_minutes: 360,
+            daily_time: dayjs("02:00", "HH:mm"),
+            timezone: "Asia/Shanghai",
+          }}
+        >
+          <Form.Item name="enabled" valuePropName="checked" label="启用">
+            <Switch />
+          </Form.Item>
+          <Form.Item name="schedule_type" label="方式">
+            <Select
+              style={{ width: 120 }}
+              options={[
+                { value: "interval", label: "按间隔" },
+                { value: "daily", label: "每天" },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item noStyle shouldUpdate>
+            {({ getFieldValue }) =>
+              getFieldValue("schedule_type") === "daily" ? (
+                <Form.Item name="daily_time" label="时间">
+                  <TimePicker format="HH:mm" />
+                </Form.Item>
+              ) : (
+                <Form.Item name="interval_minutes" label="间隔（分钟）">
+                  <InputNumber min={15} max={10080} />
+                </Form.Item>
+              )
+            }
+          </Form.Item>
+          <Form.Item name="timezone" label="时区">
+            <Input style={{ width: 150 }} />
+          </Form.Item>
+          <Button type="primary" onClick={() => void save()}>
+            保存
+          </Button>
+        </Form>
+      </Card>
+      <Card title="同步记录" style={{ marginTop: 16 }}>
+        <Table
+          rowKey="id"
+          dataSource={runs}
+          pagination={false}
+          columns={[
+            { title: "时间", dataIndex: "created_at", render: fmt },
+            {
+              title: "触发",
+              dataIndex: "trigger_type",
+              render: (v) => (v === "manual" ? "手动" : "自动"),
+            },
+            {
+              title: "状态",
+              dataIndex: "status",
+              render: (v) => (
+                <Tag
+                  color={
+                    v === "success" ? "green" : v === "failed" ? "red" : "blue"
+                  }
+                >
+                  {v}
+                </Tag>
+              ),
+            },
+            { title: "部门", dataIndex: "departments_count" },
+            {
+              title: "员工（有效 / 总数）",
+              render: (_, row) =>
+                `${row.active_users_count} / ${row.users_count}`,
+            },
+            {
+              title: "关系（有效 / 总数）",
+              render: (_, row) =>
+                `${row.active_memberships_count} / ${row.memberships_count}`,
+            },
+            { title: "错误", dataIndex: "error_message", ellipsis: true },
+          ]}
+        />
+      </Card>
+    </section>
+  );
+}
+function AuditPage() {
+  const [rows, setRows] = useState<AuditLog[]>([]);
+  useEffect(() => {
+    void enterpriseApi.audits().then(setRows);
+  }, []);
+  return (
+    <section className="enterprise-section">
+      <div className="enterprise-section__head">
+        <div>
+          <h2>审计日志</h2>
+          <p>资源、授权与目录同步关键操作</p>
+        </div>
+      </div>
+      <Table
+        rowKey="id"
+        dataSource={rows}
+        columns={[
+          { title: "时间", dataIndex: "created_at", render: fmt },
+          { title: "动作", dataIndex: "action" },
+          {
+            title: "资源",
+            render: (_, r) => `${r.resource_type}:${r.resource_id}`,
+          },
+          { title: "操作者", dataIndex: "user_id", render: (v) => v || "系统" },
+          {
+            title: "详情",
+            dataIndex: "detail",
+            render: (v) => (
+              <Typography.Text code ellipsis style={{ maxWidth: 380 }}>
+                {JSON.stringify(v)}
+              </Typography.Text>
+            ),
+          },
+        ]}
+      />
+    </section>
+  );
+}
+function ProvidersPage() {
+  const [rows, setRows] = useState<any[]>([]);
+  useEffect(() => {
+    void fetchAgentRuntimes().then(setRows);
+  }, []);
+  return (
+    <section className="enterprise-section">
+      <div className="enterprise-section__head">
+        <div>
+          <h2>Provider</h2>
+          <p>当前已注册运行时能力</p>
+        </div>
+      </div>
+      <Table
+        rowKey="key"
+        dataSource={rows}
+        columns={[
+          { title: "名称", dataIndex: "provider_name" },
+          { title: "Provider Key", dataIndex: "provider_key" },
+          { title: "Runtime", dataIndex: "runtime_type" },
+          {
+            title: "身份模式",
+            dataIndex: "identity_modes",
+            render: (v) => v?.join(", "),
+          },
+          {
+            title: "执行模式",
+            dataIndex: "execution_modes",
+            render: (v) => v?.join(", "),
+          },
+        ]}
+      />
+    </section>
+  );
+}
+function Overview() {
+  const [stats, setStats] = useState({
+    departments_total: 0,
+    departments_active: 0,
+    users_total: 0,
+    users_active: 0,
+    users_resigned: 0,
+    oauth_users: 0,
+    linked_directory_users: 0,
+  });
+  const [runs, setRuns] = useState<SyncRun[]>([]);
+  useEffect(() => {
+    void Promise.all([enterpriseApi.stats(), enterpriseApi.syncRuns(1)]).then(
+      ([s, r]) => {
+        setStats(s);
+        setRuns(r);
+      },
+    );
+  }, []);
+  const match = stats.oauth_users
+    ? Math.round((stats.linked_directory_users * 100) / stats.oauth_users)
+    : 0;
+  return (
+    <section className="enterprise-section">
+      <div className="enterprise-section__head">
+        <div>
+          <h2>企业控制台</h2>
+          <p>统一管理资源、企业目录与访问权限</p>
+        </div>
+      </div>
+      <Row gutter={[16, 16]}>
+        <Col span={6}>
+          <Card>
+            <Statistic
+              title="部门（有效 / 总数）"
+              value={`${stats.departments_active} / ${stats.departments_total}`}
+            />
+          </Card>
+        </Col>
+        <Col span={6}>
+          <Card>
+            <Statistic
+              title="员工（有效 / 总数）"
+              value={`${stats.users_active} / ${stats.users_total}`}
+            />
+          </Card>
+        </Col>
+        <Col span={6}>
+          <Card>
+            <Statistic
+              title="OAuth 关联"
+              value={stats.linked_directory_users}
+              suffix={`/ ${stats.oauth_users} · ${match}%`}
+            />
+          </Card>
+        </Col>
+        <Col span={6}>
+          <Card>
+            <Statistic title="最近同步" value={runs[0]?.status || "未执行"} />
+          </Card>
+        </Col>
+      </Row>
+      {stats.users_resigned > 0 && (
+        <Alert
+          type="info"
+          showIcon
+          message={`目录中有 ${stats.users_resigned} 名离职员工，ACL 已自动排除。`}
+        />
+      )}
+    </section>
+  );
 }
 
 export default function EnterprisePage() {
-  const { organizations, currentOrganizationId, loadOrganizations, selectOrganization } = useOrganizationStore();
-  const [active, setActive] = useState('traces');
-  const [rows, setRows] = useState<Row[]>([]);
-  const [usage, setUsage] = useState<Row>({});
-  const [loading, setLoading] = useState(false);
-  const [modalOpen, setModalOpen] = useState(false);
-  const [editing, setEditing] = useState<Row | null>(null);
-  const [detail, setDetail] = useState<Row | null>(null);
-  const [form] = Form.useForm();
-  const section = sections[active];
-
-  const reload = useCallback(async () => {
-    if (!currentOrganizationId) return;
-    if (!section.endpoint) { setRows([]); return; }
-    setLoading(true);
-    try {
-      const [data, summary] = await Promise.all([api.get(section.endpoint), api.get('/enterprise/usage/summary/')]);
-      setRows(normalize(data)); setUsage(summary as Row);
-    } finally { setLoading(false); }
-  }, [currentOrganizationId, section.endpoint]);
-
-  useEffect(() => { void loadOrganizations(); }, [loadOrganizations]);
-  useEffect(() => { void reload(); }, [reload]);
-
-  const columns: ColumnsType<Row> = (() => {
-    const base: ColumnsType<Row> = active === 'traces' ? [
-      { title: '类型', dataIndex: 'kind' }, { title: '资源', dataIndex: 'resource_id' }, { title: '状态', dataIndex: 'status', render: v => <Tag>{v}</Tag> }, { title: '时间', dataIndex: 'created_at' },
-    ] : active === 'audit' ? [
-      { title: '操作', dataIndex: 'action' }, { title: '操作者', dataIndex: 'actor_username' }, { title: '状态', render: (_, r) => r.metadata?.status_code }, { title: '时间', dataIndex: 'created_at' },
-    ] : [
-      { title: '名称', dataIndex: 'name', render: v => <strong>{v}</strong> },
-      { title: '类型 / 状态', render: (_, r) => r.provider_type || r.connector_type || r.protocol || r.trigger_type || r.target_type || r.status || '—' },
-      { title: '启用', dataIndex: 'is_active', render: v => v === undefined ? '—' : <Tag color={v ? 'green' : 'default'}>{v ? '启用' : '停用'}</Tag> },
-      { title: '更新时间', dataIndex: 'updated_at' },
-    ];
-    base.push({ title: '操作', fixed: 'right', width: 210, render: (_, row) => <Space wrap>
-      <Button size="small" onClick={() => setDetail(row)}>详情</Button>
-      {!section.readOnly && <Button size="small" onClick={() => openEdit(row)}>编辑</Button>}
-      {active === 'connectors' && <Button size="small" onClick={() => invoke(row)}>测试</Button>}
-      {active === 'automations' && <Button size="small" onClick={() => trigger(row)}>触发</Button>}
-      {active === 'knowledge' && <Button size="small" onClick={() => manageKnowledge(row)}>文档</Button>}
-      {active === 'evaluations' && <Button size="small" onClick={() => manageEvaluation(row)}>用例</Button>}
-      {!section.readOnly && <Popconfirm title="确认删除该资源？" onConfirm={() => remove(row)}><Button danger size="small">删除</Button></Popconfirm>}
-    </Space> });
-    return base;
-  })();
-
-  const openCreate = () => { setEditing(null); form.resetFields(); setModalOpen(true); };
-  const openEdit = (row: Row) => {
-    setEditing(row); form.resetFields();
-    const values = { ...row };
-    section.fields?.filter(f => f.kind === 'json').forEach(f => { values[f.name] = JSON.stringify(row[f.name] ?? (f.initialValue || {}), null, 2); });
-    form.setFieldsValue(values); setModalOpen(true);
-  };
-  const submit = async () => {
-    try {
-      const values = await form.validateFields();
-      section.fields?.filter(f => f.kind === 'json').forEach(f => { values[f.name] = parseJson(values[f.name], f.initialValue?.startsWith('[') ? [] : {}); });
-      if (editing) await api.patch(`${section.endpoint}${editing.id}/`, values); else await api.post(section.endpoint, values);
-      message.success(editing ? '更新成功' : '创建成功'); setModalOpen(false); await reload();
-    } catch (error: any) { if (error?.errorFields) return; message.error(error.message || '保存失败'); }
-  };
-  const remove = async (row: Row) => { await api.delete(`${section.endpoint}${row.id}/`); message.success('已删除'); await reload(); };
-  const invoke = async (row: Row) => { const result = await api.post(`${section.endpoint}${row.id}/invoke/`, { ping: new Date().toISOString() }); Modal.info({ title: '连接器响应', width: 720, content: <pre>{JSON.stringify(result, null, 2)}</pre> }); };
-  const trigger = async (row: Row) => { const result = await api.post(`${section.endpoint}${row.id}/trigger/`, {}); message.success(`已触发，Trace: ${result.id}`); };
-
-  const manageKnowledge = async (row: Row) => {
-    const documents = await api.get<Row[]>(`${section.endpoint}${row.id}/documents/`);
-    let title = ''; let content = '';
-    Modal.confirm({ title: `${row.name} · 文档`, width: 860, okText: '新增并索引', content: <div className="enterprise-dialog-stack">
-      <Alert type="info" showIcon message={`已有 ${documents.length} 个文档`} description={documents.map(d => `${d.title}（${d.status}）`).join('、') || '暂无文档'} />
-      <Input placeholder="文档标题" onChange={e => { title = e.target.value; }} /><Input.TextArea rows={8} placeholder="粘贴文档正文" onChange={e => { content = e.target.value; }} />
-    </div>, onOk: async () => { if (!title || !content) throw new Error('请填写标题与正文'); await api.post(`${section.endpoint}${row.id}/documents/`, { title, content, source_type: 'text' }); message.success('文档已索引'); } });
-  };
-  const manageEvaluation = async (row: Row) => {
-    const cases = await api.get<Row[]>(`${section.endpoint}${row.id}/cases/`);
-    let name = ''; let input = '{}'; let expected = '{"value":""}';
-    Modal.confirm({ title: `${row.name} · 评测用例`, width: 860, okText: '新增用例', cancelText: '关闭', content: <div className="enterprise-dialog-stack">
-      <Alert type="info" showIcon message={`已有 ${cases.length} 个用例`} description={cases.map(c => c.name).join('、') || '暂无用例'} />
-      <Input placeholder="用例名称" onChange={e => { name = e.target.value; }} /><Input.TextArea rows={3} defaultValue={input} onChange={e => { input = e.target.value; }} /><Input.TextArea rows={3} defaultValue={expected} onChange={e => { expected = e.target.value; }} />
-      <Button onClick={async () => { const result = await api.post(`${section.endpoint}${row.id}/run/`, { outputs: {} }); Modal.info({ title: '评测结果', content: <pre>{JSON.stringify(result, null, 2)}</pre> }); }}>立即运行</Button>
-    </div>, onOk: async () => { if (!name) return; await api.post(`${section.endpoint}${row.id}/cases/`, { name, input: parseJson(input, {}), expected: parseJson(expected, {}) }); message.success('用例已创建'); } });
-  };
-
-  const currentOrg = organizations.find(o => o.id === currentOrganizationId);
-  return <div className="enterprise-page animate-fade-in">
-    <div className="enterprise-hero"><div><h1 className="enterprise-title">企业控制台</h1><div className="enterprise-subtitle">多租户治理、运行观测、知识评测与企业集成</div></div><Select style={{ width: 280 }} value={currentOrganizationId} onChange={selectOrganization} options={organizations.map(o => ({ value: o.id, label: `${o.name} · ${o.role}` }))} /></div>
-    {!currentOrganizationId && <Alert type="warning" showIcon message="暂无可用组织" description="注册用户会自动创建个人组织。" />}
-    <div className="enterprise-grid"><Card><Statistic title="本月 Tokens" value={Number(usage.tokens || 0)} /></Card><Card><Statistic title="Token 配额" value={Number(usage.monthly_token_limit || 0)} /></Card><Card><Statistic title="本月成本" prefix="¥" value={Number(usage.cost || 0)} precision={4} /></Card><Card><Statistic title="成本预算" prefix="¥" value={Number(usage.monthly_cost_limit || 0)} /></Card></div>
-    <div className="enterprise-table-card">
-      <Tabs activeKey={active} onChange={setActive} items={Object.entries(sections).map(([key, value]) => ({ key, label: value.title }))} />
-      {active === 'organization' && currentOrganizationId ? <OrganizationGovernancePanel organizationId={currentOrganizationId} role={currentOrg?.role} /> : active === 'lifecycle' ? <AgentLifecyclePanel /> : <>
-        <div className="enterprise-toolbar"><Typography.Text type="secondary">当前组织：{currentOrg?.name || '—'}</Typography.Text><Space><Button onClick={() => void reload()}>刷新</Button>{section.fields && <Button type="primary" onClick={openCreate}>新建</Button>}</Space></div>
-        <Table rowKey="id" loading={loading} columns={columns} dataSource={rows} scroll={{ x: 900 }} locale={{ emptyText: <Empty description="暂无数据" /> }} />
-      </>}
-    </div>
-    <Modal title={editing ? `编辑${section.title}` : `新建${section.title}`} open={modalOpen} onCancel={() => setModalOpen(false)} onOk={submit} width={680}><Form layout="vertical" form={form}>{section.fields?.map(field => <DynamicField key={field.name} field={field} />)}</Form></Modal>
-    <Drawer title="资源详情" open={Boolean(detail)} onClose={() => setDetail(null)} width={620}>{detail && <Descriptions column={1} bordered size="small" items={Object.entries(detail).map(([key, value]) => ({ key, label: key, children: typeof value === 'object' ? <pre>{JSON.stringify(value, null, 2)}</pre> : String(value ?? '—') }))} />}</Drawer>
-  </div>;
+  const location = useLocation();
+  const navigate = useNavigate();
+  const key = currentKey(location.pathname);
+  const content = useMemo(() => {
+    if (key === "resources/agents") return <ResourcePage kind="chat" />;
+    if (key === "resources/apps") return <ResourcePage kind="fixed" />;
+    if (key.startsWith("access/agents")) return <AccessPage kind="chat" />;
+    if (key.startsWith("access/apps")) return <AccessPage kind="fixed" />;
+    if (key === "directory") return <DirectoryPage />;
+    if (key === "directory/sync") return <SyncPage />;
+    if (key === "providers") return <ProvidersPage />;
+    if (key === "audit") return <AuditPage />;
+    return <Overview />;
+  }, [key]);
+  return (
+    <Layout className="enterprise-console">
+      <Sider width={220} theme="light" className="enterprise-sider">
+        <div className="enterprise-brand">企业控制台</div>
+        <Menu
+          mode="inline"
+          selectedKeys={[key.split("?")[0]]}
+          items={menuItems}
+          onClick={({ key: k }) => navigate(pagePath(k))}
+        />
+      </Sider>
+      <Content className="enterprise-content">{content}</Content>
+    </Layout>
+  );
 }

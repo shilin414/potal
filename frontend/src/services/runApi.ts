@@ -414,7 +414,7 @@ export interface ApplicationPage {
 export interface ApplicationPageQuery {
   /** 'chat' (market) | 'fixed' (应用中心, kind <> 'chat') | 'all'. */
   kind?: 'chat' | 'fixed' | 'all';
-  scope?: 'public' | 'manage' | 'mine';
+  scope?: 'accessible' | 'public' | 'manage' | 'mine';
   /**
    * `mode` answers a DIFFERENT question from `scope` (二次复审 P0-5).
    *
@@ -463,6 +463,29 @@ export function fetchAgentRuntimes(): Promise<AgentRuntimeDescriptor[]> {
   return api.get<AgentRuntimeDescriptor[]>('/v2/runtimes');
 }
 
+export interface FixedApplicationPayload {
+  name: string;
+  slug?: string;
+  description?: string;
+  icon?: string;
+  color?: string;
+  kind?: 'page' | 'form' | 'dashboard' | 'custom' | 'task';
+  renderer_key?: string;
+}
+
+export function createFixedApplication(
+  payload: FixedApplicationPayload,
+): Promise<ManagedAgent> {
+  return api.post<ManagedAgent>('/v2/applications', { ...payload, is_public: false });
+}
+
+export function updateFixedApplication(
+  applicationId: number,
+  payload: Partial<FixedApplicationPayload> & { enabled?: boolean },
+): Promise<ManagedAgent> {
+  return api.patch<ManagedAgent>(`/v2/applications/${applicationId}`, payload);
+}
+
 export function createAgentApplication(
   payload: AgentApplicationPayload,
 ): Promise<ManagedAgent> {
@@ -471,7 +494,7 @@ export function createAgentApplication(
 
 /**
  * The AUTHORING detail read (三次复审 P0-R4.1): the backend answers this
- * only to the creator / staff — it carries the provider-authoring fields
+ * only to staff — it carries the provider-authoring fields
  * (`external_resource_id`, `identity_mode`, `execution_mode`). Consumers
  * must go through `resolveApplication` / `fetchApplicationPage` /
  * `fetchWorkspaceBootstrap`, whose consumer DTO omits those fields.

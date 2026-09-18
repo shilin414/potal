@@ -4,6 +4,7 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import AccountMenu from '@/components/AccountMenu/AccountMenu';
 import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { ThemeToggle } from '@/components/Theme';
+import { useAuthStore } from '@/stores/useAuthStore';
 import './Header.css';
 
 // 技能 / 案例库 / 工作流三个入口已从主页导航下掉（页面、路由与数据都保留，
@@ -23,6 +24,8 @@ const Header: React.FC = () => {
   // header must not ask for the whole catalog just to link to "对话".
   const defaultApplication = useWorkspaceBootstrapStore((state) => state.defaultApplication);
   const loadBootstrap = useWorkspaceBootstrapStore((state) => state.load);
+  const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
+  const visibleNavItems = navItems.filter((item) => item.key !== '/enterprise' || isStaff);
 
   React.useEffect(() => { void loadBootstrap(); }, [loadBootstrap]);
 
@@ -47,7 +50,7 @@ const Header: React.FC = () => {
 
       {/* Center: Nav */}
       <nav className="header-nav">
-        {navItems.map((item) => (
+        {visibleNavItems.map((item) => (
           <div
             key={item.key}
             className={`header-nav-item ${

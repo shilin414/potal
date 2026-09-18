@@ -1,30 +1,31 @@
-import React, { useEffect } from 'react';
-import { Menu } from 'antd';
-import { useAgentStore } from '@/stores/useAgentStore';
+import React, { useEffect } from "react";
+import { Menu } from "antd";
+import { useCatalogUiStore } from "@/stores/useCatalogUiStore";
+import { useWorkspaceBootstrapStore } from "@/stores/useWorkspaceBootstrapStore";
 
 const AgentCategoriesSidebar: React.FC = () => {
-  const { categories, selectedCategory, loadCategories, selectCategory } = useAgentStore();
-
+  const categories = useWorkspaceBootstrapStore(
+    (state) => state.agentCategories,
+  );
+  const load = useWorkspaceBootstrapStore((state) => state.load);
+  const selected = useCatalogUiStore((state) => state.agentCategory);
+  const setSelected = useCatalogUiStore((state) => state.setAgentCategory);
   useEffect(() => {
-    loadCategories();
-  }, [loadCategories]);
-
-  const menuItems = [
-    { key: 'all', label: '全部智能体' },
-    ...categories.map((cat) => ({
-      key: cat.slug,
-      label: `${cat.name} (${cat.agent_count})`,
-    })),
-  ];
-
+    void load();
+  }, [load]);
   return (
     <Menu
       mode="inline"
-      selectedKeys={[selectedCategory || 'all']}
-      items={menuItems}
-      onClick={({ key }) => selectCategory(key === 'all' ? null : key)}
+      selectedKeys={[selected || "all"]}
+      items={[
+        { key: "all", label: "全部智能体" },
+        ...categories.map((cat) => ({
+          key: cat.slug,
+          label: `${cat.name} (${cat.count})`,
+        })),
+      ]}
+      onClick={({ key }) => setSelected(key === "all" ? null : key)}
     />
   );
 };
-
 export default AgentCategoriesSidebar;

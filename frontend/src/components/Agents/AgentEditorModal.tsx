@@ -276,7 +276,6 @@ const AgentEditorModal = ({
         name: values.name,
         description: values.description || '',
         icon: values.icon || '',
-        is_public: values.is_public,
         category_slug: values.category_slug || '',
         category_name: category?.name || '',
         runtime,
@@ -291,7 +290,6 @@ const AgentEditorModal = ({
       slug: values.slug,
       description: values.description || '',
       icon: values.icon || '',
-      is_public: values.is_public,
       category_slug: values.category_slug || DEFAULT_CATEGORY.slug,
       category_name: category?.name || DEFAULT_CATEGORY.name,
       runtime,
@@ -568,14 +566,11 @@ const AgentEditorModal = ({
         ) : null}
 
         <div className="agent-form-row agent-form-row-compact">
-          <Form.Item
-            name="is_public"
-            label="公开到智能体市场"
-            valuePropName="checked"
-            extra="公开后所有用户可见可用（能否真正调用以本人飞书身份的可见性为准）；仅自己可见时只有管理员看得到。"
-          >
-            <Switch checkedChildren="公开" unCheckedChildren="仅自己可见" />
-          </Form.Item>
+          {agentType === 'local' ? (
+            <Form.Item name="is_public" label="公开" valuePropName="checked">
+              <Switch checkedChildren="公开" unCheckedChildren="私有" />
+            </Form.Item>
+          ) : null}
           {agentType === 'runtime' ? (
             <Form.Item
               name="set_default_agent"

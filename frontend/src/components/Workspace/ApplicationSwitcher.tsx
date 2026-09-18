@@ -39,7 +39,7 @@ const ApplicationSwitcher: React.FC<Props> = ({ compact }) => {
     loading,
   } = useApplicationPage({
     kind: 'chat',
-    scope: 'manage',
+    scope: 'accessible',
     // consume (二次复审 P0-5): this dropdown SWITCHES the workspace to an
     // agent, so it may only offer applications that can actually run. With
     // manage scope alone a staff user saw 停用 and binding-less agents here

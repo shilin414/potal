@@ -9,6 +9,7 @@ import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { useRunChatStore } from '@/stores/useRunChatStore';
+import { useAuthStore } from '@/stores/useAuthStore';
 import type { ShellChrome } from './useShellChrome';
 import './shell.css';
 
@@ -36,6 +37,8 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
   const navigate = useNavigate();
   const location = useLocation();
   const path = location.pathname;
+  const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
+  const visibleNavItems = NAV_ITEMS.filter((item) => item.key !== '/enterprise' || isStaff);
 
   const go = (path: string) => {
     setMobileNavOpen(false);
@@ -107,7 +110,7 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
         styles={{ body: { padding: 0, display: 'flex', flexDirection: 'column' } }}
       >
         <nav className="mobile-shell__nav">
-          {NAV_ITEMS.map((item) => (
+          {visibleNavItems.map((item) => (
             <button
               key={item.key}
               type="button"

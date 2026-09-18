@@ -7,10 +7,13 @@
  * mirror is gone (see `useWorkspaceBootstrapStore`), and a UI selection must
  * not be smuggled into a data store just to keep a component compiling.
  */
-import { create } from 'zustand';
-import { registerSessionReset } from '@/stores/resetSessionState';
+import { create } from "zustand";
+import { registerSessionReset } from "@/stores/resetSessionState";
 
 interface CatalogUiState {
+  /** Selected category slug for 智能体中心; null = 全部智能体. */
+  agentCategory: string | null;
+  setAgentCategory: (category: string | null) => void;
   /** Selected category slug for 应用中心; null = 全部应用. */
   fixedCategory: string | null;
   setFixedCategory: (category: string | null) => void;
@@ -19,9 +22,11 @@ interface CatalogUiState {
 }
 
 export const useCatalogUiStore = create<CatalogUiState>()((set) => ({
+  agentCategory: null,
+  setAgentCategory: (agentCategory) => set({ agentCategory }),
   fixedCategory: null,
   setFixedCategory: (fixedCategory) => set({ fixedCategory }),
-  reset: () => set({ fixedCategory: null }),
+  reset: () => set({ agentCategory: null, fixedCategory: null }),
 }));
 
 // A category selection is not user data, but it is stale across identities in
