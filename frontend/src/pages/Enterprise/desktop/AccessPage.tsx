@@ -1,8 +1,9 @@
 /**
  * AccessPage — desktop 权限管理（原样搬移自 EnterprisePage.tsx）。
  */
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
+  Alert,
   Button,
   Card,
   Drawer,
@@ -20,7 +21,7 @@ import {
 import type { ColumnsType } from "antd/es/table";
 import { useLocation } from "react-router-dom";
 import { useApplicationPage } from "@/hooks/useApplicationPage";
-import type { V2Application } from "@/services/runApi";
+import { fetchApplicationDetail, type V2Application } from "@/services/runApi";
 import {
   enterpriseApi,
   type AccessMode,
@@ -44,12 +45,23 @@ function buildTree(deps: DirectoryDepartment[]) {
   return roots;
 }
 
+/**
+ * The permission drawer only ever needs an id + name — a deep-linked target
+ * can be resolved through fetchApplicationDetail without waiting for its
+ * page to arrive (二次复审 P1-1)。Enterprise 挂在 AdminRoute 下，staff
+ * authoring detail 在这里是被允许的读法。
+ */
+interface AccessTarget {
+  id: number;
+  name: string;
+}
+
 export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
   const location = useLocation();
   const initial = Number(new URLSearchParams(location.search).get("app") || 0);
   const [q, setQ] = useState("");
   const {
-    items, loading, loadingMore, hasMore, loadMore,
+    items, loading, loadingMore, hasMore, loadMore, error, refresh,
   } = useApplicationPage({
     kind,
     scope: "manage",
@@ -58,13 +70,20 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
     query: q,
     limit: 50,
   });
-  const [selected, setSelected] = useState<V2Application | null>(null);
+  const [selected, setSelected] = useState<AccessTarget | null>(null);
   const [policy, setPolicy] = useState<AccessPolicy | null>(null);
   const [deps, setDeps] = useState<DirectoryDepartment[]>([]);
   const [users, setUsers] = useState<DirectoryUser[]>([]);
   const [saving, setSaving] = useState(false);
   const [includeChildren, setIncludeChildren] = useState(true);
-  const open = useCallback(async (app: V2Application) => {
+  const [deepLinkError, setDeepLinkError] = useState<string | null>(null);
+  // One resolve attempt per deep-link id — a LATER loadMore may still surface
+  // the row organically (the items.find branch picks it up), and a NEW
+  // ?app= id always gets a fresh attempt. `deepLinkAttempt` only exists to
+  // re-run the effect after an explicit retry (P2-6).
+  const deepLinkTriedRef = useRef<number | null>(null);
+  const [deepLinkAttempt, setDeepLinkAttempt] = useState(0);
+  const open = useCallback(async (app: AccessTarget) => {
     setSelected(app);
     try {
       const [p, d, u] = await Promise.all([
@@ -79,12 +98,39 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
       message.error("加载权限失败");
     }
   }, []);
+  // A changed ?app= id must clear the previous id's error banner (二次复审
+  // P2-6).
   useEffect(() => {
-    if (initial && items.length) {
-      const app = items.find((x) => x.id === initial);
-      if (app && !selected) void open(app);
+    setDeepLinkError(null);
+  }, [initial]);
+  useEffect(() => {
+    if (!initial || selected) return;
+    const hit = items.find((x) => x.id === initial);
+    if (hit) {
+      setDeepLinkError(null);
+      void open({ id: hit.id, name: hit.name });
+      return;
     }
-  }, [initial, items, open, selected]);
+    if (loading || deepLinkTriedRef.current === initial) return;
+    deepLinkTriedRef.current = initial;
+    let stale = false;
+    fetchApplicationDetail(initial)
+      .then((detail) => {
+        if (!stale) void open({ id: initial, name: detail.name });
+      })
+      .catch((err: any) => {
+        if (stale) return;
+        const status = err?.response?.status;
+        setDeepLinkError(
+          status === 403 || status === 404
+            ? "资源不存在或无权限"
+            : "加载目标资源失败",
+        );
+      });
+    return () => {
+      stale = true;
+    };
+  }, [initial, items, loading, selected, open, deepLinkAttempt]);
   const save = async () => {
     if (!selected || !policy) return;
     setSaving(true);
@@ -157,6 +203,13 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
       ),
     },
   ];
+  // 与 MobileAccessPage 相同的数据语义（二次复审 P1-1/P2-11）：
+  // fatal = 首页失败且没有任何数据；partial = 加载更多失败但表格保留。
+  const fatalError = Boolean(error) && items.length === 0;
+  const partialError = Boolean(error) && items.length > 0;
+  // A failed loadMore keeps its cursor (retry = loadMore); a failed search /
+  // first page clears it (retry = refresh).
+  const retryPartial = () => (hasMore ? void loadMore() : void refresh());
   return (
     <section className="enterprise-section">
       <div className="enterprise-section__head">
@@ -170,19 +223,64 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
           onChange={(e) => setQ(e.target.value)}
         />
       </div>
-      <Table
-        rowKey="id"
-        loading={loading}
-        dataSource={items}
-        columns={columns}
-        pagination={false}
-      />
-      {hasMore && (
-        <div style={{ textAlign: "center", marginTop: 16 }}>
-          <Button loading={loadingMore} onClick={() => void loadMore()}>
-            加载更多
-          </Button>
-        </div>
+      {fatalError ? (
+        <Alert
+          type="error"
+          showIcon
+          message="加载资源失败"
+          description={error}
+          action={
+            <Button size="small" onClick={() => void refresh()}>
+              重试
+            </Button>
+          }
+        />
+      ) : (
+        <>
+          {deepLinkError && (
+            <Alert
+              type="warning"
+              showIcon
+              message={deepLinkError}
+              style={{ marginBottom: 16 }}
+              action={
+                deepLinkError === "加载目标资源失败" ? (
+                  <Button
+                    size="small"
+                    onClick={() => {
+                      deepLinkTriedRef.current = null;
+                      setDeepLinkAttempt((n) => n + 1);
+                    }}
+                  >
+                    重试
+                  </Button>
+                ) : undefined
+              }
+            />
+          )}
+          <Table
+            rowKey="id"
+            loading={loading}
+            dataSource={items}
+            columns={columns}
+            pagination={false}
+            locale={{ emptyText: <Empty description="暂无可配置的资源" /> }}
+          />
+          {/* One CTA, never two: a failed loadMore REPLACES 加载更多 (P2-3). */}
+          {partialError ? (
+            <div style={{ textAlign: "center", marginTop: 16 }}>
+              <Button danger onClick={retryPartial}>
+                加载失败，点击重试
+              </Button>
+            </div>
+          ) : hasMore ? (
+            <div style={{ textAlign: "center", marginTop: 16 }}>
+              <Button loading={loadingMore} onClick={() => void loadMore()}>
+                加载更多
+              </Button>
+            </div>
+          ) : null}
+        </>
       )}
       <Drawer
         title={`访问权限 · ${selected?.name || ""}`}
