@@ -1,0 +1,512 @@
+/* ============================================
+   MobileConsole — the shared design system for the four mobile centres
+   (智能体 / 应用 / 定时任务 / 企业控制台). 开发执行报告 §7–§10.
+
+   Rules decided once here:
+     · only theme variables — no literal colors, light/dark must both work (§66);
+     · every tap target >= 44px (§10);
+     · one scroll container per page: the page itself (§61);
+     · safe-area on the page tail and on fixed bottoms (§59);
+     · durations stay in the 100–240ms band, no stagger (§63), and honour
+       prefers-reduced-motion (§64).
+   ============================================ */
+
+/* ── MobilePage (§8) ─────────────────────────────────────────────────── */
+
+.mobile-console-page {
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 12px 16px calc(24px + env(safe-area-inset-bottom));
+  background: var(--color-bg-void);
+}
+
+/* Optional sticky controls (search + filters) stay pinned above the scroll. */
+.mobile-console-page__sticky {
+  position: sticky;
+  top: -12px; /* undoes the page's top padding so the bar hugs the top */
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 0 10px;
+  margin: -12px 0 4px;
+  background: var(--color-bg-void);
+}
+
+/* ── MobileSection (§8) ──────────────────────────────────────────────── */
+
+.mobile-console-section {
+  margin-top: 24px;
+}
+
+.mobile-console-section__title {
+  margin: 0 0 6px;
+  color: var(--color-text);
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.mobile-console-section__desc {
+  margin: -2px 0 8px;
+  color: var(--color-text-dim);
+  font-size: 12px;
+}
+
+/* Rows rendered directly on the page read as ONE list: hairline dividers,
+   not one card per row (§14). */
+.mobile-console-section__rows {
+  background: var(--color-bg-card);
+  border-radius: 14px;
+  overflow: hidden;
+}
+
+.mobile-console-section__rows > * + * {
+  border-top: 1px solid var(--color-border);
+}
+
+/* ── MobileSearchBar (§17) ───────────────────────────────────────────── */
+
+.mobile-console-search .ant-input-affix-wrapper {
+  height: 44px;
+  border-radius: 12px;
+  border-color: var(--color-border);
+  background: var(--color-bg-elevated);
+}
+
+.mobile-console-search .ant-input {
+  background: transparent;
+  font-size: 15px;
+}
+
+/* ── MobileCategoryRail (§16) ────────────────────────────────────────── */
+
+.mobile-console-rail {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 2px 0 4px;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+
+.mobile-console-rail::-webkit-scrollbar {
+  display: none;
+}
+
+.mobile-console-rail__pill {
+  flex: none;
+  min-height: 36px;
+  padding: 6px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-sec);
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-console-rail__pill--active {
+  border-color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 12%, transparent);
+  color: var(--color-primary);
+  font-weight: 600;
+}
+
+/* ── MobileEntityRow (§14) ───────────────────────────────────────────── */
+
+.mobile-console-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 72px;
+  padding: 10px 16px;
+  border: none;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-console-row:active {
+  background: var(--color-bg-elevated);
+}
+
+.mobile-console-row__avatar {
+  flex: none;
+}
+
+.mobile-console-row__body {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mobile-console-row__title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--color-text);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.mobile-console-row__title > span:first-child {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-console-row__title-badge {
+  flex: none;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--color-warning) 18%, transparent);
+  color: var(--color-warning);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 15px;
+}
+
+.mobile-console-row__desc {
+  overflow: hidden;
+  color: var(--color-text-sec);
+  font-size: 13px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-console-row__meta {
+  overflow: hidden;
+  color: var(--color-text-dim);
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-console-row__star {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-dim);
+  font-size: 16px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-console-row__star:hover,
+.mobile-console-row__star:active {
+  background: var(--color-bg-elevated);
+}
+
+.mobile-console-row__star--on {
+  color: #f59e0b; /* the one sanctioned literal: the favorite gold (§66 特殊图形) */
+}
+
+.mobile-console-row__chevron {
+  flex: none;
+  color: var(--color-text-dim);
+  font-size: 13px;
+}
+
+/* status dot + label for enterprise resources (§36) */
+.mobile-console-row__status {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  color: var(--color-text-sec);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.mobile-console-row__dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--color-text-dim);
+}
+
+.mobile-console-row__dot--on {
+  background: var(--color-success);
+}
+
+.mobile-console-row__dot--off {
+  background: var(--color-border-lit);
+}
+
+/* ••• trailing action (§37): 44px tap target instead of the chevron. */
+.mobile-console-row__more {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 999px;
+  color: var(--color-text-sec);
+  font-size: 18px;
+  letter-spacing: 1px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-console-row__more:active {
+  background: var(--color-bg-elevated);
+}
+
+/* ── MobileActionSheet (§58) ─────────────────────────────────────────── */
+
+.mobile-action-sheet__row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 52px;
+  padding: 12px 20px;
+  border: none;
+  background: transparent;
+  color: var(--color-text);
+  font-size: 15px;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-action-sheet__row:active {
+  background: var(--color-bg-elevated);
+}
+
+.mobile-action-sheet__row[disabled] {
+  color: var(--color-text-dim);
+  cursor: not-allowed;
+}
+
+.mobile-action-sheet__row--danger {
+  color: var(--color-error);
+}
+
+.mobile-action-sheet__row-icon {
+  flex: none;
+  width: 22px;
+  font-size: 16px;
+  text-align: center;
+}
+
+/* Safe-area tail below the last action (§59). */
+.mobile-action-sheet__list {
+  padding-bottom: calc(8px + env(safe-area-inset-bottom));
+}
+
+/* ── MobileFullScreenDrawer (§29) ────────────────────────────────────── */
+
+.mobile-fs-drawer .ant-drawer-content-wrapper {
+  width: 100vw !important;
+}
+
+.mobile-fs-drawer__inner {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  height: 100dvh; /* 飞书 WebView/Safari 地址栏：dvh 才不跳动 (§93) */
+}
+
+.mobile-fs-drawer__header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--header-h);
+  padding: 0 12px;
+  padding-top: env(safe-area-inset-top);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-bg-surface);
+}
+
+.mobile-fs-drawer__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 17px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-fs-drawer__action.ant-btn {
+  flex: none;
+}
+
+.mobile-fs-drawer__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 16px 16px calc(24px + env(safe-area-inset-bottom));
+  background: var(--color-bg-void);
+}
+
+/* ── MobileStatCard (§33) ────────────────────────────────────────────── */
+
+.mobile-console-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 12px;
+}
+
+.mobile-console-stat {
+  padding: 14px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  background: var(--color-bg-card);
+}
+
+.mobile-console-stat__value {
+  color: var(--color-text);
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.mobile-console-stat__label {
+  margin-top: 4px;
+  color: var(--color-text-sec);
+  font-size: 12px;
+}
+
+.mobile-console-stat__sub {
+  margin-top: 2px;
+  color: var(--color-text-dim);
+  font-size: 12px;
+}
+
+/* ── MobileSettingsGroup / Row (§34) ─────────────────────────────────── */
+
+.mobile-console-settings-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  min-height: 60px;
+  padding: 10px 16px;
+  border: none;
+  background: transparent;
+  color: var(--color-text);
+  font-size: 15px;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-console-settings-row:active {
+  background: var(--color-bg-elevated);
+}
+
+.mobile-console-settings-row__icon {
+  display: grid;
+  flex: none;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--color-primary) 10%, transparent);
+  color: var(--color-primary);
+  font-size: 17px;
+}
+
+.mobile-console-settings-row__body {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.mobile-console-settings-row__title {
+  overflow: hidden;
+  font-size: 15px;
+  font-weight: 500;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-console-settings-row__desc {
+  overflow: hidden;
+  color: var(--color-text-dim);
+  font-size: 12px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-console-settings-row__chevron {
+  flex: none;
+  color: var(--color-text-dim);
+  font-size: 13px;
+}
+
+/* ── states (§62) ────────────────────────────────────────────────────── */
+
+.mobile-console-empty {
+  padding: 48px 24px;
+  color: var(--color-text-sec);
+  font-size: 14px;
+  text-align: center;
+}
+
+.mobile-console-empty strong {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--color-text);
+  font-weight: 600;
+}
+
+.mobile-console-empty .ant-btn {
+  margin-top: 16px;
+}
+
+.mobile-console-more {
+  display: block;
+  width: 100%;
+  margin: 12px 0 4px;
+  min-height: 44px;
+  padding: 10px 0;
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  background: var(--color-bg-elevated);
+  color: var(--color-text-sec);
+  font-size: 13px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-console-more:active {
+  background: var(--color-bg-card);
+}
+
+/* ── reduced motion (§64) ────────────────────────────────────────────── */
+
+@media (prefers-reduced-motion: reduce) {
+  .mobile-console-page,
+  .mobile-console-row,
+  .mobile-action-sheet__row,
+  .mobile-fs-drawer__inner {
+    scroll-behavior: auto;
+    transition: none;
+    animation: none;
+  }
+}
