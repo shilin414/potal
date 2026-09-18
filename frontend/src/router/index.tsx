@@ -46,6 +46,37 @@ const consolePage = { shell: { padded: true } };
 const fullWidthConsole = { shell: { hideSidebar: true, padded: true } };
 const fullscreenConsole = { shell: { hideSidebar: true, hideHeader: true } };
 
+// Mobile shell handles (开发执行报告 §6): the header swaps the workspace
+// switcher for a page title; Schedules gains a create action wired by the
+// page itself via useMobileHeader. Enterprise sub-pages override the title
+// dynamically (mode: 'detail') from EnterprisePage's mobile branch.
+const agentsPageHandle = {
+  shell: {
+    padded: true,
+    mobile: { mode: 'page' as const, title: '智能体中心' },
+  },
+};
+const appsPageHandle = {
+  shell: {
+    padded: true,
+    mobile: { mode: 'page' as const, title: '应用中心' },
+  },
+};
+const schedulesPageHandle = {
+  shell: {
+    hideSidebar: true,
+    padded: true,
+    mobile: { mode: 'page' as const, title: '定时任务', action: 'create' as const },
+  },
+};
+const enterprisePageHandle = {
+  shell: {
+    hideSidebar: true,
+    padded: true,
+    mobile: { mode: 'console' as const, title: '企业控制台' },
+  },
+};
+
 /**
  * One AppShell wraps every authenticated route (§33).
  *
@@ -74,7 +105,7 @@ const router = createBrowserRouter([
       },
 
       // ── Console (application management) ──────────────────────────────
-      { path: 'agents', element: <AgentsPage />, handle: consolePage },
+      { path: 'agents', element: <AgentsPage />, handle: agentsPageHandle },
       { path: 'agents/:id', element: <AgentDetailPage />, handle: consolePage },
       { path: 'templates', element: <TemplatesPage />, handle: consolePage },
       {
@@ -82,7 +113,7 @@ const router = createBrowserRouter([
         element: <TemplateDetailPage />,
         handle: consolePage,
       },
-      { path: 'apps', element: <AppsPage />, handle: consolePage },
+      { path: 'apps', element: <AppsPage />, handle: appsPageHandle },
       { path: 'apps/:id', element: <AdminRoute><AppDetailPage /></AdminRoute>, handle: consolePage },
       // Launched apps now live in the shell's application workspace (§32).
       { path: 'apps/:id/run', element: <LegacyAppRunRedirect /> },
@@ -92,7 +123,7 @@ const router = createBrowserRouter([
         handle: consolePage,
       },
       { path: 'skills', element: <SkillsPage />, handle: fullWidthConsole },
-      { path: 'schedules', element: <SchedulesPage />, handle: fullWidthConsole },
+      { path: 'schedules', element: <SchedulesPage />, handle: schedulesPageHandle },
       { path: 'workflows', element: <WorkflowsPage />, handle: fullWidthConsole },
       {
         path: 'workflows/:id/edit',
@@ -111,7 +142,7 @@ const router = createBrowserRouter([
         element: <WorkspacePage />,
         handle: fullWidthConsole,
       },
-      { path: 'enterprise/*', element: enterpriseElement, handle: fullWidthConsole },
+      { path: 'enterprise/*', element: enterpriseElement, handle: enterprisePageHandle },
 
       { path: '*', element: <Navigate to="/" replace /> },
     ],

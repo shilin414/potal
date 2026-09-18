@@ -1,6 +1,12 @@
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { Button, Drawer } from 'antd';
-import { MenuOutlined, PlusOutlined } from '@ant-design/icons';
+import {
+  ArrowLeftOutlined,
+  MenuOutlined,
+  MoreOutlined,
+  PlusOutlined,
+  SearchOutlined,
+} from '@ant-design/icons';
 import ConversationHistory from '@/components/ConversationHistory/ConversationHistory';
 import AccountMenu from '@/components/AccountMenu/AccountMenu';
 import MobileAgentSwitcher from '@/components/Mobile/MobileAgentSwitcher';
@@ -16,33 +22,28 @@ import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore'
 import { useRunChatStore } from '@/stores/useRunChatStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import type { ShellChrome } from './useShellChrome';
+import { MobileHeaderProvider, useMobileHeaderState } from './mobileHeader';
 import './shell.css';
 
-/**
- * MobileAppShell — bottom-anchored mobile layout (§20-§23).
- *
- * Shares WorkspaceHost/Renderer with the desktop shell (§24); only the
- * interaction chrome differs: the sidebar becomes a drawer and the agent
- * switcher moves into the top bar.
- */
-const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
+const MobileShellContent: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
   const mobileNavOpen = useWorkspaceStore((state) => state.mobileNavOpen);
   const setMobileNavOpen = useWorkspaceStore((state) => state.setMobileNavOpen);
   const navigate = useNavigate();
   const location = useLocation();
+  const pageOverride = useMobileHeaderState();
   const path = location.pathname;
   const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
   const visibleNavItems = getVisibleNavigationItems({ isStaff });
+  const mobile = { ...chrome.mobile, ...pageOverride };
+  const mode = mobile.mode ?? 'workspace';
+  const showBack = mobile.showBack ?? mode === 'detail';
+  const showMenu = mobile.showMenu ?? !showBack;
 
   const go = (targetPath: string) => {
     setMobileNavOpen(false);
     navigate(targetPath);
   };
 
-  // Same semantics as the desktop sidebar's 新建 (see Sidebar.tsx): a new
-  // conversation of the active/main chat agent, never a silent no-op. The
-  // lookup stays inside the entity cache + the bootstrap payload, so tapping
-  // 新建 costs no catalog request (执行报告 §9.4).
   const handleNewConversation = () => {
     const entities = useApplicationEntityStore.getState();
     const activeApplicationId = useWorkspaceStore.getState().activeApplicationId;
@@ -62,36 +63,75 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
     navigate(`/chat/${application.slug}`);
   };
 
+  const renderAction = () => {
+    const action = mobile.action ?? (mode === 'workspace' ? 'new-task' : 'none');
+    if (action === 'none') return <span className="mobile-shell__bar-spacer" aria-hidden />;
+    if (action === 'new-task') {
+      return (
+        <Button
+          type="primary"
+          size="small"
+          icon={<PlusOutlined />}
+          className="mobile-shell__task-btn"
+          onClick={handleNewConversation}
+        >
+          新任务
+        </Button>
+      );
+    }
+    const labels = { create: '新建', search: '搜索', more: '更多' } as const;
+    const icons = {
+      create: <PlusOutlined />,
+      search: <SearchOutlined />,
+      more: <MoreOutlined />,
+    } as const;
+    return (
+      <button
+        type="button"
+        className="mobile-shell__icon-btn"
+        aria-label={labels[action]}
+        onClick={pageOverride?.onAction}
+        disabled={!pageOverride?.onAction}
+      >
+        {icons[action]}
+      </button>
+    );
+  };
+
   return (
     <div className="mobile-shell">
       {!chrome.hideHeader && (
         <header className="mobile-shell__bar">
-          <button
-            type="button"
-            className="mobile-shell__icon-btn"
-            aria-label="打开导航"
-            onClick={() => setMobileNavOpen(true)}
-          >
-            <MenuOutlined />
-          </button>
-          {/* 移动端智能体切换走 Bottom Sheet，与首页选择器同一组件 (§7.2)；
-              桌面端继续用 ApplicationSwitcher 的 Dropdown，互不影响。 */}
-          <MobileAgentSwitcher />
-          {/* 右侧主操作：回到首页。这里原本是账号头像（纯展示、无下拉，
-              账号菜单本来就在移动端不可达），换成一个更常用的动作。 */}
-          <Button
-            type="primary"
-            size="small"
-            icon={<PlusOutlined />}
-            className="mobile-shell__task-btn"
-            onClick={() => go('/')}
-          >
-            新任务
-          </Button>
+          {showBack ? (
+            <button
+              type="button"
+              className="mobile-shell__icon-btn"
+              aria-label="返回企业控制台"
+              onClick={() => go(mobile.backTo ?? '/enterprise')}
+            >
+              <ArrowLeftOutlined />
+            </button>
+          ) : showMenu ? (
+            <button
+              type="button"
+              className="mobile-shell__icon-btn"
+              aria-label="打开导航"
+              onClick={() => setMobileNavOpen(true)}
+            >
+              <MenuOutlined />
+            </button>
+          ) : <span className="mobile-shell__bar-spacer" aria-hidden />}
+
+          {mode === 'workspace' ? (
+            <MobileAgentSwitcher />
+          ) : (
+            <div className="mobile-shell__title" title={mobile.title}>{mobile.title}</div>
+          )}
+          {renderAction()}
         </header>
       )}
 
-      <main className="mobile-shell__main">
+      <main className={`mobile-shell__main${chrome.padded ? ' mobile-shell__main--padded' : ''}`}>
         <Outlet />
       </main>
 
@@ -101,6 +141,7 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
         onClose={() => setMobileNavOpen(false)}
         width="82vw"
         title="Creation Studio"
+        rootClassName="mobile-shell__drawer"
         styles={{ body: { padding: 0, display: 'flex', flexDirection: 'column' } }}
       >
         <nav className="mobile-shell__nav" aria-label="主导航">
@@ -114,11 +155,7 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
                 aria-current={active ? 'page' : undefined}
                 onClick={() => go(item.path)}
               >
-                <NavigationItemIcon
-                  item={item}
-                  surface="mobile"
-                  className="mobile-shell__nav-icon"
-                />
+                <NavigationItemIcon item={item} surface="mobile" className="mobile-shell__nav-icon" />
                 <span>{item.mobileLabel}</span>
               </button>
             );
@@ -130,16 +167,17 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
             onNewConversation={handleNewConversation}
           />
         </div>
-        <div className="mobile-shell__theme">
-          <ThemePicker />
-        </div>
-        <AccountMenu
-          variant="panel"
-          onLogoutComplete={() => setMobileNavOpen(false)}
-        />
+        <div className="mobile-shell__theme"><ThemePicker /></div>
+        <AccountMenu variant="panel" onLogoutComplete={() => setMobileNavOpen(false)} />
       </Drawer>
     </div>
   );
 };
+
+const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => (
+  <MobileHeaderProvider>
+    <MobileShellContent chrome={chrome} />
+  </MobileHeaderProvider>
+);
 
 export default MobileAppShell;

@@ -40,6 +40,29 @@
   background: var(--color-bg-elevated);
 }
 
+/* ── Route-aware header modes (开发执行报告 §5) ────────────────────────
+   workspace: ☰ + switcher + 新任务 (unchanged)
+   page/console: ☰ + page title (+ optional action)
+   detail: ← + title (+ •••) — back targets the console root, not history. */
+.mobile-shell__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 17px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  /* Page titles read better slightly left-of-center on narrow bars. */
+  text-align: center;
+}
+
+/* Balances the leading icon button when a mode renders no trailing action. */
+.mobile-shell__bar-spacer {
+  flex: none;
+  width: 36px;
+}
+
 /* The switcher takes the free space so the current agent is the anchor. */
 .mobile-shell__bar .application-switcher {
   flex: 1;
