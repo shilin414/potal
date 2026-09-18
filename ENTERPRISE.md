@@ -1,62 +1,82 @@
-# Enterprise deployment and operations (planned — G13/G15)
+# Enterprise deployment and operations
 
-> The Django control plane described by the previous version of this document
-> has been retired (G10). Its historical implementation is archived, sanitized,
-> under [docs/archive/django-reference/](docs/archive/django-reference/README.md).
-> Enterprise governance is not yet implemented on the Go backend; this file
-> now records the target scope and its current status only.
+> Status date: 2026-09-18. The Django control plane is retired; the enterprise
+> resource, directory, and Application ACL control plane is implemented in Go.
 
-## Current status
+## Current scope
 
-- The Go backend (`backend-go/`) owns Identity, Catalog, Execution, SSE, and
-  the Aily Agent provider. Enterprise console surfaces under `/enterprise/*`
-  (organizations, RBAC, API keys, quota, audit, provider health) are planned
-  for G13 and currently return 404 through the Vite proxy.
-- Production deployment topology (Nginx REST/SSE split, container images,
-  resource limits) is G15. The historical Docker Compose stack belonged to the
-  Django deployment and was removed with it.
-- Governance storage (quota_policies, audit_logs) already exists in the Go
-  schema; the runtime enforcement and the React admin console are the missing
-  parts (G13).
+- Administrator identity remains `users.is_staff = 1`.
+- `/enterprise/*` is staff-only in the React router and all corresponding APIs
+  independently enforce staff access.
+- Resource authoring continues to use `/api/v2/applications`; every mutation is
+  staff-only. `/agents` and `/apps` are consumer-only discovery surfaces.
+- Enterprise governance APIs live under `/api/v2/admin/*`:
+  - directory departments, employees, sync configuration and sync runs;
+  - Application access policies (all / assigned / admin_only);
+  - audit-log inspection.
+- Feishu organization data is fetched with application identity
+  (`tenant_access_token`) through `directory/v1`, staged, validated, and only
+  then published in one MySQL transaction.
+- Department inheritance uses a closure table because MySQL 5.7 has no
+  recursive CTE.
+- Application ACL is shared by chat agents and fixed applications. Catalog
+  pages, workspace bootstrap, resolve, mention, favorites, run/schedule
+  admission, and the worker pre-submit gate use the same policy.
 
-## Planned Go topology (G15)
+## Rollout
+
+`ENTERPRISE_ACL_ENABLED=false` keeps the legacy `is_public` rule active while
+Directory synchronization and grants are populated. Before enabling it:
+
+1. grant the Feishu app the required Directory API and field permissions;
+2. complete at least one successful full sync and compare department/employee
+   counts plus OAuth `open_id` matching;
+3. configure Application access policies;
+4. verify representative users across catalog, resolve, mention, Run and
+   Schedule surfaces;
+5. set `ENTERPRISE_ACL_ENABLED=true` and restart API, scheduler and workers.
+
+New resources are always created with `access_mode=admin_only`. Fixed
+applications are additionally created disabled until an administrator verifies
+that the shipped `renderer_key` exists.
+
+## Required Feishu application permissions
+
+Minimum API permissions:
+
+- `directory:department:list`
+- `directory:employee:list`
+
+Department fields:
+
+- `directory:department.base:read`
+- `directory:department.parent_id:read`
+- `directory:department.order_weight:read`
+
+Employee fields:
+
+- `directory:employee.base.name.name:read`
+- `directory:employee.base.department:read`
+- `directory:employee.base.active_status:read`
+- `directory:employee.base.is_resigned:read`
+- `directory:employee.base.avatar:read`
+
+The app's Contacts data range must cover every department Potal should manage.
+These are application-identity permissions and must not be added to the user
+OAuth scope.
+
+## Runtime topology
 
 ```text
-                    Nginx
-                      │
-      ┌───────────────┴────────────────┐
-      ▼                                ▼
-React SPA (static)              Go Backend
-                    ┌──────────────┴─────────────┐
-                    ▼                            ▼
-             studio-api :8080             studio-stream :8081
-             (REST control plane)         (SSE long connections)
-                    │                            │
-                    └──────────────┬─────────────┘
-                                   │
-                 ┌─────────────────┼─────────────────┐
-                 ▼                 ▼                 ▼
-               TiDB              Redis         Object Storage
-                                   │
-                                   ▼
-                          Execution Plane
-                    studio-worker --provider=feishu_aily
-                                   │
-                                   ▼
-                             Feishu Aily
+React SPA
+    │
+    ├─ studio-api :8080
+    ├─ studio-stream :8081
+    ├─ studio-scheduler
+    │    ├─ user schedule loop
+    │    └─ directory sync loop
+    ├─ studio-worker --provider=feishu_aily
+    └─ studio-worker --provider=feishu_delivery
 
-                          Delivery Plane
-                  studio-worker --provider=feishu_delivery
-             (scheduled-run results → Feishu IM as the owner)
+MySQL 5.7 stores business truth; Redis remains cache/queue/notification state.
 ```
-
-## Governance scope (G13)
-
-- Quota: per-user token/cost/concurrent-run budgets backed by quota_policies.
-- Audit: append-only audit_logs for admin/provider/binding changes.
-- Provider health, circuit breaking, and usage accounting in the worker plane.
-- React admin console replacing the retired Django Admin for Provider,
-  RuntimeBinding, User, and runtime monitoring management.
-- Organization/enterprise APIs and SSO/SCIM surfaces are future work under the
-  same unified Application → RuntimeBinding → Run model; no Django-era chain
-  will be restored.
