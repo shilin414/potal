@@ -99,6 +99,24 @@
   background: var(--color-bg-elevated);
 }
 
+.mobile-shell__nav-item.active {
+  color: var(--color-primary);
+  background: color-mix(in srgb, var(--color-primary) 10%, transparent);
+}
+
+.mobile-shell__nav-item:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: -2px;
+}
+
+.mobile-shell__nav-icon {
+  width: 20px;
+  flex: 0 0 20px;
+  font-size: 18px;
+  line-height: 0;
+  text-align: center;
+}
+
 .mobile-shell__history {
   flex: 1;
   min-height: 160px;
@@ -117,6 +135,11 @@
   gap: 14px;
   padding: 16px;
   border-top: 1px solid var(--color-border);
+}
+
+.account-menu-panel__actions {
+  display: grid;
+  gap: 8px;
 }
 
 .account-menu-panel__identity {

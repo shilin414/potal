@@ -4,6 +4,11 @@ import { MenuOutlined, PlusOutlined } from '@ant-design/icons';
 import ConversationHistory from '@/components/ConversationHistory/ConversationHistory';
 import AccountMenu from '@/components/AccountMenu/AccountMenu';
 import MobileAgentSwitcher from '@/components/Mobile/MobileAgentSwitcher';
+import {
+  NavigationItemIcon,
+  getVisibleNavigationItems,
+  isNavigationItemActive,
+} from '@/components/Navigation';
 import { ThemePicker } from '@/components/Theme';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
@@ -12,17 +17,6 @@ import { useRunChatStore } from '@/stores/useRunChatStore';
 import { useAuthStore } from '@/stores/useAuthStore';
 import type { ShellChrome } from './useShellChrome';
 import './shell.css';
-
-// 技能 / 案例库 / 工作流三个入口已从主页导航下掉（桌面端 Header 同步改动）；
-// 页面、路由与数据都保留，仍可直接访问 /skills、/templates、/workflows。
-// 恢复时把对应项加回数组即可。
-const NAV_ITEMS = [
-  { key: '/', label: '首页', icon: '🏠' },
-  { key: '/agents', label: '智能体', icon: '🤖' },
-  { key: '/apps', label: '应用', icon: '🧩' },
-  { key: '/schedules', label: '定时任务', icon: '⏰' },
-  { key: '/enterprise', label: '企业控制台', icon: '🏢' },
-];
 
 /**
  * MobileAppShell — bottom-anchored mobile layout (§20-§23).
@@ -38,11 +32,11 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
   const location = useLocation();
   const path = location.pathname;
   const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
-  const visibleNavItems = NAV_ITEMS.filter((item) => item.key !== '/enterprise' || isStaff);
+  const visibleNavItems = getVisibleNavigationItems({ isStaff });
 
-  const go = (path: string) => {
+  const go = (targetPath: string) => {
     setMobileNavOpen(false);
-    navigate(path);
+    navigate(targetPath);
   };
 
   // Same semantics as the desktop sidebar's 新建 (see Sidebar.tsx): a new
@@ -109,18 +103,26 @@ const MobileAppShell: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
         title="Creation Studio"
         styles={{ body: { padding: 0, display: 'flex', flexDirection: 'column' } }}
       >
-        <nav className="mobile-shell__nav">
-          {visibleNavItems.map((item) => (
-            <button
-              key={item.key}
-              type="button"
-              className="mobile-shell__nav-item"
-              onClick={() => go(item.key)}
-            >
-              <span aria-hidden>{item.icon}</span>
-              {item.label}
-            </button>
-          ))}
+        <nav className="mobile-shell__nav" aria-label="主导航">
+          {visibleNavItems.map((item) => {
+            const active = isNavigationItemActive(item.id, path);
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className={`mobile-shell__nav-item${active ? ' active' : ''}`}
+                aria-current={active ? 'page' : undefined}
+                onClick={() => go(item.path)}
+              >
+                <NavigationItemIcon
+                  item={item}
+                  surface="mobile"
+                  className="mobile-shell__nav-icon"
+                />
+                <span>{item.mobileLabel}</span>
+              </button>
+            );
+          })}
         </nav>
         <div className="mobile-shell__history">
           <ConversationHistory

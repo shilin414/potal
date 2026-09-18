@@ -71,6 +71,7 @@ body {
 #root {
   width: 100%;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -104,6 +105,7 @@ a:hover {
 .app-layout {
   display: grid;
   height: 100vh;
+  height: 100dvh;
   grid-template-columns: var(--sidebar-w) 1fr;
   grid-template-rows: var(--header-h) 1fr;
   grid-template-areas:

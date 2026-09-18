@@ -13,6 +13,11 @@
 }
 
 .header-logo {
+  appearance: none;
+  justify-self: start;
+  padding: 0;
+  border: 0;
+  background: transparent;
   font-family: var(--font-display);
   font-size: 18px;
   font-weight: 700;
@@ -26,22 +31,51 @@
   color: var(--color-primary);
 }
 
+.header-logo:focus-visible,
+.header-nav-item:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
 .header-nav {
   display: flex;
-  gap: 4px;
+  gap: 2px;
   justify-content: center;
 }
 
 .header-nav-item {
-  padding: 8px 18px;
+  appearance: none;
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: var(--border-radius-sm);
+  background: transparent;
+  color: var(--color-text-sec);
+  font-family: inherit;
   font-size: 14px;
   font-weight: 500;
-  color: var(--color-text-sec);
-  border-radius: var(--border-radius-sm);
+  line-height: 1.2;
   cursor: pointer;
   transition: color 0.2s, background 0.2s;
-  position: relative;
   user-select: none;
+  white-space: nowrap;
+}
+
+.header-nav-icon {
+  flex: 0 0 auto;
+  font-size: 15px;
+  line-height: 0;
+}
+
+.header-nav-emoji {
+  flex: 0 0 auto;
+  font-size: 14px;
+  line-height: 1;
 }
 
 .header-nav-item:hover {
@@ -74,17 +108,27 @@
 }
 
 .header-user {
+  appearance: none;
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 6px 12px;
+  border: 0;
   border-radius: var(--border-radius-md);
+  background: transparent;
+  color: inherit;
+  font: inherit;
   cursor: pointer;
   transition: background 0.2s;
 }
 
 .header-user:hover {
   background: var(--color-bg-card);
+}
+
+.header-user:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
 }
 
 .header-avatar {
