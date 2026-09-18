@@ -1,13 +1,13 @@
 /**
- * ScheduleDetailDrawer — 配置摘要 + 执行历史。
- * 历史条目链接到已有 Run/Conversation，不另造执行状态。
+ * ScheduleDetailDrawer — 配置摘要 + 执行历史（Desktop Drawer，外观不变）。
+ * 加载逻辑拆到 useScheduleDetail 与移动端 MobileScheduleDetail 共用。
  */
-import React, { useEffect, useState } from 'react';
+import React from 'react';
 import { Alert, Drawer, Empty, Skeleton, Tag, Typography } from 'antd';
-import { fetchScheduleOccurrences, fetchSchedule } from '@/services/scheduleApi';
-import type { Schedule, ScheduleOccurrence } from '@/types/schedule';
+import type { ScheduleOccurrence } from '@/types/schedule';
 import { OccurrenceStatusTag } from '@/components/Schedules/ScheduleStatusTag';
 import { describeSchedulePlan, formatDateTime } from '@/lib/scheduleFormat';
+import { useScheduleDetail } from './useScheduleDetail';
 
 const { Text } = Typography;
 
@@ -18,32 +18,7 @@ export interface ScheduleDetailDrawerProps {
 }
 
 export function ScheduleDetailDrawer({ open, scheduleId, onClose }: ScheduleDetailDrawerProps) {
-  const [schedule, setSchedule] = useState<Schedule | null>(null);
-  const [occurrences, setOccurrences] = useState<ScheduleOccurrence[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!open || !scheduleId) return;
-    let stale = false;
-    setLoading(true);
-    setError(null);
-    Promise.all([fetchSchedule(scheduleId), fetchScheduleOccurrences(scheduleId)])
-      .then(([s, occs]) => {
-        if (stale) return;
-        setSchedule(s);
-        setOccurrences(occs);
-      })
-      .catch((e) => {
-        if (!stale) setError(e instanceof Error ? e.message : '加载失败');
-      })
-      .finally(() => {
-        if (!stale) setLoading(false);
-      });
-    return () => {
-      stale = true;
-    };
-  }, [open, scheduleId]);
+  const { schedule, occurrences, loading, error } = useScheduleDetail(open, scheduleId);
 
   return (
     <Drawer
@@ -89,7 +64,7 @@ export function ScheduleDetailDrawer({ open, scheduleId, onClose }: ScheduleDeta
           {occurrences.length === 0 ? (
             <Empty description="还没有执行记录" image={Empty.PRESENTED_IMAGE_SIMPLE} />
           ) : (
-            occurrences.map((occ) => (
+            occurrences.map((occ: ScheduleOccurrence) => (
               <div key={occ.id} className="schedule-card">
                 <div className="schedule-card-row">
                   <OccurrenceStatusTag status={occ.status} />

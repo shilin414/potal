@@ -1,6 +1,7 @@
 /**
  * SchedulesPage — 定时任务中心（Console 页面）。
- * 桌面表格 / 移动端单列卡片；空、错、加载三态齐全。
+ * Desktop 表格 / Mobile 全新移动中心按 React 层切换（开发执行报告 §11/§23），
+ * 共用 useSchedules 与编辑器状态机，仅信息架构不同。
  */
 import React, { useState } from 'react';
 import {
@@ -17,14 +18,17 @@ import {
 } from 'antd';
 import { PlusOutlined, ReloadOutlined } from '@ant-design/icons';
 import { useSchedules } from '@/hooks/useSchedules';
+import { useIsMobile } from '@/shell/useIsMobile';
 import { ScheduleEditorModal } from '@/components/Schedules/ScheduleEditorModal';
 import { ScheduleDetailDrawer } from '@/components/Schedules/ScheduleDetailDrawer';
 import { ScheduleStatusTag } from '@/components/Schedules/ScheduleStatusTag';
 import { describeSchedulePlan, formatDateTime } from '@/lib/scheduleFormat';
 import type { Schedule, ScheduleStatusFilter } from '@/types/schedule';
+import { MobileScheduleCenter } from './MobileScheduleCenter';
 import './SchedulesPage.css';
 
-export function SchedulesPage() {
+/** Desktop 表格 — 保留原样（开发执行报告 §54）。 */
+function DesktopScheduleCenter() {
   const {
     data, loading, error, status, search, mutatingId,
     setStatus, setSearch, reload, toggleEnabled, runNow, remove,
@@ -188,64 +192,16 @@ export function SchedulesPage() {
           )}
         </Empty>
       ) : (
-        <>
-          {/* 桌面表格 */}
-          <div className="schedules-desktop-table">
-            <Table
-              rowKey="id"
-              columns={columns}
-              dataSource={data}
-              loading={loading}
-              pagination={false}
-              scroll={{ x: 860 }}
-            />
-          </div>
-          {/* 移动端卡片 */}
-          <div className="schedules-mobile-cards">
-            {data.map((s) => (
-              <div key={s.id} className="schedule-card" onClick={() => setDetailId(s.id)} role="button" tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' || e.key === ' ') {
-                    e.preventDefault();
-                    setDetailId(s.id);
-                  }
-                }}
-              >
-                <div className="schedule-card-row">
-                  <span className="schedule-card-name">{s.name}</span>
-                  <ScheduleStatusTag schedule={s} />
-                </div>
-                <div className="schedule-card-meta">
-                  <span>{describeSchedulePlan(s)}</span>
-                  <span>下次执行：
-                    <time dateTime={s.next_run_at ?? undefined}>{formatDateTime(s.next_run_at)}</time>
-                  </span>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 12 }}>
-                  <Switch
-                    checked={s.enabled}
-                    size="small"
-                    loading={mutatingId === s.id}
-                    onClick={(checked) => void toggleEnabled(s.id, checked)}
-                    aria-label={`${s.enabled ? '停用' : '启用'} ${s.name}`}
-                  />
-                  <Button
-                    size="small"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      void runNow(s.id);
-                    }}
-                  >
-                    立即运行
-                  </Button>
-                  <Button size="small" type="link" onClick={(e) => { e.stopPropagation(); openEdit(s); }}>
-                    编辑
-                  </Button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </>
+        <div className="schedules-desktop-table">
+          <Table
+            rowKey="id"
+            columns={columns}
+            dataSource={data}
+            loading={loading}
+            pagination={false}
+            scroll={{ x: 860 }}
+          />
+        </div>
       ))}
 
       <ScheduleEditorModal
@@ -261,4 +217,9 @@ export function SchedulesPage() {
       />
     </div>
   );
+}
+
+export function SchedulesPage() {
+  const isMobile = useIsMobile();
+  return isMobile ? <MobileScheduleCenter /> : <DesktopScheduleCenter />;
 }

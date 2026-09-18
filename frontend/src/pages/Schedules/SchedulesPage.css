@@ -135,19 +135,9 @@
   }
 }
 
-/* 桌面表格 / 移动卡片响应式切换 */
-.schedules-mobile-cards {
-  display: none;
-}
-
-@media (max-width: 768px) {
-  .schedules-desktop-table {
-    display: none;
-  }
-
-  .schedules-mobile-cards {
-    display: block;
-  }
+/* 桌面表格容器（移动端由 MobileScheduleCenter 接管，React 层切换） */
+.schedules-desktop-table {
+  display: block;
 }
 
 .schedule-preview-btn {
@@ -163,4 +153,76 @@
 .schedule-preview-btn:hover {
   border-color: var(--color-primary);
   color: var(--color-primary);
+}
+
+/* ── Mobile cards (MobileScheduleCenter, 开发执行报告 §25) ───────────── */
+
+.mobile-schedule-list {
+  margin-top: 12px;
+}
+
+.mobile-schedule-card {
+  position: relative;
+  padding: 14px 48px 14px 16px;
+  margin-bottom: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  background: var(--color-bg-card);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-schedule-card:active {
+  border-color: var(--color-border-lit);
+}
+
+.mobile-schedule-card__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mobile-schedule-card__name {
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.mobile-schedule-card__meta {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 6px;
+  color: var(--color-text-sec);
+  font-size: 13px;
+}
+
+.mobile-schedule-card__meta time {
+  color: var(--color-text-dim);
+}
+
+/* ••• — 44px tap target docked to the card's trailing edge (§10/§27). */
+.mobile-schedule-card__more {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  width: 44px;
+  height: 44px;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-text-sec);
+  font-size: 18px;
+  letter-spacing: 1px;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.mobile-schedule-card__more:active {
+  background: var(--color-bg-elevated);
 }

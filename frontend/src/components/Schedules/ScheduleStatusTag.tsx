@@ -1,4 +1,4 @@
-/** 定时任务状态 Tag：状态始终有文字（不只靠颜色）。 */
+/** 定时任务状态 Tag：状态始终有文字（不只靠颜色）。compact 供移动卡片用（§26）。 */
 import React from 'react';
 import { Tag } from 'antd';
 import {
@@ -32,19 +32,27 @@ export function OccurrenceStatusTag({ status }: { status: OccurrenceStatus }) {
   );
 }
 
-/** 列表卡片状态：运行中 / 已暂停 / 上次失败。 */
-export function ScheduleStatusTag({ schedule }: { schedule: { enabled: boolean; last_occurrence?: { status: OccurrenceStatus } | null } }) {
+/**
+ * 列表卡片状态：运行中 / 已暂停 / 上次失败。
+ * `compact`（移动卡片，§26）：去图标、小字号，只留颜色 + 文字。
+ */
+export function ScheduleStatusTag({
+  schedule, compact = false,
+}: {
+  schedule: { enabled: boolean; last_occurrence?: { status: OccurrenceStatus } | null };
+  compact?: boolean;
+}) {
   if (!schedule.enabled) {
     return (
-      <Tag icon={<PauseCircleOutlined />}>已暂停</Tag>
+      <Tag icon={compact ? undefined : <PauseCircleOutlined />}>已暂停</Tag>
     );
   }
   if (schedule.last_occurrence?.status === 'failed') {
     return (
-      <Tag color="error" icon={<ExclamationCircleOutlined />}>上次失败</Tag>
+      <Tag color="error" icon={compact ? undefined : <ExclamationCircleOutlined />}>上次失败</Tag>
     );
   }
   return (
-    <Tag color="success" icon={<CheckCircleOutlined />}>运行中</Tag>
+    <Tag color="success" icon={compact ? undefined : <CheckCircleOutlined />}>运行中</Tag>
   );
 }
