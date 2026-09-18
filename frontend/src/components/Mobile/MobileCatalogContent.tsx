@@ -411,7 +411,16 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
                 onSelect={handleSelect}
               />
             ))}
-            {hasMore && (
+            {/* One CTA, never two (P2-5): a failed loadMore REPLACES 加载更多. */}
+            {partialError ? (
+              <button
+                type="button"
+                className="mobile-sheet__more-btn"
+                onClick={retryPartial}
+              >
+                加载失败，点击重试
+              </button>
+            ) : hasMore ? (
               <button
                 type="button"
                 className="mobile-sheet__more-btn"
@@ -421,17 +430,7 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
               >
                 加载更多
               </button>
-            )}
-            {partialError && (
-              // A failed loadMore/search keeps every rendered row; retry inline.
-              <button
-                type="button"
-                className="mobile-sheet__more-btn"
-                onClick={retryPartial}
-              >
-                加载失败，点击重试
-              </button>
-            )}
+            ) : null}
           </>
         )}
       </>
@@ -519,7 +518,16 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
             onSelect={handleSelect}
           />
         ))}
-        {hasMore && (
+        {/* One CTA, never two (P2-5): a failed loadMore REPLACES 加载更多. */}
+        {partialError ? (
+          <button
+            type="button"
+            className="mobile-console-more"
+            onClick={retryPartial}
+          >
+            加载失败，点击重试
+          </button>
+        ) : hasMore ? (
           <button
             type="button"
             className="mobile-console-more"
@@ -529,17 +537,7 @@ const MobileCatalogContent: React.FC<MobileCatalogContentProps> = ({
           >
             加载更多
           </button>
-        )}
-        {partialError && (
-          // A failed loadMore/search keeps every rendered row; retry inline.
-          <button
-            type="button"
-            className="mobile-console-more"
-            onClick={retryPartial}
-          >
-            加载失败，点击重试
-          </button>
-        )}
+        ) : null}
       </>
     );
   };

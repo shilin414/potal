@@ -289,4 +289,30 @@ describe('MobileCatalogContent — data boundary hardening (二次复审 P1-3/P2
     expect(document.body.textContent).toContain('财务助手');
     expect(document.body.textContent).toContain('加载失败，点击重试');
   });
+
+  it('a failed loadMore renders exactly ONE retry CTA, never 加载更多 alongside (P2-5)', async () => {
+    mocks.fetchApplicationPage.mockReset()
+      .mockResolvedValueOnce({
+        items: [app({ id: 1, name: '财务助手' })],
+        next_cursor: 'c1', has_more: true,
+      })
+      .mockRejectedValueOnce(new Error('network down'));
+    await mountTracked(
+      <MobileCatalogContent type="agent" mode="page" recentIds={[]} onSelect={() => {}} />,
+    );
+
+    await click(Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '加载更多')!);
+    await flush(20);
+
+    const ctaTexts = Array.from(document.querySelectorAll('button'))
+      .map((b) => b.textContent);
+    expect(ctaTexts).toContain('加载失败，点击重试');
+    expect(ctaTexts).not.toContain('加载更多');
+    // Exactly one of the two CTAs exists in the whole page body.
+    const ctaCount = ctaTexts.filter(
+      (t) => t === '加载失败，点击重试' || t === '加载更多',
+    ).length;
+    expect(ctaCount).toBe(1);
+  });
 });
