@@ -155,13 +155,14 @@ export default function MobileAccessPage({ kind }: { kind: 'chat' | 'fixed' }) {
         />
       ) : (
         <>
+          {/* partial 错误只展示说明（三次复审 §47–§48）：具体操作由列表底部
+              的唯一 CTA 承担 —— Alert action + 底部按钮两个重试入口会打架。 */}
           {partialError && (
             <Alert
               type="error"
               showIcon
               message="加载失败"
               description={error}
-              action={<Button size="small" onClick={retryPartial}>重试</Button>}
               style={{ marginTop: 12 }}
             />
           )}
@@ -175,11 +176,12 @@ export default function MobileAccessPage({ kind }: { kind: 'chat' | 'fixed' }) {
           ) : (
             <>
               {rows}
-              {hasMore && (
+              {/* 唯一 CTA：partial 失败 = 重试；否则加载更多。 */}
+              {(hasMore || partialError) && (
                 <button
                   type="button"
                   className="mobile-console-more"
-                  onClick={() => void loadMore()}
+                  onClick={retryPartial}
                 >
                   {loadingMore ? '加载中…' : partialError ? '加载失败，点击重试' : '加载更多'}
                 </button>

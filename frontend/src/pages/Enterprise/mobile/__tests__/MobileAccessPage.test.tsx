@@ -263,8 +263,12 @@ describe('MobileAccessPage — error states (P2-11)', () => {
     // Rows survive…
     expect(document.querySelector('.mobile-console-row__title')!.textContent)
       .toContain('财务助手');
-    // …the failure is surfaced with an inline retry.
-    expect(document.body.textContent).toContain('加载失败');
+    // …the failure is surfaced, and exactly ONE retry CTA exists (§47–§48):
+    // the Alert explains, the bottom button acts — never two retry entrypoints.
+    const ctaTexts = Array.from(document.querySelectorAll('button'))
+      .map((b) => b.textContent);
+    expect(ctaTexts.filter((t) => t === '重试')).toHaveLength(0);
+    expect(ctaTexts.filter((t) => t === '加载失败，点击重试')).toHaveLength(1);
     const retry = Array.from(document.querySelectorAll('button'))
       .find((b) => b.textContent === '加载失败，点击重试');
     expect(retry).toBeTruthy();

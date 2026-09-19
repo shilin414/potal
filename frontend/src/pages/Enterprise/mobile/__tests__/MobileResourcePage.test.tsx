@@ -188,6 +188,12 @@ describe('MobileResourcePage — error split (P2-10)', () => {
     expect(titles).toEqual(['财务助手', 'IT助手']);
     // …the inline alert surfaces…
     expect(document.body.textContent).toContain('加载失败');
+    // …and exactly ONE retry CTA exists (§47–§48): the Alert explains, the
+    // bottom button acts — never two retry entrypoints.
+    const ctaTexts = Array.from(document.querySelectorAll('button'))
+      .map((b) => b.textContent);
+    expect(ctaTexts.filter((t) => t === '重试')).toHaveLength(0);
+    expect(ctaTexts.filter((t) => t === '加载失败，点击重试')).toHaveLength(1);
     // …and the retry button re-runs loadMore (not a full refresh).
     const retry = Array.from(document.querySelectorAll('button'))
       .find((b) => b.textContent === '加载失败，点击重试');
