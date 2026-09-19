@@ -284,29 +284,47 @@ func (c *FeishuClient) authorizedGET(ctx context.Context, token, path string) (j
 	return env.Data, nil
 }
 
-// ListUserChats lists the chats (groups) the token holder belongs to.
+// ListUserChats lists the chats (groups) the token holder belongs to,
+// following the provider's page_token continuation until has_more is false.
+// The first page alone capped every picker at 100 groups (五次复审 P1-3) —
+// chat 101+ could never be selected. maxChatPages is only a defensive bound
+// against a misbehaving provider (100 pages × 100 = 10 000 chats).
 func (c *FeishuClient) ListUserChats(ctx context.Context, token string) ([]FeishuChat, error) {
-	data, err := c.authorizedGET(ctx, token, "/open-apis/im/v1/chats?page_size=100")
-	if err != nil {
-		return nil, err
-	}
-	var payload struct {
-		Items []struct {
-			ChatID string          `json:"chat_id"`
-			Name   string          `json:"name"`
-			Avatar json.RawMessage `json:"avatar"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return nil, fmt.Errorf("feishu: chats decode: %w", err)
-	}
-	out := make([]FeishuChat, 0, len(payload.Items))
-	for _, it := range payload.Items {
-		out = append(out, FeishuChat{
-			ChatID:    it.ChatID,
-			Name:      it.Name,
-			AvatarURL: avatarFromRaw(it.Avatar),
-		})
+	const maxChatPages = 100
+	var out []FeishuChat
+	pageToken := ""
+	for page := 0; page < maxChatPages; page++ {
+		path := "/open-apis/im/v1/chats?page_size=100"
+		if pageToken != "" {
+			path += "&page_token=" + url.QueryEscape(pageToken)
+		}
+		data, err := c.authorizedGET(ctx, token, path)
+		if err != nil {
+			return nil, err
+		}
+		var payload struct {
+			Items []struct {
+				ChatID string          `json:"chat_id"`
+				Name   string          `json:"name"`
+				Avatar json.RawMessage `json:"avatar"`
+			} `json:"items"`
+			HasMore   bool   `json:"has_more"`
+			PageToken string `json:"page_token"`
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return nil, fmt.Errorf("feishu: chats decode: %w", err)
+		}
+		for _, it := range payload.Items {
+			out = append(out, FeishuChat{
+				ChatID:    it.ChatID,
+				Name:      it.Name,
+				AvatarURL: avatarFromRaw(it.Avatar),
+			})
+		}
+		if !payload.HasMore || payload.PageToken == "" {
+			break
+		}
+		pageToken = payload.PageToken
 	}
 	return out, nil
 }

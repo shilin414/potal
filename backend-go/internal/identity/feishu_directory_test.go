@@ -89,4 +89,64 @@ func TestListDirectoryEmployeesUsesDepartmentAndStaffStatusFilter(t *testing.T) 
 	}
 }
 
+// TestListUserChatsFollowsPageTokenContinuation pins the fix for the 100-chat
+// truncation (五次复审 P1-3): the picker used to read ONE page of 100 groups,
+// so chat 101+ could never be selected. The client must follow the provider's
+// page_token continuation until has_more is false.
+func TestListUserChatsFollowsPageTokenContinuation(t *testing.T) {
+	var seenPageTokens []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/open-apis/im/v1/chats" {
+			t.Errorf("path=%s", r.URL.Path)
+		}
+		if r.URL.Query().Get("page_size") != "100" {
+			t.Errorf("page_size=%s", r.URL.Query().Get("page_size"))
+		}
+		seenPageTokens = append(seenPageTokens, r.URL.Query().Get("page_token"))
+		switch r.URL.Query().Get("page_token") {
+		case "":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0, "msg": "ok",
+				"data": map[string]any{
+					"items":    []any{map[string]any{"chat_id": "oc-1", "name": "第一页群"}},
+					"has_more": true, "page_token": "pt-2",
+				},
+			})
+		case "pt-2":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0, "msg": "ok",
+				"data": map[string]any{
+					"items":    []any{map[string]any{"chat_id": "oc-101", "name": "第二页的第101个群"}},
+					"has_more": true, "page_token": "pt-3",
+				},
+			})
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 0, "msg": "ok",
+				"data": map[string]any{
+					"items":      []any{map[string]any{"chat_id": "oc-201", "name": "最后一页"}},
+					"has_more":   false,
+					"page_token": "",
+				},
+			})
+		}
+	}))
+	defer srv.Close()
+	client := NewFeishuClient(srv.URL, "id", "secret", srv.Client())
+	chats, err := client.ListUserChats(context.Background(), "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chats) != 3 {
+		t.Fatalf("chats=%d, want 3 (all provider pages consumed)", len(chats))
+	}
+	if chats[1].ChatID != "oc-101" || chats[1].Name != "第二页的第101个群" {
+		t.Fatalf("chat 101 missing: %#v", chats)
+	}
+	// page_token 为空串的最后一页不得再发起下一次请求。
+	if len(seenPageTokens) != 3 {
+		t.Fatalf("page_token calls=%v", seenPageTokens)
+	}
+}
+
 func boolPtr(v bool) *bool { return &v }
