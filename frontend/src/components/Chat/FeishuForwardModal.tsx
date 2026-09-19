@@ -20,7 +20,9 @@
  * Selection reconcile（九次复审 P1）：异步发送结果只从「当前选中」里移除
  * 本轮已成功的目标 —— snapshot 决定本次发了谁，current 决定用户现在想选
  * 谁；不得用发送开始时的快照整体覆盖 selected（用户在途期间取消的目标会
- * 复活、新选的目标会被删）。
+ * 复活、新选的目标会被删）。授权失效统一按 needsFeishuReauth 文案判断
+ * （九次复审 P2）：200 per-target 授权失败与 HTTP 400/403 授权错误同一
+ * 恢复入口，普通 400 不误判。
  */
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Avatar, Empty, Input, Modal, Spin, Tabs, message as antdMessage } from 'antd';
@@ -48,6 +50,21 @@ const HISTORY_LIMIT = 10;
  * 更容易真实选到 21+，旧实现要点「发送（25）」才被后端 400 拒绝。
  */
 const MAX_FORWARD_TARGETS = 20;
+
+/**
+ * 统一的飞书授权失效判断（九次复审 P2）：授权相关文案分散在后端多处 ——
+ * per-target 的「需要重新授权」「请重新绑定飞书账号」，HTTP 400 的「请先
+ * 绑定飞书账号后使用转发」。按文案关键词判断而不是按 status：/forward
+ * 的 400 还包括 invalid body / share not owned / revoked / targets>20 等
+ * 非授权错误，不能全部当成 OAuth 问题处理。
+ */
+const needsFeishuReauth = (message?: string | null) => {
+  if (!message) return false;
+  return message.includes('重新授权')
+    || message.includes('重新绑定飞书账号')
+    || message.includes('绑定飞书账号')
+    || message.includes('授权已过期');
+};
 
 const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
   open,
@@ -187,7 +204,7 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
         // P2）：1 成功 + 1 授权失败的混合结果同样要给重新授权入口 —— 旧
         // 条件 success_count === 0 让用户只能对着注定失败的目标反复重试。
         const authFailure = result.results.find(
-          (r) => !r.ok && r.error?.includes('重新授权'),
+          (r) => !r.ok && needsFeishuReauth(r.error),
         );
         if (authFailure) {
           setNeedReauth(true);
@@ -205,7 +222,18 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
       }
     } catch (e: any) {
       if (sessionEpochRef.current !== epoch) return;
-      antdMessage.error(e?.response?.data?.detail || '转发失败，请稍后重试');
+      const detail = e?.response?.data?.detail
+        || e?.response?.data?.error
+        || '转发失败，请稍后重试';
+      // HTTP 级授权失效（九次复审 P2）：POST /forward 的 400「请先绑定飞书
+      // 账号后使用转发」此前只 toast，用户没有恢复入口 —— 目标列表早先加
+      // 载成功不代表发送时 token 还有效。统一走 needsFeishuReauth，与 200
+      // per-target 授权失败同一入口；普通 400（分享不存在 / body 非法）不
+      // 误判。
+      if (needsFeishuReauth(detail)) {
+        setNeedReauth(true);
+      }
+      antdMessage.error(detail);
     } finally {
       // 会话已切换时 sending 已由 useLayoutEffect 复位、in-flight 已被清
       // 空，都不归这个旧 closure 管。
