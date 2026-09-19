@@ -72,7 +72,11 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
   // idle = 未参与查询（user 空 query 不发请求，六次复审 P2-3）≠ 0 条结果。
   const idleSearch = tab === 'user' && active.status === 'idle';
   // 目标接口 403/400 = 飞书授权缺权限（派生自最新失败，不另存状态）。
-  const authError = active.errorStatus === 403 || active.errorStatus === 400;
+  // 续拉 403 同样是授权变化（七次复审 §23）：分页错误拆分后不能丢掉
+  // 重新授权入口。
+  const authError = active.errorStatus === 403
+    || active.errorStatus === 400
+    || active.loadMoreErrorStatus === 403;
   const showReauth = needReauth || authError;
 
   const reset = () => {
@@ -198,8 +202,10 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
           )}
 
           <div className="ffm-list">
-            {/* 加载失败 ≠ 没有目标（五次复审 §28，ERROR ≠ EMPTY）：错误
-                可见 + 可重试，不再静默空列表。 */}
+            {/* 首页加载失败 ≠ 没有目标（五次复审 §28，ERROR ≠ EMPTY）：错误
+                可见 + 可重试，不再静默空列表。分页失败（loadMoreError）不进
+                这个分支 —— 已加载的行保持可见，只在底部给重试（七次复审
+                P1-2）。 */}
             {active.error ? (
               <div className="ffm-list__center ffm-list__error">
                 <Empty
@@ -256,6 +262,25 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
                   >
                     {active.loadingMore ? '加载中…' : '加载更多'}
                   </button>
+                )}
+                {/* 分页失败 ≠ 整个数据源失败（七次复审 P1-2）：已加载的人
+                    仍然有效，只提示「更多加载失败」+ 重试失败的那一页 ——
+                    重试调 loadMore（从断点续拉），不是 refresh（回第一页
+                    丢掉全部进度）。 */}
+                {active.loadMoreError && (
+                  <div className="ffm-paging-error">
+                    <span className="ffm-paging-error__text">
+                      {active.loadMoreError || '更多联系人加载失败'}
+                    </span>
+                    <button
+                      type="button"
+                      className="ffm-paging-error__retry"
+                      disabled={active.loadingMore}
+                      onClick={() => void active.loadMore()}
+                    >
+                      <ReloadOutlined /> 重试加载
+                    </button>
+                  </div>
                 )}
               </>
             )}

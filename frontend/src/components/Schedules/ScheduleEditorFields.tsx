@@ -37,6 +37,7 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
     targets, targetsLoading,
     targetsHasMore, targetsLoadingMore, loadMoreTargets,
     targetsError, targetsPartialFailed, refreshTargets,
+    targetsLoadMoreError,
     targetQuery, setTargetQuery, setSelectedTarget,
     preview, previewing, refreshPreview,
   } = state;
@@ -307,6 +308,19 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
                 message={targetsError ? '加载飞书投递目标失败' : '部分飞书目标加载失败，仅显示可用部分'}
                 description={targetsError ?? undefined}
                 action={<Button size="small" onClick={() => void refreshTargets()}>重试</Button>}
+                style={{ marginBottom: 16 }}
+              />
+            )}
+            {/* 联系人续拉失败 ≠ 数据源失败（七次复审 P1-2）：已加载的前几页
+                仍然有效、候选仍然可选 —— 只提示「更多加载失败」，重试从断点
+                续拉（loadMoreTargets），不回第一页丢掉已加载进度。 */}
+            {targetsLoadMoreError && (
+              <Alert
+                type="warning"
+                showIcon
+                message="更多联系人加载失败，已加载的目标仍可选择"
+                description={targetsLoadMoreError}
+                action={<Button size="small" onClick={() => void loadMoreTargets()}>重试</Button>}
                 style={{ marginBottom: 16 }}
               />
             )}

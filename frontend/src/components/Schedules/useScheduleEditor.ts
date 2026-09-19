@@ -277,6 +277,10 @@ export function useScheduleEditor({
   // 已翻全量，Select 滚到底只对联系人续拉下一页。
   const targetsHasMore = userTargets.hasMore;
   const targetsLoadingMore = userTargets.loadingMore;
+  // 分页失败 ≠ 数据源失败（七次复审 P1-2）：targetsFullyFailed /
+  // targetsPartialFailed 只由首页 status 计算（loadMore 失败不再污染
+  // status），续拉错误单独暴露给 Fields —— 已加载的前 N 页仍然有效。
+  const targetsLoadMoreError = userTargets.loadMoreError;
 
   const refreshTargets = useCallback(() => {
     void userTargets.refresh();
@@ -427,10 +431,12 @@ export function useScheduleEditor({
     scheduleType, setScheduleType, setPreview,
     deliveryOn, setDeliveryOn,
     // 飞书投递目标（五次复审 P1-3）：远程搜索 + 独立错误态 + 重试；
-    // 联系人 cursor 分页（六次复审 P1-3）—— Select 滚到底续拉下一页。
+    // 联系人 cursor 分页（六次复审 P1-3）—— Select 滚到底续拉下一页；
+    // 续拉失败独立暴露（七次复审 P1-2）—— 不污染「数据源失败」判定。
     targets, targetsLoading,
     targetsHasMore, targetsLoadingMore, loadMoreTargets: userTargets.loadMore,
     targetsError, targetsPartialFailed, refreshTargets,
+    targetsLoadMoreError,
     targetQuery, setTargetQuery,
     setSelectedTarget,
     preview, previewing, refreshPreview, handleOk,
