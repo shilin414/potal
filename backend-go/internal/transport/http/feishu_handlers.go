@@ -53,6 +53,14 @@ func (s *Server) ListFeishuForwardTargets(w http.ResponseWriter, r *http.Request
 	}
 	limit := 50
 	if params.Limit != nil {
+		// Strict validation, not silent normalization (七次复审 P2-5): the
+		// OpenAPI contract declares limit 1-200; an out-of-range value must
+		// get a 400 instead of being quietly clamped into a "valid" 200 —
+		// the SearchFeishuUsers internal clamp stays as defense in depth.
+		if *params.Limit < 1 || *params.Limit > 200 {
+			writeDetail(w, http.StatusBadRequest, "limit must be between 1 and 200")
+			return
+		}
 		limit = int(*params.Limit)
 	}
 	targets := make([]map[string]any, 0)
@@ -76,6 +84,14 @@ func (s *Server) ListFeishuForwardTargets(w http.ResponseWriter, r *http.Request
 			"items": targets, "next_cursor": "", "has_more": false,
 		})
 	case genapi.ListFeishuForwardTargetsParamsTypeUser:
+		// The provider contract requires a non-empty query (七次复审 P2-4):
+		// search/v1/user marks query as REQUIRED — an empty query would be
+		// forwarded to Feishu, rejected upstream, and surface as a 502 that
+		// looks like a Feishu outage instead of a client parameter error.
+		if query == "" {
+			writeDetail(w, http.StatusBadRequest, "query is required for user target search")
+			return
+		}
 		page, err := s.Feishu.SearchFeishuUsers(r.Context(), uat, query, limit, cursor)
 		if err != nil {
 			writeFeishuError(w, err, "搜索联系人失败")
