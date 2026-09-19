@@ -138,8 +138,15 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
           && firstError?.includes('重新授权')) {
           setNeedReauth(true);
         }
-        // Keep the modal open so the sender can retry failed targets.
-        setSelected([]);
+        // Keep the modal open so the sender can retry failed targets
+        // (七次复审 P2-9)：成功的自动移除、失败的保持选中 —— 旧的
+        // setSelected([]) 把失败目标也取消选择，用户得从头再挑一遍。
+        const failedIds = new Set(
+          result.results
+            .filter((r) => !r.ok)
+            .map((r) => r.target_id),
+        );
+        setSelected(selected.filter((t) => failedIds.has(t.id)));
       }
     } catch (e: any) {
       antdMessage.error(e?.response?.data?.detail || '转发失败，请稍后重试');
