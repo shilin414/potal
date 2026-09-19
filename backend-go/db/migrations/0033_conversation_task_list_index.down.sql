@@ -1,1 +1,0 @@
-DROP INDEX idx_conversations_user_updated ON conversations;
