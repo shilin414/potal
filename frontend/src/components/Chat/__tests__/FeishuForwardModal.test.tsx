@@ -13,18 +13,23 @@
  *   · 部分发送失败：成功的自动取消选择、失败的保持选中，用户可直接再
  *     点发送重试失败目标（旧实现 setSelected([]) 全清，得从头挑）；
  *   · 发送会话 ABA（八次复审 P1）：close → reopen 后旧会话的迟到响应
- *     （成功 / 部分失败 / 授权失败）不得关闭新弹窗、污染新选中、误入重
- *     新授权视图；新会话不继承旧 sending；同会话双击只发一次请求；
+ *     （成功 / 部分失败 / 授权失败 / HTTP 授权错误）不得关闭新弹窗、污染
+ *     新选中、误入重新授权视图；新会话不继承旧 sending；同会话双击只发
+ *     一次请求；
  *   · 部分授权失败（八次复审 P2）：1 成功 + 1 授权失败的混合结果也要展
  *     示重新授权入口，不再要求 success_count === 0；
  *   · 同会话 reconcile（九次复审 P1）：发送在途期间用户改选择 / 切 Tab，
- *     异步结果只移除本轮已成功目标，不得用快照整体覆盖当前 selected。
+ *     异步结果只移除本轮已成功目标，不得用快照整体覆盖当前 selected；
+ *   · HTTP 级授权失效（九次复审 P2）：POST /forward 的 400「请先绑定飞书
+ *     账号」/ 403 权限不足进入重新授权视图，普通 400（分享不存在）只
+ *     toast 不误判。
  * @vitest-environment jsdom
  */
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react-dom/test-utils';
+import { message as antdMessage } from 'antd';
 
 const mocks = vi.hoisted(() => ({
   fetchFeishuTargets: vi.fn(),
@@ -106,11 +111,12 @@ let host: HTMLElement;
 let root: Root;
 let closed = false;
 
-/** 可控的挂起 Promise —— 模拟「发送在途」的窗口。 */
+/** 可控的挂起 Promise —— 模拟「发送在途」的窗口（可 resolve 可 reject）。 */
 function deferred<T>() {
   let resolve!: (v: T) => void;
-  const promise = new Promise<T>((res) => { resolve = res; });
-  return { promise, resolve };
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
 }
 
 /** 用指定 props 渲染（ABA 用例需要切换 open / shareToken 模拟会话切换）。 */
@@ -417,6 +423,21 @@ describe('FeishuForwardModal — 发送会话 ABA（八次复审 P1）', () => {
     expect(findButton('发送（1）')).toBeTruthy();
   });
 
+  it('a stale HTTP auth failure from session A must not force session B into re-auth', async () => {
+    const sendA = await sendPendingThenReopen();
+
+    // A 的发送以 HTTP 400「请先绑定飞书账号」拒绝（九次复审 §38）：catch
+    // 分支同样受 epoch 守卫 —— 旧会话的授权错误不得把 B 切进重新授权。
+    await act(async () => {
+      sendA.reject({ response: { status: 400, data: { detail: '请先绑定飞书账号后使用转发' } } });
+    });
+    await flush(10);
+
+    expect(document.querySelector('.ffm-reauth')).toBeNull();
+    expect(document.body.textContent).not.toContain('重新授权飞书');
+    expect(findButton('发送（1）')).toBeTruthy();
+  });
+
   it('session B must not inherit sending=true from a still-pending session A send', async () => {
     const sendA = await sendPendingThenReopen();
 
@@ -584,5 +605,65 @@ describe('FeishuForwardModal — 发送在途期间的选择变更不被快照�
     await flush(10);
     expect(document.querySelector('.ffm-row')!.className).not.toContain('ffm-row--on');
     expect(findButton('发送（1）')).toBeUndefined();
+  });
+});
+
+describe('FeishuForwardModal — HTTP 级授权失败也进入重新授权（九次复审 P2）', () => {
+  it('HTTP 400 binding failure routes to re-authorization, not just a toast', async () => {
+    mocks.fetchFeishuTargets.mockResolvedValue(page([target('oc-1', '群1', 'chat')]));
+    await mountModal();
+    await click(document.querySelector<HTMLButtonElement>('.ffm-row')!);
+
+    // 目标列表早先加载成功（errorStatus=null），但发送时 token / 绑定已
+    // 失效 —— POST /forward 直接 400。旧实现只 toast，用户没有恢复入口。
+    mocks.forwardShareToFeishu.mockRejectedValueOnce({
+      response: { status: 400, data: { detail: '请先绑定飞书账号后使用转发' } },
+    });
+    await click(findButton('发送（1）')!);
+    await flush(10);
+
+    expect(document.querySelector('.ffm-reauth')).toBeTruthy();
+    expect(document.body.textContent).toContain('重新授权飞书');
+  });
+
+  it('HTTP 403 scope failure routes to re-authorization', async () => {
+    mocks.fetchFeishuTargets.mockResolvedValue(page([target('oc-1', '群1', 'chat')]));
+    await mountModal();
+    await click(document.querySelector<HTMLButtonElement>('.ffm-row')!);
+
+    mocks.forwardShareToFeishu.mockRejectedValueOnce({
+      response: { status: 403, data: { detail: '飞书权限不足，需要重新授权' } },
+    });
+    await click(findButton('发送（1）')!);
+    await flush(10);
+
+    expect(document.querySelector('.ffm-reauth')).toBeTruthy();
+    expect(document.body.textContent).toContain('重新授权飞书');
+  });
+
+  it('an ordinary 400 (share revoked) stays a toast — no false re-auth', async () => {
+    // antd 静态 message 的容器在本文件首个 toast 用例后被 afterEach 的
+    // body.innerHTML='' 脱离文档，后续 toast 渲染进孤儿容器 —— DOM 文本
+    // 断言不可靠，改用 spy 断言 toast 内容。
+    const errorSpy = vi.spyOn(antdMessage, 'error');
+    mocks.fetchFeishuTargets.mockResolvedValue(page([target('oc-1', '群1', 'chat')]));
+    await mountModal();
+    await click(document.querySelector<HTMLButtonElement>('.ffm-row')!);
+
+    mocks.forwardShareToFeishu.mockRejectedValueOnce({
+      response: { status: 400, data: { detail: '分享不存在或已撤销' } },
+    });
+    await click(findButton('发送（1）')!);
+    await flush(10);
+
+    // 普通 400（invalid body / share not owned / revoked）不是 OAuth 问题，
+    // 不得误入重新授权 —— 防止未来把所有 400 都当授权失效处理。
+    expect(document.querySelector('.ffm-reauth')).toBeNull();
+    expect(document.body.textContent).not.toContain('重新授权飞书');
+    expect(errorSpy).toHaveBeenCalledWith('分享不存在或已撤销');
+    // 弹窗不关、选中保持，用户可处理后重试。
+    expect(closed).toBe(false);
+    expect(document.querySelector('.ffm-row')!.className).toContain('ffm-row--on');
+    errorSpy.mockRestore();
   });
 });
