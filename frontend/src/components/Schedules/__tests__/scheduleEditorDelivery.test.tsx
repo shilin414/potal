@@ -384,6 +384,79 @@ describe('投递目标 — 远程搜索契约（五次复审 P1-3）', () => {
       .find((el) => el.textContent?.includes('运营群'));
     expect(option, '可用的一半（群聊）仍应展示').toBeTruthy();
   });
+
+  it('a user PAGE-2 failure is a paging error, not a source failure (七次复审 P1-2)', async () => {
+    // user page1 成功（hasMore）、page2 失败、chat 成功：已加载的候选仍然
+    // 可选，只出现「更多联系人加载失败」，绝不出现「加载飞书投递目标
+    // 失败」（那是首页全部失败才有的整屏错误）。
+    mocks.fetchFeishuTargets.mockImplementation(
+      async (type: 'user' | 'chat', query?: string, cursor?: string) => {
+        if (type === 'chat') {
+          expect(query, 'chat 请求不得携带搜索词（本地过滤）').toBeUndefined();
+          return page([{ id: 'oc-1', name: '运营群', avatar_url: '', target_type: 'chat' }]);
+        }
+        if (cursor === 'p2') {
+          throw { response: { status: 502, data: { error: '搜索联系人失败' } } };
+        }
+        return page(
+          [{ id: 'ou-21', name: '陈二十一半', avatar_url: '', target_type: 'user' }],
+          { hasMore: true, cursor: 'p2' },
+        );
+      },
+    );
+    await mountEditor({ open: true, editing: null });
+    await click(document.querySelector<HTMLButtonElement>('[role="switch"]')!);
+    await flush(30);
+
+    await click(deliverySelect().querySelector('.ant-select-selector')!);
+    await flush(30);
+    const searchInput = deliverySelect()
+      .querySelector<HTMLInputElement>('.ant-select-selection-search-input')!;
+    await act(async () => { setNativeValue(searchInput, '陈'); });
+    await flush(350);
+    const option = Array.from(document.querySelectorAll<HTMLElement>('.ant-select-item-option'))
+      .find((el) => el.textContent?.includes('陈二十一半'));
+    expect(option, '第一页的联系人应出现在候选里').toBeTruthy();
+
+    // page2 拉挂。
+    await act(async () => { await editorState!.loadMoreTargets(); });
+    await flush(20);
+
+    expect(document.body.textContent).toContain('更多联系人加载失败');
+    expect(document.body.textContent).not.toContain('加载飞书投递目标失败');
+    expect(document.body.textContent).not.toContain('部分飞书目标加载失败');
+    // 已加载的候选不受影响：首页的联系人仍在 options 里（chat 候选按当前
+    // 搜索词「陈」本地过滤，运营群不匹配属正常 —— 关键是它没有变成错误态）。
+    expect(editorState!.targets.some((t) => t.name === '陈二十一半')).toBe(true);
+
+    // 重试入口从断点续拉（loadMore，不是 refresh 回第一页）。
+    const retry = findButton('重试');
+    expect(retry, '分页失败的重试入口').toBeTruthy();
+    mocks.fetchFeishuTargets.mockImplementation(
+      async (type: 'user' | 'chat', query?: string, cursor?: string) => {
+        if (type === 'chat') {
+          return page([{ id: 'oc-1', name: '运营群', avatar_url: '', target_type: 'chat' }]);
+        }
+        return cursor === 'p2'
+          ? page([{ id: 'ou-52', name: '陈五十二', avatar_url: '', target_type: 'user' }])
+          : page(
+            [{ id: 'ou-21', name: '陈二十一半', avatar_url: '', target_type: 'user' }],
+            { hasMore: true, cursor: 'p2' },
+          );
+      },
+    );
+    // 只派发 click（不派发 mousedown）：mousedown 会让 antd Select 失焦触发
+    // onSearch('') 清空搜索词 —— 那是「点到弹窗外」的正常产品行为，不属于
+    // 本用例要验证的续拉重试语义。
+    await act(async () => {
+      retry!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    await flush(20);
+    // 重试确实从断点续拉：带 cursor=p2（refresh 回第一页则不带 cursor）。
+    expect(mocks.fetchFeishuTargets).toHaveBeenLastCalledWith('user', '陈', 'p2');
+    expect(document.body.textContent).not.toContain('更多联系人加载失败');
+    expect(editorState!.targets.some((t) => t.name === '陈五十二')).toBe(true);
+  });
 });
 
 describe('编辑器会话 — Picker 快速关闭重开（五次复审 §36/§38）', () => {

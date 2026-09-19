@@ -359,6 +359,98 @@ describe('useFeishuTargets — ERROR ≠ EMPTY（五次复审 P2-7）', () => {
   });
 });
 
+describe('useFeishuTargets — 分页错误与首页错误分离（七次复审 P1-2/P1-3）', () => {
+  it('page2 FAILS: page1 rows survive, status stays success, loadMoreError carries the failure', async () => {
+    // page1 成功（50 人 + hasMore），page2 网络失败 —— 失败的只是「下一
+    // 页」，不是整个数据源：items/status/hasMore 全部保持，错误进独立的
+    // loadMoreError（旧实现把 status 拨成 error，Host 会把 50 人全部清空
+    // 只剩错误屏）。
+    mockFetch
+      .mockResolvedValueOnce(page(
+        Array.from({ length: 50 }, (_, i) => target(`u${i + 1}`, `员工${i + 1}`)),
+        { hasMore: true, cursor: 'p2' },
+      ))
+      .mockRejectedValueOnce({ response: { status: 502, data: { error: '搜索联系人失败' } } });
+    options = { type: 'user', enabled: true, query: '张' };
+    await rerender();
+    await flush(350);
+    expect(latest.current!.items).toHaveLength(50);
+
+    await act(async () => { await latest.current!.loadMore(); });
+    await flush(10);
+    expect(latest.current!.items).toHaveLength(50); // 已加载页不丢
+    expect(latest.current!.status).toBe('success'); // 不是 error
+    expect(latest.current!.error).toBeNull(); // 首页错误通道干净
+    expect(latest.current!.errorStatus).toBeNull();
+    expect(latest.current!.loadMoreError).toBe('搜索联系人失败');
+    expect(latest.current!.loadMoreErrorStatus).toBe(502);
+    expect(latest.current!.hasMore).toBe(true); // 断点仍在，可重试
+    expect(latest.current!.loadingMore).toBe(false);
+  });
+
+  it('retrying page2 SUCCEEDS: rows append AND the paging error is truly cleared', async () => {
+    // page2 第一次失败 → 再次 loadMore 成功：数据 append 之外，
+    // loadMoreError/loadMoreErrorStatus 必须清掉（旧实现不清 error，数据
+    // 已恢复而 UI 永远显示失败态）。
+    mockFetch
+      .mockResolvedValueOnce(page([target('u1', '张一')], { hasMore: true, cursor: 'p2' }))
+      .mockRejectedValueOnce({ response: { status: 502, data: { error: '搜索联系人失败' } } })
+      .mockResolvedValueOnce(page([target('u2', '张二')], { hasMore: false }));
+    options = { type: 'user', enabled: true, query: '张' };
+    await rerender();
+    await flush(350);
+    await act(async () => { await latest.current!.loadMore(); });
+    await flush(10);
+    expect(latest.current!.loadMoreError).toBeTruthy();
+
+    // 重试失败的那一页（不是 refresh 回第一页）。
+    await act(async () => { await latest.current!.loadMore(); });
+    await flush(10);
+    expect(mockFetch).toHaveBeenLastCalledWith('user', '张', 'p2');
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['张一', '张二']);
+    expect(latest.current!.loadMoreError).toBeNull();
+    expect(latest.current!.loadMoreErrorStatus).toBeNull();
+    expect(latest.current!.status).toBe('success');
+  });
+
+  it('a loadMore 403 surfaces loadMoreErrorStatus so the host can still offer re-authorization', async () => {
+    // 续拉 403 = 授权权限变化（七次复审 §23）：错误拆分后重新授权入口
+    // 不能丢 —— loadMoreErrorStatus 必须带出 403。
+    mockFetch
+      .mockResolvedValueOnce(page([target('u1', '张一')], { hasMore: true, cursor: 'p2' }))
+      .mockRejectedValueOnce({ response: { status: 403, data: { detail: '飞书权限不足' } } });
+    options = { type: 'user', enabled: true, query: '张' };
+    await rerender();
+    await flush(350);
+    await act(async () => { await latest.current!.loadMore(); });
+    await flush(10);
+    expect(latest.current!.loadMoreErrorStatus).toBe(403);
+    expect(latest.current!.loadMoreError).toBe('飞书权限不足');
+    expect(latest.current!.status).toBe('success');
+  });
+
+  it('a NEW first page clears a stale paging error from the previous query', async () => {
+    // 张/page2 失败后改搜李：新 query 的首页落地时，旧的分页错误属于旧
+    // 数据代际，必须清掉 —— 否则李的结果正常展示却仍挂着「更多加载失败」。
+    mockFetch
+      .mockResolvedValueOnce(page([target('u1', '张一')], { hasMore: true, cursor: 'p2' }))
+      .mockRejectedValueOnce({ response: { status: 502, data: { error: '搜索联系人失败' } } })
+      .mockResolvedValueOnce(page([target('l1', '李一')]));
+    options = { type: 'user', enabled: true, query: '张' };
+    await rerender();
+    await flush(350);
+    await act(async () => { await latest.current!.loadMore(); });
+    await flush(10);
+    expect(latest.current!.loadMoreError).toBeTruthy();
+
+    options = { ...options, query: '李' };
+    await rerender();
+    await flush(350);
+    expect(latest.current!.loadMoreError).toBeNull();
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['李一']);
+  });
+});
+
 describe('useFeishuTargets — 会话与关闭重置（五次复审 §37–§39）', () => {
   it('disabling the surface invalidates in-flight requests and clears session state', async () => {
     const a = deferred<FeishuForwardTargetPage>();
