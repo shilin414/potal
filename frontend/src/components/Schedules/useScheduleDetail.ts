@@ -60,12 +60,13 @@ export function useScheduleDetail(
   const scheduleSeqRef = useRef(0);
   const occSeqRef = useRef(0);
 
-  // 目标变化（或首次打开）先清空两域旧数据，再各自加载。
+  // 目标变化与「关闭」都清空两域旧数据：关闭时的清空发生在抽屉不可见期
+  // 间，重开新目标不会在首帧闪现上一个任务的配置/执行记录（复审 P1）。
   useEffect(() => {
-    if (!open || !scheduleId) return;
     setSchedule(null);
     setOccurrences([]);
     setOccurrenceError(null);
+    setError(null);
     setHasMoreOccurrences(false);
   }, [open, scheduleId]);
 
@@ -115,6 +116,10 @@ export function useScheduleDetail(
 
   useEffect(() => {
     void loadOccurrences();
+    return () => {
+      // 关闭/目标切换废弃在途的执行记录请求：旧响应不得回填新目标。
+      occSeqRef.current += 1;
+    };
   }, [loadOccurrences]);
 
   const loadMoreOccurrences = useCallback(async () => {
@@ -139,7 +144,9 @@ export function useScheduleDetail(
       // 已加载的执行记录保留；下一次点击 loadMore 即重试。
       setOccurrenceError(e instanceof Error ? e.message : '加载更多执行记录失败');
     } finally {
-      if (seq === occSeqRef.current) setLoadingMoreOccurrences(false);
+      // 无条件复位：目标变化 bump 了 seq，若在此守卫，loadingMoreOccurrences
+      // 会永久卡 true（复审意见 #2）。
+      setLoadingMoreOccurrences(false);
     }
   }, [
     open, scheduleId, occurrences, loadingMoreOccurrences,

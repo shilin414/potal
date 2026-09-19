@@ -14,6 +14,7 @@ import {
   Input,
   Radio,
   Select,
+  Skeleton,
   Space,
   Switch,
   Table,
@@ -78,8 +79,10 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
   const [includeChildren, setIncludeChildren] = useState(true);
   const [deepLinkError, setDeepLinkError] = useState<string | null>(null);
   const {
-    policy, departments: deps, saving, ready,
-    save, setAccessMode, setDepartmentIds, patchDepartmentGrant, setUserGrants,
+    policy, departments: deps,
+    loading: policyLoading, loadError: policyLoadError,
+    saving, ready, reload, save,
+    setAccessMode, setDepartmentIds, patchDepartmentGrant, setUserGrants,
   } = useAccessPolicyEditor({
     applicationId: selected?.id ?? null,
     enabled: Boolean(selected),
@@ -171,9 +174,14 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
     return Array.from(byId.values());
   }, [policy, users]);
 
+  // A stale search response must not overwrite a newer one (复审 P2): each
+  // keystroke bumps the generation; only the newest may setUsers.
+  const userSearchSeqRef = useRef(0);
   const searchUsers = async (value: string) => {
+    const seq = ++userSearchSeqRef.current;
     try {
       const result = await enterpriseApi.users({ q: value, limit: 100 });
+      if (seq !== userSearchSeqRef.current) return;
       setUsers(result.results);
     } catch {
       /* keep current options */
@@ -310,8 +318,21 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
           </Button>
         }
       >
-        {!policy ? (
-          <Empty />
+        {policyLoadError ? (
+          /* 与 MobilePermissionEditor 同款三态：失败可原地重试，保存保持禁用。 */
+          <Alert
+            type="error"
+            showIcon
+            message="加载访问权限失败"
+            action={
+              <Button size="small" onClick={() => void reload()}>
+                重试
+              </Button>
+            }
+          />
+        ) : policyLoading || !policy ? (
+          /* 首帧（policy 尚未落地）也走 Skeleton —— Empty 只属于确认无数据。 */
+          <Skeleton active />
         ) : (
           <Space direction="vertical" size="large" style={{ width: "100%" }}>
             <div>

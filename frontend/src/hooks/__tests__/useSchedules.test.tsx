@@ -260,3 +260,35 @@ describe('useSchedules — 服务端搜索（三次复审 §23–§28）', () =>
     expect(mockFetch).toHaveBeenLastCalledWith('all', 1, 51, '日报');
   });
 });
+
+describe('useSchedules — loadMore 失效复位（复审意见 #2）', () => {
+  it('a loadMore invalidated by a filter change still clears loadingMore', async () => {
+    // loadMore 在途时筛选变化 bump 了 seq：旧响应必须作废，且 loadingMore
+    // 必须复位 —— 否则「加载更多」按钮永久楔死（曾用 seq 守卫 finally 的缺陷）。
+    let resolveStale!: (value: Schedule[]) => void;
+    mockFetch
+      .mockResolvedValueOnce(page(51, 100))                                        // 初始页 ids 100..51
+      .mockImplementationOnce(() => new Promise<Schedule[]>((res) => { resolveStale = res; })) // 在途 loadMore
+      .mockResolvedValueOnce(page(2, 200));                                        // 筛选变化后的新首页
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    expect(latest.current!.hasMore).toBe(true);
+
+    const more = latest.current!.loadMore();
+    await flush(10);
+    expect(latest.current!.loadingMore).toBe(true);
+
+    // 筛选变化：bump seq + 新首页请求。
+    await act(async () => { latest.current!.setStatus('running'); });
+    await flush(10);
+    expect(latest.current!.loading).toBe(false);     // 新首页已落地
+    expect(latest.current!.loadingMore).toBe(true);  // 旧 loadMore 仍在途
+
+    await act(async () => { resolveStale(page(3, 50)); });
+    await act(async () => { await more; });
+    await flush(10);
+    // 旧页被丢弃，且 loadingMore 复位（按钮不再楔死）。
+    expect(latest.current!.loadingMore).toBe(false);
+    expect(latest.current!.data.map((s) => s.id)).toEqual([200, 199]);
+  });
+});

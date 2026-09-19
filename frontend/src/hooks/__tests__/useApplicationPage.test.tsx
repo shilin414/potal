@@ -214,4 +214,45 @@ describe('useApplicationPage', () => {
     expect(latest.current!.hasMore).toBe(true);
     expect(latest.current!.error).toBeTruthy();
   });
+
+  it('a loadMore invalidated by a new search still clears loadingMore (复审意见 #2)', async () => {
+    // loadMore 在途时新搜索 bump 了 request id：旧响应必须作废，且
+    // loadingMore 必须复位 —— 否则「加载更多」永久楔死（本 hook 曾漏修）。
+    let resolveStale!: (value: ApplicationPage) => void;
+    mockPage
+      .mockResolvedValueOnce(page([1, 2], 'cursor-1', true))
+      .mockImplementationOnce(() => new Promise<ApplicationPage>((res) => {
+        resolveStale = res;
+      }))
+      .mockResolvedValueOnce(page([9], '', false));
+    const latest: Probe<ReturnType<typeof useApplicationPage>> = { current: null };
+    const host = document.createElement('div');
+    hosts.push(host);
+    const root = createRoot(host);
+    roots.push(root);
+    function Probe({ query }: { query?: string }) {
+      latest.current = useApplicationPage({ kind: 'chat', query });
+      return null;
+    }
+    await act(async () => { root.render(React.createElement(Probe, { query: undefined })); });
+    await flush(10);
+    expect(latest.current!.hasMore).toBe(true);
+
+    const more = latest.current!.loadMore();
+    await flush(10);
+    expect(latest.current!.loadingMore).toBe(true);
+
+    // 新搜索在 loadMore 在途时开始：bump request id + 新首页。
+    await act(async () => { root.render(React.createElement(Probe, { query: '新词' })); });
+    await flush(350); // 300ms 防抖到期 + 新首页落地
+    expect(latest.current!.loading).toBe(false);
+    expect(latest.current!.loadingMore).toBe(true); // 旧 loadMore 仍在途
+
+    await act(async () => { resolveStale(page([3, 4], '', false)); });
+    await act(async () => { await more; });
+    await flush(10);
+    // 旧页被丢弃，loadingMore 复位（按钮不再楔死）。
+    expect(latest.current!.loadingMore).toBe(false);
+    expect(latest.current!.items.map((item) => item.id)).toEqual([9]);
+  });
 });

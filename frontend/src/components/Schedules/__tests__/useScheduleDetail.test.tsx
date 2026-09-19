@@ -59,9 +59,10 @@ let host: HTMLElement;
 let root: Root;
 let latest: Probe;
 let openRef: { current: boolean };
+let idRef: { current: number | null };
 
 function ProbeComponent() {
-  latest.current = useScheduleDetail(openRef.current, 9);
+  latest.current = useScheduleDetail(openRef.current, idRef.current);
   return null;
 }
 
@@ -70,6 +71,7 @@ beforeEach(() => {
   mockOccurrences.mockReset();
   latest = { current: null };
   openRef = { current: true };
+  idRef = { current: 9 };
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -169,5 +171,84 @@ describe('useScheduleDetail — 执行记录分页（§33–§35）', () => {
     await flush(10);
     expect(latest.current!.occurrences).toHaveLength(51);
     expect(latest.current!.occurrenceError).toBeNull();
+  });
+});
+
+describe('useScheduleDetail — 关闭清空（复审 P1）', () => {
+  it('closing drops the config/history so a reopen never flashes them', async () => {
+    mockSchedule.mockResolvedValue(schedule(9));
+    mockOccurrences.mockResolvedValue([occ(3), occ(2)]);
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    expect(latest.current!.schedule?.name).toBe('任务9');
+    expect(latest.current!.occurrences).toHaveLength(2);
+
+    // Close the drawer: the closed surface must hold NOTHING of the previous
+    // target — otherwise reopening for another schedule paints 任务9's
+    // config under the new title for the first frame.
+    openRef.current = false;
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    expect(latest.current!.schedule).toBeNull();
+    expect(latest.current!.occurrences).toEqual([]);
+    expect(latest.current!.occurrenceError).toBeNull();
+    expect(latest.current!.hasMoreOccurrences).toBe(false);
+    expect(latest.current!.error).toBeNull();
+  });
+
+  it('a late occurrences response cannot repopulate after close', async () => {
+    mockSchedule.mockResolvedValue(schedule(9));
+    let resolveOccs!: (value: ScheduleOccurrence[]) => void;
+    mockOccurrences.mockImplementationOnce(
+      () => new Promise<ScheduleOccurrence[]>((res) => { resolveOccs = res; }));
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+
+    openRef.current = false;
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    expect(latest.current!.occurrences).toEqual([]);
+
+    // The in-flight response settles now — it must be discarded entirely.
+    await act(async () => { resolveOccs([occ(5), occ(4)]); });
+    await flush(10);
+    expect(latest.current!.occurrences).toEqual([]);
+    expect(latest.current!.hasMoreOccurrences).toBe(false);
+  });
+});
+
+describe('useScheduleDetail — loadMore 失效复位（复审意见 #2）', () => {
+  it('a loadMore invalidated by a target switch still clears loadingMoreOccurrences', async () => {
+    // A 的 loadMore 在途时切到任务 B：occSeq 被 bump，A 的旧响应必须作废，
+    // 且 loadingMoreOccurrences 必须复位 —— 否则 B 的「加载更多」永久楔死。
+    mockSchedule.mockResolvedValue(schedule(9));
+    let resolveStale!: (value: ScheduleOccurrence[]) => void;
+    mockOccurrences
+      .mockResolvedValueOnce(Array.from({ length: 51 }, (_, i) => occ(100 - i))) // A 首页
+      .mockImplementationOnce(() => new Promise<ScheduleOccurrence[]>((res) => {
+        resolveStale = res;
+      })) // A loadMore 在途
+      .mockResolvedValueOnce([occ(7)]); // B 首页
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    expect(latest.current!.hasMoreOccurrences).toBe(true);
+
+    const more = latest.current!.loadMoreOccurrences();
+    await flush(10);
+    expect(latest.current!.loadingMoreOccurrences).toBe(true);
+
+    // 在途时切到任务 B。
+    idRef.current = 10;
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    expect(latest.current!.occurrencesLoading).toBe(false);       // B 首页已落地
+    expect(latest.current!.loadingMoreOccurrences).toBe(true);    // A loadMore 仍在途
+
+    await act(async () => { resolveStale([occ(50), occ(49)]); });
+    await act(async () => { await more; });
+    await flush(10);
+    // A 的旧页被丢弃，loadingMoreOccurrences 复位。
+    expect(latest.current!.loadingMoreOccurrences).toBe(false);
+    expect(latest.current!.occurrences.map((o) => o.id)).toEqual([7]);
   });
 });

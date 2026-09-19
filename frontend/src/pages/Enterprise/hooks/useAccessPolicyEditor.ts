@@ -83,6 +83,11 @@ export function useAccessPolicyEditor({
   // against its own closure, so switching targets mid-save is detected.
   const targetIdRef = useRef<number | null>(applicationId);
   useEffect(() => { targetIdRef.current = applicationId; }, [applicationId]);
+  // Save generation: only the NEWEST save may reset the spinner. A save for
+  // A that finishes after the switch to B must not leave `saving` wedged on
+  // (B's button would spin forever), nor must it cancel B's own in-flight
+  // spinner if B saved afterwards (复审意见 #1).
+  const saveSeqRef = useRef(0);
   const onSavedRef = useRef(onSaved);
   useEffect(() => { onSavedRef.current = onSaved; });
 
@@ -115,9 +120,18 @@ export function useAccessPolicyEditor({
   // in flight for the PREVIOUS target — closing A or switching to B must
   // abandon A's requests entirely (P0-2).
   useEffect(() => {
-    if (enabled && applicationId) {
-      void reload();
+    if (!enabled || !applicationId) {
+      // Closed (or no target): drop the previous target's policy HERE, while
+      // the surface is invisible — a reopen would otherwise paint A's grants
+      // under B's title for the first frame (复审 P1). Every in-flight write
+      // is generation-guarded, so nothing can repopulate after this clear.
+      setPolicy(null);
+      setDepartments([]);
+      setLoadError(null);
+      setLoading(false);
+      return;
     }
+    void reload();
     return () => {
       requestSeqRef.current += 1;
     };
@@ -139,6 +153,7 @@ export function useAccessPolicyEditor({
       return false;
     }
     const saveTargetId = applicationId;
+    const mySave = ++saveSeqRef.current;
     setSaving(true);
     try {
       const next = await enterpriseApi.updateAccess(saveTargetId, {
@@ -162,7 +177,12 @@ export function useAccessPolicyEditor({
       }
       return false;
     } finally {
-      if (targetIdRef.current === saveTargetId) setSaving(false);
+      // Only the newest save resets the spinner — an older save finishing
+      // after a newer one started must neither wedge `saving` on (review #1)
+      // nor cancel the newer save's spinner.
+      if (saveSeqRef.current === mySave) {
+        setSaving(false);
+      }
     }
   }, [applicationId, policy]);
 

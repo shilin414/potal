@@ -169,10 +169,14 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
       // consumers render a persistent partial-error tail off `error`.
       setError(null);
     } catch (err: any) {
+      if (requestIdRef.current !== requestId) return; // filters changed mid-flight
       // 加载更多 keeps the already-rendered pages; the next click retries.
       setError(err?.response?.data?.detail || '加载更多失败');
     } finally {
-      if (requestIdRef.current === requestId) setLoadingMore(false);
+      // 无条件复位：新搜索/关闭 bump 了 requestId，若在此守卫，loadingMore
+      // 会永久卡 true（加载更多按钮楔死，复审意见 #2 同款漏修点）。loadMore
+      // 自身的 loadingMore 互斥已排除并发，无条件复位是安全的。
+      setLoadingMore(false);
     }
   }, [enabled, kind, scope, mode, includeUnbound, debouncedQuery, category, limit, cursor, loadingMore, loading]);
 

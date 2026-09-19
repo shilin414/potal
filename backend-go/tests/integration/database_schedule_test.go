@@ -445,3 +445,96 @@ func TestRunNowQueueBehindActive(t *testing.T) {
 		t.Fatalf("pending occurrence not admitted after active finished: runs = %d, want 1", n)
 	}
 }
+
+// TestScheduleListSearchIsServerSideCaseInsensitiveAndLiteral pins 1.1.2
+// (三次复审 §23–§27): `q` searches the WHOLE table server-side over s.name —
+// case-insensitive through COLLATE utf8mb4_unicode_ci on a utf8mb4_bin
+// table, with LIKE wildcards (%/_) escaped to literals — and composes with
+// the keyset cursor (before_id). Mirrors the catalog precedent
+// (TestApplicationPageSearchIsCaseInsensitive).
+func TestScheduleListSearchIsServerSideCaseInsensitiveAndLiteral(t *testing.T) {
+	env := newScheduleEnv(t)
+	ctx := context.Background()
+	q := db.New(env.db)
+
+	seed := func(name string) int64 {
+		t.Helper()
+		trigger, _ := json.Marshal(map[string]any{"time": "09:00"})
+		payload, _ := json.Marshal(map[string]any{"prompt": "itest"})
+		res, err := q.CreateSchedule(ctx, db.CreateScheduleParams{
+			OwnerUserID:        42,
+			Name:               name,
+			ApplicationID:      1,
+			InputPayload:       payload,
+			ScheduleType:       schedule.TypeDaily,
+			CronExpression:     "0 9 * * *",
+			TriggerConfig:      trigger,
+			Timezone:           "Asia/Shanghai",
+			Enabled:            false, // never picked up by the live dev scheduler
+			NextRunAt:          sql.NullTime{Time: time.Now().UTC().Add(24 * time.Hour), Valid: true},
+			ConversationPolicy: schedule.ConversationNewEachRun,
+			OverlapPolicy:      schedule.OverlapSkip,
+			MisfirePolicy:      schedule.MisfireFireOnce,
+			DeadlinePolicy:     schedule.DeadlineExecuteAnyway,
+		})
+		if err != nil {
+			t.Fatalf("seed %q: %v", name, err)
+		}
+		id, _ := res.LastInsertId()
+		t.Cleanup(func() { _, _ = q.DeleteSchedule(ctx, uint64(id)) })
+		return id
+	}
+
+	// Distinctive ASCII names (Chinese hides case bugs). The wildcard probes
+	// must stay LITERAL: an unescaped `_` would also match WildXcard, an
+	// unescaped `%` would also match "500 off".
+	idA := seed("itestSchedSales Agent")
+	idB := seed("itestSched Wild_card 200")
+	idC := seed("itestSched WildXcard 300")
+	idD := seed("itestSched 50% off 400")
+	_ = seed("itestSched 500 off 500")
+	seeded := []int64{idA, idB, idC, idD}
+
+	list := func(f schedule.ListFilter) map[int64]bool {
+		t.Helper()
+		items, err := env.svc.List(ctx, 42, f)
+		if err != nil {
+			t.Fatalf("list %+v: %v", f, err)
+		}
+		// Owner 42 carries other fixtures — count only what this test seeded.
+		got := map[int64]bool{}
+		for _, it := range items {
+			for _, id := range seeded {
+				if it.ID == id {
+					got[id] = true
+				}
+			}
+		}
+		return got
+	}
+
+	// Case-insensitive over a utf8mb4_bin table (COLLATE utf8mb4_unicode_ci).
+	for _, needle := range []string{"itestschedsales", "ITESTSCHEDSALES", "SchedSales"} {
+		if got := list(schedule.ListFilter{Status: "all", Query: needle, Limit: 100}); len(got) != 1 || !got[idA] {
+			t.Fatalf("q=%q must match the seeded schedule case-insensitively, got %v", needle, got)
+		}
+	}
+
+	// `_` stays a literal: Wild_card matches only the underscore row, never
+	// WildXcard (which a single-character wildcard would also hit).
+	if got := list(schedule.ListFilter{Status: "all", Query: "Wild_card", Limit: 100}); len(got) != 1 || !got[idB] {
+		t.Fatalf("`_` must stay a literal, not a single-character wildcard, got %v", got)
+	}
+
+	// `%` stays a literal: "50% off" must not match "500 off".
+	if got := list(schedule.ListFilter{Status: "all", Query: "50% off", Limit: 100}); len(got) != 1 || !got[idD] {
+		t.Fatalf("`%%` must stay a literal, not a wildcard, got %v", got)
+	}
+
+	// Search composes with the keyset cursor: before_id = C keeps only the
+	// rows seeded BEFORE C (insert order gives strictly ascending ids).
+	got := list(schedule.ListFilter{Status: "all", Query: "itestSched", BeforeID: idC, Limit: 100})
+	if len(got) != 2 || !got[idA] || !got[idB] {
+		t.Fatalf("q + before_id must return only the earlier matches, got %v", got)
+	}
+}

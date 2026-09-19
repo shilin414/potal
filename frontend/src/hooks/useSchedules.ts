@@ -154,9 +154,10 @@ export function useSchedules(): UseSchedulesResult {
         setErrorPhase('loadMore');
       }
     } finally {
-      if (seq === seqRef.current) {
-        setLoadingMore(false);
-      }
+      // 无条件复位：筛选变化 bump 了 seq，若在此守卫 seq，loadingMore 会
+      // 永久卡 true（加载更多按钮楔死，复审意见 #2）。loadMore 自身的
+      // loadingMore 互斥已排除并发，无条件复位是安全的。
+      setLoadingMore(false);
     }
   }, [status, debouncedSearch, data, loading, loadingMore, hasMore]);
 

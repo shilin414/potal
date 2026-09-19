@@ -69,25 +69,38 @@ vi.mock('antd', () => ({
     </div>
   ),
   Button: ({
-    children, onClick, disabled,
-  }: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
-    <button type="button" onClick={onClick} disabled={disabled}>{children}</button>
+    children, onClick, disabled, loading,
+  }: React.ButtonHTMLAttributes<HTMLButtonElement> & { loading?: boolean }) => (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      data-loading={loading ? 'true' : 'false'}
+    >
+      {children}
+    </button>
   ),
   Card: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
   Drawer: ({
-    open, title, children, extra,
+    open, title, children, extra, onClose,
   }: {
     open?: boolean;
     title?: React.ReactNode;
     children?: React.ReactNode;
     extra?: React.ReactNode;
+    onClose?: () => void;
   }) => (open ? (
     <div data-testid="drawer">
-      <span>{title}</span>{extra}{children}
+      <span>{title}</span>
+      <button type="button" data-testid="drawer-close" onClick={onClose}>×</button>
+      {extra}{children}
     </div>
   ) : null),
   Empty: ({ description }: { description?: React.ReactNode }) => (
     <div data-testid="empty">{description}</div>
+  ),
+  Skeleton: ({ active }: { active?: boolean }) => (
+    <div data-testid="skeleton" data-active={String(Boolean(active))} />
   ),
   Input: Object.assign(
     (props: React.InputHTMLAttributes<HTMLInputElement>) => <input {...props} />,
@@ -387,5 +400,109 @@ describe('desktop AccessPage — permission target race (三次复审 P0)', () =
     const drawer = document.querySelector('[data-testid="drawer"]')!;
     expect(drawer.textContent).toContain('B资源部门');
     expect(drawer.textContent).not.toContain('A资源部门');
+  });
+});
+
+describe('desktop AccessPage — drawer 三态 + save spinner 复位（复审）', () => {
+  const POLICY_A = {
+    application_id: 7,
+    access_mode: 'assigned' as const,
+    departments: [{ department_id: 3, name: 'A资源部门', include_children: true, covered_users: 12 }],
+    users: [],
+  };
+  const POLICY_B = {
+    application_id: 8,
+    access_mode: 'assigned' as const,
+    departments: [{ department_id: 4, name: 'B资源部门', include_children: true, covered_users: 5 }],
+    users: [],
+  };
+
+  beforeEach(() => {
+    vi.mocked(enterpriseApi.access).mockReset();
+    vi.mocked(enterpriseApi.updateAccess).mockReset();
+    vi.mocked(message.success).mockReset();
+    pageState.items = [];
+    pageState.error = null;
+    pageState.hasMore = false;
+  });
+
+  it('a failed policy load shows an in-drawer error + 重试 (never an eternal Empty)', async () => {
+    pageState.items = [row(7, 'A资源')];
+    vi.mocked(enterpriseApi.access).mockRejectedValueOnce(new Error('network down'));
+    vi.mocked(enterpriseApi.access).mockResolvedValue(POLICY_A);
+
+    await mountPage();
+    await click(document.querySelector('[data-open-cell="7"] button')!);
+    await flush(20);
+
+    const drawer = () => document.querySelector('[data-testid="drawer"]')!;
+    expect(drawer().textContent).toContain('加载访问权限失败');
+    // 保存 disabled until a policy is actually loaded.
+    const save = Array.from(drawer().querySelectorAll('button'))
+      .find((el) => el.textContent === '保存')!;
+    expect(save.disabled).toBe(true);
+
+    const retry = Array.from(drawer().querySelectorAll('button'))
+      .find((el) => el.textContent === '重试')!;
+    await click(retry);
+    await flush(20);
+    expect(vi.mocked(enterpriseApi.access)).toHaveBeenCalledTimes(2);
+    expect(drawer().textContent).toContain('A资源部门');
+    expect(drawer().textContent).not.toContain('加载访问权限失败');
+  });
+
+  it('a save finishing after the target switch clears the saving spinner (复审意见 #1)', async () => {
+    pageState.items = [row(7, 'A资源'), row(8, 'B资源')];
+    vi.mocked(enterpriseApi.access).mockImplementation(
+      (id: number) => Promise.resolve(id === 7 ? POLICY_A : POLICY_B),
+    );
+    const saveResult = deferred<typeof POLICY_A>();
+    vi.mocked(enterpriseApi.updateAccess).mockReturnValue(saveResult.promise);
+
+    await mountPage();
+    await click(document.querySelector('[data-open-cell="7"] button')!);
+    await flush(20);
+    const save = () => Array.from(document.querySelectorAll('button'))
+      .find((el) => el.textContent === '保存')!;
+    await click(save()!);
+    expect(save()!.dataset.loading).toBe('true'); // spinner on while A saves
+
+    // While A's save is travelling, switch the drawer to B.
+    await click(document.querySelector('[data-open-cell="8"] button')!);
+    await flush(20);
+
+    await act(async () => { saveResult.resolve(POLICY_A); });
+    await flush(20);
+    // B's 保存 must not spin forever — the spinner cleared with the save.
+    expect(save()!.dataset.loading).toBe('false');
+    expect(save()!.disabled).toBe(false); // B loaded and idle
+  });
+
+  it('reopening for B never flashes A\'s grants under B\'s title (复审 P1)', async () => {
+    pageState.items = [row(7, 'A资源'), row(8, 'B资源')];
+    vi.mocked(enterpriseApi.access).mockImplementation(
+      (id: number) => (id === 7
+        ? Promise.resolve(POLICY_A)
+        : new Promise<typeof POLICY_B>(() => {})), // B stays pending → skeleton holds
+    );
+
+    await mountPage();
+    await click(document.querySelector('[data-open-cell="7"] button')!);
+    await flush(20);
+    const drawer = () => document.querySelector('[data-testid="drawer"]')!;
+    expect(drawer().textContent).toContain('A资源部门');
+
+    // Close A — the drawer content unmounts.
+    await click(document.querySelector('[data-testid="drawer-close"]')!);
+    await flush(20);
+    expect(document.querySelector('[data-testid="drawer"]')).toBeNull();
+
+    // Reopen for B: the drawer must show the loading skeleton and NEVER A's
+    // departments/users (the hook cleared them while the drawer was closed).
+    await click(document.querySelector('[data-open-cell="8"] button')!);
+    await flush(20);
+    expect(drawer().textContent).not.toContain('A资源部门');
+    expect(drawer().querySelector('[data-testid="skeleton"]')).toBeTruthy();
+    expect(drawer().querySelector('[data-testid="empty"]')).toBeNull();
   });
 });

@@ -106,3 +106,38 @@ describe('useDirectoryUsers — disabled invalidation (§43–§45)', () => {
     expect(latest.current!.error).toBeNull(); // no stale error to flash on reopen
   });
 });
+
+describe('useDirectoryUsers — loadMore 失效复位（复审意见 #2）', () => {
+  it('a loadMore invalidated by a new search still clears loadingMore', async () => {
+    // loadMore 在途时新搜索 bump 了 request id：旧响应必须作废，且
+    // loadingMore 必须复位 —— 否则「加载更多」永久楔死。
+    let resolveStale!: (page: { results: DirectoryUser[]; next_cursor: string | null }) => void;
+    mockUsers
+      .mockResolvedValueOnce({ results: [user(1, '张三')], next_cursor: 'c1' })
+      .mockImplementationOnce(() => new Promise((res) => { resolveStale = res; }))
+      .mockResolvedValueOnce({ results: [user(9, '王五')], next_cursor: null });
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    expect(latest.current!.hasMore).toBe(true);
+
+    const more = latest.current!.loadMore();
+    await flush(10);
+    expect(latest.current!.loadingMore).toBe(true);
+
+    // 新搜索在 loadMore 在途时开始：bump request id + 新首页。
+    options = { ...options, query: '王' };
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(350); // 300ms 防抖到期 + 新首页落地
+    expect(latest.current!.loading).toBe(false);
+    expect(latest.current!.loadingMore).toBe(true); // 旧 loadMore 仍在途
+
+    await act(async () => {
+      resolveStale({ results: [user(5, '李四')], next_cursor: null });
+    });
+    await act(async () => { await more; });
+    await flush(10);
+    // 旧页被丢弃，loadingMore 复位。
+    expect(latest.current!.loadingMore).toBe(false);
+    expect(latest.current!.items.map((u) => u.id)).toEqual([9]);
+  });
+});

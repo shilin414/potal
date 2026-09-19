@@ -136,7 +136,9 @@ export function useDirectoryUsers({
       // 加载更多 keeps the already-rendered rows; the next click retries.
       setError('加载更多失败');
     } finally {
-      if (requestIdRef.current === requestId) setLoadingMore(false);
+      // 无条件复位：disabled/新搜索 bump 了 requestId，若在此守卫，
+      // loadingMore 会永久卡 true（复审意见 #2）。
+      setLoadingMore(false);
     }
   }, [enabled, debouncedQuery, limit, includeInactive, cursor, loadingMore, loading]);
 
