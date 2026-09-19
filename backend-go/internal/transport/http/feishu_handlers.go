@@ -21,6 +21,13 @@ import (
 const feishuForwardMaxTargets = 20
 
 // ListFeishuForwardTargets implements GET /api/v2/feishu/forward/targets.
+//
+// Response envelope (六次复审 P1-3): {items, next_cursor, has_more}. user
+// targets paginate with the provider's page_token (search/v1/user supports
+// page_size 1-200 / page_token — the old single 20-row page silently hid
+// match #21+); chat targets are always returned in full (the backend already
+// follows the provider's pagination to has_more=false), so next_cursor stays
+// empty and has_more false for chats.
 func (s *Server) ListFeishuForwardTargets(w http.ResponseWriter, r *http.Request, params genapi.ListFeishuForwardTargetsParams) {
 	caller := userFrom(r.Context())
 	if caller == nil {
@@ -40,6 +47,14 @@ func (s *Server) ListFeishuForwardTargets(w http.ResponseWriter, r *http.Request
 	if params.Query != nil {
 		query = strings.TrimSpace(*params.Query)
 	}
+	cursor := ""
+	if params.Cursor != nil {
+		cursor = strings.TrimSpace(*params.Cursor)
+	}
+	limit := 50
+	if params.Limit != nil {
+		limit = int(*params.Limit)
+	}
 	targets := make([]map[string]any, 0)
 	switch params.Type {
 	case genapi.ListFeishuForwardTargetsParamsTypeChat:
@@ -56,22 +71,28 @@ func (s *Server) ListFeishuForwardTargets(w http.ResponseWriter, r *http.Request
 				"id": c.ChatID, "name": c.Name, "avatar_url": c.AvatarURL, "target_type": "chat",
 			})
 		}
+		// Chats are not cursor-paginated: the list above IS the complete set.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items": targets, "next_cursor": "", "has_more": false,
+		})
 	case genapi.ListFeishuForwardTargetsParamsTypeUser:
-		users, err := s.Feishu.SearchFeishuUsers(r.Context(), uat, query)
+		page, err := s.Feishu.SearchFeishuUsers(r.Context(), uat, query, limit, cursor)
 		if err != nil {
 			writeFeishuError(w, err, "搜索联系人失败")
 			return
 		}
-		for _, u := range users {
+		for _, u := range page.Users {
 			targets = append(targets, map[string]any{
 				"id": u.OpenID, "name": u.Name, "avatar_url": u.AvatarURL, "target_type": "user",
 			})
 		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"items": targets, "next_cursor": page.PageToken, "has_more": page.HasMore,
+		})
 	default:
 		writeDetail(w, http.StatusBadRequest, "type 必须是 user 或 chat")
 		return
 	}
-	writeJSON(w, http.StatusOK, targets)
 }
 
 // ForwardShareToFeishu implements POST /api/v2/feishu/forward.

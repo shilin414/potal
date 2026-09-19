@@ -1652,6 +1652,13 @@ paths:
       operationId: listFeishuForwardTargets
       tags: [runs]
       summary: Feishu forward targets (contacts or groups) for the caller
+      description: |
+        One page of targets plus a continuation cursor. user targets come
+        from the Feishu user search (search/v1/user, user_access_token
+        only) and paginate with the provider's page_token; chat targets are
+        always returned IN FULL in a single response (the backend follows
+        the provider's pagination to has_more=false), so the cursor only
+        applies to type=user.
       parameters:
         - name: type
           in: query
@@ -1661,15 +1668,27 @@ paths:
         - name: query
           in: query
           schema: { type: string }
-          description: Name search (user type only).
+          description: |
+            Name search. For user targets the query is sent to the Feishu
+            user search; for chat targets the query filters the caller's
+            chat list (applied server-side after the full list is read).
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: |
+            Continuation token for type=user (the next_cursor from the
+            previous response, i.e. the provider's page_token). Ignored
+            for type=chat.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+          description: Page size for type=user (provider range 1-200, default 50).
       responses:
         "200":
-          description: Bare array of targets
+          description: One page of targets plus the continuation cursor
           content:
             application/json:
-              schema:
-                type: array
-                items: { $ref: "#/components/schemas/FeishuForwardTarget" }
+              schema: { $ref: "#/components/schemas/FeishuForwardTargetPage" }
         "400":
           description: caller has no bound Feishu identity / bad type
           content:
@@ -2142,6 +2161,22 @@ components:
         name: { type: string }
         avatar_url: { type: string }
         target_type: { type: string, enum: [user, chat] }
+
+    FeishuForwardTargetPage:
+      type: object
+      required: [items, has_more]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/FeishuForwardTarget" }
+        next_cursor:
+          type: string
+          description: |
+            Continuation token — pass back as ?cursor to fetch the next
+            page (type=user only). Empty when has_more is false.
+        has_more:
+          type: boolean
+          description: Whether another page exists (always false for chats).
 
     FeishuForwardResult:
       type: object

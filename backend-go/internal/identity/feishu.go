@@ -359,35 +359,68 @@ func firstNonEmptyStr(vals ...string) string {
 	return ""
 }
 
-// SearchFeishuUsers searches the org directory for coworkers. Requires a
-// user_access_token (the app-only token has no directory search).
-func (c *FeishuClient) SearchFeishuUsers(ctx context.Context, token, query string) ([]FeishuContactUser, error) {
+// FeishuContactUserPage is one page of the search/v1/user results, mirroring
+// the official response shape (feishu-doc 通讯录/用户/搜索用户:
+// data.{users, has_more, page_token}).
+type FeishuContactUserPage struct {
+	Users     []FeishuContactUser
+	HasMore   bool
+	PageToken string
+}
+
+// SearchFeishuUsers searches the org directory for coworkers, ONE page per
+// call. Requires a user_access_token (the search/v1/user endpoint accepts
+// nothing else — tenant-wide search would also decouple "who is visible"
+// from "who I can message as myself").
+//
+// The response is decoded STRICTLY against the official contract:
+// data.users / data.has_more / data.page_token (六次复审 P1-2). The old code
+// read data.entities — a field that never exists in this response — so every
+// search compiled, passed CI and still returned zero contacts. The field
+// names below are contract, not suggestion: a fixture test
+// (TestSearchFeishuUsersDecodesOfficialUsersShape) pins them to the official
+// documentation so "users" can never silently become "entities" again.
+// pageSize is clamped to the provider range 1-200; pageToken "" = first page.
+func (c *FeishuClient) SearchFeishuUsers(ctx context.Context, token, query string, pageSize int, pageToken string) (*FeishuContactUserPage, error) {
+	if pageSize < 1 {
+		pageSize = 20
+	}
+	if pageSize > 200 {
+		pageSize = 200
+	}
 	q := url.Values{}
 	q.Set("query", query)
-	q.Set("page_size", "20")
+	q.Set("page_size", strconv.Itoa(pageSize))
+	if pageToken != "" {
+		q.Set("page_token", pageToken)
+	}
 	data, err := c.authorizedGET(ctx, token, "/open-apis/search/v1/user?"+q.Encode())
 	if err != nil {
 		return nil, err
 	}
 	var payload struct {
-		Entities []struct {
-			OpenID string          `json:"open_id"`
-			ID     string          `json:"id"`
+		HasMore   bool   `json:"has_more"`
+		PageToken string `json:"page_token"`
+		Users     []struct {
+			OpenID string `json:"open_id"`
+			// Decoded for contract fidelity; deliveries address users by
+			// open_id (receive_id_type=open_id), user_id is unused today.
+			UserID string          `json:"user_id"`
 			Name   string          `json:"name"`
 			Avatar json.RawMessage `json:"avatar"`
-		} `json:"entities"`
+		} `json:"users"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return nil, fmt.Errorf("feishu: search user decode: %w", err)
 	}
-	out := make([]FeishuContactUser, 0, len(payload.Entities))
-	for _, it := range payload.Entities {
-		id := it.OpenID
-		if id == "" {
-			id = it.ID
-		}
-		out = append(out, FeishuContactUser{
-			OpenID:    id,
+	out := &FeishuContactUserPage{
+		Users:     make([]FeishuContactUser, 0, len(payload.Users)),
+		HasMore:   payload.HasMore,
+		PageToken: payload.PageToken,
+	}
+	for _, it := range payload.Users {
+		out.Users = append(out.Users, FeishuContactUser{
+			OpenID:    it.OpenID,
 			Name:      it.Name,
 			AvatarURL: avatarFromRaw(it.Avatar),
 		})
