@@ -16,7 +16,9 @@
  *     （成功 / 部分失败 / 授权失败）不得关闭新弹窗、污染新选中、误入重
  *     新授权视图；新会话不继承旧 sending；同会话双击只发一次请求；
  *   · 部分授权失败（八次复审 P2）：1 成功 + 1 授权失败的混合结果也要展
- *     示重新授权入口，不再要求 success_count === 0。
+ *     示重新授权入口，不再要求 success_count === 0；
+ *   · 同会话 reconcile（九次复审 P1）：发送在途期间用户改选择 / 切 Tab，
+ *     异步结果只移除本轮已成功目标，不得用快照整体覆盖当前 selected。
  * @vitest-environment jsdom
  */
 import React from 'react';
@@ -489,5 +491,98 @@ describe('FeishuForwardModal — 部分授权失败也进入重新授权（八�
     // success_count === 0 让用户只能对着注定失败的目标反复重试。
     expect(document.querySelector('.ffm-reauth')).toBeTruthy();
     expect(document.body.textContent).toContain('重新授权飞书');
+  });
+});
+
+describe('FeishuForwardModal — 发送在途期间的选择变更不被快照覆盖（九次复审 P1）', () => {
+  it('deselect B + select C while pending: only the live selection survives the reconcile', async () => {
+    mocks.fetchFeishuTargets.mockResolvedValue(page([
+      target('oc-A', 'A群', 'chat'),
+      target('oc-B', 'B群', 'chat'),
+      target('oc-C', 'C群', 'chat'),
+    ]));
+    await mountModal();
+    const rows = Array.from(document.querySelectorAll<HTMLButtonElement>('.ffm-row'));
+    await click(rows[0]); // 选 A
+    await click(rows[1]); // 选 B
+
+    const send = deferred<FeishuForwardResult>();
+    mocks.forwardShareToFeishu.mockReturnValueOnce(send.promise);
+    await click(findButton('发送（2）')!);
+
+    // 发送在途（列表 / chip 均可操作，只有发送按钮 disabled）：用户取消
+    // B、新增 C —— selected 变成 [A, C]。
+    await click(rows[1]); // 取消 B
+    await click(rows[2]); // 选 C
+
+    // 结果：A 成功、B 失败。
+    await act(async () => {
+      send.resolve({
+        results: [
+          { target_id: 'oc-A', ok: true },
+          { target_id: 'oc-B', ok: false, error: '发送失败' },
+        ],
+        success_count: 1,
+        fail_count: 1,
+      });
+    });
+    await flush(10);
+
+    // 旧实现 setSelected(snapshot 失败目标) 会把 selected 整体覆盖成 [B]：
+    // 用户刚取消的 B 复活、新选的 C 被删。正确 reconcile 只从 current 移除
+    // 已成功的 A —— B 已被用户主动取消不复活，C 未参与本轮发送不被删。
+    expect(findButton('发送（1）')).toBeTruthy();
+    expect(rows[0].className).not.toContain('ffm-row--on'); // A：发送成功，移除
+    expect(rows[1].className).not.toContain('ffm-row--on'); // B：用户已取消，不复活
+    expect(rows[2].className).toContain('ffm-row--on'); // C：用户新选，保留
+
+    // History 仍基于发送瞬间的 snapshot（九次复审 §19）：只记录本轮真正
+    // 成功的 A，不混入用户在途新选的 C。
+    expect(mocks.saveForwardHistory).toHaveBeenCalledTimes(1);
+    expect(mocks.saveForwardHistory.mock.calls[0][0]).toEqual([target('oc-A', 'A群', 'chat')]);
+  });
+
+  it('switching tabs while pending: the cleared selection stays cleared', async () => {
+    mocks.fetchFeishuTargets.mockImplementation(
+      async (type: 'user' | 'chat', _query?: string, _cursor?: string) => {
+        if (type === 'chat') return page([target('oc-A', 'A群', 'chat')]);
+        return page([target('u-1', '张三', 'user')]);
+      },
+    );
+    await mountModal();
+    await click(document.querySelector<HTMLButtonElement>('.ffm-row')!); // 选中 A群
+
+    const send = deferred<FeishuForwardResult>();
+    mocks.forwardShareToFeishu.mockReturnValueOnce(send.promise);
+    await click(findButton('发送（1）')!);
+
+    // 发送在途切到联系人 tab：Tabs onChange 明确 setSelected([])。
+    const userTab = Array.from(document.querySelectorAll<HTMLElement>('.ant-tabs-tab'))
+      .find((t) => t.textContent?.includes('联系人'));
+    await click(userTab!);
+    await flush(10);
+
+    // A群 发送失败 —— 旧实现把 snapshot 里的失败目标写回 selected，当前
+    // 页面在联系人 tab、发送按钮却显示「发送（1）」，下次点发送会向刚切
+    // 走的旧群聊目标重发。
+    await act(async () => {
+      send.resolve({
+        results: [{ target_id: 'oc-A', ok: false, error: '发送失败' }],
+        success_count: 0,
+        fail_count: 1,
+      });
+    });
+    await flush(10);
+
+    expect(findButton('发送（1）')).toBeUndefined();
+    expect(document.querySelector<HTMLButtonElement>('.ffm-send')!.disabled).toBe(true);
+
+    // 切回群聊 tab：A群 不得复活为选中态。
+    const chatTab = Array.from(document.querySelectorAll<HTMLElement>('.ant-tabs-tab'))
+      .find((t) => t.textContent?.includes('群聊'));
+    await click(chatTab!);
+    await flush(10);
+    expect(document.querySelector('.ffm-row')!.className).not.toContain('ffm-row--on');
+    expect(findButton('发送（1）')).toBeUndefined();
   });
 });
