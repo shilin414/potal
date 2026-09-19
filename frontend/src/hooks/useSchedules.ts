@@ -112,12 +112,23 @@ export function useSchedules(): UseSchedulesResult {
     return () => clearTimeout(timer);
   }, [search, debouncedSearch]);
 
+  // 当前结果集正在使用的筛选（五次复审 P1-1）：mutation 成功后的 refresh
+  // 不再读点击那一刻的闭包快照（status/debouncedSearch），而是读「现在
+  // 正在展示的结果集」的筛选 —— runNow/toggle 在途期间用户切换页签或搜索
+  // 词，晚到的响应刷新的必须是用户当前看到的结果集，绝不能用旧 running
+  // 闭包把新 paused 列表覆盖回 running 数据。
+  const activeFilterRef = useRef<{ status: ScheduleStatusFilter; query: string }>({
+    status: 'all',
+    query: '',
+  });
+
   const load = useCallback(async (
     filter: ScheduleStatusFilter,
     q: string,
     phase: SchedulesErrorPhase,
   ) => {
     const seq = ++seqRef.current;
+    activeFilterRef.current = { status: filter, query: q };
     // 新结果集 → 旧结果集的在途 loadMore 立即作废（四次复审 P1-2）。
     loadMoreSeqRef.current += 1;
     setLoadingMore(false);
@@ -154,9 +165,18 @@ export function useSchedules(): UseSchedulesResult {
     void load(status, debouncedSearch, 'initial');
   }, [load, status, debouncedSearch]);
 
+  /**
+   * 刷新「当前」结果集（五次复审 P1-1）：所有 mutation 之后的 refresh 统一
+   * 走这里，不再让每个 mutation 自己捕获 status/debouncedSearch 闭包。
+   */
+  const reloadCurrent = useCallback(async () => {
+    const { status: currentStatus, query: currentQuery } = activeFilterRef.current;
+    await load(currentStatus, currentQuery, 'refresh');
+  }, [load]);
+
   const reload = useCallback(async () => {
-    await load(status, debouncedSearch, 'refresh');
-  }, [load, status, debouncedSearch]);
+    await reloadCurrent();
+  }, [reloadCurrent]);
 
   const loadMore = useCallback(async () => {
     if (loading || loadingMore || !hasMore) return;
@@ -206,10 +226,15 @@ export function useSchedules(): UseSchedulesResult {
     patchLocal(id, { enabled }); // 乐观更新，失败回滚
     try {
       const updated = enabled ? await enableSchedule(id) : await disableSchedule(id);
-      // 结果集已换代：上面的 status 是点击时的闭包快照，拿它归并新结果
-      // 集（如 running 视图暂停在途时切到 all）会把刚被新 load 放回来的
-      // 行误删。新 load 才是新结果集的权威快照，旧响应一概不碰。
-      if (seqRef.current !== seqAtStart) return;
+      // 结果集已换代（五次复审 P1-2）：旧 mutation 的成功响应既不能拿闭包
+      // 快照归并新结果集，也不能直接丢弃 —— 新结果集的 GET 可能恰好读到了
+      // mutation commit 之前的旧状态（A.enabled=true），直接 return 会让前端
+      // 一直显示旧值直到下次刷新。重新拉一遍「当前」结果集是最安全的收敛
+      // 方式；代价只是这个边界竞态下回到第一页（正确性 > 滚动位置）。
+      if (seqRef.current !== seqAtStart) {
+        void reloadCurrent();
+        return;
+      }
       // 与服务端筛选语义对齐（四次复审 P1-4）：running = enabled、
       // paused = disabled、failed/all 与 enabled 无关。停用一个任务后它就
       // 不再属于「运行中」结果集 —— 留在列表里只是行内状态翻转，与后端
@@ -231,14 +256,21 @@ export function useSchedules(): UseSchedulesResult {
     } finally {
       endMutation(id);
     }
-  }, [patchLocal, status, beginMutation, endMutation]);
+  }, [patchLocal, status, reloadCurrent, beginMutation, endMutation]);
 
   const runNow = useCallback(async (id: number) => {
     beginMutation(id);
     try {
       await runScheduleNow(id);
       message.success('已加入执行队列');
-      await load(status, debouncedSearch, 'refresh');
+      // run-now 新增一条 occurrence 后，failed 筛选的成员关系可能变化，所以
+      // 必须刷新；但两个生命周期不绑死（五次复审 P1-1）：
+      //   · 刷新的是 activeFilterRef 里的「当前」筛选 —— 点击时刻闭包里的
+      //     status/debouncedSearch 在途期间可能已过期，不能拿旧 running
+      //     覆盖用户刚切过去的新结果集；
+      //   · 行锁在业务 mutation 结束时立即释放（不等列表 GET）—— 网络卡
+      //     30 秒的 refresh 不能让这一行一直 isMutating。
+      void reloadCurrent();
       return true;
     } catch (e) {
       message.error(e instanceof Error ? e.message : '立即运行失败');
@@ -246,7 +278,7 @@ export function useSchedules(): UseSchedulesResult {
     } finally {
       endMutation(id);
     }
-  }, [load, status, debouncedSearch, beginMutation, endMutation]);
+  }, [reloadCurrent, beginMutation, endMutation]);
 
   const remove = useCallback(async (id: number) => {
     beginMutation(id);

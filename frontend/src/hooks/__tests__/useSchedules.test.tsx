@@ -464,3 +464,127 @@ describe('useSchedules — 并发行级 mutation（四次复审 P2-1）', () => 
     expect(latest.current!.isMutating(5)).toBe(false);
   });
 });
+
+describe('useSchedules — mutation 刷新当前结果集（五次复审 P1-1/P1-2）', () => {
+  it('runNow settling after a filter switch refreshes the CURRENT set — running never overwrites paused', async () => {
+    // 页签与数据结果集一致性：running 视图点「立即运行」，请求在途时切到
+    // paused 且 paused 列表已落地；旧 runNow 完成后的 refresh 必须仍是
+    // paused（读 activeFilterRef），绝不能用点击时刻闭包里的 running 把
+    // paused 数据覆盖回 running 列表。
+    let resolveRun!: (value: ScheduleOccurrence) => void;
+    const pausedRows = [schedule(3, '暂停任务3'), schedule(2, '暂停任务2')];
+    mockFetch
+      .mockResolvedValueOnce(page(2, 5))    // 挂载（all）
+      .mockResolvedValueOnce(page(2, 5))    // 切 running 后的首页 ids 5,4
+      .mockResolvedValueOnce(pausedRows)    // 切 paused 后的首页 ids 3,2
+      .mockResolvedValueOnce(pausedRows);   // runNow 成功后的 reloadCurrent
+    mockRunNow.mockImplementationOnce(
+      () => new Promise<ScheduleOccurrence>((res) => { resolveRun = res; }));
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    await act(async () => { latest.current!.setStatus('running'); });
+    await flush(10);
+    expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
+
+    // 立即运行在途 → 切 paused（新结果集落地）→ runNow 才返回。
+    const run = latest.current!.runNow(5);
+    await flush(10);
+    await act(async () => { latest.current!.setStatus('paused'); });
+    await flush(10);
+    expect(latest.current!.status).toBe('paused');
+    expect(latest.current!.data.map((s) => s.id)).toEqual([3, 2]);
+
+    await act(async () => {
+      resolveRun({ id: 5, schedule_id: 5, scheduled_at: '', status: 'pending' } as ScheduleOccurrence);
+    });
+    await act(async () => { await run; });
+    await flush(10);
+
+    // 最后一次列表请求必须是 paused，最终数据属于 paused。
+    expect(mockFetch).toHaveBeenLastCalledWith('paused', undefined, 51, '');
+    expect(latest.current!.data.map((s) => s.id)).toEqual([3, 2]);
+  });
+
+  it('runNow releases the row lock when the mutation ends — a stuck refresh cannot keep isMutating on', async () => {
+    // 业务 mutation 生命周期 ≠ 列表 refresh 生命周期：run-now 已成功但随后
+    // 的列表 GET 卡 30 秒，这一行也必须已经 isMutating=false。
+    let resolveRefresh!: (value: Schedule[]) => void;
+    mockFetch
+      .mockResolvedValueOnce(page(2, 5)) // 挂载首页
+      .mockImplementationOnce(() => new Promise<Schedule[]>((res) => { resolveRefresh = res; }));
+    mockRunNow.mockResolvedValueOnce(
+      { id: 5, schedule_id: 5, scheduled_at: '', status: 'pending' } as ScheduleOccurrence);
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+
+    await act(async () => { await latest.current!.runNow(5); });
+    await flush(10);
+    // run-now 成功即解锁；refresh 仍在途（未 resolve）。
+    expect(latest.current!.isMutating(5)).toBe(false);
+    expect(latest.current!.loading).toBe(true);
+
+    // 卡住的 refresh 最终返回也不破坏数据。
+    await act(async () => { resolveRefresh(page(2, 5)); });
+    await flush(10);
+    expect(latest.current!.loading).toBe(false);
+    expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
+  });
+
+  it('a toggle settling after a filter switch re-fetches the CURRENT set — stale pre-commit rows are corrected', async () => {
+    // 边界竞态（五次复审 §12–§14）：disable 在途时切到 all，all 的 GET 恰好
+    // 读到 commit 之前的 enabled=true；disable 成功返回时旧实现直接 return
+    // 丢弃响应 → 前端 all 列表一直显示 enabled=true。现在必须 refresh 当前
+    // 结果集，最终 enabled=false。
+    let resolveDisable!: (value: Schedule) => void;
+    mockFetch
+      .mockResolvedValueOnce(page(2, 5))                        // 挂载 all 首页
+      .mockResolvedValueOnce(page(2, 5))                        // 切 running 后首页
+      .mockResolvedValueOnce([{ ...schedule(5), enabled: true }, schedule(4)]) // 切回 all：读到 pre-commit 状态
+      .mockResolvedValueOnce([{ ...schedule(5), enabled: false }, schedule(4)]); // reloadCurrent：commit 后状态
+    mockDisable.mockImplementationOnce(
+      () => new Promise<Schedule>((res) => { resolveDisable = res; }));
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    await act(async () => { latest.current!.setStatus('running'); });
+    await flush(10);
+    expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
+
+    // running 视图发起暂停（不等待落地），在途时切回 all —— seqRef 换代。
+    let toggle!: Promise<void>;
+    await act(async () => { toggle = latest.current!.toggleEnabled(5, false); });
+    await act(async () => { latest.current!.setStatus('all'); });
+    await flush(10);
+    // all 的 GET 读到 pre-commit：行 5 仍 enabled=true。
+    expect(latest.current!.data.find((s) => s.id === 5)?.enabled).toBe(true);
+
+    // disable 现在才成功：不能直接丢弃 —— 必须 refresh 当前（all）结果集。
+    await act(async () => {
+      resolveDisable({ ...schedule(5), enabled: false });
+      await toggle;
+    });
+    await flush(10);
+    expect(mockFetch).toHaveBeenLastCalledWith('all', undefined, 51, '');
+    expect(latest.current!.data.find((s) => s.id === 5)?.enabled).toBe(false);
+  });
+
+  it('a same-generation toggle still reconciles locally — no reload, pagination position kept', async () => {
+    // 正常同结果集 toggle 继续 local reconcile（不 reload）：已 loadMore 的
+    // 行不会被 reload 打回第一页（五次复审 §15 的权衡边界）。
+    mockFetch
+      .mockResolvedValueOnce(page(51, 100))  // 首页 ids 100..51
+      .mockResolvedValueOnce(page(3, 50));   // 第二页 ids 50..48
+    mockDisable.mockResolvedValueOnce({ ...schedule(50), enabled: false });
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    await act(async () => { await latest.current!.loadMore(); });
+    await flush(10);
+    expect(latest.current!.data).toHaveLength(53);
+
+    await act(async () => { await latest.current!.toggleEnabled(50, false); });
+    await flush(10);
+    // all 视图：行保留 + 服务器状态落地 + 没有新的列表请求（不 reload）。
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(latest.current!.data).toHaveLength(53);
+    expect(latest.current!.data.find((s) => s.id === 50)?.enabled).toBe(false);
+  });
+});
