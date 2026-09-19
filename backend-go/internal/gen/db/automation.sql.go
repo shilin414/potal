@@ -1146,26 +1146,38 @@ WHERE s.owner_user_id = ?
         )
         ELSE TRUE
       END
+  AND (? IS NULL
+       OR s.name COLLATE utf8mb4_unicode_ci LIKE ?)
   AND (? = 0 OR s.id < ?)
 ORDER BY s.id DESC
 LIMIT ?
 `
 
 type ListSchedulesByOwnerParams struct {
-	OwnerUserID uint64
-	Status      interface{}
-	BeforeID    uint64
-	Limit       int32
+	OwnerUserID    uint64
+	Status         interface{}
+	Search         interface{}
+	SearchNameLike interface{}
+	BeforeID       uint64
+	Limit          int32
 }
 
 // status: all | running | paused | failed (UI filters). Soft-deleted
 // schedules (deleted_at) never appear.
+// ⚠️ The COLLATE on the search is LOAD-BEARING (三次复审 §27, same as
+// catalog.sql): `schedules` is `DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+// so a bare `s.name LIKE ?` compares BYTE-wise and "sales" never matches
+// "Sales" — the client-side filter this replaces (JS toLowerCase) was
+// case-insensitive. The Go side feeds `search_name_like` pre-escaped
+// (`%`, `_`, `\` literal), like catalog's likePattern.
 func (q *Queries) ListSchedulesByOwner(ctx context.Context, arg ListSchedulesByOwnerParams) ([]Schedule, error) {
 	rows, err := q.db.QueryContext(ctx, listSchedulesByOwner,
 		arg.OwnerUserID,
 		arg.Status,
 		arg.Status,
 		arg.Status,
+		arg.Search,
+		arg.SearchNameLike,
 		arg.BeforeID,
 		arg.BeforeID,
 		arg.Limit,

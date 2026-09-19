@@ -54,6 +54,21 @@ describe('fetchSchedules', () => {
       before_id: 42,
     });
   });
+
+  it('sends the server-side search needle as q (三次复审 §25)', async () => {
+    await fetchSchedules('all', undefined, 51, '库存');
+    expect(mocks.get).toHaveBeenCalledWith('/v2/schedules', {
+      limit: 51,
+      status: 'all',
+      q: '库存',
+    });
+  });
+
+  it('omits q for blank needles', async () => {
+    await fetchSchedules('all', undefined, 51, '   ');
+    const params = mocks.get.mock.calls[0][1] as Record<string, unknown>;
+    expect(params).not.toHaveProperty('q');
+  });
 });
 
 describe('CRUD verbs', () => {

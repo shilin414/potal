@@ -27,6 +27,12 @@ FROM schedules WHERE id = ?;
 -- name: ListSchedulesByOwner :many
 -- status: all | running | paused | failed (UI filters). Soft-deleted
 -- schedules (deleted_at) never appear.
+-- ⚠️ The COLLATE on the search is LOAD-BEARING (三次复审 §27, same as
+-- catalog.sql): `schedules` is `DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+-- so a bare `s.name LIKE ?` compares BYTE-wise and "sales" never matches
+-- "Sales" — the client-side filter this replaces (JS toLowerCase) was
+-- case-insensitive. The Go side feeds `search_name_like` pre-escaped
+-- (`%`, `_`, `\` literal), like catalog's likePattern.
 SELECT s.id, s.owner_user_id, s.name, s.description, s.application_id,
        COALESCE(s.input_payload, '{}') AS input_payload,
        s.schedule_type, s.cron_expression, COALESCE(s.trigger_config, '{}') AS trigger_config,
@@ -47,6 +53,8 @@ WHERE s.owner_user_id = ?
         )
         ELSE TRUE
       END
+  AND (sqlc.narg('search') IS NULL
+       OR s.name COLLATE utf8mb4_unicode_ci LIKE sqlc.arg('search_name_like'))
   AND (sqlc.arg('before_id') = 0 OR s.id < sqlc.arg('before_id'))
 ORDER BY s.id DESC
 LIMIT ?;

@@ -7,6 +7,9 @@
  * DESC id），接口回裸数组没有 next_cursor，所以用 51 probe / 50 display 推
  * 导 hasMore —— 请求 limit = 50+1，返回 51 条 → 只展示前 50 条且 hasMore；
  * ≤50 条 → 全部展示且没有更多。loadMore 用已展示最后一行的 id 作 before_id。
+ *
+ * 搜索（三次复审 P1 §23–§28）：q 直发后端（300ms 防抖），覆盖全部任务
+ * 而不只是已加载页 —— 搜索词变化重置回第一页。浏览器端不再本地过滤。
  * Desktop 表格与 Mobile 卡片共用本 hook，任何一端不得自行请求 API。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -22,6 +25,9 @@ import {
 
 /** 每页展示条数；实际请求 +1 作 hasMore 探针（三次复审 §21）。 */
 const SCHEDULES_PAGE_SIZE = 50;
+
+/** 搜索防抖（三次复审 §28）。 */
+const SEARCH_DEBOUNCE_MS = 300;
 
 /** 51 probe / 50 display：返回 51 条 → 展示前 50 且 hasMore。 */
 const splitPage = (items: Schedule[]) => {
@@ -62,13 +68,21 @@ export function useSchedules(): UseSchedulesResult {
   const [mutatingId, setMutatingId] = useState<number | null>(null);
   const seqRef = useRef(0);
 
-  const load = useCallback(async (filter: ScheduleStatusFilter) => {
+  // 防抖只平滑「打字」：status 切换与首次挂载立即请求。
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  useEffect(() => {
+    if (search === debouncedSearch) return undefined;
+    const timer = setTimeout(() => setDebouncedSearch(search), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [search, debouncedSearch]);
+
+  const load = useCallback(async (filter: ScheduleStatusFilter, q: string) => {
     const seq = ++seqRef.current;
     setLoading(true);
     setError(null);
     try {
       const items = await fetchSchedules(
-        filter, undefined, SCHEDULES_PAGE_SIZE + 1);
+        filter, undefined, SCHEDULES_PAGE_SIZE + 1, q);
       if (seq === seqRef.current) {
         const { page, more } = splitPage(items);
         setData(page);
@@ -85,13 +99,14 @@ export function useSchedules(): UseSchedulesResult {
     }
   }, []);
 
+  // status / debouncedSearch 任一变化 = 新结果集：清 cursor，回第一页。
   useEffect(() => {
-    void load(status);
-  }, [load, status]);
+    void load(status, debouncedSearch);
+  }, [load, status, debouncedSearch]);
 
   const reload = useCallback(async () => {
-    await load(status);
-  }, [load, status]);
+    await load(status, debouncedSearch);
+  }, [load, status, debouncedSearch]);
 
   const loadMore = useCallback(async () => {
     if (loading || loadingMore || !hasMore) return;
@@ -102,7 +117,7 @@ export function useSchedules(): UseSchedulesResult {
     setLoadingMore(true);
     try {
       const items = await fetchSchedules(
-        status, beforeId, SCHEDULES_PAGE_SIZE + 1);
+        status, beforeId, SCHEDULES_PAGE_SIZE + 1, debouncedSearch);
       if (seq === seqRef.current) {
         const { page, more } = splitPage(items);
         setData((prev) => [...prev, ...page]);
@@ -120,7 +135,7 @@ export function useSchedules(): UseSchedulesResult {
         setLoadingMore(false);
       }
     }
-  }, [status, data, loading, loadingMore, hasMore]);
+  }, [status, debouncedSearch, data, loading, loadingMore, hasMore]);
 
   const patchLocal = useCallback((id: number, patch: Partial<Schedule>) => {
     setData((prev) => prev.map((s) => (s.id === id ? { ...s, ...patch } : s)));
@@ -146,7 +161,7 @@ export function useSchedules(): UseSchedulesResult {
     try {
       await runScheduleNow(id);
       message.success('已加入执行队列');
-      await load(status);
+      await load(status, debouncedSearch);
       return true;
     } catch (e) {
       message.error(e instanceof Error ? e.message : '立即运行失败');
@@ -154,7 +169,7 @@ export function useSchedules(): UseSchedulesResult {
     } finally {
       setMutatingId(null);
     }
-  }, [load, status]);
+  }, [load, status, debouncedSearch]);
 
   const remove = useCallback(async (id: number) => {
     setMutatingId(id);
@@ -171,13 +186,8 @@ export function useSchedules(): UseSchedulesResult {
     }
   }, []);
 
-  const filtered = search.trim()
-    ? data.filter((s) =>
-        s.name.toLowerCase().includes(search.trim().toLowerCase()))
-    : data;
-
   return {
-    data: filtered,
+    data,
     loading,
     loadingMore,
     error,

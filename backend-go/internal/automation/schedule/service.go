@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
@@ -374,6 +375,7 @@ func (s *Service) Get(ctx context.Context, id, userID int64, isStaff bool) (*Sch
 // ListFilter narrows the owner list.
 type ListFilter struct {
 	Status   string // all | running | paused | failed
+	Query    string // server-side name substring; "" disables the search
 	BeforeID int64
 	Limit    int
 }
@@ -395,11 +397,23 @@ func (s *Service) List(ctx context.Context, userID int64, f ListFilter) ([]Sched
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
+	// Server-side name search (三次复审 §23–§27): the whole table is
+	// searched, not just the pages the browser already loaded. `search` is
+	// the narg probe (nil → `? IS NULL` short-circuits the LIKE branch);
+	// `search_name_like` carries the pre-escaped needle, the same
+	// likePattern rule catalog.sql uses so `%`, `_` and `\` compare literally.
+	search := strings.TrimSpace(f.Query)
+	var searchArg interface{}
+	if search != "" {
+		searchArg = int(1)
+	}
 	rows, err := s.q(ctx).ListSchedulesByOwner(ctx, db.ListSchedulesByOwnerParams{
-		OwnerUserID: uint64(userID),
-		Status:      status,
-		BeforeID:    uint64(f.BeforeID),
-		Limit:       int32(limit),
+		OwnerUserID:    uint64(userID),
+		Status:         status,
+		Search:         searchArg,
+		SearchNameLike: likePattern(search),
+		BeforeID:       uint64(f.BeforeID),
+		Limit:          int32(limit),
 	})
 	if err != nil {
 		return nil, err
@@ -427,6 +441,19 @@ func (s *Service) List(ctx context.Context, userID int64, f ListFilter) ([]Sched
 		}
 	}
 	return out, nil
+}
+
+// likePattern renders the SQL LIKE needle for the schedule-name search —
+// the same escaping rule catalog's repo uses (三次复审 §27): `%`, `_` and
+// `\` are compared as LITERAL characters (MySQL LIKE treats backslash as
+// the default escape), and an empty search degrades to a match-anything
+// needle gated off by the narg probe in the SQL.
+func likePattern(search string) string {
+	if search == "" {
+		return "%"
+	}
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(search)
+	return "%" + escaped + "%"
 }
 
 // ListOccurrences returns one keyset page of history for one schedule.

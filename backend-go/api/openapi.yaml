@@ -792,6 +792,14 @@ paths:
         - name: status
           in: query
           schema: { type: string, enum: [all, running, paused, failed], default: all }
+        - name: q
+          in: query
+          schema: { type: string, maxLength: 200 }
+          description: >
+            Server-side substring search on the schedule name. The needle is
+            escaped (`%`, `_`, `\` compared literally) and the comparison is
+            collated utf8mb4_unicode_ci, so it stays case-insensitive for
+            ASCII like the client-side filter it replaced.
         - name: before_id
           in: query
           schema: { type: integer }

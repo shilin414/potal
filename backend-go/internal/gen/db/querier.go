@@ -778,6 +778,12 @@ type Querier interface {
 	ListRunsByConversation(ctx context.Context, conversationID sql.NullInt64) ([]Run, error)
 	// status: all | running | paused | failed (UI filters). Soft-deleted
 	// schedules (deleted_at) never appear.
+	// ⚠️ The COLLATE on the search is LOAD-BEARING (三次复审 §27, same as
+	// catalog.sql): `schedules` is `DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin`,
+	// so a bare `s.name LIKE ?` compares BYTE-wise and "sales" never matches
+	// "Sales" — the client-side filter this replaces (JS toLowerCase) was
+	// case-insensitive. The Go side feeds `search_name_like` pre-escaped
+	// (`%`, `_`, `\` literal), like catalog's likePattern.
 	ListSchedulesByOwner(ctx context.Context, arg ListSchedulesByOwnerParams) ([]Schedule, error)
 	// Occurrences stuck in pending longer than the grace period: their
 	// creating scheduler died between INSERT and the run-creating commit.

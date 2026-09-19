@@ -139,6 +139,11 @@ func (s *Server) ListSchedules(w http.ResponseWriter, r *http.Request, params ge
 		status = string(*params.Status)
 	}
 	f := schedule.ListFilter{Status: status, Limit: 50}
+	// Server-side name search (三次复审 §23–§27): the needle reaches the
+	// whole table through the keyset query, so a task on page 2+ is findable.
+	if params.Q != nil {
+		f.Query = *params.Q
+	}
 	if params.BeforeId != nil {
 		f.BeforeID = int64(*params.BeforeId)
 	}

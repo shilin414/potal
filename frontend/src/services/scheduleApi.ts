@@ -14,9 +14,12 @@ export async function fetchSchedules(
   status: ScheduleStatusFilter = 'all',
   beforeId?: number,
   limit = 50,
+  q?: string,
 ): Promise<Schedule[]> {
   const params: Record<string, number | string> = { limit, status };
   if (beforeId) params.before_id = beforeId;
+  const needle = q?.trim();
+  if (needle) params.q = needle;
   return api.get<Schedule[]>('/v2/schedules', params);
 }
 

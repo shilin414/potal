@@ -1,9 +1,10 @@
 /**
- * useSchedules — keyset 分页回归（三次复审 P1 §17–§22）。
+ * useSchedules — keyset 分页 + 服务端搜索回归（三次复审 P1 §17–§28）。
  *
  * 后端 /v2/schedules 回裸数组（没有 next_cursor），hasMore 由 51 probe /
  * 50 display 推导：请求 51 条 → 展示 50、hasMore；≤50 条 → 全展示、到底。
- * loadMore 以已展示最后一行 id 作 before_id；筛选变化重置回第一页。
+ * loadMore 以已展示最后一行 id 作 before_id；筛选/搜索变化重置回第一页。
+ * 搜索 q 直发后端（300ms 防抖），覆盖全部任务而不是已加载页。
  * renderHook-style coverage via createRoot/act（本项目无 testing-library）。
  * @vitest-environment jsdom
  */
@@ -45,7 +46,7 @@ const schedule = (id: number, name = `任务${id}`): Schedule => ({
   created_at: '', updated_at: '', deliveries: [],
 });
 
-/** ids 1..n，DESC 顺序模拟后端 ORDER BY id DESC。 */
+/** ids DESC：count 条、最大 id = maxId（模拟 ORDER BY id DESC）。 */
 const page = (count: number, maxId: number) => (
   Array.from({ length: count }, (_, i) => schedule(maxId - i)));
 
@@ -57,22 +58,18 @@ const flush = async (ms = 0) => {
 
 interface Probe { current: UseSchedulesResult | null }
 
-function mountProbe(latest: Probe) {
-  const host = document.createElement('div');
-  document.body.appendChild(host);
-  const root = createRoot(host);
-  function ProbeComponent() {
-    latest.current = useSchedules();
-    return null;
-  }
-  return { host, root, element: React.createElement(ProbeComponent) };
-}
-
 let host: HTMLElement;
 let root: Root;
+let latest: Probe;
+
+function ProbeComponent() {
+  latest.current = useSchedules();
+  return null;
+}
 
 beforeEach(() => {
   mockFetch.mockReset();
+  latest = { current: null };
   host = document.createElement('div');
   document.body.appendChild(host);
   root = createRoot(host);
@@ -86,11 +83,10 @@ afterEach(async () => {
 describe('useSchedules — 51 probe / 50 display 分页', () => {
   it('requests 51, shows only 50 and flags hasMore when a 51st exists', async () => {
     mockFetch.mockResolvedValue(page(51, 51));
-    const latest: Probe = { current: null };
-    await act(async () => { root.render(mountProbe(latest).element); });
+    await act(async () => { root.render(<ProbeComponent />); });
     await flush(10);
 
-    expect(mockFetch).toHaveBeenCalledWith('all', undefined, 51);
+    expect(mockFetch).toHaveBeenCalledWith('all', undefined, 51, '');
     expect(latest.current!.data).toHaveLength(50);
     expect(latest.current!.data[0]!.id).toBe(51);
     expect(latest.current!.hasMore).toBe(true);
@@ -98,8 +94,7 @@ describe('useSchedules — 51 probe / 50 display 分页', () => {
 
   it('a short page (≤50) is shown whole with hasMore = false', async () => {
     mockFetch.mockResolvedValue(page(7, 7));
-    const latest: Probe = { current: null };
-    await act(async () => { root.render(mountProbe(latest).element); });
+    await act(async () => { root.render(<ProbeComponent />); });
     await flush(10);
 
     expect(latest.current!.data).toHaveLength(7);
@@ -110,8 +105,7 @@ describe('useSchedules — 51 probe / 50 display 分页', () => {
     mockFetch
       .mockResolvedValueOnce(page(51, 100))   // ids 100..50 → 显示 100..51
       .mockResolvedValueOnce(page(3, 50));    // 尾页 ids 50..48
-    const latest: Probe = { current: null };
-    await act(async () => { root.render(mountProbe(latest).element); });
+    await act(async () => { root.render(<ProbeComponent />); });
     await flush(10);
     expect(latest.current!.data).toHaveLength(50);
 
@@ -119,7 +113,7 @@ describe('useSchedules — 51 probe / 50 display 分页', () => {
     await flush(10);
 
     // 第二页以第一页最后一行（id 51）为 cursor。
-    expect(mockFetch).toHaveBeenLastCalledWith('all', 51, 51);
+    expect(mockFetch).toHaveBeenLastCalledWith('all', 51, 51, '');
     expect(latest.current!.data).toHaveLength(53);
     expect(latest.current!.data.map((s) => s.id)).toEqual([
       ...Array.from({ length: 50 }, (_, i) => 100 - i),
@@ -132,8 +126,7 @@ describe('useSchedules — 51 probe / 50 display 分页', () => {
     mockFetch
       .mockResolvedValueOnce(page(51, 60))
       .mockResolvedValueOnce(page(2, 5));
-    const latest: Probe = { current: null };
-    await act(async () => { root.render(mountProbe(latest).element); });
+    await act(async () => { root.render(<ProbeComponent />); });
     await flush(10);
     expect(latest.current!.hasMore).toBe(true);
 
@@ -142,7 +135,7 @@ describe('useSchedules — 51 probe / 50 display 分页', () => {
     });
     await flush(10);
 
-    expect(mockFetch).toHaveBeenLastCalledWith('running', undefined, 51);
+    expect(mockFetch).toHaveBeenLastCalledWith('running', undefined, 51, '');
     expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
     expect(latest.current!.hasMore).toBe(false);
   });
@@ -151,14 +144,13 @@ describe('useSchedules — 51 probe / 50 display 分页', () => {
     mockFetch
       .mockResolvedValueOnce(page(51, 60))
       .mockResolvedValueOnce(page(51, 61));
-    const latest: Probe = { current: null };
-    await act(async () => { root.render(mountProbe(latest).element); });
+    await act(async () => { root.render(<ProbeComponent />); });
     await flush(10);
 
     await act(async () => { await latest.current!.reload(); });
     await flush(10);
 
-    expect(mockFetch).toHaveBeenLastCalledWith('all', undefined, 51);
+    expect(mockFetch).toHaveBeenLastCalledWith('all', undefined, 51, '');
     expect(latest.current!.data).toHaveLength(50);
     expect(latest.current!.data[0]!.id).toBe(61);
   });
@@ -168,8 +160,7 @@ describe('useSchedules — 51 probe / 50 display 分页', () => {
       .mockResolvedValueOnce(page(51, 60))
       .mockRejectedValueOnce(new Error('网络中断'))
       .mockResolvedValueOnce(page(1, 10));
-    const latest: Probe = { current: null };
-    await act(async () => { root.render(mountProbe(latest).element); });
+    await act(async () => { root.render(<ProbeComponent />); });
     await flush(10);
 
     await act(async () => { await latest.current!.loadMore(); });
@@ -182,5 +173,48 @@ describe('useSchedules — 51 probe / 50 display 分页', () => {
     await flush(10);
     expect(latest.current!.data).toHaveLength(51);
     expect(latest.current!.error).toBeNull();
+  });
+});
+
+describe('useSchedules — 服务端搜索（三次复审 §23–§28）', () => {
+  it('the needle goes to the SERVER (q) after the debounce and resets to page one', async () => {
+    mockFetch
+      .mockResolvedValueOnce(page(51, 60))                          // 初始页
+      .mockResolvedValueOnce([schedule(75, '月度库存分析')]);      // 搜索命中第 2 页任务
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      latest.current!.setSearch('库存');
+    });
+    // 防抖窗口内没有新请求。
+    await flush(100);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    await flush(250); // 300ms 防抖到期
+    expect(mockFetch).toHaveBeenLastCalledWith('all', undefined, 51, '库存');
+    expect(latest.current!.data.map((s) => s.name)).toEqual(['月度库存分析']);
+    // 搜索 = 新结果集：重置回第一页（无 before_id）。
+    expect(latest.current!.hasMore).toBe(false);
+  });
+
+  it('loadMore carries the active search needle', async () => {
+    mockFetch
+      .mockResolvedValueOnce(page(51, 100))
+      .mockResolvedValueOnce(page(51, 50));
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+
+    await act(async () => {
+      latest.current!.setSearch('日报');
+    });
+    await flush(350);
+    expect(mockFetch).toHaveBeenLastCalledWith('all', undefined, 51, '日报');
+
+    await act(async () => { await latest.current!.loadMore(); });
+    await flush(10);
+    // 搜索命中页展示 ids 50..1 → cursor 是最后一行 id=1，且带同一搜索词。
+    expect(mockFetch).toHaveBeenLastCalledWith('all', 1, 51, '日报');
   });
 });
