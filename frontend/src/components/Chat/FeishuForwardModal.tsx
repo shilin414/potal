@@ -176,8 +176,13 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
         antdMessage.error(
           `${result.success_count} 个成功，${result.fail_count} 个失败${firstError ? `：${firstError}` : ''}`,
         );
-        if (result.fail_count > 0 && result.success_count === 0
-          && firstError?.includes('重新授权')) {
+        // 重新授权看「是否存在授权失败」而不是「是否全部失败」（八次复审
+        // P2）：1 成功 + 1 授权失败的混合结果同样要给重新授权入口 —— 旧
+        // 条件 success_count === 0 让用户只能对着注定失败的目标反复重试。
+        const authFailure = result.results.find(
+          (r) => !r.ok && r.error?.includes('重新授权'),
+        );
+        if (authFailure) {
           setNeedReauth(true);
         }
         // Keep the modal open so the sender can retry failed targets
