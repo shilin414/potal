@@ -1669,9 +1669,11 @@ paths:
           in: query
           schema: { type: string }
           description: |
-            Name search. For user targets the query is sent to the Feishu
-            user search; for chat targets the query filters the caller's
-            chat list (applied server-side after the full list is read).
+            Name search. REQUIRED for type=user (the Feishu search/v1/user
+            endpoint marks query as required — an empty query is rejected
+            with 400 instead of being forwarded upstream). For chat targets
+            the query filters the caller's chat list (applied server-side
+            after the full list is read) and is optional.
         - name: cursor
           in: query
           schema: { type: string }
@@ -1682,7 +1684,9 @@ paths:
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
-          description: Page size for type=user (provider range 1-200, default 50).
+          description: Page size for type=user (provider range 1-200, default
+            50). Out-of-range values are rejected with 400 — they are not
+            silently clamped.
       responses:
         "200":
           description: One page of targets plus the continuation cursor
@@ -1690,7 +1694,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/FeishuForwardTargetPage" }
         "400":
-          description: caller has no bound Feishu identity / bad type
+          description: |
+            caller has no bound Feishu identity / bad type / empty query
+            with type=user / limit outside 1-200
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
@@ -1699,6 +1705,21 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
+        "403":
+          description: Feishu authorization lacks required scopes
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "500":
+          description: forwarding integration unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
+        "502":
+          description: Feishu upstream failure
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
 
   /api/v2/feishu/forward:
     post:
@@ -2164,7 +2185,7 @@ components:
 
     FeishuForwardTargetPage:
       type: object
-      required: [items, has_more]
+      required: [items, next_cursor, has_more]
       properties:
         items:
           type: array
