@@ -1,6 +1,6 @@
 /**
  * FeishuForwardModal — 分页失败 UX / 20 目标上限 / 部分失败保留（七次复审
- * P1-2 / P2-8 / P2-9）。
+ * P1-2 / P2-8 / P2-9）+ 发送会话守卫（八次复审 P1）。
  *
  *   · page2 拉挂：已加载的 50 人仍然渲染，底部出现「重试加载」（调
  *     loadMore 从断点续拉），不出现整屏「搜索联系人失败」错误态；
@@ -8,7 +8,10 @@
  *     仍为 20）—— 与 Backend feishuForwardMaxTargets、OpenAPI maxItems
  *     形成三层一致契约，不再等点「发送（21）」才吃后端 400；
  *   · 部分发送失败：成功的自动取消选择、失败的保持选中，用户可直接再
- *     点发送重试失败目标（旧实现 setSelected([]) 全清，得从头挑）。
+ *     点发送重试失败目标（旧实现 setSelected([]) 全清，得从头挑）；
+ *   · 发送会话 ABA（八次复审 P1）：close → reopen 后旧会话的迟到响应
+ *     （成功 / 部分失败 / 授权失败）不得关闭新弹窗、污染新选中、误入重
+ *     新授权视图；新会话不继承旧 sending；同会话双击只发一次请求。
  * @vitest-environment jsdom
  */
 import React from 'react';
@@ -32,7 +35,11 @@ vi.mock('@/services/shareApi', async (importOriginal) => ({
 }));
 
 import FeishuForwardModal from '../FeishuForwardModal';
-import type { FeishuForwardTarget, FeishuForwardTargetPage } from '@/services/shareApi';
+import type {
+  FeishuForwardResult,
+  FeishuForwardTarget,
+  FeishuForwardTargetPage,
+} from '@/services/shareApi';
 
 // ── jsdom 环境补齐（antd 依赖） ────────────────────────────────────
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -92,14 +99,57 @@ let host: HTMLElement;
 let root: Root;
 let closed = false;
 
-async function mountModal() {
-  closed = false;
+/** 可控的挂起 Promise —— 模拟「发送在途」的窗口。 */
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+/** 用指定 props 渲染（ABA 用例需要切换 open / shareToken 模拟会话切换）。 */
+async function renderModal(props: { open: boolean; shareToken: string | null }) {
   await act(async () => {
     root.render(
-      <FeishuForwardModal open shareToken="share-tok" onClose={() => { closed = true; }} />,
+      <FeishuForwardModal
+        open={props.open}
+        shareToken={props.shareToken}
+        onClose={() => { closed = true; }}
+      />,
     );
   });
   await flush(10);
+}
+
+async function mountModal() {
+  closed = false;
+  await renderModal({ open: true, shareToken: 'share-tok' });
+}
+
+/**
+ * ABA 共用前置（八次复审 §14）：打开 A → 选中目标 → 点发送（挂起）→
+ * 取消关闭 A → 打开 B 并选中 B 的目标。返回 A 的 deferred send，供用例
+ * 在 B 会话进行中放行 A 的迟到响应。
+ */
+async function sendPendingThenReopen() {
+  const sendA = deferred<FeishuForwardResult>();
+  mocks.fetchFeishuTargets.mockResolvedValue(page([target('oc-A1', 'A群', 'chat')]));
+  await renderModal({ open: true, shareToken: 'share-A' });
+  await click(document.querySelector<HTMLButtonElement>('.ffm-row')!);
+  mocks.forwardShareToFeishu.mockReturnValueOnce(sendA.promise);
+  await click(findButton('发送（1）')!);
+
+  // 关闭 A（发送仍在途 —— 取消按钮不禁用）。
+  await click(findButton('取消')!);
+  expect(closed).toBe(true);
+  await renderModal({ open: false, shareToken: 'share-A' });
+
+  // 打开 B（新会话：新 shareToken），选中 B 的目标。
+  closed = false;
+  mocks.fetchFeishuTargets.mockResolvedValue(page([target('oc-B1', 'B群', 'chat')]));
+  await renderModal({ open: true, shareToken: 'share-B' });
+  await click(document.querySelector<HTMLButtonElement>('.ffm-row')!);
+  expect(findButton('发送（1）')).toBeTruthy();
+  return sendA;
 }
 
 /** 切到「联系人」tab 并输入搜索词，等服务端搜索第一页落地。 */
@@ -295,5 +345,112 @@ describe('FeishuForwardModal — 部分失败保留失败目标（七次复审 P
     // 选中的是失败的那个（成功群不在选中态，失败群在）。
     expect(rows[0].className).not.toContain('ffm-row--on');
     expect(rows[1].className).toContain('ffm-row--on');
+  });
+});
+
+describe('FeishuForwardModal — 发送会话 ABA（八次复审 P1）', () => {
+  it('a stale success from session A must not close the freshly opened session B', async () => {
+    const sendA = await sendPendingThenReopen();
+
+    // A 的发送此时才返回成功（B 已经打开并选中了自己的目标）。
+    await act(async () => {
+      sendA.resolve({
+        results: [{ target_id: 'oc-A1', ok: true }],
+        success_count: 1,
+        fail_count: 0,
+      });
+    });
+    await flush(10);
+
+    // B 弹窗保持打开、B 的选中不受影响 —— 旧实现会 message.success +
+    // close() 把刚打开的 B 直接关掉。
+    expect(closed).toBe(false);
+    expect(findButton('发送（1）')).toBeTruthy();
+    expect(document.querySelector('.ffm-row')!.className).toContain('ffm-row--on');
+  });
+
+  it('a stale partial failure from session A must not mutate session B selection', async () => {
+    const sendA = await sendPendingThenReopen();
+
+    await act(async () => {
+      sendA.resolve({
+        results: [{ target_id: 'oc-A1', ok: false, error: '发送失败' }],
+        success_count: 0,
+        fail_count: 1,
+      });
+    });
+    await flush(10);
+
+    // B 的选中保持原样 —— 旧实现 setSelected(A 的失败目标) 会把 B 的选中
+    // 覆盖成 A 的 [A群]，B 的行当场失去选中态。
+    expect(closed).toBe(false);
+    expect(document.querySelector('.ffm-row')!.className).toContain('ffm-row--on');
+    expect(findButton('发送（1）')).toBeTruthy();
+  });
+
+  it('a stale authorization failure from session A must not force session B into re-auth', async () => {
+    const sendA = await sendPendingThenReopen();
+
+    await act(async () => {
+      sendA.resolve({
+        results: [{ target_id: 'oc-A1', ok: false, error: '飞书权限不足，需要重新授权' }],
+        success_count: 0,
+        fail_count: 1,
+      });
+    });
+    await flush(10);
+
+    // B 不进入重新授权视图 —— 旧实现 setNeedReauth(true) 会让 B 的整个
+    // picker 被替换成重新授权引导。
+    expect(document.querySelector('.ffm-reauth')).toBeNull();
+    expect(document.body.textContent).not.toContain('重新授权飞书');
+    expect(findButton('发送（1）')).toBeTruthy();
+  });
+
+  it('session B must not inherit sending=true from a still-pending session A send', async () => {
+    const sendA = await sendPendingThenReopen();
+
+    // B 的发送按钮不在「发送中…」态，可以立即发送（旧实现 B 继承
+    // sending=true，按钮一直 disabled 到 A 请求结束）。
+    expect(findButton('发送（1）')).toBeTruthy();
+    expect(findButton('发送中…')).toBeUndefined();
+
+    const sendB = deferred<FeishuForwardResult>();
+    mocks.forwardShareToFeishu.mockReturnValueOnce(sendB.promise);
+    await click(findButton('发送（1）')!);
+    expect(mocks.forwardShareToFeishu).toHaveBeenCalledTimes(2);
+
+    // 收尾：两个会话的请求都放行，不留挂起的 microtask。
+    await act(async () => {
+      sendA.resolve({ results: [{ target_id: 'oc-A1', ok: true }], success_count: 1, fail_count: 0 });
+      sendB.resolve({ results: [{ target_id: 'oc-B1', ok: true }], success_count: 1, fail_count: 0 });
+    });
+    await flush(10);
+  });
+
+  it('double-clicking send in the same session fires only one API request', async () => {
+    mocks.fetchFeishuTargets.mockResolvedValue(page([target('oc-1', '群1', 'chat')]));
+    await mountModal();
+    await click(document.querySelector<HTMLButtonElement>('.ffm-row')!);
+
+    const send = deferred<FeishuForwardResult>();
+    mocks.forwardShareToFeishu.mockReturnValue(send.promise);
+    const sendBtn = findButton('发送（1）')!;
+    // 同一帧内连点两次 —— single-flight 拒绝第二次触发，只发一次请求。
+    await act(async () => {
+      sendBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      sendBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      sendBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      sendBtn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      sendBtn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      sendBtn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    await flush(10);
+    expect(mocks.forwardShareToFeishu).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      send.resolve({ results: [{ target_id: 'oc-1', ok: true }], success_count: 1, fail_count: 0 });
+    });
+    await flush(10);
   });
 });
