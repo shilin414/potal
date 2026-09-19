@@ -44,7 +44,7 @@ function ScheduleCardSkeleton() {
 
 export function MobileScheduleCenter() {
   const {
-    data, loading, loadingMore, error, hasMore, loadMore,
+    data, loading, loadingMore, error, errorPhase, hasMore, loadMore,
     status, search, mutatingId,
     setStatus, setSearch, reload, toggleEnabled, runNow, remove,
   } = useSchedules();
@@ -52,6 +52,13 @@ export function MobileScheduleCenter() {
   const [editing, setEditing] = useState<Schedule | null>(null);
   const [detailId, setDetailId] = useState<number | null>(null);
   const [sheetFor, setSheetFor] = useState<Schedule | null>(null);
+
+  // 错误分类（三次复审 §30–§31）：fatal = 第一页失败且无数据；
+  // partial = 已有数据时刷新失败 → 警告 + 旧数据继续展示；loadMore 失败
+  // → 底部唯一 CTA 变重试。已有任务绝不能因为一次刷新失败从 UI 消失。
+  const fatalError = Boolean(error) && data.length === 0;
+  const partialError = Boolean(error) && data.length > 0
+    && errorPhase !== 'loadMore';
 
   // 顶栏 ＝ 新建定时任务（§24）：直接打开编辑器，不再 navigate('/')。
   const openNew = useCallback(() => {
@@ -124,7 +131,7 @@ export function MobileScheduleCenter() {
         />
       </div>
 
-      {error && (
+      {fatalError && (
         <Alert
           type="error"
           showIcon
@@ -135,75 +142,97 @@ export function MobileScheduleCenter() {
         />
       )}
 
-      {!error && (loading && data.length === 0 ? (
-        <div className="mobile-schedule-list">
-          <ScheduleCardSkeleton />
-          <ScheduleCardSkeleton />
-          <ScheduleCardSkeleton />
-        </div>
-      ) : data.length === 0 ? (
-        status === 'all' && !search ? (
-          <MobileEmptyState
-            title="还没有定时任务"
-            hint="创建一个任务，让智能体自动完成重复工作"
-            action={(
-              <Button type="primary" onClick={openNew}>
-                创建定时任务
-              </Button>
-            )}
-          />
-        ) : (
-          <MobileEmptyState title="没有匹配当前条件的任务" />
-        )
-      ) : (
-        <div className="mobile-schedule-list">
-          {data.map((s) => (
-            <div key={s.id} className="mobile-schedule-card">
-              {/* Wrapper / Main / ••• — 全部原生 button，浏览器接管焦点树与
-                  Enter/Space 激活（二次复审 P2-2，不再用 role=button 容器）。 */}
-              <button
-                type="button"
-                className="mobile-schedule-card__main"
-                aria-label={`查看任务详情：${s.name}`}
-                onClick={() => setDetailId(s.id)}
-              >
-                <div className="mobile-schedule-card__row">
-                  <span className="mobile-schedule-card__name">{s.name}</span>
-                  <ScheduleStatusTag schedule={s} compact />
-                </div>
-                <div className="mobile-schedule-card__meta">
-                  <span>{describeSchedulePlan(s)}</span>
-                  <span>
-                    下次执行：
-                    <time dateTime={s.next_run_at ?? undefined}>
-                      {formatDateTime(s.next_run_at)}
-                    </time>
-                  </span>
-                </div>
-              </button>
-              <button
-                type="button"
-                className="mobile-schedule-card__more"
-                aria-label={`更多操作：${s.name}`}
-                onClick={() => setSheetFor(s)}
-              >
-                •••
-              </button>
-            </div>
-          ))}
-          {/* >50 条任务继续可见（三次复审 P1）：Desktop/Mobile 共用
-              useSchedules 的 keyset 分页。 */}
-          {hasMore && (
-            <button
-              type="button"
-              className="mobile-console-more"
-              onClick={() => void loadMore()}
-            >
-              {loadingMore ? '加载中…' : '加载更多'}
-            </button>
+      {!fatalError && (
+        <>
+          {/* partial：刷新失败，旧数据保留 + 警告（三次复审 §31）。 */}
+          {partialError && (
+            <Alert
+              type="warning"
+              showIcon
+              message="刷新失败，当前显示的是上次已加载数据"
+              description={error}
+              action={<Button size="small" onClick={() => void reload()}>重试</Button>}
+              style={{ marginTop: 12 }}
+            />
           )}
-        </div>
-      ))}
+          {loading && data.length === 0 ? (
+            <div className="mobile-schedule-list">
+              <ScheduleCardSkeleton />
+              <ScheduleCardSkeleton />
+              <ScheduleCardSkeleton />
+            </div>
+          ) : data.length === 0 ? (
+            status === 'all' && !search ? (
+              <MobileEmptyState
+                title="还没有定时任务"
+                hint="创建一个任务，让智能体自动完成重复工作"
+                action={(
+                  <Button type="primary" onClick={openNew}>
+                    创建定时任务
+                  </Button>
+                )}
+              />
+            ) : (
+              <MobileEmptyState title="没有匹配当前条件的任务" />
+            )
+          ) : (
+            <div className="mobile-schedule-list">
+              {data.map((s) => (
+                <div key={s.id} className="mobile-schedule-card">
+                  {/* Wrapper / Main / ••• — 全部原生 button，浏览器接管焦点树与
+                      Enter/Space 激活（二次复审 P2-2，不再用 role=button 容器）。 */}
+                  <button
+                    type="button"
+                    className="mobile-schedule-card__main"
+                    aria-label={`查看任务详情：${s.name}`}
+                    onClick={() => setDetailId(s.id)}
+                  >
+                    <div className="mobile-schedule-card__row">
+                      <span className="mobile-schedule-card__name">{s.name}</span>
+                      <ScheduleStatusTag schedule={s} compact />
+                    </div>
+                    <div className="mobile-schedule-card__meta">
+                      <span>{describeSchedulePlan(s)}</span>
+                      <span>
+                        下次执行：
+                        <time dateTime={s.next_run_at ?? undefined}>
+                          {formatDateTime(s.next_run_at)}
+                        </time>
+                      </span>
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    className="mobile-schedule-card__more"
+                    aria-label={`更多操作：${s.name}`}
+                    onClick={() => setSheetFor(s)}
+                  >
+                    •••
+                  </button>
+                </div>
+              ))}
+              {/* 唯一 CTA（三次复审 §32）：翻页失败 → 重试；否则加载更多。 */}
+              {errorPhase === 'loadMore' ? (
+                <button
+                  type="button"
+                  className="mobile-console-more"
+                  onClick={() => void loadMore()}
+                >
+                  {loadingMore ? '加载中…' : '加载失败，点击重试'}
+                </button>
+              ) : hasMore && (
+                <button
+                  type="button"
+                  className="mobile-console-more"
+                  onClick={() => void loadMore()}
+                >
+                  {loadingMore ? '加载中…' : '加载更多'}
+                </button>
+              )}
+            </div>
+          )}
+        </>
+      )}
 
       <MobileActionSheet
         open={sheetFor !== null}

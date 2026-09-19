@@ -26,8 +26,20 @@ vi.mock('antd', () => {
       ? <aside data-testid="modal">{children}</aside> : null);
   (ModalMock as unknown as { confirm: unknown }).confirm = mocks.modalConfirm;
   return {
-    Alert: ({ message, children }: { message?: React.ReactNode; children?: React.ReactNode }) => (
-      <div role="alert">{message}{children}</div>
+    Alert: ({
+      message, description, action, children,
+    }: {
+      message?: React.ReactNode;
+      description?: React.ReactNode;
+      action?: React.ReactNode;
+      children?: React.ReactNode;
+    }) => (
+      <div role="alert">
+        {message}
+        {description}
+        {action}
+        {children}
+      </div>
     ),
     Button: ({ children, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
       <button type="button" {...props}>{children}</button>
@@ -134,6 +146,12 @@ async function mountCenter() {
   });
 }
 
+const flush = async (ms = 0) => {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  });
+};
+
 function click(el: Element) {
   return act(async () => {
     el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
@@ -226,5 +244,41 @@ describe('MobileScheduleCenter (§25/§27/§79)', () => {
     await click(document.querySelector('[aria-label="更多操作：每日销售日报"]')!);
     await click(actionRow('暂停')!);
     expect(mocks.disableSchedule).toHaveBeenCalledWith(1);
+  });
+});
+
+describe('MobileScheduleCenter — 错误语义（三次复审 §30–§32）', () => {
+  it('a reload failure KEEPS the already-loaded cards and shows a warning', async () => {
+    mocks.fetchSchedules
+      .mockResolvedValueOnce(SCHEDULES)
+      .mockRejectedValueOnce(new Error('刷新失败'));
+    await mountCenter();
+    await flush(20);
+
+    // Two real cards loaded…
+    expect(document.querySelectorAll('.mobile-schedule-card')).toHaveLength(2);
+
+    // …the next load (status switch here — same reload path) fails…
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-value="running"]')!.click();
+    });
+    await flush(20);
+
+    // …已加载的两张卡仍在（数据没有消失），partial 警告可见。
+    expect(document.querySelectorAll('.mobile-schedule-card')).toHaveLength(2);
+    expect(document.body.textContent).toContain('刷新失败');
+    expect(document.body.textContent)
+      .toContain('当前显示的是上次已加载数据');
+  });
+
+  it('a first-page failure with no data is a fatal error state, not an empty list', async () => {
+    mocks.fetchSchedules.mockRejectedValue(new Error('网络错误'));
+    await mountCenter();
+    await flush(20);
+
+    expect(document.body.textContent).toContain('加载定时任务失败');
+    expect(document.body.textContent).not.toContain('还没有定时任务');
+    // 没有任何卡片被渲染。
+    expect(document.querySelectorAll('.mobile-schedule-card')).toHaveLength(0);
   });
 });

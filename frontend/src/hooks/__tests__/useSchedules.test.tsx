@@ -168,11 +168,59 @@ describe('useSchedules — 51 probe / 50 display 分页', () => {
     // 已有 50 行仍在，错误可见，重试（再点 loadMore）可恢复。
     expect(latest.current!.data).toHaveLength(50);
     expect(latest.current!.error).toBe('网络中断');
+    expect(latest.current!.errorPhase).toBe('loadMore');
 
     await act(async () => { await latest.current!.loadMore(); });
     await flush(10);
     expect(latest.current!.data).toHaveLength(51);
     expect(latest.current!.error).toBeNull();
+    expect(latest.current!.errorPhase).toBeNull();
+  });
+});
+
+describe('useSchedules — 失败保留旧数据（三次复审 §30–§32）', () => {
+  it('a reload failure keeps the loaded data and reports errorPhase = refresh', async () => {
+    mockFetch
+      .mockResolvedValueOnce(page(10, 30))
+      .mockRejectedValueOnce(new Error('刷新失败'));
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    expect(latest.current!.data).toHaveLength(10);
+
+    await act(async () => { await latest.current!.reload(); });
+    await flush(10);
+
+    // 已加载的 10 条真实数据仍在，错误是 refresh 相位。
+    expect(latest.current!.data).toHaveLength(10);
+    expect(latest.current!.error).toBe('刷新失败');
+    expect(latest.current!.errorPhase).toBe('refresh');
+    // 首页失败清 cursor：重试回第一页而不是继续旧 cursor。
+    expect(latest.current!.hasMore).toBe(false);
+  });
+
+  it('a first-load failure with no data reports errorPhase = initial', async () => {
+    mockFetch.mockRejectedValue(new Error('冷启动失败'));
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+
+    expect(latest.current!.data).toHaveLength(0);
+    expect(latest.current!.error).toBe('冷启动失败');
+    expect(latest.current!.errorPhase).toBe('initial');
+  });
+
+  it('a failed SEARCH keeps the previous rows (data does not vanish)', async () => {
+    mockFetch
+      .mockResolvedValueOnce(page(10, 30))
+      .mockRejectedValueOnce(new Error('搜索失败'));
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+
+    await act(async () => { latest.current!.setSearch('库存'); });
+    await flush(350); // 300ms 防抖到期 + 请求失败
+
+    expect(latest.current!.data).toHaveLength(10);
+    expect(latest.current!.error).toBe('搜索失败');
+    expect(latest.current!.errorPhase).toBe('initial');
   });
 });
 

@@ -35,6 +35,14 @@ const splitPage = (items: Schedule[]) => {
   return { page: more ? items.slice(0, SCHEDULES_PAGE_SIZE) : items, more };
 };
 
+/**
+ * 失败发生在哪一阶段（三次复审 §30–§32）：
+ *   initial  — 挂载/筛选变化后的第一页，且还没有任何数据 → fatal；
+ *   refresh  — 显式刷新/搜索失败，但已有数据 → partial（旧数据保留）；
+ *   loadMore — 翻页失败 → 底部 CTA 变重试，已加载行保留。
+ */
+export type SchedulesErrorPhase = 'initial' | 'refresh' | 'loadMore';
+
 export interface UseSchedulesResult {
   data: Schedule[];
 
@@ -42,6 +50,7 @@ export interface UseSchedulesResult {
   loadingMore: boolean;
 
   error: string | null;
+  errorPhase: SchedulesErrorPhase | null;
   hasMore: boolean;
 
   loadMore(): Promise<void>;
@@ -62,6 +71,7 @@ export function useSchedules(): UseSchedulesResult {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [errorPhase, setErrorPhase] = useState<SchedulesErrorPhase | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [status, setStatus] = useState<ScheduleStatusFilter>('all');
   const [search, setSearch] = useState('');
@@ -76,10 +86,15 @@ export function useSchedules(): UseSchedulesResult {
     return () => clearTimeout(timer);
   }, [search, debouncedSearch]);
 
-  const load = useCallback(async (filter: ScheduleStatusFilter, q: string) => {
+  const load = useCallback(async (
+    filter: ScheduleStatusFilter,
+    q: string,
+    phase: SchedulesErrorPhase,
+  ) => {
     const seq = ++seqRef.current;
     setLoading(true);
     setError(null);
+    setErrorPhase(null);
     try {
       const items = await fetchSchedules(
         filter, undefined, SCHEDULES_PAGE_SIZE + 1, q);
@@ -90,7 +105,13 @@ export function useSchedules(): UseSchedulesResult {
       }
     } catch (e) {
       if (seq === seqRef.current) {
+        // 失败保留旧数据（三次复审 §30）：加载过 50 条真实任务的列表
+        // 不能因为一次刷新失败整体消失。
         setError(e instanceof Error ? e.message : '加载定时任务失败');
+        setErrorPhase(phase);
+        // 首页失败清掉 cursor（重试必须回到第一页，而不是带着旧
+        // cursor 跳过新首页）——与 useDirectoryUsers 同一规则。
+        setHasMore(false);
       }
     } finally {
       if (seq === seqRef.current) {
@@ -101,11 +122,11 @@ export function useSchedules(): UseSchedulesResult {
 
   // status / debouncedSearch 任一变化 = 新结果集：清 cursor，回第一页。
   useEffect(() => {
-    void load(status, debouncedSearch);
+    void load(status, debouncedSearch, 'initial');
   }, [load, status, debouncedSearch]);
 
   const reload = useCallback(async () => {
-    await load(status, debouncedSearch);
+    await load(status, debouncedSearch, 'refresh');
   }, [load, status, debouncedSearch]);
 
   const loadMore = useCallback(async () => {
@@ -124,11 +145,13 @@ export function useSchedules(): UseSchedulesResult {
         setHasMore(more);
         // 重试成功清掉「加载更多失败」（与 useDirectoryUsers 同一规则）。
         setError(null);
+        setErrorPhase(null);
       }
     } catch (e) {
       if (seq === seqRef.current) {
         // 已加载行保留；下一次点击 loadMore 即重试。
         setError(e instanceof Error ? e.message : '加载更多失败');
+        setErrorPhase('loadMore');
       }
     } finally {
       if (seq === seqRef.current) {
@@ -161,7 +184,7 @@ export function useSchedules(): UseSchedulesResult {
     try {
       await runScheduleNow(id);
       message.success('已加入执行队列');
-      await load(status, debouncedSearch);
+      await load(status, debouncedSearch, 'refresh');
       return true;
     } catch (e) {
       message.error(e instanceof Error ? e.message : '立即运行失败');
@@ -191,6 +214,7 @@ export function useSchedules(): UseSchedulesResult {
     loading,
     loadingMore,
     error,
+    errorPhase,
     hasMore,
     loadMore,
     status,

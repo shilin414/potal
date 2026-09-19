@@ -30,13 +30,20 @@ import './SchedulesPage.css';
 /** Desktop 表格 — 保留原样（开发执行报告 §54）。 */
 function DesktopScheduleCenter() {
   const {
-    data, loading, loadingMore, error, hasMore, loadMore,
+    data, loading, loadingMore, error, errorPhase, hasMore, loadMore,
     status, search, mutatingId,
     setStatus, setSearch, reload, toggleEnabled, runNow, remove,
   } = useSchedules();
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<Schedule | null>(null);
   const [detailId, setDetailId] = useState<number | null>(null);
+
+  // 错误分类（三次复审 §30–§31）：fatal = 第一页就失败且没有任何数据；
+  // partial = 已有数据时刷新失败 → 警告 + 旧数据继续展示；loadMore 失败
+  // → 底部唯一 CTA 变重试。已有任务绝不能因为一次刷新失败从 UI 消失。
+  const fatalError = Boolean(error) && data.length === 0;
+  const partialError = Boolean(error) && data.length > 0
+    && errorPhase !== 'loadMore';
 
   const openNew = () => {
     setEditing(null);
@@ -158,7 +165,7 @@ function DesktopScheduleCenter() {
         </Space>
       </div>
 
-      {error && (
+      {fatalError && (
         <Alert
           type="error"
           showIcon
@@ -169,50 +176,70 @@ function DesktopScheduleCenter() {
         />
       )}
 
-      {!error && (loading ? (
-        <div style={{ padding: '48px 0', textAlign: 'center' }} aria-busy="true">
-          <Spin size="large" />
-        </div>
-      ) : data.length === 0 ? (
-        <Empty
-          description={
-            status === 'all' && !search ? (
-              <div className="schedule-empty-extra">
-                <p style={{ fontWeight: 600 }}>还没有定时任务</p>
-                <p>创建一个任务，让智能体按固定时间自动工作</p>
-              </div>
-            ) : (
-              '没有匹配当前条件的任务'
-            )
-          }
-        >
-          {status === 'all' && !search && (
-            <Button type="primary" icon={<PlusOutlined />} onClick={openNew}>
-              新建定时任务
-            </Button>
+      {!fatalError && (
+        <>
+          {/* partial：刷新失败，旧数据保留 + 警告（三次复审 §31）。 */}
+          {partialError && (
+            <Alert
+              type="warning"
+              showIcon
+              message="刷新失败，当前显示的是上次已加载数据"
+              description={error}
+              action={<Button size="small" onClick={() => void reload()}>重试</Button>}
+              style={{ marginBottom: 16 }}
+            />
           )}
-        </Empty>
-      ) : (
-        <div className="schedules-desktop-table">
-          <Table
-            rowKey="id"
-            columns={columns}
-            dataSource={data}
-            loading={loading}
-            pagination={false}
-            scroll={{ x: 860 }}
-          />
-          {/* >50 条任务继续可见（三次复审 P1 §17–§22）：keyset 翻页，
-              Desktop 与 Mobile 共用 useSchedules 的分页语义。 */}
-          {hasMore && (
-            <div style={{ textAlign: 'center', marginTop: 16 }}>
-              <Button loading={loadingMore} onClick={() => void loadMore()}>
-                加载更多
-              </Button>
+          {loading && data.length === 0 ? (
+            <div style={{ padding: '48px 0', textAlign: 'center' }} aria-busy="true">
+              <Spin size="large" />
+            </div>
+          ) : data.length === 0 ? (
+            <Empty
+              description={
+                status === 'all' && !search ? (
+                  <div className="schedule-empty-extra">
+                    <p style={{ fontWeight: 600 }}>还没有定时任务</p>
+                    <p>创建一个任务，让智能体按固定时间自动工作</p>
+                  </div>
+                ) : (
+                  '没有匹配当前条件的任务'
+                )
+              }
+            >
+              {status === 'all' && !search && (
+                <Button type="primary" icon={<PlusOutlined />} onClick={openNew}>
+                  新建定时任务
+                </Button>
+              )}
+            </Empty>
+          ) : (
+            <div className="schedules-desktop-table">
+              <Table
+                rowKey="id"
+                columns={columns}
+                dataSource={data}
+                loading={loading}
+                pagination={false}
+                scroll={{ x: 860 }}
+              />
+              {/* 唯一 CTA（三次复审 §32）：翻页失败 → 重试；否则加载更多。 */}
+              {errorPhase === 'loadMore' ? (
+                <div style={{ textAlign: 'center', marginTop: 16 }}>
+                  <Button danger loading={loadingMore} onClick={() => void loadMore()}>
+                    加载失败，点击重试
+                  </Button>
+                </div>
+              ) : hasMore && (
+                <div style={{ textAlign: 'center', marginTop: 16 }}>
+                  <Button loading={loadingMore} onClick={() => void loadMore()}>
+                    加载更多
+                  </Button>
+                </div>
+              )}
             </div>
           )}
-        </div>
-      ))}
+        </>
+      )}
 
       <ScheduleEditorModal
         open={editorOpen}
