@@ -15,6 +15,13 @@ func TestAppBuildWiresEnterpriseACLFlagToRepoAndService(t *testing.T) {
 		t.Skip("set STUDIO_TEST_DB=1 and STUDIO_TEST_REDIS=1")
 	}
 	t.Setenv("ENTERPRISE_ACL_ENABLED", "true")
+	// The CI integration job provides ONLY database/Redis env vars — Build
+	// dies in crypto.NewAESGCM("") without a TOKEN_ENCRYPTION_KEY (no
+	// .env.local on CI; the same trap worker_dispatch_test.go already
+	// documents). APP_ENV is pinned to development so a CI-side production
+	// setting cannot drag validateProduction into this wiring test.
+	t.Setenv("APP_ENV", "development")
+	t.Setenv("TOKEN_ENCRYPTION_KEY", "enterprise-acl-app-wiring-integration-key")
 	cfg, err := config.Load()
 	if err != nil {
 		t.Fatal(err)
