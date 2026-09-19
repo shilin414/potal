@@ -10,8 +10,14 @@
  * Scope errors (403) surface a re-authorization action that reuses the
  * existing OAuth start → callback chain, which now requests the forwarding
  * scopes — that is how already-logged-in users top up permissions.
+ *
+ * Send session guard（八次复审 P1）：发送会话身份 = (open, shareToken)，
+ * session epoch + single-flight + stale response guard —— 旧会话在途的发送
+ * 响应对新会话 UI 一律无效。旧实现里 close → reopen 后，A 的迟到成功会把
+ * 刚打开的 B 弹窗直接关掉，迟到失败会把 B 的选中目标覆盖成 A 的失败目
+ * 标，且 B 会继承 A 的 sending 锁死发送按钮。
  */
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Avatar, Empty, Input, Modal, Spin, Tabs, message as antdMessage } from 'antd';
 import { CheckOutlined, ReloadOutlined, SendOutlined } from '@ant-design/icons';
 import {
@@ -49,6 +55,24 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
   const [selected, setSelected] = useState<FeishuForwardTarget[]>([]);
   const [history, setHistory] = useState<FeishuForwardTarget[]>([]);
   const [sending, setSending] = useState(false);
+
+  // 发送会话代际（八次复审 P1）：会话身份 = (open, shareToken)，任一变化
+  // 即新会话 —— close → reopen 同一分享、A 分享 → B 分享都算换会话。与
+  // Schedule Editor 的 editorEpochRef 同一套已验证模型：session epoch +
+  // single-flight + stale response guard。
+  const sessionEpochRef = useRef(0);
+  // single-flight：同会话内已有发送在途时，后续触发直接拒绝（双击发送只
+  // 发一次 API 请求）。
+  const sendInFlightRef = useRef<{ epoch: number } | null>(null);
+
+  // 会话失效是 session identity invalidation，须在 commit 后同步完成
+  // （useLayoutEffect 而非 useEffect）：新会话打开的那一帧 sending 已复
+  // 位、旧 in-flight 已作废，不留给旧响应操纵新会话 UI 的窗口。
+  useLayoutEffect(() => {
+    sessionEpochRef.current += 1;
+    sendInFlightRef.current = null;
+    setSending(false);
+  }, [open, shareToken]);
 
   useEffect(() => {
     if (!open) return;
@@ -113,17 +137,35 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
   };
 
   const handleSend = async () => {
-    if (!shareToken || !selected.length) return;
+    const epoch = sessionEpochRef.current;
+    if (!shareToken || !selected.length
+      || sendInFlightRef.current?.epoch === epoch) {
+      return;
+    }
+    sendInFlightRef.current = { epoch };
+
+    // snapshot（八次复审 §21）：API 请求、历史、失败目标 reconcile 全部
+    // 基于同一批发送目标，不混用发送结束时可能已经变化的 selected /
+    // shareToken（闭包里虽是旧值，显式命名让这个不变式可见）。
+    const selectedSnapshot = selected;
+    const shareTokenSnapshot = shareToken;
+
     setSending(true);
     try {
       const result = await forwardShareToFeishu(
-        shareToken,
-        selected.map((t) => ({ target_type: t.target_type, id: t.id })),
+        shareTokenSnapshot,
+        selectedSnapshot.map((t) => ({ target_type: t.target_type, id: t.id })),
       );
+      // 旧会话的迟到响应对新会话 UI 一律无效，直接丢弃（八次复审 §22）：
+      // 不能 message / setSelected / setNeedReauth / close / setSending ——
+      // 这些副作用已经不属于当前 session。后端转发本身无法撤销，守卫的
+      // 边界是「旧响应不操纵新会话的 UI」。
+      if (sessionEpochRef.current !== epoch) return;
+
       const succeeded = result.results.filter((r) => r.ok);
       if (succeeded.length) {
         saveForwardHistory(
-          selected.filter((t) => succeeded.some((r) => r.target_id === t.id)),
+          selectedSnapshot.filter((t) => succeeded.some((r) => r.target_id === t.id)),
         );
       }
       if (result.fail_count === 0) {
@@ -146,12 +188,20 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
             .filter((r) => !r.ok)
             .map((r) => r.target_id),
         );
-        setSelected(selected.filter((t) => failedIds.has(t.id)));
+        setSelected(selectedSnapshot.filter((t) => failedIds.has(t.id)));
       }
     } catch (e: any) {
+      if (sessionEpochRef.current !== epoch) return;
       antdMessage.error(e?.response?.data?.detail || '转发失败，请稍后重试');
     } finally {
-      setSending(false);
+      // 会话已切换时 sending 已由 useLayoutEffect 复位、in-flight 已被清
+      // 空，都不归这个旧 closure 管。
+      if (sessionEpochRef.current === epoch) {
+        setSending(false);
+      }
+      if (sendInFlightRef.current?.epoch === epoch) {
+        sendInFlightRef.current = null;
+      }
     }
   };
 
