@@ -4,12 +4,26 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/creation-agent-studio/backend-go/internal/automation/schedule"
 	"github.com/creation-agent-studio/backend-go/internal/automation/scheduler"
 	genapi "github.com/creation-agent-studio/backend-go/internal/gen/api"
 )
+
+// scheduleQueryMaxLength mirrors the OpenAPI contract's q maxLength (200).
+const scheduleQueryMaxLength = 200
+
+// scheduleQueryTooLong enforces that contract at RUNTIME (四次复审 P2-6):
+// oapi-codegen generates plain structs without constraint validation, so a
+// >200-rune needle would otherwise travel straight into the LIKE query. The
+// limit counts CHARACTERS (runes), not bytes — TrimSpace first so padding
+// cannot smuggle extra length past the gate.
+func scheduleQueryTooLong(q string) bool {
+	return utf8.RuneCountInString(strings.TrimSpace(q)) > scheduleQueryMaxLength
+}
 
 // scheduleRecord is the wire shape of a Schedule.
 // deliveryRecord is the wire shape of one configured target.
@@ -141,8 +155,15 @@ func (s *Server) ListSchedules(w http.ResponseWriter, r *http.Request, params ge
 	f := schedule.ListFilter{Status: status, Limit: 50}
 	// Server-side name search (三次复审 §23–§27): the needle reaches the
 	// whole table through the keyset query, so a task on page 2+ is findable.
+	// The runtime length gate (四次复审 P2-6) rejects >200-rune needles as
+	// 400 instead of letting them reach the LIKE query.
 	if params.Q != nil {
-		f.Query = *params.Q
+		if scheduleQueryTooLong(*params.Q) {
+			writeDetail(w, http.StatusBadRequest,
+				"q must be at most 200 characters")
+			return
+		}
+		f.Query = strings.TrimSpace(*params.Q)
 	}
 	if params.BeforeId != nil {
 		f.BeforeID = int64(*params.BeforeId)
