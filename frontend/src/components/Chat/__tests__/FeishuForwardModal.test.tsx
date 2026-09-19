@@ -20,6 +20,9 @@
  *     示重新授权入口，不再要求 success_count === 0；
  *   · 同会话 reconcile（九次复审 P1）：发送在途期间用户改选择 / 切 Tab，
  *     异步结果只移除本轮已成功目标，不得用快照整体覆盖当前 selected；
+ *   · 同会话 live interaction（十次复审 P1）：全部成功也只处理
+ *     本轮未被用户重新触碰的目标；在途新选、切 Tab、搜索或取消后
+ *     重选都要保留当前意图，只有无新交互时才自动关闭；
  *   · HTTP 级授权失效（九次复审 P2）：POST /forward 的 400「请先绑定飞书
  *     账号」/ 403 权限不足进入重新授权视图，普通 400（分享不存在）只
  *     toast 不误判。
@@ -605,6 +608,111 @@ describe('FeishuForwardModal — 发送在途期间的选择变更不被快照�
     await flush(10);
     expect(document.querySelector('.ffm-row')!.className).not.toContain('ffm-row--on');
     expect(findButton('发送（1）')).toBeUndefined();
+  });
+});
+
+describe('FeishuForwardModal — 全部成功也保留在途交互（十次复审 P1）', () => {
+  it('selecting C while A is pending keeps the modal open with only C selected', async () => {
+    mocks.fetchFeishuTargets.mockResolvedValue(page([
+      target('oc-A', 'A群', 'chat'),
+      target('oc-C', 'C群', 'chat'),
+    ]));
+    await mountModal();
+    const rows = Array.from(document.querySelectorAll<HTMLButtonElement>('.ffm-row'));
+    await click(rows[0]);
+
+    const send = deferred<FeishuForwardResult>();
+    mocks.forwardShareToFeishu.mockReturnValueOnce(send.promise);
+    await click(findButton('发送（1）')!);
+    await click(rows[1]);
+
+    await act(async () => {
+      send.resolve({
+        results: [{ target_id: 'oc-A', ok: true }],
+        success_count: 1,
+        fail_count: 0,
+      });
+    });
+    await flush(10);
+
+    expect(closed).toBe(false);
+    expect(findButton('发送（1）')).toBeTruthy();
+    expect(rows[0].className).not.toContain('ffm-row--on');
+    expect(rows[1].className).toContain('ffm-row--on');
+  });
+
+  it('switching tabs and searching while pending prevents an old success from closing the picker', async () => {
+    mocks.fetchFeishuTargets.mockImplementation(
+      async (type: 'user' | 'chat') => (
+        type === 'chat'
+          ? page([target('oc-A', 'A群', 'chat')])
+          : page([target('u-1', '张三', 'user')])
+      ),
+    );
+    await mountModal();
+    await click(document.querySelector<HTMLButtonElement>('.ffm-row')!);
+
+    const send = deferred<FeishuForwardResult>();
+    mocks.forwardShareToFeishu.mockReturnValueOnce(send.promise);
+    await click(findButton('发送（1）')!);
+    await searchUsers('张三');
+
+    await act(async () => {
+      send.resolve({
+        results: [{ target_id: 'oc-A', ok: true }],
+        success_count: 1,
+        fail_count: 0,
+      });
+    });
+    await flush(10);
+
+    expect(closed).toBe(false);
+    expect(document.querySelector<HTMLInputElement>('input[placeholder="输入姓名搜索联系人"]')?.value)
+      .toBe('张三');
+    const activeTab = document.querySelector<HTMLElement>('.ant-tabs-tab-active');
+    expect(activeTab?.textContent).toContain('联系人');
+  });
+
+  it('a successful target deselected and reselected while pending stays selected for the next send', async () => {
+    mocks.fetchFeishuTargets.mockResolvedValue(page([target('oc-A', 'A群', 'chat')]));
+    await mountModal();
+    const row = document.querySelector<HTMLButtonElement>('.ffm-row')!;
+    await click(row);
+
+    const send = deferred<FeishuForwardResult>();
+    mocks.forwardShareToFeishu.mockReturnValueOnce(send.promise);
+    await click(findButton('发送（1）')!);
+    await click(row);
+    await click(row);
+
+    await act(async () => {
+      send.resolve({
+        results: [{ target_id: 'oc-A', ok: true }],
+        success_count: 1,
+        fail_count: 0,
+      });
+    });
+    await flush(10);
+
+    expect(closed).toBe(false);
+    expect(findButton('发送（1）')).toBeTruthy();
+    expect(row.className).toContain('ffm-row--on');
+  });
+
+  it('an all-success send with no newer interaction keeps the existing auto-close behavior', async () => {
+    mocks.fetchFeishuTargets.mockResolvedValue(page([target('oc-A', 'A群', 'chat')]));
+    await mountModal();
+    await click(document.querySelector<HTMLButtonElement>('.ffm-row')!);
+
+    mocks.forwardShareToFeishu.mockResolvedValueOnce({
+      results: [{ target_id: 'oc-A', ok: true }],
+      success_count: 1,
+      fail_count: 0,
+    });
+    await click(findButton('发送（1）')!);
+    await flush(10);
+
+    expect(closed).toBe(true);
   });
 });
 
