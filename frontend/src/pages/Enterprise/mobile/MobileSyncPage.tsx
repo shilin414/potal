@@ -10,7 +10,7 @@
  *   · 已有配置后的刷新失败 = stale warning（旧数据保留 + 提示），不是
  *     无声吞掉。
  */
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Button,
@@ -48,16 +48,24 @@ export default function MobileSyncPage() {
   const [runsError, setRunsError] = useState<string | null>(null);
   const [form] = Form.useForm();
   const [saving, setSaving] = useState(false);
+  // sequence guard（三次复审 §52–§53）：页面有多个重试入口，快速连点会
+  // 触发多个 load；响应乱序返回时旧数据会覆盖新数据。
+  const loadSeqRef = useRef(0);
+  const [refreshing, setRefreshing] = useState(false);
 
   // 失败保留旧数据（cfg/runs 不清空），显式错误态 + 重试；config 与 runs
   // 独立失败域（P2-8）——syncRuns 挂了不能让配置管理整体不可用。
   const load = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
+    setRefreshing(true);
     setConfigError(null);
     setRunsError(null);
     const [configResult, runsResult] = await Promise.allSettled([
       enterpriseApi.syncConfig(),
       enterpriseApi.syncRuns(),
     ]);
+    // 旧一代 load 的响应（成功或失败）一律作废，只有最新一代能落地。
+    if (seq !== loadSeqRef.current) return;
     if (configResult.status === 'fulfilled') {
       const loaded = configResult.value;
       setCfg(loaded);
@@ -70,6 +78,7 @@ export default function MobileSyncPage() {
     } else {
       setRunsError('加载同步记录失败');
     }
+    setRefreshing(false);
   }, [form]);
 
   useEffect(() => {
@@ -115,7 +124,7 @@ export default function MobileSyncPage() {
           <div className="mobile-console-empty">
             <strong>加载失败</strong>
             {configError}
-            <Button onClick={() => void load()}>重试</Button>
+            <Button loading={refreshing} onClick={() => void load()}>重试</Button>
           </div>
         ) : cfg === null ? (
           <Skeleton active />
@@ -158,7 +167,7 @@ export default function MobileSyncPage() {
             <div className="mobile-console-empty">
               <strong>无法加载同步配置</strong>
               {configError}
-              <Button onClick={() => void load()}>重试</Button>
+              <Button loading={refreshing} onClick={() => void load()}>重试</Button>
             </div>
           ) : (
             <Skeleton active />
@@ -172,7 +181,15 @@ export default function MobileSyncPage() {
                 showIcon
                 message="刷新失败，当前显示的是上次已加载数据"
                 style={{ marginBottom: 12 }}
-                action={<Button size="small" onClick={() => void load()}>重试</Button>}
+                action={(
+                  <Button
+                    size="small"
+                    loading={refreshing}
+                    onClick={() => void load()}
+                  >
+                    重试
+                  </Button>
+                )}
               />
             )}
             {/* vertical，每字段一行（§48）——不用桌面 inline form */}
@@ -227,7 +244,7 @@ export default function MobileSyncPage() {
           runsError ? (
             <div className="mobile-console-empty">
               {runsError}
-              <Button onClick={() => void load()}>重试</Button>
+              <Button loading={refreshing} onClick={() => void load()}>重试</Button>
             </div>
           ) : (
             <div className="mobile-console-empty">还没有同步记录</div>
@@ -237,7 +254,13 @@ export default function MobileSyncPage() {
             {runsError && (
               <div className="mobile-console-empty">
                 刷新记录失败，以上为上次已加载数据
-                <Button size="small" onClick={() => void load()}>重试</Button>
+                <Button
+                  size="small"
+                  loading={refreshing}
+                  onClick={() => void load()}
+                >
+                  重试
+                </Button>
               </div>
             )}
             {runs.map((run) => (

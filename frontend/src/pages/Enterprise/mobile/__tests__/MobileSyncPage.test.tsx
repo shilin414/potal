@@ -248,3 +248,44 @@ describe('MobileSyncPage — config write guard (P1-3)', () => {
     expect(document.body.textContent).toContain('加载同步记录失败');
   });
 });
+
+describe('MobileSyncPage — out-of-order loads (三次复审 §52–§53)', () => {
+  it('the NEWEST load wins: a stale response resolving last is ignored', async () => {
+    // Generation 1 hangs (both domains); generation 2 resolves immediately.
+    let releaseCfg1!: (v: unknown) => void;
+    let releaseRuns1!: (v: unknown) => void;
+    let call = 0;
+    mocks.syncConfig.mockImplementation(() => {
+      call += 1;
+      if (call === 1) return new Promise((resolve) => { releaseCfg1 = resolve; });
+      return Promise.resolve({ ...CFG, last_success_at: '2026-08-15T02:00:00Z' });
+    });
+    let runsCall = 0;
+    mocks.syncRuns.mockImplementation(() => {
+      runsCall += 1;
+      if (runsCall === 1) return new Promise((resolve) => { releaseRuns1 = resolve; });
+      return Promise.resolve([{ ...RUN(2, 'failed'), error_message: '新一代失败原因' }]);
+    });
+    mocks.triggerSync.mockResolvedValue({});
+
+    await mountPage(); // generation 1 still travelling
+
+    // 立即同步 → triggerSync → generation 2 load resolves immediately.
+    const trigger = Array.from(document.querySelectorAll('button'))
+      .find((b) => b.textContent === '立即同步');
+    expect(trigger).toBeTruthy();
+    await click(trigger!);
+    await flush(40);
+    // Generation 2's data is on screen.
+    expect(document.body.textContent).toContain('新一代失败原因');
+
+    // Generation 1 resolves LAST — it must be ignored entirely.
+    await act(async () => {
+      releaseCfg1({ ...CFG, last_success_at: '2026-09-01T02:00:00Z' });
+      releaseRuns1([RUN(1, 'success')]);
+    });
+    await flush(20);
+    expect(document.body.textContent).toContain('新一代失败原因');
+    expect(document.body.textContent).not.toContain('成功');
+  });
+});
