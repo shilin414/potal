@@ -1727,8 +1727,11 @@ paths:
       tags: [runs]
       summary: Deliver a share snapshot card to Feishu users/groups (owner only)
       description: Sends an interactive card carrying the share link. The link
-        origin comes from the request Origin header. Per-target results are
-        returned; a failing user-token send falls back to the app token.
+        origin comes from the request Origin header. Messages are sent with
+        the caller's Feishu user access token only, so delivery keeps the
+        caller's identity (the forward UI presents the send as coming from
+        the user; there is no app-token fallback). Per-target delivery
+        failures are returned in the result envelope.
       requestBody:
         required: true
         content:
@@ -1764,6 +1767,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
+        "500":
+          description: forwarding integration unavailable
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SimpleError" }
 
   # ─────────────────────────────────────────────────────────────── auth ──
   /api/auth/register/:

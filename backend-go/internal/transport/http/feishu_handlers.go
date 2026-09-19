@@ -14,9 +14,10 @@ import (
 //
 // Delivers a share snapshot card to Feishu users/groups. The share token is
 // validated against the caller's own shares, the link origin comes from the
-// request Origin header, and each target send tries the caller's user token
-// before falling back to the app token (the OAuth grant may not carry the
-// IM scope; the bot usually does).
+// request Origin header, and every send uses the caller's user access token
+// only — delivery keeps the caller's identity (the forward UI presents the
+// message as sent by the user; there is no app-token fallback, which would
+// silently switch the sender identity to the bot).
 
 const feishuForwardMaxTargets = 20
 
