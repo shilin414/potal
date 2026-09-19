@@ -1758,7 +1758,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/FeishuForwardResult" }
         "400":
-          description: invalid body / share not owned by caller
+          description: |
+            Invalid body / share not owned by caller or revoked /
+            caller has no usable bound Feishu identity.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DetailError" }
