@@ -1,9 +1,12 @@
 /**
  * FeishuForwardModal — 分页失败 UX / 20 目标上限 / 部分失败保留（七次复审
- * P1-2 / P2-8 / P2-9）+ 发送会话守卫（八次复审 P1）。
+ * P1-2 / P2-8 / P2-9）+ 发送会话守卫 / CTA 去重 / 部分授权失败（八次复审
+ * P1 / P2）。
  *
  *   · page2 拉挂：已加载的 50 人仍然渲染，底部出现「重试加载」（调
- *     loadMore 从断点续拉），不出现整屏「搜索联系人失败」错误态；
+ *     loadMore 从断点续拉），不出现整屏「搜索联系人失败」错误态，且
+ *     「加载更多」与「重试加载」互斥（八次复审 P2 —— 两个按钮调的都是
+ *     loadMore，不能并排出现）；
  *   · 20 目标上限：选到 20 个后第 21 个被 toggle 拒绝（warning + 计数
  *     仍为 20）—— 与 Backend feishuForwardMaxTargets、OpenAPI maxItems
  *     形成三层一致契约，不再等点「发送（21）」才吃后端 400；
@@ -11,7 +14,9 @@
  *     点发送重试失败目标（旧实现 setSelected([]) 全清，得从头挑）；
  *   · 发送会话 ABA（八次复审 P1）：close → reopen 后旧会话的迟到响应
  *     （成功 / 部分失败 / 授权失败）不得关闭新弹窗、污染新选中、误入重
- *     新授权视图；新会话不继承旧 sending；同会话双击只发一次请求。
+ *     新授权视图；新会话不继承旧 sending；同会话双击只发一次请求；
+ *   · 部分授权失败（八次复审 P2）：1 成功 + 1 授权失败的混合结果也要展
+ *     示重新授权入口，不再要求 success_count === 0。
  * @vitest-environment jsdom
  */
 import React from 'react';
@@ -214,6 +219,9 @@ describe('FeishuForwardModal — 分页失败不吞已加载页（七次复审 P
     // 底部分页错误 + 从断点重试（重试加载 → loadMore，不是 refresh 回首页）。
     const retry = findButton('重试加载');
     expect(retry, '底部「重试加载」入口').toBeTruthy();
+    // CTA 互斥（八次复审 P2）：失败期间「加载更多」必须消失 —— 两个按钮
+    // 调的都是 loadMore，并排出现只是重复动作入口。
+    expect(document.querySelector('.ffm-load-more')).toBeNull();
 
     // 重试成功：p2 断点续拉，51 人可见，错误入口消失。
     mocks.fetchFeishuTargets.mockImplementation(
@@ -452,5 +460,34 @@ describe('FeishuForwardModal — 发送会话 ABA（八次复审 P1）', () => {
       send.resolve({ results: [{ target_id: 'oc-1', ok: true }], success_count: 1, fail_count: 0 });
     });
     await flush(10);
+  });
+});
+
+describe('FeishuForwardModal — 部分授权失败也进入重新授权（八次复审 P2）', () => {
+  it('1 success + 1 re-auth failure shows the re-authorization CTA', async () => {
+    mocks.fetchFeishuTargets.mockResolvedValue(page([
+      target('oc-1', '成功群', 'chat'),
+      target('oc-2', '授权失败群', 'chat'),
+    ]));
+    await mountModal();
+    const rows = Array.from(document.querySelectorAll<HTMLButtonElement>('.ffm-row'));
+    await click(rows[0]);
+    await click(rows[1]);
+
+    mocks.forwardShareToFeishu.mockResolvedValue({
+      results: [
+        { target_id: 'oc-1', ok: true },
+        { target_id: 'oc-2', ok: false, error: '飞书权限不足，需要重新授权' },
+      ],
+      success_count: 1,
+      fail_count: 1,
+    });
+    await click(findButton('发送（2）')!);
+    await flush(10);
+
+    // 混合结果（success_count=1）同样展示重新授权入口 —— 旧条件
+    // success_count === 0 让用户只能对着注定失败的目标反复重试。
+    expect(document.querySelector('.ffm-reauth')).toBeTruthy();
+    expect(document.body.textContent).toContain('重新授权飞书');
   });
 });
