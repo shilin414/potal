@@ -14,9 +14,10 @@ import {
   resolveApplication,
   type V2Application,
 } from '@/services/runApi';
-import { fetchFeishuTargets, type FeishuForwardTarget } from '@/services/shareApi';
+import type { FeishuForwardTarget } from '@/services/shareApi';
 import { createSchedule, previewScheduleRuns, updateSchedule } from '@/services/scheduleApi';
 import { useApplicationPage } from '@/hooks/useApplicationPage';
+import { useFeishuTargets } from '@/hooks/useFeishuTargets';
 import type { Schedule, ScheduleType } from '@/types/schedule';
 import {
   formToPayload,
@@ -47,8 +48,6 @@ export function useScheduleEditor({
   const [saving, setSaving] = useState(false);
   const [scheduleType, setScheduleType] = useState<ScheduleType>('daily');
   const [deliveryOn, setDeliveryOn] = useState(false);
-  const [targets, setTargets] = useState<FeishuForwardTarget[]>([]);
-  const [targetsLoading, setTargetsLoading] = useState(false);
   const [preview, setPreview] = useState<string[]>([]);
   const [previewing, setPreviewing] = useState(false);
 
@@ -61,6 +60,11 @@ export function useScheduleEditor({
   const editorEpochRef = useRef(0);
   const saveSeqRef = useRef(0);
   const editingId = editing?.id ?? null;
+  // 会话标识（五次复审 §38）：作为 useApplicationPage / useFeishuTargets 的
+  // sessionKey —— 关闭 → null，编辑 A/B → 各自 id，新建 → 'new:preset'。
+  const editorSessionKey = open
+    ? (editingId ?? `new:${presetApplicationId ?? ''}`)
+    : null;
   useEffect(() => {
     editorEpochRef.current += 1;
     saveSeqRef.current += 1;
@@ -72,6 +76,26 @@ export function useScheduleEditor({
   // 也能通过 loadMore 全部选到；搜索词直发后端，浏览器不再只在前 N 条里
   // 本地过滤。编辑器关闭时 `enabled: false` 完全静默。
   const [appQuery, setAppQuery] = useState('');
+  // 投递目标搜索词（五次复审 P1-3）：飞书目标改为远程搜索 —— 不再在打开
+  // 时预拉「前 20 个联系人 + 前 100 个群聊」然后本地过滤。
+  const [targetQuery, setTargetQuery] = useState('');
+  // 已选中的投递目标（五次复审 §24）：远程搜索下当前候选页可能不含它，
+  // 必须把它注入 options，否则 Select 显示裸 id。
+  const [selectedTarget, setSelectedTarget] = useState<FeishuForwardTarget | null>(null);
+
+  // 会话切换的 render-time 重置（五次复审 §38）：新会话的那一帧就清空两个
+  // 搜索词与已选目标 —— useApplicationPage / useFeishuTargets 的 sessionKey
+  // 重置因此在同一次 commit 里拿到已清空的 query，首屏请求直接 q=''，
+  // 不会先漏发一次旧词请求（旧的 !open effect 要等 passive effect + 300ms
+  // 防抖，「关闭 50ms 后重开」仍会带旧词先请求一次）。
+  const [prevEditorSession, setPrevEditorSession] = useState(editorSessionKey);
+  if (prevEditorSession !== editorSessionKey) {
+    setPrevEditorSession(editorSessionKey);
+    setAppQuery('');
+    setTargetQuery('');
+    setSelectedTarget(null);
+  }
+
   const {
     items: apps,
     loading: appsLoading,
@@ -89,13 +113,8 @@ export function useScheduleEditor({
     query: appQuery,
     limit: 50,
     enabled: open,
+    sessionKey: editorSessionKey,
   });
-
-  // Reopen starts from an empty search — the shells stay mounted, so the
-  // previous session's term would otherwise filter the dropdown invisibly.
-  useEffect(() => {
-    if (!open) setAppQuery('');
-  }, [open]);
 
   // 回填目标（二次复审 P1-2/P1-3）：编辑的已绑定智能体，或从智能体卡片/
   // 对话页带入的 presetApplicationId —— 两者都可能不在当前页（搜索词/翻页
@@ -179,6 +198,16 @@ export function useScheduleEditor({
       setScheduleType(v.schedule_type);
       setDeliveryOn(v.deliveries.length > 0);
       form.setFieldValue('deliveries', v.deliveries);
+      // 回填的投递目标注入 options（五次复审 §24）：远程搜索下它不一定
+      // 在当前候选页里，不注入 Select 就显示裸 id。
+      setSelectedTarget(v.deliveries[0]
+        ? {
+          id: v.deliveries[0].target_id,
+          name: v.deliveries[0].target_name,
+          target_type: v.deliveries[0].target_type,
+          avatar_url: '',
+        }
+        : null);
     } else {
       form.resetFields();
       form.setFieldsValue({
@@ -195,21 +224,53 @@ export function useScheduleEditor({
       });
       setScheduleType('daily');
       setDeliveryOn(false);
+      setSelectedTarget(null);
     }
     setPreview([]);
   }, [open, editing, presetApplicationId, form]);
 
-  // 飞书目标：开启投递时加载（用户 + 群聊）。
-  useEffect(() => {
-    if (!open || !deliveryOn) return;
-    setTargetsLoading(true);
-    Promise.all([
-      fetchFeishuTargets('user').catch(() => []),
-      fetchFeishuTargets('chat').catch(() => []),
-    ])
-      .then(([users, chats]) => setTargets([...users, ...chats]))
-      .finally(() => setTargetsLoading(false));
-  }, [open, deliveryOn]);
+  // 飞书投递目标（五次复审 P1-3）：远程搜索，不再预拉全量后本地过滤。
+  //   · user：空 query 不请求（provider 一页只有 20 条，空查询拿到的是
+  //     「全公司任意前 20 人」）；输入姓名后服务端搜索；
+  //   · chat：后端已按 page_token 翻页到 has_more=false，query 由后端
+  //     按名称过滤，空 query = 全量群聊。
+  // 两个 hook 独立请求、独立失败（ERROR ≠ EMPTY，五次复审 §28）——
+  // 用户失败而群聊成功时仍展示群聊，只给「部分失败」警告 + 重试。
+  const userTargets = useFeishuTargets({
+    type: 'user',
+    enabled: open && deliveryOn,
+    query: targetQuery,
+    sessionKey: editorSessionKey,
+  });
+  const chatTargets = useFeishuTargets({
+    type: 'chat',
+    enabled: open && deliveryOn,
+    query: targetQuery,
+    sessionKey: editorSessionKey,
+  });
+
+  // 候选 = 用户搜索结果 + 群聊（后端已过滤），已选目标始终保留在首位。
+  const targets = useMemo<FeishuForwardTarget[]>(() => {
+    const merged = [...userTargets.items, ...chatTargets.items];
+    if (selectedTarget && !merged.some((t) => t.id === selectedTarget.id)) {
+      merged.unshift(selectedTarget);
+    }
+    return merged;
+  }, [userTargets.items, chatTargets.items, selectedTarget]);
+
+  const targetsLoading = userTargets.loading || chatTargets.loading;
+  const targetsFullyFailed = Boolean(userTargets.error && chatTargets.error);
+  const targetsPartialFailed = !targetsFullyFailed
+    && Boolean(userTargets.error || chatTargets.error);
+  const targetsError = targetsFullyFailed
+    ? (userTargets.error || chatTargets.error)
+    : null;
+
+  const refreshTargets = useCallback(() => {
+    void userTargets.refresh();
+    void chatTargets.refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userTargets.refresh, chatTargets.refresh]);
 
   /**
    * 校验并读回表单值。
@@ -249,10 +310,22 @@ export function useScheduleEditor({
     }
   }, [readValues]);
 
+  // 保存 single-flight（五次复审 P2-9）：handleOk 过去在 `await readValues()`
+  // 之后才 setSaving(true) —— 当前校验都是同步规则所以撞不上，但未来引入
+  // async validator 或组件层重复触发时，两个调用可以同时穿过 saving=false
+  // 检查把 createSchedule 调两次。operation ref 在函数入口同步加锁；锁带
+  // epoch 标记：会话换代后旧锁不阻塞新会话的保存，旧 operation 的 finally
+  // 也只清理属于自己的锁（五次复审 §42：不要让旧 operation 把新会话的
+  // synchronous lock 状态弄乱）。
+  const saveInFlightRef = useRef<{ epoch: number } | null>(null);
+
   const handleOk = async () => {
     const saveEpoch = editorEpochRef.current;
+    if (saveInFlightRef.current?.epoch === saveEpoch) return; // 同会话重复触发
+    saveInFlightRef.current = { epoch: saveEpoch };
     const mySave = ++saveSeqRef.current;
     try {
+      setSaving(true);
       const payload = formToPayload(await readValues());
       if (!deliveryOn) payload.deliveries = undefined;
       // 原智能体已不可执行（§41）：保存只会被后端 validation 以
@@ -264,7 +337,6 @@ export function useScheduleEditor({
         message.error('原智能体当前不可用，请重新选择一个智能体');
         return;
       }
-      setSaving(true);
       if (editing) {
         await updateSchedule(editing.id, payload);
       } else {
@@ -287,6 +359,10 @@ export function useScheduleEditor({
       // saving 已被会话 effect 置回 false，旧保存在此跳过即可。
       if (saveSeqRef.current === mySave) {
         setSaving(false);
+      }
+      // 只释放属于自己的锁：会话已换代时锁属于新 operation（或为空）。
+      if (saveInFlightRef.current?.epoch === saveEpoch) {
+        saveInFlightRef.current = null;
       }
     }
   };
@@ -333,7 +409,11 @@ export function useScheduleEditor({
     appQuery, setAppQuery,
     scheduleType, setScheduleType, setPreview,
     deliveryOn, setDeliveryOn,
+    // 飞书投递目标（五次复审 P1-3）：远程搜索 + 独立错误态 + 重试。
     targets, targetsLoading,
+    targetsError, targetsPartialFailed, refreshTargets,
+    targetQuery, setTargetQuery,
+    setSelectedTarget,
     preview, previewing, refreshPreview, handleOk,
   };
 }

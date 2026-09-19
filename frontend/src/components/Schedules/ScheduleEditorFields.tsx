@@ -30,10 +30,12 @@ const TIME_OPTIONS = Array.from({ length: 24 }, (_, h) => ({
 export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) {
   const {
     form, apps, appsLoading, appsHasMore, appsLoadingMore, loadMoreApps,
-    appsError, refreshApps,
+    appsError, refreshApps, appQuery, setAppQuery,
     appResolution, resolutionApplies, retryResolveApp,
-    setAppQuery, scheduleType, setScheduleType,
-    setPreview, deliveryOn, setDeliveryOn, targets, targetsLoading,
+    scheduleType, setScheduleType,
+    setPreview, deliveryOn, setDeliveryOn,
+    targets, targetsLoading, targetsError, targetsPartialFailed, refreshTargets,
+    targetQuery, setTargetQuery, setSelectedTarget,
     preview, previewing, refreshPreview,
   } = state;
 
@@ -56,12 +58,15 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
           {/* 服务端搜索 + 分页（二次复审 P1-2）：filterOption=false 让搜索词
               直发后端（覆盖全部智能体，而不只是已加载页）；下拉滚到底再拉
               下一页，>50 个可调度智能体也不会被截断。notFoundContent 区分
-              loading / empty / error（三次复审 §39）。 */}
+              loading / empty / error（三次复审 §39）。searchValue 受控
+              （五次复审 §40）：编辑器会话切换清空 appQuery 时，Select 内部
+              搜索文本同步清空。 */}
           <Select
             loading={appsLoading}
             placeholder="选择要定时执行的智能体"
             showSearch
             filterOption={false}
+            searchValue={appQuery}
             onSearch={setAppQuery}
             onPopupScroll={(e) => {
               const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
@@ -234,12 +239,29 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
               name={['deliveries', 0, 'target_id']}
               label="投递目标"
               rules={[{ required: true, message: '请选择投递目标' }]}
+              extra="输入姓名搜索联系人；群聊列表自动展示"
             >
+              {/* 远程搜索（五次复审 P1-3）：不再预拉「前 20 个联系人 + 前
+                  100 个群聊」后本地过滤 —— 第 21 个人/第 101 个群聊曾永远
+                  选不到。现在搜索词直发后端（user 走目录搜索，chat 由后端
+                  按 page_token 翻全量后过滤）；已选目标始终注入 options，
+                  搜索词变化后 Select 不显示裸 id。 */}
               <Select
                 loading={targetsLoading}
                 showSearch
-                optionFilterProp="label"
-                placeholder="选择飞书用户或群聊"
+                filterOption={false}
+                searchValue={targetQuery}
+                onSearch={setTargetQuery}
+                placeholder="搜索并选择飞书用户或群聊"
+                notFoundContent={
+                  targetsError
+                    ? '加载投递目标失败'
+                    : targetsLoading
+                      ? '搜索中…'
+                      : targetQuery.trim()
+                        ? '没有匹配的目标'
+                        : '输入姓名可搜索联系人'
+                }
                 options={targets.map((t) => ({
                   value: t.id,
                   label: `${t.target_type === 'chat' ? '[群聊] ' : ''}${t.name}`,
@@ -247,6 +269,7 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
                 onSelect={(value) => {
                   const target = targets.find((t) => t.id === value);
                   if (target) {
+                    setSelectedTarget(target);
                     form.setFieldsValue({
                       deliveries: [{
                         target_id: target.id,
@@ -255,9 +278,25 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
                       }],
                     });
                   }
+                  // 选中后清空搜索词：受控 searchValue 下必须显式清，
+                  // 同时让候选回到默认群聊列表。
+                  setTargetQuery('');
                 }}
               />
             </Form.Item>
+            {/* 投递目标加载失败 ≠ 没有目标（五次复审 §28，ERROR ≠ EMPTY）：
+                全部失败给 error + 重试；部分失败（如联系人接口挂了但群聊
+                正常）仍展示可用部分，给 warning + 重试。 */}
+            {(targetsError || targetsPartialFailed) && (
+              <Alert
+                type={targetsError ? 'error' : 'warning'}
+                showIcon
+                message={targetsError ? '加载飞书投递目标失败' : '部分飞书目标加载失败，仅显示可用部分'}
+                description={targetsError ?? undefined}
+                action={<Button size="small" onClick={() => void refreshTargets()}>重试</Button>}
+                style={{ marginBottom: 16 }}
+              />
+            )}
             <Alert
               type="info"
               showIcon
