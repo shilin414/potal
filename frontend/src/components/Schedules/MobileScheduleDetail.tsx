@@ -26,7 +26,7 @@ export function MobileScheduleDetail({ open, scheduleId, onClose }: MobileSchedu
     schedule, loading, error,
     occurrences, occurrencesLoading, occurrenceError,
     hasMoreOccurrences, loadingMoreOccurrences, loadMoreOccurrences,
-    retryOccurrences,
+    retryOccurrences, retrySchedule,
   } = useScheduleDetail(open, scheduleId);
 
   return (
@@ -37,7 +37,14 @@ export function MobileScheduleDetail({ open, scheduleId, onClose }: MobileSchedu
     >
       {loading && <Skeleton active />}
       {error && (
-        <Alert type="error" showIcon message="加载失败" description={error} />
+        /* 配置失败可原地重试（四次复审 P2-3），不再只能关抽屉重开。 */
+        <Alert
+          type="error"
+          showIcon
+          message="加载任务详情失败"
+          description={error}
+          action={<Button size="small" onClick={() => void retrySchedule()}>重试</Button>}
+        />
       )}
       {!loading && !error && schedule && (
         <>

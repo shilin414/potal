@@ -41,6 +41,8 @@ export interface UseScheduleDetailResult {
 
   /** 执行记录独立重试（不影响已加载的任务配置）。 */
   retryOccurrences(): Promise<void>;
+  /** 任务配置独立重试（四次复审 P2-3）：配置加载失败不再只能关抽屉重开。 */
+  retrySchedule(): Promise<void>;
 }
 
 export function useScheduleDetail(
@@ -74,28 +76,31 @@ export function useScheduleDetail(
     setHasMoreOccurrences(false);
   }, [open, scheduleId]);
 
-  // 任务配置：主数据，独立失败域（§37）。
-  useEffect(() => {
+  // 任务配置：主数据，独立失败域（§37）。提取为可重试的加载函数（四次复审
+  // P2-3）——配置失败不再只能「关抽屉重开」，原地给重试按钮。
+  const loadSchedule = useCallback(async () => {
     if (!open || !scheduleId) return;
     const seq = ++scheduleSeqRef.current;
     setLoading(true);
     setError(null);
-    fetchSchedule(scheduleId)
-      .then((s) => {
-        if (seq === scheduleSeqRef.current) setSchedule(s);
-      })
-      .catch((e) => {
-        if (seq === scheduleSeqRef.current) {
-          setError(e instanceof Error ? e.message : '加载失败');
-        }
-      })
-      .finally(() => {
-        if (seq === scheduleSeqRef.current) setLoading(false);
-      });
+    try {
+      const s = await fetchSchedule(scheduleId);
+      if (seq === scheduleSeqRef.current) setSchedule(s);
+    } catch (e) {
+      if (seq === scheduleSeqRef.current) {
+        setError(e instanceof Error ? e.message : '加载失败');
+      }
+    } finally {
+      if (seq === scheduleSeqRef.current) setLoading(false);
+    }
+  }, [open, scheduleId]);
+
+  useEffect(() => {
+    void loadSchedule();
     return () => {
       scheduleSeqRef.current += 1;
     };
-  }, [open, scheduleId]);
+  }, [loadSchedule]);
 
   // 执行记录：辅助历史数据，独立加载 + 独立重试（§37），分页（§35）。
   const loadOccurrences = useCallback(async () => {
@@ -175,5 +180,6 @@ export function useScheduleDetail(
     loadingMoreOccurrences,
     loadMoreOccurrences,
     retryOccurrences: loadOccurrences,
+    retrySchedule: loadSchedule,
   };
 }

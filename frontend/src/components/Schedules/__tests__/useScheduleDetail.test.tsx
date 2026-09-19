@@ -121,6 +121,24 @@ describe('useScheduleDetail — 失败域解耦（§36–§37）', () => {
     expect(latest.current!.occurrenceError).toBeNull();
     expect(latest.current!.occurrences).toHaveLength(1);
   });
+
+  it('the SCHEDULE retry recovers after a config failure (四次复审 P2-3)', async () => {
+    mockSchedule
+      .mockRejectedValueOnce(new Error('配置暂时不可用'))
+      .mockResolvedValueOnce(schedule(9));
+    mockOccurrences.mockResolvedValue([occ(3)]);
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    expect(latest.current!.error).toBe('配置暂时不可用');
+    expect(latest.current!.schedule).toBeNull();
+
+    await act(async () => { await latest.current!.retrySchedule(); });
+    await flush(10);
+    expect(latest.current!.error).toBeNull();
+    expect(latest.current!.schedule?.name).toBe('任务9');
+    // 配置重试不影响已独立的执行记录域。
+    expect(latest.current!.occurrenceError).toBeNull();
+  });
 });
 
 describe('useScheduleDetail — 执行记录分页（§33–§35）', () => {
