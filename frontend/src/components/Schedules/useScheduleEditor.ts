@@ -8,7 +8,7 @@
  * paths and silently drops `deliveries[0].target_type/target_name` (see
  * scheduleEditorPayload.test).
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Form, message } from 'antd';
 import {
   resolveApplication,
@@ -23,6 +23,13 @@ import {
   scheduleToForm,
   type ScheduleFormValues,
 } from '@/lib/scheduleFormat';
+
+/**
+ * 回填目标的状态（三次复审 §40–§42）：resolveApplication 是消费面端点，
+ * 404 = 原智能体已停用/解绑/Provider 停用/权限被移除（不可执行，需要换
+ * 一个）；5xx / network = 临时故障（可重试），绝不伪装成「智能体 #id」。
+ */
+export type AppResolutionState = 'ready' | 'unavailable' | 'transient-error';
 
 export interface UseScheduleEditorOptions {
   open: boolean;
@@ -56,6 +63,10 @@ export function useScheduleEditor({
     loadingMore: appsLoadingMore,
     hasMore: appsHasMore,
     loadMore: loadMoreApps,
+    // 列表失败 ≠ 没有智能体（三次复审 §38–§39）：错误必须可见 + 可重试，
+    // 不能让 Select 看起来只是「空的」。
+    error: appsError,
+    refresh: refreshApps,
   } = useApplicationPage({
     kind: 'chat',
     scope: 'mine',
@@ -80,25 +91,61 @@ export function useScheduleEditor({
   // 普通用户也能进，旧逻辑让每个"目标不在第一页"的普通用户都先吃一条 403
   // 再退化成 “智能体 #id”。
   const [extraApp, setExtraApp] = useState<{ id: number; name: string } | null>(null);
+  const [appResolution, setAppResolution] = useState<AppResolutionState>('ready');
+  // 仅作为 effect 的重跑信号（重试按钮），值本身不参与逻辑。
+  const [resolveAttempt, setResolveAttempt] = useState(0);
+  const resolvedForRef = useRef<number | null>(null);
   useEffect(() => {
     const id = targetApplicationId;
     if (!open || !id) {
       setExtraApp(null);
+      setAppResolution('ready');
+      resolvedForRef.current = null;
       return;
+    }
+    // 换了目标：先清掉上一个目标残留在屏的 unavailable/transient 状态。
+    if (resolvedForRef.current !== id) {
+      setExtraApp(null);
+      setAppResolution('ready');
+      resolvedForRef.current = id;
     }
     if (extraApp?.id === id) return;
     if (appsLoading) return; // 等 first page 到位再判断是否真的够不到
     if (apps.some((a) => a.id === id)) {
       // 目标已经在当前页：清掉上一次 editing 残留的 extraApp（§15 收口）。
       setExtraApp(null);
+      setAppResolution('ready');
       return;
     }
     let stale = false;
     resolveApplication({ id })
-      .then((resolved) => { if (!stale) setExtraApp({ id, name: resolved.name }); })
-      .catch(() => { if (!stale) setExtraApp({ id, name: `智能体 #${id}` }); });
+      .then((resolved) => {
+        if (stale) return;
+        setExtraApp({ id, name: resolved.name });
+        setAppResolution('ready');
+      })
+      .catch((err: unknown) => {
+        if (stale) return;
+        const status = (err as { response?: { status?: number } })?.response?.status;
+        if (status === 404) {
+          // 消费面 404 = 原智能体已不可执行（停用/解绑/Provider/权限）。
+          // 仍注入 #id 占位让 Select 不空白，但保存必须先换一个。
+          setExtraApp({ id, name: `智能体 #${id}` });
+          setAppResolution('unavailable');
+        } else {
+          // 5xx / 网络 = 临时故障：不把故障伪装成「智能体 #id」，
+          // 给独立错误 + 重试。
+          setExtraApp(null);
+          setAppResolution('transient-error');
+        }
+      });
     return () => { stale = true; };
-  }, [open, targetApplicationId, apps, appsLoading, extraApp]);
+  }, [open, targetApplicationId, apps, appsLoading, extraApp, resolveAttempt]);
+
+  /** 重试回填 resolve（transient-error 专用，§42）。 */
+  const retryResolveApp = useCallback(() => {
+    setResolveAttempt((n) => n + 1);
+  }, []);
 
   // The editor reads `apps` for options — splice the resolved row in without
   // duplicating a value the current page already carries.
@@ -181,6 +228,15 @@ export function useScheduleEditor({
     try {
       const payload = formToPayload(await readValues());
       if (!deliveryOn) payload.deliveries = undefined;
+      // 原智能体已不可执行（§41）：保存只会被后端 validation 以
+      // "application is not schedulable" 拒绝 —— 在前端就拦下，要求换一个。
+      if (
+        appResolution === 'unavailable'
+        && payload.application_id === targetApplicationId
+      ) {
+        message.error('原智能体当前不可用，请重新选择一个智能体');
+        return;
+      }
       setSaving(true);
       if (editing) {
         await updateSchedule(editing.id, payload);
@@ -210,6 +266,10 @@ export function useScheduleEditor({
     form, saving,
     apps: pickerApps, appsLoading,
     appsHasMore, appsLoadingMore, loadMoreApps,
+    // 列表失败 ≠ 空（§38–§39）：错误 + 刷新入口给到 Fields。
+    appsError, refreshApps,
+    // 回填状态（§40–§42）：404 = 原智能体不可用；5xx/network = 可重试。
+    appResolution, targetApplicationId, retryResolveApp,
     appQuery, setAppQuery,
     scheduleType, setScheduleType, setPreview,
     deliveryOn, setDeliveryOn,

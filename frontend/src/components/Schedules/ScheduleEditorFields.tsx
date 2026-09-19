@@ -6,6 +6,7 @@
 import React from 'react';
 import {
   Alert,
+  Button,
   Checkbox,
   DatePicker,
   Form,
@@ -29,6 +30,8 @@ const TIME_OPTIONS = Array.from({ length: 24 }, (_, h) => ({
 export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) {
   const {
     form, apps, appsLoading, appsHasMore, appsLoadingMore, loadMoreApps,
+    appsError, refreshApps,
+    appResolution, retryResolveApp,
     setAppQuery, scheduleType, setScheduleType,
     setPreview, deliveryOn, setDeliveryOn, targets, targetsLoading,
     preview, previewing, refreshPreview,
@@ -52,7 +55,8 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
         >
           {/* 服务端搜索 + 分页（二次复审 P1-2）：filterOption=false 让搜索词
               直发后端（覆盖全部智能体，而不只是已加载页）；下拉滚到底再拉
-              下一页，>50 个可调度智能体也不会被截断。 */}
+              下一页，>50 个可调度智能体也不会被截断。notFoundContent 区分
+              loading / empty / error（三次复审 §39）。 */}
           <Select
             loading={appsLoading}
             placeholder="选择要定时执行的智能体"
@@ -67,12 +71,49 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
                 void loadMoreApps();
               }
             }}
+            notFoundContent={
+              appsError
+                ? '加载智能体失败'
+                : appsLoading
+                  ? '搜索中…'
+                  : '没有匹配的智能体'
+            }
             options={apps.map((a) => ({
               value: a.id,
               label: a.name,
             }))}
           />
         </Form.Item>
+        {/* 列表请求失败 ≠ 没有智能体（三次复审 §38–§39）：错误可见 + 重试。 */}
+        {appsError && (
+          <Alert
+            type="error"
+            showIcon
+            message="加载智能体失败"
+            description={appsError}
+            action={<Button size="small" onClick={() => void refreshApps()}>重试</Button>}
+            style={{ marginBottom: 16 }}
+          />
+        )}
+        {/* 回填状态（§40–§42）：404 = 原智能体不可执行，必须换一个；
+            5xx / 网络 = 临时故障，给重试而不是伪装成「智能体 #id」。 */}
+        {appResolution === 'unavailable' && (
+          <Alert
+            type="warning"
+            showIcon
+            message="原智能体当前不可用，请选择新的智能体"
+            style={{ marginBottom: 16 }}
+          />
+        )}
+        {appResolution === 'transient-error' && (
+          <Alert
+            type="error"
+            showIcon
+            message="无法加载智能体信息"
+            action={<Button size="small" onClick={retryResolveApp}>重试</Button>}
+            style={{ marginBottom: 16 }}
+          />
+        )}
         <Form.Item
           name="prompt"
           label="任务指令"

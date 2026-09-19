@@ -43,6 +43,7 @@ vi.mock('@/services/scheduleApi', () => ({
 }));
 
 import { ScheduleEditorModal } from '../ScheduleEditorModal';
+import { updateSchedule } from '@/services/scheduleApi';
 
 // ── jsdom 环境补齐（antd 依赖） ────────────────────────────────────
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -239,19 +240,91 @@ describe('agent picker — editing backfill (P1-2/P1-3)', () => {
     await unmount(root, host);
   });
 
-  it('falls back to 智能体 #id when the resolve fails — the form stays usable', async () => {
+/** antd 按钮文本可能带换行/空格 —— 统一压平后比较（同 payload 测试）。 */
+const btnText = (el: Element) => (el.textContent || '').replace(/\s+/g, '');
+
+const findButton = (label: string) => (
+  Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+    .find((b) => btnText(b) === label));
+
+  it('a 404 resolve is UNAVAILABLE: placeholder name, explicit warning, save blocked (§41)', async () => {
     mocks.fetchApplicationPage.mockResolvedValue({
       items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }],
       next_cursor: '', has_more: false,
     });
-    mocks.resolveApplication.mockRejectedValue(new Error('404'));
+    mocks.resolveApplication.mockRejectedValue({ response: { status: 404 } });
 
     const { root, host } = await mount(
       <ScheduleEditorModal open editing={editingSchedule} onClose={() => {}} onSaved={() => {}} />,
     );
+    await flush(50);
 
-    const selected = agentSelectionItem();
-    expect(selected?.textContent).toContain('智能体 #888');
+    // The Select still shows a non-blank placeholder…
+    expect(agentSelectionItem()?.textContent).toContain('智能体 #888');
+    // …an explicit warning says the agent can no longer run…
+    expect(document.body.textContent).toContain('原智能体当前不可用');
+    // …and 保存 is refused until a new agent is picked.
+    const save = Array.from(document.querySelectorAll<HTMLButtonElement>(
+      '.ant-modal-footer .ant-btn')).find((b) => btnText(b) === '保存');
+    expect(save).toBeTruthy();
+    vi.mocked(updateSchedule).mockClear();
+    await click(save!);
+    await flush(50);
+    expect(vi.mocked(updateSchedule)).not.toHaveBeenCalled();
+
+    await unmount(root, host);
+  });
+
+  it('a 5xx / network resolve failure is RETRYABLE — never faked as 智能体 #id (§42)', async () => {
+    mocks.fetchApplicationPage.mockResolvedValue({
+      items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }],
+      next_cursor: '', has_more: false,
+    });
+    mocks.resolveApplication
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValueOnce({ name: '恢复后的智能体' });
+
+    const { root, host } = await mount(
+      <ScheduleEditorModal open editing={editingSchedule} onClose={() => {}} onSaved={() => {}} />,
+    );
+    await flush(50);
+
+    // No fake 智能体 #id for a transient failure — an explicit error + retry.
+    expect(agentSelectionItem()?.textContent ?? '').not.toContain('智能体 #888');
+    expect(document.body.textContent).toContain('无法加载智能体信息');
+    const retry = findButton('重试');
+    expect(retry).toBeTruthy();
+
+    await click(retry!);
+    await flush(50);
+    expect(mocks.resolveApplication).toHaveBeenCalledTimes(2);
+    expect(agentSelectionItem()?.textContent).toContain('恢复后的智能体');
+    expect(document.body.textContent).not.toContain('无法加载智能体信息');
+
+    await unmount(root, host);
+  });
+
+  it('a failed agent LIST surfaces an error + retry — never an empty-looking Select (§38–§39)', async () => {
+    mocks.fetchApplicationPage
+      .mockRejectedValueOnce(new Error('目录服务故障'))
+      .mockResolvedValueOnce({
+        items: [{ id: 7, name: '恢复后的智能体', enabled: true, is_bound: true }],
+        next_cursor: '', has_more: false,
+      });
+
+    const { root, host } = await mount(
+      <ScheduleEditorModal open editing={null} onClose={() => {}} onSaved={() => {}} />,
+    );
+    await flush(50);
+
+    expect(document.body.textContent).toContain('加载智能体失败');
+    const retry = findButton('重试');
+    expect(retry).toBeTruthy();
+
+    await click(retry!);
+    await flush(50);
+    expect(mocks.fetchApplicationPage).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).not.toContain('加载智能体失败');
 
     await unmount(root, host);
   });
