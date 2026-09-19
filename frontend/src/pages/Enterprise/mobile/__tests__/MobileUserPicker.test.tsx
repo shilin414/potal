@@ -263,3 +263,44 @@ describe('MobileUserPicker — error states (P2-5)', () => {
     expect(row.getAttribute('aria-pressed')).toBe('true');
   });
 });
+
+describe('MobileUserPicker — close resets the query (三次复审 §46)', () => {
+  it('reopening never fires a request carrying the previous search term', async () => {
+    const { root } = await mountPicker();
+    const input = document.querySelector('input')!;
+    await act(async () => { setNativeValue(input, '张'); });
+    await flush(350);
+    expect(mocks.users).toHaveBeenLastCalledWith(
+      expect.objectContaining({ q: '张' }));
+
+    // Close → the query clears immediately (no stale term survives).
+    await act(async () => {
+      root.render(
+        <MobileUserPicker
+          open={false}
+          selectedUsers={[]}
+          onClose={() => {}}
+          onDone={() => {}}
+        />,
+      );
+    });
+    await flush(350);
+
+    // Reopen → page one must NOT carry the previous term.
+    mocks.users.mockClear();
+    await act(async () => {
+      root.render(
+        <MobileUserPicker
+          open
+          selectedUsers={[]}
+          onClose={() => {}}
+          onDone={() => {}}
+        />,
+      );
+    });
+    await flush(350);
+    expect(mocks.users).toHaveBeenCalled();
+    expect(mocks.users).not.toHaveBeenCalledWith(
+      expect.objectContaining({ q: '张' }));
+  });
+});

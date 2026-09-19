@@ -45,11 +45,15 @@ export default function MobileUserPicker({
   const [query, setQuery] = useState('');
   const [picked, setPicked] = useState<MobilePickedUser[]>([]);
 
+  // 关闭时立即清空 query（三次复审 §46）：否则重开的第一帧仍会带着上一次
+  // 的搜索词先发一次请求，再被清空重发一次。开启时重置已选与搜索词。
   useEffect(() => {
-    if (open) {
-      setPicked(selectedUsers.map((u) => ({ ...u })));
+    if (!open) {
       setQuery('');
+      return;
     }
+    setPicked(selectedUsers.map((u) => ({ ...u })));
+    setQuery('');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 

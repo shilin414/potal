@@ -66,6 +66,21 @@ export function useDirectoryUsers({
   }, [query, debouncedQuery, debounceMs]);
 
   const requestIdRef = useRef(0);
+
+  // An INACTIVE surface (the users tab switched away, the picker sheet
+  // closed) must abandon whatever is in flight (三次复审 §43–§45): bumping
+  // the request id invalidates a travelling response so it can no longer
+  // land and repopulate a surface nobody is looking at (a reopen would
+  // otherwise briefly flash the previous search's rows/error). The items
+  // are deliberately KEPT — they are still real data, and a reopen
+  // refreshes page one anyway.
+  useEffect(() => {
+    if (enabled) return;
+    requestIdRef.current += 1;
+    setLoading(false);
+    setLoadingMore(false);
+  }, [enabled]);
+
   const fetchFirstPage = useCallback(async () => {
     if (!enabled) return;
     const requestId = ++requestIdRef.current;
