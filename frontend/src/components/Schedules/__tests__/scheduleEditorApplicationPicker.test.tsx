@@ -300,7 +300,7 @@ const findButton = (label: string) => (
     expect(agentSelectionItem()?.textContent).toContain('日报智能体');
 
     // 换了智能体后保存不再被 unavailable 拦截。
-    vi.mocked(updateSchedule).mockClear().mockResolvedValue({ id: 9 });
+    vi.mocked(updateSchedule).mockClear();
     const save = Array.from(document.querySelectorAll<HTMLButtonElement>(
       '.ant-modal-footer .ant-btn')).find((b) => btnText(b) === '保存');
     await click(save!);

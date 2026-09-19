@@ -619,7 +619,7 @@ describe('desktop AccessPage — user picker server search + pagination (四次�
     await click(document.querySelector('[data-open-cell="7"] button')!);
     await flush(20);
 
-    const select = () => document.querySelector('[data-testid="user-select"]')!;
+    const select = () => document.querySelector<HTMLElement>('[data-testid="user-select"]')!;
     const options = () => JSON.parse(select().dataset.options!) as number[];
     // 第一页 50 人已在候选；已授权但不在目录页里的 999 也有 label
     // （policy.users 合并进 options，不退化成 raw id）。

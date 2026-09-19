@@ -19,7 +19,7 @@ import {
   fetchSchedules,
   runScheduleNow,
 } from '@/services/scheduleApi';
-import type { Schedule } from '@/types/schedule';
+import type { Schedule, ScheduleOccurrence } from '@/types/schedule';
 
 vi.mock('@/services/scheduleApi', async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -397,12 +397,12 @@ describe('useSchedules — toggle 与筛选语义归并（四次复审 P1-4）',
 describe('useSchedules — 并发行级 mutation（四次复审 P2-1）', () => {
   it('A finishing first does not free B: rows mutate concurrently and independently', async () => {
     let resolveA!: (value: Schedule) => void;
-    let resolveB!: (value: unknown) => void;
+    let resolveB!: (value: ScheduleOccurrence) => void;
     mockFetch.mockResolvedValue(page(2, 5)); // 挂载首页 + runNow 成功后的 refresh
     mockDisable.mockImplementationOnce(
       () => new Promise<Schedule>((res) => { resolveA = res; }));
     mockRunNow.mockImplementationOnce(
-      () => new Promise<unknown>((res) => { resolveB = res; }));
+      () => new Promise<ScheduleOccurrence>((res) => { resolveB = res; }));
     await act(async () => { root.render(<ProbeComponent />); });
     await flush(10);
     expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
@@ -423,7 +423,9 @@ describe('useSchedules — 并发行级 mutation（四次复审 P2-1）', () => 
     expect(latest.current!.isMutating(4)).toBe(true);
 
     // B 结束后自己的行才解锁。
-    await act(async () => { resolveB(undefined); });
+    await act(async () => {
+      resolveB({ id: 4, schedule_id: 4, scheduled_at: '', status: 'pending' } as ScheduleOccurrence);
+    });
     await act(async () => { await b; });
     await flush(10);
     expect(latest.current!.isMutating(4)).toBe(false);

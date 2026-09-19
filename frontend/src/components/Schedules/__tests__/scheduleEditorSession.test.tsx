@@ -12,7 +12,7 @@
 // @vitest-environment jsdom
 import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createRoot, type Root } from 'react-dom/client';
+import { createRoot } from 'react-dom/client';
 import { act } from 'react-dom/test-utils';
 
 import type { Schedule } from '@/types/schedule';
