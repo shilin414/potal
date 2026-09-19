@@ -227,15 +227,20 @@ export function useScheduleEditor({
   }, [form]);
 
   const refreshPreview = useCallback(async () => {
+    // 预览代际（四次复审 P2-5）：请求在途时用户还能继续改执行时间/星期/
+    // 时区 —— 旧表单算出的预览晚到后不得覆盖新配置下的结果。
+    const seq = ++previewSeqRef.current;
     try {
       setPreviewing(true);
       const payload = formToPayload(await readValues());
       const runs = await previewScheduleRuns(payload);
+      if (seq !== previewSeqRef.current) return; // 表单已变，预览已作废
       setPreview(runs);
     } catch {
       // 校验失败时静默——表单自身会提示
     } finally {
-      setPreviewing(false);
+      // 只有最新一次预览拥有 spinner 状态。
+      if (seq === previewSeqRef.current) setPreviewing(false);
     }
   }, [readValues]);
 
@@ -292,6 +297,27 @@ export function useScheduleEditor({
   // 在 Select 里换成新 Agent 后，原 Agent 的 unavailable/transient 告警必须
   // 立即消失 —— 告警绑定的是当前字段值，而不是 resolve 时的目标。
   const resolutionApplies = watchedAppId === targetApplicationId;
+
+  // 预览作废（四次复审 P2-5）：执行时间相关字段一变，旧预览立即作废并
+  // 清空 —— 请求在途时改配置，晚到的旧预览不再误导（seq 守卫见
+  // refreshPreview）。
+  const previewSeqRef = useRef(0);
+  const watchedScheduleType = Form.useWatch('schedule_type', form);
+  const watchedTriggerTime = Form.useWatch(['trigger', 'time'], form);
+  const watchedDaysOfWeek = Form.useWatch(['trigger', 'days_of_week'], form);
+  const watchedDayOfMonth = Form.useWatch(['trigger', 'day_of_month'], form);
+  const watchedRunAt = Form.useWatch('run_at_local', form);
+  const watchedTimezone = Form.useWatch('timezone', form);
+  useEffect(() => {
+    // 触发字段变化：在途预览立即作废 —— 清空结果并归还 spinner（被作废的
+    // 预览自身已无权复位它）；其晚到的响应由 refreshPreview 的 seq 守卫丢弃。
+    previewSeqRef.current += 1;
+    setPreview([]);
+    setPreviewing(false);
+  }, [
+    watchedScheduleType, watchedTriggerTime, watchedDaysOfWeek,
+    watchedDayOfMonth, watchedRunAt, watchedTimezone,
+  ]);
 
   return {
     form, saving,
