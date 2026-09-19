@@ -17,6 +17,11 @@
  *   · status（六次复审 P2-3）：idle（未参与查询）≠ success(0 条)——
  *     Schedule Editor 据此区分「部分数据源失败」与「全部参与的数据源都
  *     失败」，空 query 下 chat 失败不再是「部分失败」而是全失败；
+ *   · 分页错误与首页错误分离（七次复审 P1-2/P1-3）：loadMore 失败只置
+ *     loadMoreError（status 保持 success、已加载页保留、hasMore 保留），
+ *     绝不把「第 4 页拉挂了」升级成「整个数据源失败」把前 150 条一起
+ *     清掉；续拉成功必须清掉 loadMoreError（旧实现 page2 重试成功后
+ *     error 仍残留，UI 永远显示失败态）；
  *   · Surface 关闭（enabled=false）或 sessionKey 变化：立即作废在途
  *     请求并清空会话状态 —— 快速重开的第一帧不闪旧结果/旧错误。
  */
@@ -54,6 +59,14 @@ export interface UseFeishuTargetsResult {
   error: string | null;
   /** 失败响应的 HTTP 状态码（403/400 = 需要重新授权飞书）。 */
   errorStatus: number | null;
+  /**
+   * 续拉下一页失败（七次复审 P1-2）：partial paging error，不是整个数据
+   * 源失败 —— status/items/hasMore 均保持原状，Host 在列表底部给「更多
+   * 加载失败 + 重试续拉」入口即可，不得清掉已加载页。
+   */
+  loadMoreError: string | null;
+  /** 续拉失败的 HTTP 状态码（403 = 授权变化，Host 仍要给重新授权入口）。 */
+  loadMoreErrorStatus: number | null;
   /** 是否还有下一页（仅 user 分页有意义）。 */
   hasMore: boolean;
   /** idle = 未参与查询（如 user 空 query），区别于 success(0 条)。 */
@@ -73,6 +86,10 @@ export function useFeishuTargets({
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [errorStatus, setErrorStatus] = useState<number | null>(null);
+  // 分页错误独立于首页错误（七次复审 P1-2）：loadMore 失败不动 status/
+  // items/hasMore —— 已加载的页仍然有效，只有「下一页」暂时拉不到。
+  const [loadMoreError, setLoadMoreError] = useState<string | null>(null);
+  const [loadMoreErrorStatus, setLoadMoreErrorStatus] = useState<number | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [status, setStatus] = useState<FeishuTargetStatus>('idle');
 
@@ -113,6 +130,8 @@ export function useFeishuTargets({
     setLoadingMore(false);
     setError(null);
     setErrorStatus(null);
+    setLoadMoreError(null);
+    setLoadMoreErrorStatus(null);
     setHasMore(false);
     setStatus('idle');
     setDebouncedQuery(nextQuery);
@@ -148,6 +167,8 @@ export function useFeishuTargets({
       setHasMore(false);
       setError(null);
       setErrorStatus(null);
+      setLoadMoreError(null);
+      setLoadMoreErrorStatus(null);
       setStatus('idle');
       return;
     }
@@ -162,6 +183,8 @@ export function useFeishuTargets({
       setHasMore(false);
       setError(null);
       setErrorStatus(null);
+      setLoadMoreError(null);
+      setLoadMoreErrorStatus(null);
       setStatus('success');
       return;
     }
@@ -175,6 +198,10 @@ export function useFeishuTargets({
     setLoading(true);
     setError(null);
     setErrorStatus(null);
+    // 新的首页请求也作废旧的分页错误：这是新的数据代际，不是旧代际
+    // 的第 2 页重试（七次复审 P1-2）。
+    setLoadMoreError(null);
+    setLoadMoreErrorStatus(null);
     setStatus('loading');
     try {
       // effectiveQuery：user = debouncedQuery（服务端搜索）；chat 固定为空串
@@ -216,6 +243,8 @@ export function useFeishuTargets({
     setLoadingMore(false);
     setError(null);
     setErrorStatus(null);
+    setLoadMoreError(null);
+    setLoadMoreErrorStatus(null);
     setHasMore(false);
     setStatus('idle');
   }, [enabled]);
@@ -241,15 +270,21 @@ export function useFeishuTargets({
       });
       cursorRef.current = page.next_cursor ?? '';
       setHasMore(Boolean(page.has_more) && (page.next_cursor ?? '') !== '');
+      // 续拉成功必须真正清除分页错误（七次复审 P1-3）：page2 第一次失败后
+      // 重试成功，数据已 append 而 error 残留会让 UI 永远显示失败态。
+      setLoadMoreError(null);
+      setLoadMoreErrorStatus(null);
     } catch (e: any) {
       if (seq !== requestSeqRef.current || loadSeq !== loadMoreSeqRef.current) return;
-      setError(
+      // Partial paging error（七次复审 P1-2）：第一页的数据仍然有效，失败
+      // 的只是「下一页」。绝不动 status/items/hasMore —— 旧实现把它们全
+      // 拨成 error，ForwardModal 会把已加载的 50 人瞬间清空只剩错误屏。
+      setLoadMoreError(
         e?.response?.data?.error
         || e?.response?.data?.detail
         || '搜索联系人失败',
       );
-      setErrorStatus(e?.response?.status ?? null);
-      setStatus('error');
+      setLoadMoreErrorStatus(e?.response?.status ?? null);
     } finally {
       if (seq === requestSeqRef.current && loadSeq === loadMoreSeqRef.current) {
         setLoadingMore(false);
@@ -275,6 +310,7 @@ export function useFeishuTargets({
 
   return {
     items, loading, loadingMore, error, errorStatus,
+    loadMoreError, loadMoreErrorStatus,
     hasMore, status, loadMore, refresh,
   };
 }
