@@ -44,7 +44,7 @@ const MobileFullScreenDrawer: React.FC<MobileFullScreenDrawerProps> = ({
       <header className="mobile-fs-drawer__header">
         <button
           type="button"
-          className="mobile-shell__icon-btn"
+          className="mobile-fs-drawer__back"
           aria-label="返回"
           onClick={onClose}
         >
@@ -62,7 +62,7 @@ const MobileFullScreenDrawer: React.FC<MobileFullScreenDrawerProps> = ({
           >
             {actionText}
           </Button>
-        ) : <span className="mobile-shell__bar-spacer" aria-hidden />}
+        ) : <span className="mobile-fs-drawer__spacer" aria-hidden />}
       </header>
       <div className="mobile-fs-drawer__body">{children}</div>
     </div>

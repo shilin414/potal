@@ -227,7 +227,12 @@ describe('MobileFullScreenDrawer (§29)', () => {
         <div />
       </MobileFullScreenDrawer>,
     );
-    expect(document.querySelector('.mobile-fs-drawer__header .mobile-shell__bar-spacer'))
+    expect(document.querySelector('.mobile-fs-drawer__header .mobile-fs-drawer__spacer'))
       .toBeTruthy();
+    // The primitive owns its chrome — no Shell classes leak in (§54).
+    expect(document.querySelector('.mobile-fs-drawer__header .mobile-shell__bar-spacer'))
+      .toBeNull();
+    expect(document.querySelector('.mobile-fs-drawer__header .mobile-shell__icon-btn'))
+      .toBeNull();
   });
 });

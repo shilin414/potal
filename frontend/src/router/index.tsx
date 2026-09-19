@@ -1,4 +1,4 @@
-import { lazy, Suspense } from 'react';
+import { lazy, Suspense, type ReactNode } from 'react';
 import { createBrowserRouter, Navigate } from 'react-router-dom';
 import { AuthLayout } from '@/layouts';
 import AppShell from '@/shell/AppShell';
@@ -6,20 +6,24 @@ import WorkspaceHost from '@/components/Workspace/WorkspaceHost';
 import { AdminRoute, ProtectedRoute, PublicRoute } from './guards';
 import LegacyAppRunRedirect from './LegacyAppRunRedirect';
 
-// Console pages (application management).
-import AgentsPage from '@/pages/Agents/AgentsPage';
-import AgentDetailPage from '@/pages/Agents/AgentDetailPage';
-import TemplatesPage from '@/pages/Templates/TemplatesPage';
-import TemplateDetailPage from '@/pages/Templates/TemplateDetailPage';
-import AppsPage from '@/pages/Apps/AppsPage';
-import AppDetailPage from '@/pages/Apps/AppDetailPage';
-import ChatApplicationEditPage from '@/pages/Apps/ChatApplicationEditPage';
-import WorkspacePage from '@/pages/Workspace/WorkspacePage';
-import WorkflowsPage from '@/pages/Workflows/WorkflowsPage';
-import WorkflowEditorPage from '@/pages/Workflows/WorkflowEditorPage';
-import WorkflowRunnerPage from '@/pages/Workflows/WorkflowRunnerPage';
-import SkillsPage from '@/pages/Skills/SkillsPage';
-import { SchedulesPage } from '@/pages/Schedules/SchedulesPage';
+// Console pages (application management) are route-level lazy (三次复审
+// §55–§58): 首页 / Chat 首屏不再下载用户可能永远不会进入的管理页 ——
+// Enterprise 已用同一模式证明可行。只切分次级 console 路由：
+// WorkspaceHost / 主 Chat / Shell / 登录页 保持同步加载。
+const AgentsPage = lazy(() => import('@/pages/Agents/AgentsPage'));
+const AgentDetailPage = lazy(() => import('@/pages/Agents/AgentDetailPage'));
+const TemplatesPage = lazy(() => import('@/pages/Templates/TemplatesPage'));
+const TemplateDetailPage = lazy(() => import('@/pages/Templates/TemplateDetailPage'));
+const AppsPage = lazy(() => import('@/pages/Apps/AppsPage'));
+const AppDetailPage = lazy(() => import('@/pages/Apps/AppDetailPage'));
+const ChatApplicationEditPage = lazy(() => import('@/pages/Apps/ChatApplicationEditPage'));
+const WorkspacePage = lazy(() => import('@/pages/Workspace/WorkspacePage'));
+const WorkflowsPage = lazy(() => import('@/pages/Workflows/WorkflowsPage'));
+const WorkflowEditorPage = lazy(() => import('@/pages/Workflows/WorkflowEditorPage'));
+const WorkflowRunnerPage = lazy(() => import('@/pages/Workflows/WorkflowRunnerPage'));
+const SkillsPage = lazy(() => import('@/pages/Skills/SkillsPage'));
+const SchedulesPage = lazy(() => import('@/pages/Schedules/SchedulesPage')
+  .then((m) => ({ default: m.SchedulesPage })));
 
 // Auth pages stay outside the shell entirely.
 // 普通用户 = 飞书 SSO Only（/login 自动发起 OAuth）；管理员 = /login/admin。
@@ -39,6 +43,11 @@ const enterpriseElement = (
   <Suspense fallback={<div style={{ padding: 32 }}>正在加载企业控制台…</div>}>
     <AdminRoute><EnterprisePage /></AdminRoute>
   </Suspense>
+);
+
+/** 次级 console 路由的懒加载壳：短 fallback，不打断布局。 */
+const lazyConsole = (node: ReactNode) => (
+  <Suspense fallback={<div style={{ padding: 32 }}>正在加载…</div>}>{node}</Suspense>
 );
 
 /** Console pages scroll and pad; workspaces lay themselves out (§17/§33). */
@@ -104,42 +113,70 @@ const router = createBrowserRouter([
         element: <WorkspaceHost kind="workflow" />,
       },
 
-      // ── Console (application management) ──────────────────────────────
-      { path: 'agents', element: <AgentsPage />, handle: agentsPageHandle },
-      { path: 'agents/:id', element: <AgentDetailPage />, handle: consolePage },
-      { path: 'templates', element: <TemplatesPage />, handle: consolePage },
+      // ── Console (application management, route-level lazy) ────────────
+      { path: 'agents', element: lazyConsole(<AgentsPage />), handle: agentsPageHandle },
       {
-        path: 'templates/:id',
-        element: <TemplateDetailPage />,
+        path: 'agents/:id',
+        element: lazyConsole(<AgentDetailPage />),
         handle: consolePage,
       },
-      { path: 'apps', element: <AppsPage />, handle: appsPageHandle },
-      { path: 'apps/:id', element: <AdminRoute><AppDetailPage /></AdminRoute>, handle: consolePage },
+      {
+        path: 'templates',
+        element: lazyConsole(<TemplatesPage />),
+        handle: consolePage,
+      },
+      {
+        path: 'templates/:id',
+        element: lazyConsole(<TemplateDetailPage />),
+        handle: consolePage,
+      },
+      { path: 'apps', element: lazyConsole(<AppsPage />), handle: appsPageHandle },
+      {
+        path: 'apps/:id',
+        element: lazyConsole(
+          <AdminRoute><AppDetailPage /></AdminRoute>,
+        ),
+        handle: consolePage,
+      },
       // Launched apps now live in the shell's application workspace (§32).
       { path: 'apps/:id/run', element: <LegacyAppRunRedirect /> },
       {
         path: 'apps/:id/edit',
-        element: <AdminRoute><ChatApplicationEditPage /></AdminRoute>,
+        element: lazyConsole(
+          <AdminRoute><ChatApplicationEditPage /></AdminRoute>,
+        ),
         handle: consolePage,
       },
-      { path: 'skills', element: <SkillsPage />, handle: fullWidthConsole },
-      { path: 'schedules', element: <SchedulesPage />, handle: schedulesPageHandle },
-      { path: 'workflows', element: <WorkflowsPage />, handle: fullWidthConsole },
+      { path: 'skills', element: lazyConsole(<SkillsPage />), handle: fullWidthConsole },
+      {
+        path: 'schedules',
+        element: lazyConsole(<SchedulesPage />),
+        handle: schedulesPageHandle,
+      },
+      {
+        path: 'workflows',
+        element: lazyConsole(<WorkflowsPage />),
+        handle: fullWidthConsole,
+      },
       {
         path: 'workflows/:id/edit',
-        element: <WorkflowEditorPage />,
+        element: lazyConsole(<WorkflowEditorPage />),
         handle: fullWidthConsole,
       },
       {
         path: 'workflow-runs/:runId',
-        element: <WorkflowRunnerPage />,
+        element: lazyConsole(<WorkflowRunnerPage />),
         handle: fullscreenConsole,
       },
       // Template-workflow workspace: still on the legacy agent engine.
-      { path: 'workspace', element: <WorkspacePage />, handle: consolePage },
+      {
+        path: 'workspace',
+        element: lazyConsole(<WorkspacePage />),
+        handle: consolePage,
+      },
       {
         path: 'workspace/:id',
-        element: <WorkspacePage />,
+        element: lazyConsole(<WorkspacePage />),
         handle: fullWidthConsole,
       },
       { path: 'enterprise/*', element: enterpriseElement, handle: enterprisePageHandle },
