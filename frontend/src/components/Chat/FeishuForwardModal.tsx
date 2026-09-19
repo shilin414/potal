@@ -31,6 +31,13 @@ interface FeishuForwardModalProps {
 
 const HISTORY_LIMIT = 10;
 
+/**
+ * 前端 20 目标上限（七次复审 P2-8）：Backend feishuForwardMaxTargets=20、
+ * OpenAPI maxItems=20，前端 toggle 必须同限 —— Chat 全量 + user 分页让用户
+ * 更容易真实选到 21+，旧实现要点「发送（25）」才被后端 400 拒绝。
+ */
+const MAX_FORWARD_TARGETS = 20;
+
 const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
   open,
   shareToken,
@@ -91,12 +98,18 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
     onClose();
   };
 
+  // toggle 是唯一的选中入口（列表行 + 最近转发 chip 都走它，七次复审
+  // §35），上限写在 toggle 里两个入口同时生效。
   const toggle = (t: FeishuForwardTarget) => {
-    setSelected((current) => (
-      current.some((x) => x.id === t.id)
-        ? current.filter((x) => x.id !== t.id)
-        : [...current, t]
-    ));
+    if (selected.some((x) => x.id === t.id)) {
+      setSelected(selected.filter((x) => x.id !== t.id));
+      return;
+    }
+    if (selected.length >= MAX_FORWARD_TARGETS) {
+      antdMessage.warning('一次最多转发给 20 个目标');
+      return;
+    }
+    setSelected([...selected, t]);
   };
 
   const handleSend = async () => {
