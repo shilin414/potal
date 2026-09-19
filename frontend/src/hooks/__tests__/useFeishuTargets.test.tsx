@@ -1,13 +1,19 @@
 /**
- * useFeishuTargets — 飞书目标远程搜索回归（五次复审 P1-3 / P2-7 / P2-8）。
+ * useFeishuTargets — 飞书目标远程搜索回归（五次复审 P1-3 / P2-7 / P2-8，
+ * 六次复审 P1-3 / P2-1 / P2-3）。
  *
- *   · user：空 query 不发请求（provider 一页只有 20 条，空查询拿到的是
- *     「全公司任意前 20 人」）；有 query 才服务端搜索；
- *   · chat：query 直发后端过滤，空 query = 全量群聊；
- *   · 请求代际：旧查询晚到的响应整体丢弃（ForwardModal 旧实现曾让慢的
- *     旧查询覆盖新查询）；
+ *   · user：空 query 不发请求（idle ≠ success(0 条)，六次复审 P2-3）；
+ *     有 query 才服务端搜索，并按 cursor 续拉（六次复审 P1-3 —— 官方
+ *     search/v1/user 支持 page_size 1-200 / page_token，旧的「一页 20
+ *     条」让第 21+ 人永远选不到）；
+ *   · chat：一个 picker 会话只请求一次全量（六次复审 P2-1）—— 后端已
+ *     翻到 has_more=false，query 由 hook 在完整数据集上本地过滤，输入
+ *     「运/运营/运营群」不再每敲一个字符就重扫一遍完整群列表；
+ *   · 请求代际：旧查询晚到的响应（含续拉页）整体丢弃，不得 append 到
+ *     新查询的结果（ForwardModal 旧实现曾让慢的旧查询覆盖新查询）；
  *   · ERROR ≠ EMPTY：失败暴露 error + errorStatus，refresh 可重试；
- *   · enabled / sessionKey 变化：立即作废在途请求并清空会话状态。
+ *   · enabled / sessionKey 变化：立即作废在途请求并清空会话状态；
+ *     chat 会话缓存跨 enabled 切换存续（切 tab 回来不重拉）。
  * @vitest-environment jsdom
  */
 import React from 'react';
@@ -15,7 +21,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react-dom/test-utils';
 import { useFeishuTargets, type UseFeishuTargetsOptions, type UseFeishuTargetsResult } from '../useFeishuTargets';
-import { fetchFeishuTargets, type FeishuForwardTarget } from '@/services/shareApi';
+import { fetchFeishuTargets, type FeishuForwardTarget, type FeishuForwardTargetPage } from '@/services/shareApi';
 
 vi.mock('@/services/shareApi', async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -28,6 +34,16 @@ const mockFetch = vi.mocked(fetchFeishuTargets);
 
 const target = (id: string, name: string, type: 'user' | 'chat' = 'user'): FeishuForwardTarget => ({
   id, name, avatar_url: '', target_type: type,
+});
+
+/** 官方分页 envelope（六次复审 P1-3）：{items, next_cursor, has_more}。 */
+const page = (
+  items: FeishuForwardTarget[],
+  opts?: { hasMore?: boolean; cursor?: string },
+): FeishuForwardTargetPage => ({
+  items,
+  next_cursor: opts?.cursor ?? '',
+  has_more: opts?.hasMore ?? false,
 });
 
 const flush = async (ms = 0) => {
@@ -74,19 +90,31 @@ afterEach(async () => {
   host.remove();
 });
 
-describe('useFeishuTargets — 搜索契约（五次复审 P1-3）', () => {
-  it('user: an EMPTY query never fires — the provider page of 20 is not "any 20 coworkers"', async () => {
-    mockFetch.mockResolvedValue([target('u1', '张三')]);
+describe('useFeishuTargets — 搜索契约（五次复审 P1-3 / 六次复审 P2-3）', () => {
+  it('user: an EMPTY query never fires — status is IDLE, not success(empty)', async () => {
+    mockFetch.mockResolvedValue(page([target('u1', '张三')]));
     options = { type: 'user', enabled: true, query: '' };
     await rerender();
     await flush(350);
     expect(mockFetch).not.toHaveBeenCalled();
     expect(latest.current!.items).toEqual([]);
     expect(latest.current!.loading).toBe(false);
+    // idle = 未参与查询（六次复审 P2-3）：绝不是「成功加载了 0 条」。
+    expect(latest.current!.status).toBe('idle');
+  });
+
+  it('user: a zero-row SUCCESS page is success, not idle — 未请求 ≠ 请求成功但 0 条', async () => {
+    mockFetch.mockResolvedValue(page([]));
+    options = { type: 'user', enabled: true, query: '不存在的人' };
+    await rerender();
+    await flush(350);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(latest.current!.items).toEqual([]);
+    expect(latest.current!.status).toBe('success');
   });
 
   it('user: typing a name goes to the SERVER — the 21st coworker becomes findable', async () => {
-    mockFetch.mockResolvedValue([target('u21', '第二十一人')]);
+    mockFetch.mockResolvedValue(page([target('u21', '第二十一人')]));
     options = { type: 'user', enabled: true, query: '' };
     await rerender();
     await flush(10);
@@ -97,19 +125,128 @@ describe('useFeishuTargets — 搜索契约（五次复审 P1-3）', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
     expect(mockFetch).toHaveBeenLastCalledWith('user', '二十');
     expect(latest.current!.items.map((t) => t.name)).toEqual(['第二十一人']);
+    expect(latest.current!.status).toBe('success');
   });
 
-  it('chat: an empty query loads the full list; a term goes to the server filter', async () => {
-    mockFetch.mockResolvedValue([target('c1', '销售群', 'chat')]);
+  it('chat: one full-list fetch per session — typing only filters LOCALLY', async () => {
+    mockFetch.mockResolvedValue(page([
+      target('c1', '运营群', 'chat'),
+      target('c2', '技术群', 'chat'),
+    ]));
     options = { type: 'chat', enabled: true, query: '' };
     await rerender();
     await flush(10);
-    expect(mockFetch).toHaveBeenCalledWith('chat', undefined);
+    // 空 query = 全量（后端已翻到 has_more=false），不带搜索词。
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(mockFetch).toHaveBeenLastCalledWith('chat', undefined);
 
-    options = { ...options, query: '销售' };
+    // 逐字输入（六次复审 P2-1）：旧实现每敲一个字符都重扫一遍完整群列表。
+    options = { ...options, query: '运' };
     await rerender();
     await flush(350);
-    expect(mockFetch).toHaveBeenLastCalledWith('chat', '销售');
+    options = { ...options, query: '运营' };
+    await rerender();
+    await flush(350);
+    options = { ...options, query: '运营群' };
+    await rerender();
+    await flush(350);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    // 本地过滤发生在完整数据集上（区别于旧的「只拉前 100 再过滤」）。
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['运营群']);
+
+    // 清空搜索词：回到全量，仍然是那一次请求。
+    options = { ...options, query: '' };
+    await rerender();
+    await flush(10);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['运营群', '技术群']);
+  });
+});
+
+describe('useFeishuTargets — user cursor 分页（六次复审 P1-3）', () => {
+  it('loadMore appends the next page (provider page_token as cursor) and dedupes', async () => {
+    mockFetch
+      .mockResolvedValueOnce(page([target('u1', '张一'), target('u2', '张二')], { hasMore: true, cursor: 'p2' }))
+      .mockResolvedValueOnce(page([target('u3', '张三'), target('u1', '张一(重复)')], { hasMore: false }));
+    options = { type: 'user', enabled: true, query: '张' };
+    await rerender();
+    await flush(350);
+    expect(latest.current!.hasMore).toBe(true);
+
+    await act(async () => { await latest.current!.loadMore(); });
+    await flush(10);
+    // 第二页带 cursor 续拉，append 且按 id 去重。
+    expect(mockFetch).toHaveBeenLastCalledWith('user', '张', 'p2');
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['张一', '张二', '张三']);
+    expect(latest.current!.hasMore).toBe(false);
+    expect(latest.current!.loadingMore).toBe(false);
+  });
+
+  it('a late page from an OLD query never appends to the NEW query', async () => {
+    // query 张：page1 已落地，page2（张三/张四）在途；用户改搜李。
+    const stalePage2 = deferred<FeishuForwardTargetPage>();
+    mockFetch
+      .mockResolvedValueOnce(page([target('u1', '张一')], { hasMore: true, cursor: 'p2' }))
+      .mockImplementationOnce(() => stalePage2.promise)
+      .mockResolvedValueOnce(page([target('l1', '李一')]));
+    options = { type: 'user', enabled: true, query: '张' };
+    await rerender();
+    await flush(350);
+    await act(async () => { void latest.current!.loadMore(); });
+    await flush(10); // 张/page2 在途
+
+    options = { ...options, query: '李' };
+    await rerender();
+    await flush(350); // 李 page1 落地
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['李一']);
+
+    // 旧 张/page2 迟到：不得 append 到李的结果。
+    await act(async () => { stalePage2.resolve(page([target('u3', '张三'), target('u4', '张四')])); });
+    await flush(10);
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['李一']);
+  });
+
+  it('a query change while a loadMore is in flight resets loadingMore', async () => {
+    // 张 page1 落地（hasMore），续拉 page2 在途；用户改搜李 —— 新首页
+    // 作废在途续拉后，loadingMore 必须复位：其 finally 的双 seq 检查必
+    // 不过、不会自己清，卡 true 会永久锁死该会话的续拉入口。
+    const stalePage2 = deferred<FeishuForwardTargetPage>();
+    mockFetch
+      .mockResolvedValueOnce(page([target('u1', '张一')], { hasMore: true, cursor: 'p2' }))
+      .mockImplementationOnce(() => stalePage2.promise)
+      .mockResolvedValueOnce(page([target('l1', '李一')], { hasMore: true, cursor: 'l2' }));
+    options = { type: 'user', enabled: true, query: '张' };
+    await rerender();
+    await flush(350);
+    await act(async () => { void latest.current!.loadMore(); });
+    await flush(10);
+    expect(latest.current!.loadingMore).toBe(true);
+
+    options = { ...options, query: '李' };
+    await rerender();
+    await flush(350); // 李 page1 落地 + 作废在途续拉
+    expect(latest.current!.loading).toBe(false);
+    expect(latest.current!.loadingMore).toBe(false); // 不得卡死
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['李一']);
+
+    // 迟到的 张/page2 不得 append；且续拉功能仍然可用。
+    await act(async () => { stalePage2.resolve(page([target('u2', '张二')])); });
+    await flush(10);
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['李一']);
+
+    mockFetch.mockResolvedValueOnce(page([target('l2', '李二')]));
+    await act(async () => { await latest.current!.loadMore(); });
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['李一', '李二']);
+  });
+  it('loadMore is a no-op while a page is already in flight or hasMore is false', async () => {
+    mockFetch.mockResolvedValue(page([target('u1', '张一')], { hasMore: false }));
+    options = { type: 'user', enabled: true, query: '张' };
+    await rerender();
+    await flush(350);
+    expect(latest.current!.hasMore).toBe(false);
+    await act(async () => { await latest.current!.loadMore(); });
+    expect(mockFetch).toHaveBeenCalledTimes(1); // hasMore=false：不再请求
   });
 });
 
@@ -117,8 +254,8 @@ describe('useFeishuTargets — 请求代际（五次复审 P2-8 / §29）', () =
   it('a slow OLD query can never overwrite the NEW one', async () => {
     // q1=张 请求 A 在途；用户继续输入 q2=张三 请求 B；B 先返回、A 后返回
     // —— 最终列表只能是 B 的结果（旧实现里 A 会覆盖 B）。
-    const a = deferred<FeishuForwardTarget[]>();
-    const b = deferred<FeishuForwardTarget[]>();
+    const a = deferred<FeishuForwardTargetPage>();
+    const b = deferred<FeishuForwardTargetPage>();
     mockFetch
       .mockImplementationOnce(() => a.promise)
       .mockImplementationOnce(() => b.promise);
@@ -132,19 +269,19 @@ describe('useFeishuTargets — 请求代际（五次复审 P2-8 / §29）', () =
     await flush(350); // 新防抖到期 → 请求 B 在途
 
     // B 先返回：B 的结果落地。
-    await act(async () => { b.resolve([target('u9', '张三本人')]); });
+    await act(async () => { b.resolve(page([target('u9', '张三本人')])); });
     await flush(10);
     expect(latest.current!.items.map((t) => t.name)).toEqual(['张三本人']);
     expect(latest.current!.loading).toBe(false);
 
     // A 后返回：整体丢弃，不得覆盖 B。
-    await act(async () => { a.resolve([target('u1', '张'), target('u2', '张二号')]); });
+    await act(async () => { a.resolve(page([target('u1', '张'), target('u2', '张二号')])); });
     await flush(10);
     expect(latest.current!.items.map((t) => t.name)).toEqual(['张三本人']);
   });
 
   it('clearing the query invalidates an in-flight search immediately', async () => {
-    const a = deferred<FeishuForwardTarget[]>();
+    const a = deferred<FeishuForwardTargetPage>();
     mockFetch.mockImplementationOnce(() => a.promise);
     options = { type: 'user', enabled: true, query: '张' };
     await rerender();
@@ -156,8 +293,9 @@ describe('useFeishuTargets — 请求代际（五次复审 P2-8 / §29）', () =
     await rerender();
     await flush(10);
     expect(latest.current!.loading).toBe(false);
+    expect(latest.current!.status).toBe('idle');
 
-    await act(async () => { a.resolve([target('u1', '张')]); });
+    await act(async () => { a.resolve(page([target('u1', '张')])); });
     await flush(10);
     expect(latest.current!.items).toEqual([]);
   });
@@ -174,6 +312,7 @@ describe('useFeishuTargets — ERROR ≠ EMPTY（五次复审 P2-7）', () => {
 
     expect(latest.current!.error).toBe('获取群聊列表失败');
     expect(latest.current!.errorStatus).toBe(502);
+    expect(latest.current!.status).toBe('error');
     expect(latest.current!.items).toEqual([]);
   });
 
@@ -192,7 +331,7 @@ describe('useFeishuTargets — ERROR ≠ EMPTY（五次复审 P2-7）', () => {
   it('refresh retries with the CURRENT query and clears the error on success', async () => {
     mockFetch
       .mockRejectedValueOnce(new Error('network down'))
-      .mockResolvedValueOnce([target('u1', '张三')]);
+      .mockResolvedValueOnce(page([target('u1', '张三')]));
     options = { type: 'user', enabled: true, query: '张三' };
     await rerender();
     await flush(350);
@@ -203,11 +342,26 @@ describe('useFeishuTargets — ERROR ≠ EMPTY（五次复审 P2-7）', () => {
     expect(latest.current!.error).toBeNull();
     expect(latest.current!.items.map((t) => t.name)).toEqual(['张三']);
   });
+
+  it('refresh on chat re-fetches the full list (cache invalidated)', async () => {
+    mockFetch
+      .mockResolvedValueOnce(page([target('c1', '旧群', 'chat')]))
+      .mockResolvedValueOnce(page([target('c2', '新群', 'chat')]));
+    options = { type: 'chat', enabled: true, query: '' };
+    await rerender();
+    await flush(10);
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['旧群']);
+
+    await act(async () => { await latest.current!.refresh(); });
+    await flush(10);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['新群']);
+  });
 });
 
 describe('useFeishuTargets — 会话与关闭重置（五次复审 §37–§39）', () => {
   it('disabling the surface invalidates in-flight requests and clears session state', async () => {
-    const a = deferred<FeishuForwardTarget[]>();
+    const a = deferred<FeishuForwardTargetPage>();
     mockFetch.mockImplementationOnce(() => a.promise);
     options = { type: 'chat', enabled: true, query: '' };
     await rerender();
@@ -218,16 +372,39 @@ describe('useFeishuTargets — 会话与关闭重置（五次复审 §37–§39�
     await rerender();
     await flush(10);
     expect(latest.current!.loading).toBe(false);
+    expect(latest.current!.status).toBe('idle');
 
     // 迟到的响应不得落地。
-    await act(async () => { a.resolve([target('c1', '群', 'chat')]); });
+    await act(async () => { a.resolve(page([target('c1', '群', 'chat')])); });
     await flush(10);
     expect(latest.current!.items).toEqual([]);
   });
 
+  it('chat: re-enabling within the SAME session restores the cache without a new request', async () => {
+    // 六次复审 P2-1：切 tab（enabled=false）再切回不算新会话 —— 会话缓存
+    // 跨 enabled 切换存续，不重拉全量。
+    mockFetch.mockResolvedValue(page([target('c1', '运营群', 'chat')]));
+    options = { type: 'chat', enabled: true, query: '', sessionKey: 's1' };
+    await rerender();
+    await flush(10);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['运营群']);
+
+    options = { ...options, enabled: false };
+    await rerender();
+    await flush(10);
+    expect(latest.current!.items).toEqual([]); // UI 不闪旧数据
+
+    options = { ...options, enabled: true };
+    await rerender();
+    await flush(10);
+    expect(mockFetch).toHaveBeenCalledTimes(1); // 缓存恢复：0 次新请求
+    expect(latest.current!.items.map((t) => t.name)).toEqual(['运营群']);
+  });
+
   it('a sessionKey change is a NEW session: immediate reset, no stale-q request, no stale items', async () => {
     // 会话 A：搜索「张伟」成功。
-    mockFetch.mockResolvedValue([target('u1', '张伟')]);
+    mockFetch.mockResolvedValue(page([target('u1', '张伟')]));
     options = { type: 'user', enabled: true, query: '张伟', sessionKey: 'a' };
     await rerender();
     await flush(350);
@@ -241,7 +418,7 @@ describe('useFeishuTargets — 会话与关闭重置（五次复审 §37–§39�
     expect(latest.current!.items).toEqual([]);
 
     // 立即重开会话 B（不等防抖）：首屏请求必须 q=undefined（空词）。
-    mockFetch.mockResolvedValue([target('c1', '默认群', 'chat')]);
+    mockFetch.mockResolvedValue(page([target('c1', '默认群', 'chat')]));
     options = { type: 'chat', enabled: true, query: '', sessionKey: 'b' };
     await rerender();
     await flush(10);

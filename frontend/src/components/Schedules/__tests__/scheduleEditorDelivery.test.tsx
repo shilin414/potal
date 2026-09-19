@@ -1,10 +1,19 @@
 /**
  * useScheduleEditor / ScheduleEditorFields — 飞书投递目标与编辑器会话回归
- * （五次复审 P1-3 / P2-5 / P2-9）。
+ * （五次复审 P1-3 / P2-5 / P2-9，六次复审 P1-1 / P1-3 / P2-3）。
  *
  *   · 投递目标远程搜索：不再预拉「前 20 个联系人 + 前 100 个群聊」后本地
  *     过滤 —— 开启投递只拉群聊（user 空 query 不请求），输入姓名才走
  *     服务端搜索，第 21 个之后的员工也能选到；
+ *   · 联系人 cursor 分页（六次复审 P1-3）：滚到底续拉下一页，第 51+ 个
+ *     匹配不再被第一页截断；
+ *   · chat 会话缓存（六次复审 P2-1）：输入搜索词不再触发后端全量群聊
+ *     扫描 —— 一个编辑会话只拉一次，过滤在本地完整数据集上完成；
+ *   · 关闭投递必须显式 PATCH deliveries: []（六次复审 P1-1）：后端契约
+ *     是「deliveries 缺失 = 保留原有投递」，undefined 会让旧投递静默
+ *     存活 —— 用户已关闭通知，任务执行后仍继续发飞书；
+ *   · idle ≠ failed（六次复审 P2-3）：空 query 下 user 是 idle（未参与
+ *     查询），chat 失败 = 全部失败（不再是「部分失败」）；
  *   · 已选/回填目标注入 options：搜索词变化或回填目标不在候选页时，
  *     Select 不显示裸 id；
  *   · 投递目标加载失败 ≠ 没有目标（ERROR ≠ EMPTY）：全部失败 error +
@@ -55,6 +64,17 @@ vi.mock('@/services/scheduleApi', () => ({
 import { useScheduleEditor } from '../useScheduleEditor';
 import { ScheduleEditorFields } from '../ScheduleEditorFields';
 import { updateSchedule } from '@/services/scheduleApi';
+import type { FeishuForwardTarget, FeishuForwardTargetPage } from '@/services/shareApi';
+
+/** 官方分页 envelope（六次复审 P1-3）：{items, next_cursor, has_more}。 */
+const page = (
+  items: FeishuForwardTarget[],
+  opts?: { hasMore?: boolean; cursor?: string },
+): FeishuForwardTargetPage => ({
+  items,
+  next_cursor: opts?.cursor ?? '',
+  has_more: opts?.hasMore ?? false,
+});
 
 // ── jsdom 环境补齐（antd 依赖） ────────────────────────────────────
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -196,7 +216,7 @@ beforeEach(() => {
     next_cursor: '', has_more: false,
   });
   mocks.resolveApplication.mockReset().mockResolvedValue({ id: 888, name: '日报智能体' });
-  mocks.fetchFeishuTargets.mockReset().mockResolvedValue([]);
+  mocks.fetchFeishuTargets.mockReset().mockResolvedValue(page([]));
   mocks.updateSchedule.mockReset().mockResolvedValue({ id: 9 });
   mocks.createSchedule.mockReset().mockResolvedValue({ id: 1 });
   mocks.previewScheduleRuns.mockReset().mockResolvedValue([]);
@@ -205,9 +225,9 @@ beforeEach(() => {
 
 describe('投递目标 — 远程搜索契约（五次复审 P1-3）', () => {
   it('enabling delivery loads CHATS only — an empty user query never fires', async () => {
-    mocks.fetchFeishuTargets.mockResolvedValue([
+    mocks.fetchFeishuTargets.mockResolvedValue(page([
       { id: 'oc-1', name: '运营群', avatar_url: '', target_type: 'chat' },
-    ]);
+    ]));
     await mountEditor({ open: true, editing: null });
 
     // 投递未开启：完全不请求飞书目标。
@@ -230,18 +250,27 @@ describe('投递目标 — 远程搜索契约（五次复审 P1-3）', () => {
     expect(option, '群聊应出现在候选里').toBeTruthy();
   });
 
-  it('typing a name goes to the SERVER — the 21st coworker becomes findable', async () => {
-    mocks.fetchFeishuTargets.mockImplementation(async (type: 'user' | 'chat', query?: string) => {
-      if (type === 'user') {
-        return query === '陈'
-          ? [{ id: 'ou-21', name: '陈二十一半', avatar_url: '', target_type: 'user' }]
-          : [];
-      }
-      return [{ id: 'oc-1', name: '运营群', avatar_url: '', target_type: 'chat' }];
-    });
+  it('typing a name goes to the SERVER — and does NOT re-scan the full chat list', async () => {
+    // 六次复审 P2-1：chat 是会话内缓存 + 本地过滤 —— 输入「陈」只触发
+    // user 的服务端搜索，chat 不得再次全量请求（旧实现每个字符都重扫）。
+    mocks.fetchFeishuTargets.mockImplementation(
+      async (type: 'user' | 'chat', query?: string, cursor?: string) => {
+        if (type === 'user') {
+          return cursor === 'p2'
+            ? page([{ id: 'ou-52', name: '陈五十二', avatar_url: '', target_type: 'user' }])
+            : page(
+              [{ id: 'ou-21', name: '陈二十一半', avatar_url: '', target_type: 'user' }],
+              { hasMore: true, cursor: 'p2' },
+            );
+        }
+        expect(query, 'chat 请求不得携带搜索词（本地过滤）').toBeUndefined();
+        return page([{ id: 'oc-1', name: '运营群', avatar_url: '', target_type: 'chat' }]);
+      },
+    );
     await mountEditor({ open: true, editing: null });
     await click(document.querySelector<HTMLButtonElement>('[role="switch"]')!);
     await flush(30);
+    expect(mocks.fetchFeishuTargets).toHaveBeenCalledTimes(1); // chat 全量
 
     await click(deliverySelect().querySelector('.ant-select-selector')!);
     await flush(30);
@@ -250,16 +279,23 @@ describe('投递目标 — 远程搜索契约（五次复审 P1-3）', () => {
     await act(async () => { setNativeValue(searchInput, '陈'); });
     await flush(350); // 300ms 防抖
 
-    // user 走服务端搜索（chat 也会用同一词过滤 —— 两个 hook 都发请求）。
-    expect(mocks.fetchFeishuTargets).toHaveBeenCalledWith('user', '陈');
+    // user 走服务端搜索；chat 保持会话缓存（仍只有那 1 次请求）。
+    expect(mocks.fetchFeishuTargets).toHaveBeenCalledTimes(2);
+    expect(mocks.fetchFeishuTargets).toHaveBeenLastCalledWith('user', '陈');
     const option = Array.from(document.querySelectorAll<HTMLElement>('.ant-select-item-option'))
       .find((el) => el.textContent?.includes('陈二十一半'));
     expect(option, '服务端搜索结果应出现在候选里').toBeTruthy();
+
+    // 联系人 cursor 分页（六次复审 P1-3）：滚到底续拉，第 51+ 人可见。
+    await act(async () => { await editorState!.loadMoreTargets(); });
+    await flush(20);
+    expect(mocks.fetchFeishuTargets).toHaveBeenLastCalledWith('user', '陈', 'p2');
+    expect(editorState!.targets.some((t) => t.name === '陈五十二')).toBe(true);
   });
 
   it('editing backfills the bound target into options — never a bare id', async () => {
     // 回填的投递目标（oc-9 运营群）不在服务端返回里也必须显示名称。
-    mocks.fetchFeishuTargets.mockResolvedValue([]);
+    mocks.fetchFeishuTargets.mockResolvedValue(page([]));
     const withDelivery: Schedule = {
       ...editingSchedule,
       deliveries: [{
@@ -281,17 +317,38 @@ describe('投递目标 — 远程搜索契约（五次复审 P1-3）', () => {
     expect(selection?.textContent).toContain('回填运营群');
   });
 
-  it('a fully failed target load is an ERROR with retry — never a silent empty list', async () => {
-    // 空 query 时只有 chat 在请求（user 空 query 不请求）→ 部分失败（warning）；
-    // 输入搜索词后 user+chat 都在请求 → 全部失败必须是 error + 重试。
+  it('an EMPTY-query chat failure is a FULL failure — idle user did not participate', async () => {
+    // 六次复审 P2-3：空 query 时只有 chat 参与查询（user 是 idle）——
+    // chat 失败 = 一个目标都没有加载成功，必须是 error + 重试，而不是
+    // 旧判定的「部分失败」（页面曾提示「仅显示可用部分」）。
     mocks.fetchFeishuTargets.mockRejectedValue({
       response: { status: 502, data: { error: '获取群聊列表失败' } },
     });
     await mountEditor({ open: true, editing: null });
     await click(document.querySelector<HTMLButtonElement>('[role="switch"]')!);
     await flush(30);
-    // 空查询：chat 失败、user 未请求 → 部分失败警告，不是静默空列表。
-    expect(document.body.textContent).toContain('部分飞书目标加载失败');
+    expect(document.body.textContent).toContain('加载飞书投递目标失败');
+    expect(document.body.textContent).not.toContain('部分飞书目标加载失败');
+
+    const retry = findButton('重试');
+    expect(retry, '重试入口').toBeTruthy();
+
+    mocks.fetchFeishuTargets.mockResolvedValue(page([
+      { id: 'oc-1', name: '恢复后的群', avatar_url: '', target_type: 'chat' },
+    ]));
+    await click(retry!);
+    await flush(30);
+    expect(document.body.textContent).not.toContain('加载飞书投递目标失败');
+  });
+
+  it('with a query, both sources engaged and all failing is an ERROR', async () => {
+    // 有搜索词：user + chat 都参与 —— 全部失败必须是 error + 重试。
+    mocks.fetchFeishuTargets.mockRejectedValue({
+      response: { status: 502, data: { error: '获取群聊列表失败' } },
+    });
+    await mountEditor({ open: true, editing: null });
+    await click(document.querySelector<HTMLButtonElement>('[role="switch"]')!);
+    await flush(30);
 
     await click(deliverySelect().querySelector('.ant-select-selector')!);
     await flush(30);
@@ -299,27 +356,17 @@ describe('投递目标 — 远程搜索契约（五次复审 P1-3）', () => {
       .querySelector<HTMLInputElement>('.ant-select-selection-search-input')!;
     await act(async () => { setNativeValue(searchInput, '陈'); });
     await flush(350);
-    // 有搜索词：user+chat 全部失败 → error。
     expect(document.body.textContent).toContain('加载飞书投递目标失败');
-
-    const retry = findButton('重试');
-    expect(retry, '重试入口').toBeTruthy();
-
-    mocks.fetchFeishuTargets.mockResolvedValue([
-      { id: 'oc-1', name: '恢复后的群', avatar_url: '', target_type: 'chat' },
-    ]);
-    await click(retry!);
-    await flush(30);
-    expect(document.body.textContent).not.toContain('加载飞书投递目标失败');
   });
 
   it('a PARTIAL failure keeps the working half and shows a warning', async () => {
-    // 输入搜索词后：user 接口挂了，chat 正常 —— 仍展示群聊 + 部分失败警告。
+    // 输入搜索词后：user 接口挂了，chat 已缓存成功 —— 仍展示群聊 + 部分
+    // 失败警告（engaged = user(error) + chat(success)）。
     mocks.fetchFeishuTargets.mockImplementation(async (type: 'user' | 'chat') => {
       if (type === 'user') {
         throw { response: { status: 502, data: { error: '搜索联系人失败' } } };
       }
-      return [{ id: 'oc-1', name: '运营群', avatar_url: '', target_type: 'chat' }];
+      return page([{ id: 'oc-1', name: '运营群', avatar_url: '', target_type: 'chat' }]);
     });
     await mountEditor({ open: true, editing: null });
     await click(document.querySelector<HTMLButtonElement>('[role="switch"]')!);
@@ -375,6 +422,67 @@ describe('编辑器会话 — Picker 快速关闭重开（五次复审 §36/§38
       expect(call[0]?.q || '').toBe('');
     }
     expect(editorState!.apps.map((a) => a.name)).toEqual(['日报智能体']);
+  });
+});
+
+describe('编辑器保存 — 投递开关语义（六次复审 P1-1）', () => {
+  it('turning delivery OFF saves deliveries: [] — undefined would KEEP the old rows', async () => {
+    // 后端 PATCH 契约：deliveries 缺失 = 不修改原有 delivery。已有投递的
+    // 任务关闭开关后保存，前端必须显式发送 []（替换为空集合），否则数据
+    // 库旧投递静默存活 —— 用户已关闭飞书通知，下次执行仍继续发送。
+    const withDelivery: Schedule = {
+      ...editingSchedule,
+      deliveries: [{
+        id: 1,
+        target_type: 'chat',
+        target_id: 'oc-9',
+        target_name: '运营群',
+        content_mode: 'summary',
+        enabled: true,
+      }],
+    };
+    await mountEditor({ open: true, editing: withDelivery });
+    await flush(30);
+    // 回填 deliveries.length > 0 → 投递自动开启。
+    expect(editorState!.deliveryOn).toBe(true);
+
+    // 关闭投递开关并保存。
+    await click(document.querySelector<HTMLButtonElement>('[role="switch"]')!);
+    await flush(30);
+    expect(editorState!.deliveryOn).toBe(false);
+
+    await act(async () => { await editorState!.handleOk(); });
+    await flush(20);
+    expect(vi.mocked(updateSchedule)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(updateSchedule)).toHaveBeenCalledWith(
+      9,
+      expect.objectContaining({ deliveries: [] }),
+    );
+  });
+
+  it('delivery left ON carries the chosen target — [] is not blanket-clearing', async () => {
+    const withDelivery: Schedule = {
+      ...editingSchedule,
+      deliveries: [{
+        id: 1,
+        target_type: 'chat',
+        target_id: 'oc-9',
+        target_name: '运营群',
+        content_mode: 'summary',
+        enabled: true,
+      }],
+    };
+    await mountEditor({ open: true, editing: withDelivery });
+    await flush(30);
+
+    await act(async () => { await editorState!.handleOk(); });
+    await flush(20);
+    expect(vi.mocked(updateSchedule)).toHaveBeenCalledWith(
+      9,
+      expect.objectContaining({
+        deliveries: [expect.objectContaining({ target_id: 'oc-9' })],
+      }),
+    );
   });
 });
 

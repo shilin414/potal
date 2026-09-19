@@ -64,6 +64,17 @@ export interface FeishuForwardTarget {
   target_type: 'user' | 'chat';
 }
 
+/**
+ * 目标分页响应（六次复审 P1-3）：user 走 search/v1/user 的
+ * page_token 续拉（官方 page_size 1-200），chat 恒为全量单页
+ * （后端已翻到 has_more=false，next_cursor 恒空）。
+ */
+export interface FeishuForwardTargetPage {
+  items: FeishuForwardTarget[];
+  next_cursor: string;
+  has_more: boolean;
+}
+
 export interface FeishuForwardResult {
   results: { target_id: string; ok: boolean; error?: string }[];
   success_count: number;
@@ -73,8 +84,12 @@ export interface FeishuForwardResult {
 export const fetchFeishuTargets = (
   type: 'user' | 'chat',
   query?: string,
-): Promise<FeishuForwardTarget[]> =>
-  api.get<FeishuForwardTarget[]>('/v2/feishu/forward/targets', { type, query });
+  cursor?: string,
+  limit?: number,
+): Promise<FeishuForwardTargetPage> =>
+  api.get<FeishuForwardTargetPage>('/v2/feishu/forward/targets', {
+    type, query, cursor, limit,
+  });
 
 export const forwardShareToFeishu = (
   shareToken: string,

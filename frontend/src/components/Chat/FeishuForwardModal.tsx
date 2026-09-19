@@ -69,6 +69,8 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
   const active = tab === 'chat' ? chats : users;
   const targets = active.items;
   const loading = active.loading;
+  // idle = 未参与查询（user 空 query 不发请求，六次复审 P2-3）≠ 0 条结果。
+  const idleSearch = tab === 'user' && active.status === 'idle';
   // 目标接口 403/400 = 飞书授权缺权限（派生自最新失败，不另存状态）。
   const authError = active.errorStatus === 403 || active.errorStatus === 400;
   const showReauth = needReauth || authError;
@@ -214,33 +216,48 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
               <div className="ffm-list__center">
                 <Empty
                   image={Empty.PRESENTED_IMAGE_SIMPLE}
-                  description={tab === 'user' && !query.trim()
+                  description={idleSearch
                     ? '输入姓名搜索联系人'
                     : '没有匹配的结果'}
                 />
               </div>
             ) : (
-              targets.map((t) => {
-                const on = selected.some((x) => x.id === t.id);
-                return (
+              <>
+                {targets.map((t) => {
+                  const on = selected.some((x) => x.id === t.id);
+                  return (
+                    <button
+                      key={t.id}
+                      className={`ffm-row ${on ? 'ffm-row--on' : ''}`}
+                      onClick={() => toggle(t)}
+                    >
+                      <Avatar size={32} src={t.avatar_url || undefined}>
+                        {(t.name || '?').slice(0, 1)}
+                      </Avatar>
+                      <span className="ffm-row__name" title={t.name}>{t.name}</span>
+                      <span className="ffm-row__type">
+                        {t.target_type === 'chat' ? '群聊' : '联系人'}
+                      </span>
+                      <span className={`ffm-row__check ${on ? 'ffm-row__check--on' : ''}`}>
+                        {on && <CheckOutlined />}
+                      </span>
+                    </button>
+                  );
+                })}
+                {/* 联系人 cursor 分页（六次复审 P1-3）：匹配的第 51+ 人靠
+                    续拉补齐 —— 旧的「一页 20 条」让第 21 人永远选不到；
+                    chat 恒全量，不显示此入口。 */}
+                {active.hasMore && (
                   <button
-                    key={t.id}
-                    className={`ffm-row ${on ? 'ffm-row--on' : ''}`}
-                    onClick={() => toggle(t)}
+                    type="button"
+                    className="ffm-load-more"
+                    disabled={active.loadingMore}
+                    onClick={() => void active.loadMore()}
                   >
-                    <Avatar size={32} src={t.avatar_url || undefined}>
-                      {(t.name || '?').slice(0, 1)}
-                    </Avatar>
-                    <span className="ffm-row__name" title={t.name}>{t.name}</span>
-                    <span className="ffm-row__type">
-                      {t.target_type === 'chat' ? '群聊' : '联系人'}
-                    </span>
-                    <span className={`ffm-row__check ${on ? 'ffm-row__check--on' : ''}`}>
-                      {on && <CheckOutlined />}
-                    </span>
+                    {active.loadingMore ? '加载中…' : '加载更多'}
                   </button>
-                );
-              })
+                )}
+              </>
             )}
           </div>
 

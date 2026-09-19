@@ -34,7 +34,9 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
     appResolution, resolutionApplies, retryResolveApp,
     scheduleType, setScheduleType,
     setPreview, deliveryOn, setDeliveryOn,
-    targets, targetsLoading, targetsError, targetsPartialFailed, refreshTargets,
+    targets, targetsLoading,
+    targetsHasMore, targetsLoadingMore, loadMoreTargets,
+    targetsError, targetsPartialFailed, refreshTargets,
     targetQuery, setTargetQuery, setSelectedTarget,
     preview, previewing, refreshPreview,
   } = state;
@@ -243,15 +245,26 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
             >
               {/* 远程搜索（五次复审 P1-3）：不再预拉「前 20 个联系人 + 前
                   100 个群聊」后本地过滤 —— 第 21 个人/第 101 个群聊曾永远
-                  选不到。现在搜索词直发后端（user 走目录搜索，chat 由后端
-                  按 page_token 翻全量后过滤）；已选目标始终注入 options，
-                  搜索词变化后 Select 不显示裸 id。 */}
+                  选不到。现在 user 搜索词直发后端目录搜索 + cursor 续拉，
+                  chat 一个会话只拉一次全量、搜索词在本地完整数据集上过
+                  滤；已选目标始终注入 options，
+                  搜索词变化后 Select 不显示裸 id。
+                  联系人 cursor 分页（六次复审 P1-3）：滚到底续拉下一页 ——
+                  匹配的第 51+ 人不再被第一页截断（chat 恒全量、无续拉）。 */}
               <Select
                 loading={targetsLoading}
                 showSearch
                 filterOption={false}
                 searchValue={targetQuery}
                 onSearch={setTargetQuery}
+                onPopupScroll={(e) => {
+                  const { scrollTop, scrollHeight, clientHeight } = e.currentTarget;
+                  if (targetsHasMore
+                    && !targetsLoadingMore
+                    && scrollHeight - scrollTop - clientHeight < 24) {
+                    void loadMoreTargets();
+                  }
+                }}
                 placeholder="搜索并选择飞书用户或群聊"
                 notFoundContent={
                   targetsError

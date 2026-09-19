@@ -39,12 +39,15 @@ vi.mock('@/services/runApi', () => ({
   resolveApplication: vi.fn(async () => ({ name: '日报智能体' })),
 }));
 
+// 官方分页 envelope（六次复审 P1-3）：{items, next_cursor, has_more}。
 vi.mock('@/services/shareApi', () => ({
-  fetchFeishuTargets: vi.fn(async (type: 'user' | 'chat') =>
-    type === 'user'
+  fetchFeishuTargets: vi.fn(async (type: 'user' | 'chat') => ({
+    items: type === 'user'
       ? [{ id: 'ou_1', name: '张三', avatar_url: '', target_type: 'user' }]
       : [{ id: 'oc_1', name: '运营群', avatar_url: '', target_type: 'chat' }],
-  ),
+    next_cursor: '',
+    has_more: false,
+  })),
 }));
 
 vi.mock('@/services/scheduleApi', () => ({

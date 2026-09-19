@@ -33,7 +33,7 @@ vi.mock('@/services/runApi', () => ({
 }));
 
 vi.mock('@/services/shareApi', () => ({
-  fetchFeishuTargets: vi.fn(async () => []),
+  fetchFeishuTargets: vi.fn(async () => ({ items: [], next_cursor: '', has_more: false })),
 }));
 
 vi.mock('@/services/scheduleApi', () => ({

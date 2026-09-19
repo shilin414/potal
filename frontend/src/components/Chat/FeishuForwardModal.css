@@ -219,3 +219,26 @@
   font-family: inherit;
   cursor: pointer;
 }
+
+/* 联系人 cursor 分页（六次复审 P1-3）：列表底部的续拉入口。 */
+.ffm-load-more {
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  border-top: 1px solid var(--color-border);
+  background: none;
+  color: var(--color-text-dim);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: color 0.15s ease;
+}
+
+.ffm-load-more:hover:not(:disabled) {
+  color: var(--color-primary);
+}
+
+.ffm-load-more:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}

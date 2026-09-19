@@ -233,7 +233,7 @@ export function useScheduleEditor({
   //   · user：空 query 不请求（provider 一页只有 20 条，空查询拿到的是
   //     「全公司任意前 20 人」）；输入姓名后服务端搜索；
   //   · chat：后端已按 page_token 翻页到 has_more=false，query 由后端
-  //     按名称过滤，空 query = 全量群聊。
+  //     按名称在本地完整数据集上过滤，空 query = 全量群聊。
   // 两个 hook 独立请求、独立失败（ERROR ≠ EMPTY，五次复审 §28）——
   // 用户失败而群聊成功时仍展示群聊，只给「部分失败」警告 + 重试。
   const userTargets = useFeishuTargets({
@@ -259,12 +259,24 @@ export function useScheduleEditor({
   }, [userTargets.items, chatTargets.items, selectedTarget]);
 
   const targetsLoading = userTargets.loading || chatTargets.loading;
-  const targetsFullyFailed = Boolean(userTargets.error && chatTargets.error);
-  const targetsPartialFailed = !targetsFullyFailed
-    && Boolean(userTargets.error || chatTargets.error);
+  // idle ≠ failed（六次复审 P2-3）：user 在空 query 下是 idle（未参与查
+  // 询），不是「成功加载了 0 条」—— 只统计真正参与过查询的数据源，
+  // 「参与且全部失败」才是 full failure。旧判定把「chat 失败 + user 空
+  // query 未请求」误判成 partial（页面提示「仅显示可用部分」，实际上一
+  // 个目标都没有成功加载）。
+  const engagedTargets = [userTargets, chatTargets]
+    .filter((s) => s.status !== 'idle');
+  const failedEngaged = engagedTargets.filter((s) => s.status === 'error');
+  const targetsFullyFailed = failedEngaged.length > 0
+    && failedEngaged.length === engagedTargets.length;
+  const targetsPartialFailed = failedEngaged.length > 0 && !targetsFullyFailed;
   const targetsError = targetsFullyFailed
-    ? (userTargets.error || chatTargets.error)
+    ? (failedEngaged[0]?.error ?? null)
     : null;
+  // 联系人分页（六次复审 P1-3）：只有 user 走 cursor 分页 —— chat 后端
+  // 已翻全量，Select 滚到底只对联系人续拉下一页。
+  const targetsHasMore = userTargets.hasMore;
+  const targetsLoadingMore = userTargets.loadingMore;
 
   const refreshTargets = useCallback(() => {
     void userTargets.refresh();
@@ -414,8 +426,10 @@ export function useScheduleEditor({
     appQuery, setAppQuery,
     scheduleType, setScheduleType, setPreview,
     deliveryOn, setDeliveryOn,
-    // 飞书投递目标（五次复审 P1-3）：远程搜索 + 独立错误态 + 重试。
+    // 飞书投递目标（五次复审 P1-3）：远程搜索 + 独立错误态 + 重试；
+    // 联系人 cursor 分页（六次复审 P1-3）—— Select 滚到底续拉下一页。
     targets, targetsLoading,
+    targetsHasMore, targetsLoadingMore, loadMoreTargets: userTargets.loadMore,
     targetsError, targetsPartialFailed, refreshTargets,
     targetQuery, setTargetQuery,
     setSelectedTarget,
