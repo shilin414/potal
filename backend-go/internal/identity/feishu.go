@@ -289,10 +289,18 @@ func (c *FeishuClient) authorizedGET(ctx context.Context, token, path string) (j
 // The first page alone capped every picker at 100 groups (五次复审 P1-3) —
 // chat 101+ could never be selected. maxChatPages is only a defensive bound
 // against a misbehaving provider (100 pages × 100 = 10 000 chats).
+//
+// TRUNCATED != COMPLETE (六次复审 P2-2): reaching the safety limit while the
+// provider still reports has_more is an ERROR, not a silent partial list —
+// the caller would treat the first 10 000 chats as the complete set. A
+// repeated page_token (provider cycling the same continuation) likewise
+// fails fast instead of appending the same page forever.
 func (c *FeishuClient) ListUserChats(ctx context.Context, token string) ([]FeishuChat, error) {
 	const maxChatPages = 100
 	var out []FeishuChat
 	pageToken := ""
+	seenTokens := map[string]struct{}{}
+	completed := false
 	for page := 0; page < maxChatPages; page++ {
 		path := "/open-apis/im/v1/chats?page_size=100"
 		if pageToken != "" {
@@ -322,9 +330,17 @@ func (c *FeishuClient) ListUserChats(ctx context.Context, token string) ([]Feish
 			})
 		}
 		if !payload.HasMore || payload.PageToken == "" {
+			completed = true
 			break
 		}
+		if _, dup := seenTokens[payload.PageToken]; dup {
+			return nil, fmt.Errorf("feishu: repeated chat page token %q", payload.PageToken)
+		}
+		seenTokens[payload.PageToken] = struct{}{}
 		pageToken = payload.PageToken
+	}
+	if !completed {
+		return nil, fmt.Errorf("feishu: chat pagination exceeded safety limit (%d pages)", maxChatPages)
 	}
 	return out, nil
 }

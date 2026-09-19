@@ -3,8 +3,10 @@ package identity
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -245,3 +247,64 @@ func TestSearchFeishuUsersSendsQueryPageSizePageToken(t *testing.T) {
 	}
 }
 
+// TestListUserChatsSafetyCapFailsLoud (六次复审 P2-2): hitting the 100-page
+// safety cap while the provider still reports has_more must ERROR — the
+// first 10 000 chats would otherwise masquerade as the complete set
+// (TRUNCATED != COMPLETE). Tokens are fresh every page so the cycle
+// detector does not fire first; this isolates the page-count cap.
+func TestListUserChatsSafetyCapFailsLoud(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": 0, "msg": "ok",
+			"data": map[string]any{
+				"items":      []any{map[string]any{"chat_id": "oc-x", "name": "群"}},
+				"has_more":   true,
+				"page_token": fmt.Sprintf("pt-%d", calls),
+			},
+		})
+	}))
+	defer srv.Close()
+	client := NewFeishuClient(srv.URL, "id", "secret", srv.Client())
+	chats, err := client.ListUserChats(context.Background(), "token")
+	if err == nil {
+		t.Fatalf("expected safety-limit error, got %d chats as if complete", len(chats))
+	}
+	if !strings.Contains(err.Error(), "safety limit") {
+		t.Fatalf("err=%v", err)
+	}
+	if calls != 100 {
+		t.Fatalf("provider calls=%d, want exactly the 100-page cap", calls)
+	}
+}
+
+// TestListUserChatsRepeatedPageTokenFails (六次复审 §二十八): a provider
+// cycling the same page_token must fail fast instead of re-requesting and
+// re-appending the same page until the cap.
+func TestListUserChatsRepeatedPageTokenFails(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": 0, "msg": "ok",
+			"data": map[string]any{
+				"items":      []any{map[string]any{"chat_id": "oc-x", "name": "群"}},
+				"has_more":   true,
+				"page_token": "pt-loop",
+			},
+		})
+	}))
+	defer srv.Close()
+	client := NewFeishuClient(srv.URL, "id", "secret", srv.Client())
+	chats, err := client.ListUserChats(context.Background(), "token")
+	if err == nil {
+		t.Fatalf("expected repeated-token error, got %d chats", len(chats))
+	}
+	if !strings.Contains(err.Error(), "repeated chat page token") {
+		t.Fatalf("err=%v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("provider calls=%d, want fast-fail on the 2nd page", calls)
+	}
+}
