@@ -1,38 +1,161 @@
 /**
  * useScheduleDetail — 配置 + 执行记录的加载逻辑，桌面 Drawer 与移动
  * 全屏详情共用（开发执行报告 §30）。
+ *
+ * 任务详情与执行记录是两个失败域（三次复审 §36–§37）：Occurrences 是辅助
+ * 历史数据，它的接口故障不能让任务本身的名称/计划/Prompt 不可查看。
+ * 两者独立加载、独立重试。
+ *
+ * 执行记录分页（三次复审 §33–§35）：后端 occurrences 也是 keyset（before_id
+ * + DESC id）裸数组，同样用 51 probe / 50 display 推导 hasMore —— 第 51 条
+ * 以前的执行历史不再永远不可见。
  */
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { fetchSchedule, fetchScheduleOccurrences } from '@/services/scheduleApi';
 import type { Schedule, ScheduleOccurrence } from '@/types/schedule';
 
-export function useScheduleDetail(open: boolean, scheduleId: number | null) {
+/** 执行记录每页展示条数；请求 +1 作 hasMore 探针。 */
+const OCCURRENCES_PAGE_SIZE = 50;
+
+/** 51 probe / 50 display：返回 51 条 → 展示前 50 且 hasMore。 */
+const splitOccurrences = (items: ScheduleOccurrence[]) => {
+  const more = items.length > OCCURRENCES_PAGE_SIZE;
+  return {
+    page: more ? items.slice(0, OCCURRENCES_PAGE_SIZE) : items,
+    more,
+  };
+};
+
+export interface UseScheduleDetailResult {
+  schedule: Schedule | null;
+  loading: boolean;
+  error: string | null;
+
+  occurrences: ScheduleOccurrence[];
+  occurrencesLoading: boolean;
+  occurrenceError: string | null;
+
+  hasMoreOccurrences: boolean;
+  loadingMoreOccurrences: boolean;
+  loadMoreOccurrences(): Promise<void>;
+
+  /** 执行记录独立重试（不影响已加载的任务配置）。 */
+  retryOccurrences(): Promise<void>;
+}
+
+export function useScheduleDetail(
+  open: boolean,
+  scheduleId: number | null,
+): UseScheduleDetailResult {
   const [schedule, setSchedule] = useState<Schedule | null>(null);
-  const [occurrences, setOccurrences] = useState<ScheduleOccurrence[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const [occurrences, setOccurrences] = useState<ScheduleOccurrence[]>([]);
+  const [occurrencesLoading, setOccurrencesLoading] = useState(false);
+  const [occurrenceError, setOccurrenceError] = useState<string | null>(null);
+  const [hasMoreOccurrences, setHasMoreOccurrences] = useState(false);
+  const [loadingMoreOccurrences, setLoadingMoreOccurrences] = useState(false);
+
+  const scheduleSeqRef = useRef(0);
+  const occSeqRef = useRef(0);
+
+  // 目标变化（或首次打开）先清空两域旧数据，再各自加载。
   useEffect(() => {
     if (!open || !scheduleId) return;
-    let stale = false;
+    setSchedule(null);
+    setOccurrences([]);
+    setOccurrenceError(null);
+    setHasMoreOccurrences(false);
+  }, [open, scheduleId]);
+
+  // 任务配置：主数据，独立失败域（§37）。
+  useEffect(() => {
+    if (!open || !scheduleId) return;
+    const seq = ++scheduleSeqRef.current;
     setLoading(true);
     setError(null);
-    Promise.all([fetchSchedule(scheduleId), fetchScheduleOccurrences(scheduleId)])
-      .then(([s, occs]) => {
-        if (stale) return;
-        setSchedule(s);
-        setOccurrences(occs);
+    fetchSchedule(scheduleId)
+      .then((s) => {
+        if (seq === scheduleSeqRef.current) setSchedule(s);
       })
       .catch((e) => {
-        if (!stale) setError(e instanceof Error ? e.message : '加载失败');
+        if (seq === scheduleSeqRef.current) {
+          setError(e instanceof Error ? e.message : '加载失败');
+        }
       })
       .finally(() => {
-        if (!stale) setLoading(false);
+        if (seq === scheduleSeqRef.current) setLoading(false);
       });
     return () => {
-      stale = true;
+      scheduleSeqRef.current += 1;
     };
   }, [open, scheduleId]);
 
-  return { schedule, occurrences, loading, error };
+  // 执行记录：辅助历史数据，独立加载 + 独立重试（§37），分页（§35）。
+  const loadOccurrences = useCallback(async () => {
+    if (!open || !scheduleId) return;
+    const seq = ++occSeqRef.current;
+    setOccurrencesLoading(true);
+    setOccurrenceError(null);
+    try {
+      const occs = await fetchScheduleOccurrences(
+        scheduleId, undefined, OCCURRENCES_PAGE_SIZE + 1);
+      if (seq !== occSeqRef.current) return;
+      const { page, more } = splitOccurrences(occs);
+      setOccurrences(page);
+      setHasMoreOccurrences(more);
+    } catch (e) {
+      if (seq !== occSeqRef.current) return;
+      setOccurrenceError(e instanceof Error ? e.message : '加载执行记录失败');
+    } finally {
+      if (seq === occSeqRef.current) setOccurrencesLoading(false);
+    }
+  }, [open, scheduleId]);
+
+  useEffect(() => {
+    void loadOccurrences();
+  }, [loadOccurrences]);
+
+  const loadMoreOccurrences = useCallback(async () => {
+    if (!open || !scheduleId) return;
+    if (loadingMoreOccurrences || occurrencesLoading || !hasMoreOccurrences) return;
+    const beforeId = occurrences[occurrences.length - 1]?.id;
+    if (!beforeId) return;
+    // 翻页与首页同代（不 bump seq）：目标变化会 bump，在途翻页自动作废。
+    const seq = occSeqRef.current;
+    setLoadingMoreOccurrences(true);
+    try {
+      const occs = await fetchScheduleOccurrences(
+        scheduleId, beforeId, OCCURRENCES_PAGE_SIZE + 1);
+      if (seq !== occSeqRef.current) return;
+      const { page, more } = splitOccurrences(occs);
+      setOccurrences((prev) => [...prev, ...page]);
+      setHasMoreOccurrences(more);
+      // 重试成功清错误（与列表 hook 同一规则）。
+      setOccurrenceError(null);
+    } catch (e) {
+      if (seq !== occSeqRef.current) return;
+      // 已加载的执行记录保留；下一次点击 loadMore 即重试。
+      setOccurrenceError(e instanceof Error ? e.message : '加载更多执行记录失败');
+    } finally {
+      if (seq === occSeqRef.current) setLoadingMoreOccurrences(false);
+    }
+  }, [
+    open, scheduleId, occurrences, loadingMoreOccurrences,
+    occurrencesLoading, hasMoreOccurrences,
+  ]);
+
+  return {
+    schedule,
+    loading,
+    error,
+    occurrences,
+    occurrencesLoading,
+    occurrenceError,
+    hasMoreOccurrences,
+    loadingMoreOccurrences,
+    loadMoreOccurrences,
+    retryOccurrences: loadOccurrences,
+  };
 }
