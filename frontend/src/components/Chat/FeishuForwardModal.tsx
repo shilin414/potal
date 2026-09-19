@@ -322,8 +322,10 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
                 })}
                 {/* 联系人 cursor 分页（六次复审 P1-3）：匹配的第 51+ 人靠
                     续拉补齐 —— 旧的「一页 20 条」让第 21 人永远选不到；
-                    chat 恒全量，不显示此入口。 */}
-                {active.hasMore && (
+                    chat 恒全量，不显示此入口。分页失败时与「重试加载」互
+                    斥（八次复审 P2）：两个按钮调的都是 loadMore，同时出
+                    现只是两个并排的重复动作入口。 */}
+                {active.hasMore && !active.loadMoreError && (
                   <button
                     type="button"
                     className="ffm-load-more"
