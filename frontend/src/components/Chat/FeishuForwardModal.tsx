@@ -23,6 +23,11 @@
  * 复活、新选的目标会被删）。授权失效统一按 needsFeishuReauth 文案判断
  * （九次复审 P2）：200 per-target 授权失败与 HTTP 400/403 授权错误同一
  * 恢复入口，普通 400 不误判。
+ *
+ * Live interaction reconcile（十次复审 P1）：发送后的 toggle / Tab /
+ * query 变更属于下一轮用户意图。全部成功只在没有新交互时自动关闭；
+ * 已成功目标若在途被用户重新触碰（如取消后再选）则保留，不让旧请求的
+ * 结果覆盖当前 picker 意图。
  */
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Avatar, Empty, Input, Modal, Spin, Tabs, message as antdMessage } from 'antd';
@@ -50,6 +55,16 @@ const HISTORY_LIMIT = 10;
  * 更容易真实选到 21+，旧实现要点「发送（25）」才被后端 400 拒绝。
  */
 const MAX_FORWARD_TARGETS = 20;
+
+const targetKey = (
+  target: Pick<FeishuForwardTarget, 'target_type' | 'id'>,
+) => `${target.target_type}:${target.id}`;
+
+interface SendFlight {
+  epoch: number;
+  interactionRevision: number;
+  touchedTargetKeys: Set<string>;
+}
 
 /**
  * 统一的飞书授权失效判断（九次复审 P2）：授权相关文案分散在后端多处 ——
@@ -83,15 +98,19 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
   // Schedule Editor 的 editorEpochRef 同一套已验证模型：session epoch +
   // single-flight + stale response guard。
   const sessionEpochRef = useRef(0);
+  // 同会话内的 picker 交互代际：区分「响应仍属于当前弹窗」与
+  // 「响应是否仍能覆盖用户刚刚开始的下一轮操作」。
+  const pickerInteractionRevisionRef = useRef(0);
   // single-flight：同会话内已有发送在途时，后续触发直接拒绝（双击发送只
   // 发一次 API 请求）。
-  const sendInFlightRef = useRef<{ epoch: number } | null>(null);
+  const sendInFlightRef = useRef<SendFlight | null>(null);
 
   // 会话失效是 session identity invalidation，须在 commit 后同步完成
   // （useLayoutEffect 而非 useEffect）：新会话打开的那一帧 sending 已复
   // 位、旧 in-flight 已作废，不留给旧响应操纵新会话 UI 的窗口。
   useLayoutEffect(() => {
     sessionEpochRef.current += 1;
+    pickerInteractionRevisionRef.current = 0;
     sendInFlightRef.current = null;
     setSending(false);
   }, [open, shareToken]);
@@ -144,9 +163,18 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
     onClose();
   };
 
+  const markPickerInteraction = () => {
+    pickerInteractionRevisionRef.current += 1;
+  };
+
   // toggle 是唯一的选中入口（列表行 + 最近转发 chip 都走它，七次复审
   // §35），上限写在 toggle 里两个入口同时生效。
   const toggle = (t: FeishuForwardTarget) => {
+    markPickerInteraction();
+    const flight = sendInFlightRef.current;
+    if (flight?.epoch === sessionEpochRef.current) {
+      flight.touchedTargetKeys.add(targetKey(t));
+    }
     if (selected.some((x) => x.id === t.id)) {
       setSelected(selected.filter((x) => x.id !== t.id));
       return;
@@ -164,7 +192,12 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
       || sendInFlightRef.current?.epoch === epoch) {
       return;
     }
-    sendInFlightRef.current = { epoch };
+    const flight: SendFlight = {
+      epoch,
+      interactionRevision: pickerInteractionRevisionRef.current,
+      touchedTargetKeys: new Set<string>(),
+    };
+    sendInFlightRef.current = flight;
 
     // snapshot（八次复审 §21）：API 请求、历史、失败目标 reconcile 全部
     // 基于同一批发送目标，不混用发送结束时可能已经变化的 selected /
@@ -192,9 +225,25 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
           selectedSnapshot.filter((t) => succeededIds.has(t.id)),
         );
       }
+      const succeededKeys = new Set(
+        selectedSnapshot
+          .filter((t) => succeededIds.has(t.id))
+          .map(targetKey),
+      );
+      // 全成功 / 部分失败共用同一套 live-edit reconcile：只移除
+      // 本轮成功且发送后未被用户再次触碰的目标。
+      setSelected((current) => current.filter((t) => (
+        !succeededKeys.has(targetKey(t))
+        || flight.touchedTargetKeys.has(targetKey(t))
+      )));
+
       if (result.fail_count === 0) {
         antdMessage.success(`已发送给 ${result.success_count} 个目标`);
-        close();
+        const pickerChanged = pickerInteractionRevisionRef.current
+          !== flight.interactionRevision;
+        if (!pickerChanged) {
+          close();
+        }
       } else {
         const firstError = result.results.find((r) => !r.ok)?.error;
         antdMessage.error(
@@ -209,16 +258,6 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
         if (authFailure) {
           setNeedReauth(true);
         }
-        // Keep the modal open so the sender can retry failed targets
-        // (七次复审 P2-9)：成功的自动移除、失败的保持选中 —— 旧的
-        // setSelected([]) 把失败目标也取消选择，用户得从头再挑一遍。
-        // reconcile 只做「从当前选中里移除本轮已成功的目标」（九次复审
-        // P1）：snapshot 决定本次发了谁，current 决定用户现在想选谁 ——
-        // 发送在途期间列表 / Tab / 搜索 / chip 都可操作，旧实现
-        // setSelected(snapshot 失败目标) 把发送开始时的快照当成发送结束时
-        // 整个 UI 的真相：用户刚取消的失败目标复活、新选的目标被删、切
-        // Tab 后旧目标整组写回。
-        setSelected((current) => current.filter((t) => !succeededIds.has(t.id)));
       }
     } catch (e: any) {
       if (sessionEpochRef.current !== epoch) return;
@@ -280,7 +319,11 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
         <div className="ffm-body">
           <Tabs
             activeKey={tab}
-            onChange={(k) => { setTab(k as 'user' | 'chat'); setSelected([]); }}
+            onChange={(k) => {
+              markPickerInteraction();
+              setTab(k as 'user' | 'chat');
+              setSelected([]);
+            }}
             items={[
               { key: 'chat', label: '群聊' },
               { key: 'user', label: '联系人' },
@@ -291,7 +334,10 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
             placeholder={tab === 'user' ? '输入姓名搜索联系人' : '搜索群聊名称'}
             value={query}
             allowClear
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              markPickerInteraction();
+              setQuery(e.target.value);
+            }}
           />
 
           {recent.length > 0 && (
