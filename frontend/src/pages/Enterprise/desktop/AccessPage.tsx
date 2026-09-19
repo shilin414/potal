@@ -81,17 +81,24 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
   // useDirectoryUsers 的服务端搜索 + cursor 分页（下拉滚动加载），与
   // MobileUserPicker 完全一致 —— 企业 10000 人时不再被「前 100 条」截断。
   const [userQuery, setUserQuery] = useState("");
-  // 抽屉关闭/切换目标时立即清空人员搜索词（对齐 MobileUserPicker 三次
-  // 复审 §46）：否则重开的第一帧仍带着上一次的 q 先发一次请求，输入框
-  // 已清空而下拉显示旧词的过滤子集 —— UI 与数据不一致。
-  useEffect(() => {
+  // 人员 Picker 会话（五次复审 §37–§38）：sessionKey = 当前授权目标。
+  // 换目标 / 关闭重开 = 新会话：useDirectoryUsers 立即作废在途请求并清空
+  // 旧会话的 items/error，搜索词也在同一帧清空（render-time，官方
+  // 「props 变化时调整 state」模式）—— 快速关闭重开的第一帧既不带旧 q
+  // 发请求，也不闪上一个会话的搜索结果。之前的实现要等 300ms 防抖，
+  // 「关闭 50ms 后重开」仍会先用旧词请求一次。
+  const userPickerSession = selected?.id ?? null;
+  const [prevUserPickerSession, setPrevUserPickerSession] = useState(userPickerSession);
+  if (prevUserPickerSession !== userPickerSession) {
+    setPrevUserPickerSession(userPickerSession);
     setUserQuery("");
-  }, [selected]);
+  }
   const directoryUsers = useDirectoryUsers({
     query: userQuery,
     enabled: Boolean(selected),
     // ACL 只提供在职员工（二次复审 D1）：离职人员不再出现在候选里。
     includeInactive: false,
+    sessionKey: userPickerSession,
   });
 
   const {
@@ -391,12 +398,16 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
                   <Typography.Title level={5}>授权人员</Typography.Title>
                   {/* 与 MobileUserPicker 同一契约（四次复审 P2-2）：搜索词直发
                       后端（覆盖全部员工而非已加载页），下拉滚到底拉下一页，
-                      >100 人的搜索结果也能全部选到。 */}
+                      >100 人的搜索结果也能全部选到。searchValue 受控
+                      （五次复审 §40）：会话切换清空 userQuery 时，Select
+                      内部搜索文本同步清空。notFoundContent 区分
+                      error / loading / empty（五次复审 P2-4，ERROR ≠ EMPTY）。 */}
                   <Select
                     mode="multiple"
                     showSearch
                     filterOption={false}
                     loading={directoryUsers.loading}
+                    searchValue={userQuery}
                     onSearch={setUserQuery}
                     onPopupScroll={(e) => {
                       const { scrollTop, scrollHeight, clientHeight } =
@@ -409,12 +420,44 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
                         void directoryUsers.loadMore();
                       }
                     }}
+                    notFoundContent={
+                      directoryUsers.error
+                        ? '加载人员失败'
+                        : directoryUsers.loading
+                          ? '搜索中…'
+                          : '没有匹配人员'
+                    }
                     value={policy.users.map((u) => u.directory_user_id)}
                     onChange={setUserIds}
                     style={{ width: "100%" }}
                     options={userOptions}
                     placeholder="搜索并选择人员"
                   />
+                  {/* 人员接口失败 ≠ 没有候选（五次复审 P2-4）：错误可见 +
+                      可重试，重试入口按 hook 还剩什么决定 —— loadMore 失败
+                      保留 cursor（重试 = loadMore），首页/搜索失败清了
+                      cursor（重试 = refresh），与 MobileUserPicker 同语义。 */}
+                  {directoryUsers.error && (
+                    <Alert
+                      type="error"
+                      showIcon
+                      message="加载人员失败"
+                      description={directoryUsers.error}
+                      style={{ marginTop: 10 }}
+                      action={
+                        <Button
+                          size="small"
+                          onClick={() => (
+                            directoryUsers.hasMore
+                              ? void directoryUsers.loadMore()
+                              : void directoryUsers.refresh()
+                          )}
+                        >
+                          重试
+                        </Button>
+                      }
+                    />
+                  )}
                 </div>
               </>
             )}

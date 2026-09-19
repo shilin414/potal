@@ -111,7 +111,7 @@ vi.mock('antd', () => ({
     { Group: ({ children }: { children?: React.ReactNode }) => <div>{children}</div> },
   ),
   Select: ({
-    options, onSearch, onPopupScroll, loading, mode,
+    options, onSearch, onPopupScroll, loading, mode, notFoundContent,
   }: {
     options?: Array<{ value: number; label: string }>;
     onSearch?: (value: string) => void;
@@ -120,6 +120,7 @@ vi.mock('antd', () => ({
     }) => void;
     loading?: boolean;
     mode?: string;
+    notFoundContent?: React.ReactNode;
   }) => (
     <div
       data-testid="user-select"
@@ -127,6 +128,9 @@ vi.mock('antd', () => ({
       data-loading={loading ? 'true' : 'false'}
       data-options={JSON.stringify((options ?? []).map((o) => o.value))}
     >
+      {notFoundContent ? (
+        <div data-testid="select-notfound">{notFoundContent}</div>
+      ) : null}
       <button type="button" data-testid="select-search" onClick={() => onSearch?.('张伟')}>
         search
       </button>
@@ -683,5 +687,68 @@ describe('desktop AccessPage — user picker server search + pagination (四次�
     const calls = vi.mocked(enterpriseApi.users).mock.calls;
     const lastArgs = calls[calls.length - 1]![0]!;
     expect(lastArgs.q).toBeUndefined();
+  });
+
+  it('closing A and IMMEDIATELY reopening B never fires a stale-q request (五次复审 §33–§38)', async () => {
+    // 旧实现的测试要等 350ms 才敢重开 —— 实际用户 50ms 后就会重开，那时
+    // 防抖还没到期，重开的第一屏会带旧词先发一次请求。sessionKey 重置 +
+    // 关闭期间同步防抖后，「关闭 → 立即重开」必须直接 q=''。
+    pageState.items = [row(7, 'A资源'), row(8, 'B资源')];
+    vi.mocked(enterpriseApi.users).mockImplementation(
+      async () => ({ results: [dirUser(1)], next_cursor: null }),
+    );
+
+    await mountPage();
+    await click(document.querySelector('[data-open-cell="7"] button')!);
+    await flush(20);
+    await click(document.querySelector('[data-testid="select-search"]')!);
+    await flush(350);
+    expect(vi.mocked(enterpriseApi.users)).toHaveBeenLastCalledWith(
+      expect.objectContaining({ q: '张伟' }),
+    );
+
+    // 关闭 → 不等防抖 → 立即打开 B。
+    vi.mocked(enterpriseApi.users).mockClear();
+    await click(document.querySelector('[data-testid="drawer-close"]')!);
+    await flush(10);
+    await click(document.querySelector('[data-open-cell="8"] button')!);
+    await flush(20);
+
+    // B 的首屏请求：恰好一次，且不带旧词。
+    expect(vi.mocked(enterpriseApi.users)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(enterpriseApi.users)).not.toHaveBeenCalledWith(
+      expect.objectContaining({ q: '张伟' }),
+    );
+  });
+
+  it('a failed user load is an explicit error with retry — never an empty-looking picker (P2-4)', async () => {
+    pageState.items = [row(7, 'A资源')];
+    vi.mocked(enterpriseApi.users)
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValue({ results: [dirUser(1)], next_cursor: null });
+
+    await mountPage();
+    await click(document.querySelector('[data-open-cell="7"] button')!);
+    await flush(20);
+
+    const drawer = () => document.querySelector('[data-testid="drawer"]')!;
+    // 人员接口失败 ≠ 没有候选：错误可见（notFound + Alert），不是静默空下拉。
+    expect(drawer().querySelector('[data-testid="select-notfound"]')?.textContent)
+      .toBe('加载人员失败');
+    expect(drawer().textContent).toContain('加载人员失败');
+
+    // 首页失败清了 cursor → 重试 = refresh，成功后错误消失。
+    const retry = Array.from(drawer().querySelectorAll('button'))
+      .find((b) => b.textContent === '重试')!;
+    expect(retry).toBeTruthy();
+    await click(retry);
+    await flush(20);
+    expect(vi.mocked(enterpriseApi.users)).toHaveBeenCalledTimes(2);
+    expect(drawer().textContent).not.toContain('加载人员失败');
+    // 候选恢复（1 号员工可选）。
+    const options = () => JSON.parse(
+      document.querySelector<HTMLElement>('[data-testid="user-select"]')!.dataset.options!,
+    ) as number[];
+    expect(options()).toContain(1);
   });
 });
