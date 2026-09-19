@@ -288,6 +288,11 @@ export function useScheduleEditor({
   );
   void selectedApp; // 展示预留：选中智能体的头像/名称随后续迭代上屏
 
+  // 回填告警只对「当前仍选中的原智能体」生效（四次复审 P2-4）：用户已经
+  // 在 Select 里换成新 Agent 后，原 Agent 的 unavailable/transient 告警必须
+  // 立即消失 —— 告警绑定的是当前字段值，而不是 resolve 时的目标。
+  const resolutionApplies = watchedAppId === targetApplicationId;
+
   return {
     form, saving,
     apps: pickerApps, appsLoading,
@@ -296,6 +301,8 @@ export function useScheduleEditor({
     appsError, refreshApps,
     // 回填状态（§40–§42）：404 = 原智能体不可用；5xx/network = 可重试。
     appResolution, targetApplicationId, retryResolveApp,
+    // 换了智能体后旧告警立即隐藏（四次复审 P2-4）。
+    resolutionApplies,
     appQuery, setAppQuery,
     scheduleType, setScheduleType, setPreview,
     deliveryOn, setDeliveryOn,

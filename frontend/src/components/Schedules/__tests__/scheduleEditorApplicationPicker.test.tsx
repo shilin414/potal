@@ -249,8 +249,7 @@ const findButton = (label: string) => (
 
   it('a 404 resolve is UNAVAILABLE: placeholder name, explicit warning, save blocked (§41)', async () => {
     mocks.fetchApplicationPage.mockResolvedValue({
-      items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }],
-      next_cursor: '', has_more: false,
+      items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }], next_cursor: '', has_more: false,
     });
     mocks.resolveApplication.mockRejectedValue({ response: { status: 404 } });
 
@@ -271,6 +270,42 @@ const findButton = (label: string) => (
     await click(save!);
     await flush(50);
     expect(vi.mocked(updateSchedule)).not.toHaveBeenCalled();
+
+    await unmount(root, host);
+  });
+
+  it('picking a REPLACEMENT agent hides the unavailable warning immediately (四次复审 P2-4)', async () => {
+    mocks.fetchApplicationPage.mockResolvedValue({
+      items: [{ id: 7, name: '日报智能体', enabled: true, is_bound: true }], next_cursor: '', has_more: false,
+    });
+    mocks.resolveApplication.mockRejectedValue({ response: { status: 404 } });
+
+    const { root, host } = await mount(
+      <ScheduleEditorModal open editing={editingSchedule} onClose={() => {}} onSaved={() => {}} />,
+    );
+    await flush(50);
+    // 原 Agent 404 → unavailable 告警在屏。
+    expect(document.body.textContent).toContain('原智能体当前不可用');
+
+    // 用户已经在 Select 里换成了新智能体 → 告警必须立即消失。告警绑定
+    // 「当前字段值」，而不是 resolve 时的目标（旧状态不得跟随新选择）。
+    await click(agentSelect().querySelector('.ant-select-selector')!);
+    await flush(30);
+    const option = Array.from(document.querySelectorAll<HTMLElement>('.ant-select-item-option'))
+      .find((el) => el.textContent?.includes('日报智能体'));
+    expect(option, '替换候选应出现在下拉里').toBeTruthy();
+    await click(option!);
+    await flush(30);
+    expect(document.body.textContent).not.toContain('原智能体当前不可用');
+    expect(agentSelectionItem()?.textContent).toContain('日报智能体');
+
+    // 换了智能体后保存不再被 unavailable 拦截。
+    vi.mocked(updateSchedule).mockClear().mockResolvedValue({ id: 9 });
+    const save = Array.from(document.querySelectorAll<HTMLButtonElement>(
+      '.ant-modal-footer .ant-btn')).find((b) => btnText(b) === '保存');
+    await click(save!);
+    await flush(50);
+    expect(vi.mocked(updateSchedule)).toHaveBeenCalledTimes(1);
 
     await unmount(root, host);
   });

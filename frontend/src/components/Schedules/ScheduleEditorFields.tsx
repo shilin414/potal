@@ -31,7 +31,7 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
   const {
     form, apps, appsLoading, appsHasMore, appsLoadingMore, loadMoreApps,
     appsError, refreshApps,
-    appResolution, retryResolveApp,
+    appResolution, resolutionApplies, retryResolveApp,
     setAppQuery, scheduleType, setScheduleType,
     setPreview, deliveryOn, setDeliveryOn, targets, targetsLoading,
     preview, previewing, refreshPreview,
@@ -95,9 +95,11 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
             style={{ marginBottom: 16 }}
           />
         )}
-        {/* 回填状态（§40–§42）：404 = 原智能体不可执行，必须换一个；
-            5xx / 网络 = 临时故障，给重试而不是伪装成「智能体 #id」。 */}
-        {appResolution === 'unavailable' && (
+        {/* 回填状态（§40–§42）：404 = 原智能体不可用，必须换一个；
+            5xx / 网络 = 临时故障，给重试而不是伪装成「智能体 #id」。
+            告警只对「当前仍选中的原智能体」生效（四次复审 P2-4）—— 用户
+            已换成新 Agent 后，旧 Agent 的告警立即隐藏。 */}
+        {resolutionApplies && appResolution === 'unavailable' && (
           <Alert
             type="warning"
             showIcon
@@ -105,7 +107,7 @@ export function ScheduleEditorFields({ state }: { state: ScheduleEditorState }) 
             style={{ marginBottom: 16 }}
           />
         )}
-        {appResolution === 'transient-error' && (
+        {resolutionApplies && appResolution === 'transient-error' && (
           <Alert
             type="error"
             showIcon
