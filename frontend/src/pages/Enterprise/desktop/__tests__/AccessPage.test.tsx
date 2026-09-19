@@ -654,4 +654,34 @@ describe('desktop AccessPage — user picker server search + pagination (四次�
       expect.objectContaining({ q: '张伟' }),
     );
   });
+
+  it('closing the drawer resets the search — reopening B starts from a clean q (P1)', async () => {
+    pageState.items = [row(7, 'A资源'), row(8, 'B资源')];
+    vi.mocked(enterpriseApi.users).mockImplementation(
+      async () => ({ results: [dirUser(1)], next_cursor: null }),
+    );
+
+    await mountPage();
+    // A 会话：搜索「张伟」上服务端。
+    await click(document.querySelector('[data-open-cell="7"] button')!);
+    await flush(20);
+    await click(document.querySelector('[data-testid="select-search"]')!);
+    await flush(350);
+    expect(vi.mocked(enterpriseApi.users)).toHaveBeenLastCalledWith(
+      expect.objectContaining({ q: '张伟' }),
+    );
+
+    // 关闭 A（userQuery 被会话重置清空）→ 防抖落地 → 打开 B。
+    await click(document.querySelector('[data-testid="drawer-close"]')!);
+    await flush(350);
+    await click(document.querySelector('[data-open-cell="8"] button')!);
+    await flush(350);
+
+    // B 的候选首页请求不再携带 A 会话遗留的 q —— 输入框为空，数据也不
+    // 被旧词过滤（否则下拉显示旧词的过滤子集而输入框为空，UI 与数据
+    // 不一致）。
+    const calls = vi.mocked(enterpriseApi.users).mock.calls;
+    const lastArgs = calls[calls.length - 1]![0]!;
+    expect(lastArgs.q).toBeUndefined();
+  });
 });

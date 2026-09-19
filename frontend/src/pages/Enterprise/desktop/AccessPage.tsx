@@ -81,6 +81,12 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
   // useDirectoryUsers 的服务端搜索 + cursor 分页（下拉滚动加载），与
   // MobileUserPicker 完全一致 —— 企业 10000 人时不再被「前 100 条」截断。
   const [userQuery, setUserQuery] = useState("");
+  // 抽屉关闭/切换目标时立即清空人员搜索词（对齐 MobileUserPicker 三次
+  // 复审 §46）：否则重开的第一帧仍带着上一次的 q 先发一次请求，输入框
+  // 已清空而下拉显示旧词的过滤子集 —— UI 与数据不一致。
+  useEffect(() => {
+    setUserQuery("");
+  }, [selected]);
   const directoryUsers = useDirectoryUsers({
     query: userQuery,
     enabled: Boolean(selected),

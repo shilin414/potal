@@ -815,6 +815,11 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Schedule" }
+        "400":
+          description: q exceeds 200 characters (runtime rune-count guard)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
         "401":
           description: not authenticated
           content:

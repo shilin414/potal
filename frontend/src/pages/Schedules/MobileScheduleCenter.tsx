@@ -106,6 +106,7 @@ export function MobileScheduleCenter() {
     },
     {
       key: 'remove', label: '删除', icon: <DeleteOutlined />, danger: true,
+      disabled: isMutating(sheetFor.id),
       onClick: () => confirmRemove(sheetFor),
     },
   ] : [];

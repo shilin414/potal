@@ -392,6 +392,38 @@ describe('useSchedules — toggle 与筛选语义归并（四次复审 P1-4）',
     expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
     expect(latest.current!.data.find((s) => s.id === 5)?.enabled).toBe(true);
   });
+
+  it('a toggle settling after a filter switch cannot remove rows from the NEW set (审查收尾)', async () => {
+    let resolveDisable!: (value: Schedule) => void;
+    mockFetch
+      .mockResolvedValueOnce(page(2, 5))  // 挂载 all 首页
+      .mockResolvedValueOnce(page(2, 5))  // running 首页
+      .mockResolvedValueOnce(page(2, 5)); // 切回 all 的新首页（行 5 仍在）
+    mockDisable.mockImplementationOnce(
+      () => new Promise<Schedule>((res) => { resolveDisable = res; }));
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    await act(async () => { latest.current!.setStatus('running'); });
+    await flush(10);
+    expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
+
+    // 在 running 视图发起暂停（不等待落地），在途时切回 all —— seqRef 换代。
+    let toggle!: Promise<void>;
+    await act(async () => { toggle = latest.current!.toggleEnabled(5, false); });
+    await act(async () => { latest.current!.setStatus('all'); });
+    await flush(10);
+    expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
+
+    // 旧 toggle 现在才返回：running 的闭包快照若参与归并会把行 5 从 all
+    // 列表误删（running && enabled=false → 不属于）；seq 守卫放弃归并，
+    // 新结果集的行保留。
+    await act(async () => {
+      resolveDisable({ ...schedule(5), enabled: false });
+      await toggle;
+    });
+    await flush(10);
+    expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
+  });
 });
 
 describe('useSchedules — 并发行级 mutation（四次复审 P2-1）', () => {

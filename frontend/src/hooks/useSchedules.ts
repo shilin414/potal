@@ -199,10 +199,17 @@ export function useSchedules(): UseSchedulesResult {
 
   const toggleEnabled = useCallback(async (id: number, enabled: boolean) => {
     beginMutation(id);
+    // 点击时的结果集代际：toggle 在途期间用户切了筛选/搜索会 bump seqRef
+    // —— 响应落地时发现已换代就不做成员归并（见 await 之后）。
+    const seqAtStart = seqRef.current;
     const rollback = () => patchLocal(id, { enabled: !enabled });
     patchLocal(id, { enabled }); // 乐观更新，失败回滚
     try {
       const updated = enabled ? await enableSchedule(id) : await disableSchedule(id);
+      // 结果集已换代：上面的 status 是点击时的闭包快照，拿它归并新结果
+      // 集（如 running 视图暂停在途时切到 all）会把刚被新 load 放回来的
+      // 行误删。新 load 才是新结果集的权威快照，旧响应一概不碰。
+      if (seqRef.current !== seqAtStart) return;
       // 与服务端筛选语义对齐（四次复审 P1-4）：running = enabled、
       // paused = disabled、failed/all 与 enabled 无关。停用一个任务后它就
       // 不再属于「运行中」结果集 —— 留在列表里只是行内状态翻转，与后端

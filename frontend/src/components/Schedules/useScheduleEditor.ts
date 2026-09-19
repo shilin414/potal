@@ -226,6 +226,11 @@ export function useScheduleEditor({
     return form.getFieldsValue(true) as ScheduleFormValues;
   }, [form]);
 
+  // 预览代际（四次复审 P2-5）：执行时间相关字段一变，旧预览立即作废并
+  // 清空 —— 请求在途时改配置，晚到的旧预览不再误导（作废与 seq 守卫见
+  // refreshPreview 与下方的触发字段 effect）。
+  const previewSeqRef = useRef(0);
+
   const refreshPreview = useCallback(async () => {
     // 预览代际（四次复审 P2-5）：请求在途时用户还能继续改执行时间/星期/
     // 时区 —— 旧表单算出的预览晚到后不得覆盖新配置下的结果。
@@ -298,10 +303,6 @@ export function useScheduleEditor({
   // 立即消失 —— 告警绑定的是当前字段值，而不是 resolve 时的目标。
   const resolutionApplies = watchedAppId === targetApplicationId;
 
-  // 预览作废（四次复审 P2-5）：执行时间相关字段一变，旧预览立即作废并
-  // 清空 —— 请求在途时改配置，晚到的旧预览不再误导（seq 守卫见
-  // refreshPreview）。
-  const previewSeqRef = useRef(0);
   const watchedScheduleType = Form.useWatch('schedule_type', form);
   const watchedTriggerTime = Form.useWatch(['trigger', 'time'], form);
   const watchedDaysOfWeek = Form.useWatch(['trigger', 'days_of_week'], form);
