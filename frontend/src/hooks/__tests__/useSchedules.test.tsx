@@ -13,13 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react-dom/test-utils';
 import { useSchedules, type UseSchedulesResult } from '../useSchedules';
-import {
-  deleteSchedule,
-  disableSchedule,
-  enableSchedule,
-  fetchSchedules,
-  runScheduleNow,
-} from '@/services/scheduleApi';
+import { fetchSchedules } from '@/services/scheduleApi';
 import type { Schedule } from '@/types/schedule';
 
 vi.mock('@/services/scheduleApi', async (importOriginal) => ({
