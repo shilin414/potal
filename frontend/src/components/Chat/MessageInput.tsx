@@ -47,7 +47,7 @@ const MessageInput: React.FC<MessageInputProps> = ({
   onValueChange,
   onSendMessage,
   disabled = false,
-  placeholder = '输入消息...',
+  placeholder = '继续描述需求或补充要求',
   currentAgent = null,
   workspaceLocked = false,
 }) => {

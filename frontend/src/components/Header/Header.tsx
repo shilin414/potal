@@ -10,7 +10,6 @@ import {
 import { ThemeToggle } from '@/components/Theme';
 import { useAuthStore } from '@/stores/useAuthStore';
 import { useNavigationPreferencesStore } from '@/stores/useNavigationPreferencesStore';
-import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import './Header.css';
 
 const Header: React.FC = () => {
@@ -18,22 +17,12 @@ const Header: React.FC = () => {
   const location = useLocation();
   // The main agent comes from the bootstrap payload (执行报告 §9) — the
   // header must not ask for the whole catalog just to link to "对话".
-  const defaultApplication = useWorkspaceBootstrapStore((state) => state.defaultApplication);
-  const loadBootstrap = useWorkspaceBootstrapStore((state) => state.load);
   const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
   const iconMode = useNavigationPreferencesStore((state) => state.iconMode);
   const visibleNavItems = getVisibleNavigationItems({ isStaff });
 
-  React.useEffect(() => { void loadBootstrap(); }, [loadBootstrap]);
 
   const handleNavigation = (item: NavigationItem) => {
-    // "对话" is the chat surface, not the idle home: open the main agent's
-    // workspace so the switcher / new-conversation header is available. Falls
-    // back to the home workspace when no bound chat application exists yet.
-    if (item.id === 'root') {
-      navigate(defaultApplication ? `/chat/${defaultApplication.slug}` : '/');
-      return;
-    }
     navigate(item.path);
   };
 

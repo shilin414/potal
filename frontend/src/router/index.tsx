@@ -10,6 +10,7 @@ import LegacyAppRunRedirect from './LegacyAppRunRedirect';
 // §55–§58): 首页 / Chat 首屏不再下载用户可能永远不会进入的管理页 ——
 // Enterprise 已用同一模式证明可行。只切分次级 console 路由：
 // WorkspaceHost / 主 Chat / Shell / 登录页 保持同步加载。
+const TaskCenterPage = lazy(() => import('@/workbench/tasks/TaskCenterPage'));
 const AgentsPage = lazy(() => import('@/pages/Agents/AgentsPage'));
 const AgentDetailPage = lazy(() => import('@/pages/Agents/AgentDetailPage'));
 const TemplatesPage = lazy(() => import('@/pages/Templates/TemplatesPage'));
@@ -52,13 +53,22 @@ const lazyConsole = (node: ReactNode) => (
 
 /** Console pages scroll and pad; workspaces lay themselves out (§17/§33). */
 const consolePage = { shell: { padded: true } };
-const fullWidthConsole = { shell: { hideSidebar: true, padded: true } };
+const fullWidthConsole = { shell: { padded: true } };
 const fullscreenConsole = { shell: { hideSidebar: true, hideHeader: true } };
 
 // Mobile shell handles (开发执行报告 §6): the header swaps the workspace
 // switcher for a page title; Schedules gains a create action wired by the
 // page itself via useMobileHeader. Enterprise sub-pages override the title
 // dynamically (mode: 'detail') from EnterprisePage's mobile branch.
+const fixedWorkspaceHandle = {
+  shell: { mobile: { mode: 'page' as const, title: '应用', action: 'none' as const } },
+};
+const taskPageHandle = {
+  shell: {
+    padded: false,
+    mobile: { mode: 'page' as const, title: '任务', action: 'none' as const },
+  },
+};
 const agentsPageHandle = {
   shell: {
     padded: true,
@@ -73,14 +83,12 @@ const appsPageHandle = {
 };
 const schedulesPageHandle = {
   shell: {
-    hideSidebar: true,
     padded: true,
-    mobile: { mode: 'page' as const, title: '定时任务', action: 'create' as const },
+    mobile: { mode: 'page' as const, title: '自动化', action: 'create' as const },
   },
 };
 const enterprisePageHandle = {
   shell: {
-    hideSidebar: true,
     padded: true,
     mobile: { mode: 'console' as const, title: '企业控制台' },
   },
@@ -106,11 +114,13 @@ const router = createBrowserRouter([
     children: [
       // ── Workspaces (§18/§33) ──────────────────────────────────────────
       { index: true, element: <WorkspaceHost kind="home" /> },
+      { path: 'tasks', element: lazyConsole(<TaskCenterPage />), handle: taskPageHandle },
       { path: 'chat/:applicationSlug', element: <WorkspaceHost kind="chat" /> },
-      { path: 'app/:applicationSlug', element: <WorkspaceHost kind="page" /> },
+      { path: 'app/:applicationSlug', element: <WorkspaceHost kind="page" />, handle: fixedWorkspaceHandle },
       {
         path: 'workflow/:applicationSlug',
         element: <WorkspaceHost kind="workflow" />,
+        handle: fixedWorkspaceHandle,
       },
 
       // ── Console (application management, route-level lazy) ────────────

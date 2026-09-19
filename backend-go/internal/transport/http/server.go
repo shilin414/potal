@@ -239,6 +239,10 @@ func normalizeRoute(r *http.Request) string {
 		return p
 	case p == "/api/v2/workspace/bootstrap":
 		return p
+	case p == "/api/v2/tasks":
+		return p
+	case strings.HasPrefix(p, "/api/v2/tasks/"):
+		return "/api/v2/tasks/{id}"
 	case p == "/api/v2/applications":
 		return p
 	case strings.HasPrefix(p, "/api/v2/applications/"):

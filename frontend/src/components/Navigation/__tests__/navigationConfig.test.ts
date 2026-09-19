@@ -8,13 +8,12 @@ import {
 describe('navigationConfig', () => {
   it('keeps the product navigation set and desktop/mobile root labels centralized', () => {
     expect(NAVIGATION_ITEMS.map((item) => item.id)).toEqual([
-      'root', 'agents', 'apps', 'schedules', 'enterprise',
+      'root', 'tasks', 'agents', 'apps', 'schedules', 'enterprise',
     ]);
     expect(NAVIGATION_ITEMS[0]).toMatchObject({
-      desktopLabel: '对话',
+      desktopLabel: '首页',
       mobileLabel: '首页',
-      defaultIcon: 'message',
-      mobileDefaultIcon: 'home',
+      defaultIcon: 'home',
     });
     expect(NAVIGATION_ITEMS.some((item) => (
       ['skills', 'templates', 'workflows'] as string[]
@@ -25,6 +24,7 @@ describe('navigationConfig', () => {
     ['root', '/', true],
     ['root', '/chat/main', true],
     ['root', '/apps', false],
+    ['tasks', '/tasks', true],
     ['agents', '/agents', true],
     ['agents', '/agents/42', true],
     ['apps', '/apps', true],

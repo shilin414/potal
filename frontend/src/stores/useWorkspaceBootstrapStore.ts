@@ -46,6 +46,8 @@ import {
   type ApplicationSummary,
   type ComposerApplication,
 } from '@/services/runApi';
+import { adaptTask } from '@/services/taskApi';
+import type { TaskSummary } from '@/types/task';
 import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 import {
   captureSessionGeneration,
@@ -60,6 +62,8 @@ export interface BootstrapState {
   recent: ApplicationSummary[];
   recommended: ApplicationSummary[];
   recentFixedApps: ApplicationSummary[];
+  recentCapabilities: ApplicationSummary[];
+  recentTasks: TaskSummary[];
   agentCategories: ApplicationCategory[];
   appCategories: ApplicationCategory[];
   isLoading: boolean;
@@ -117,6 +121,8 @@ const initialBootstrapState = {
   recent: [] as ApplicationSummary[],
   recommended: [] as ApplicationSummary[],
   recentFixedApps: [] as ApplicationSummary[],
+  recentCapabilities: [] as ApplicationSummary[],
+  recentTasks: [] as TaskSummary[],
   agentCategories: [] as ApplicationCategory[],
   appCategories: [] as ApplicationCategory[],
   isLoading: false,
@@ -234,6 +240,8 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
           recent: payload.recent ?? [],
           recommended: payload.recommended ?? [],
           recentFixedApps: payload.recent_fixed_apps ?? [],
+          recentCapabilities: payload.recent_capabilities ?? [],
+          recentTasks: (payload.recent_tasks ?? []).map(adaptTask),
           agentCategories: payload.agent_categories ?? [],
           appCategories: payload.app_categories ?? [],
           isLoading: false,
@@ -275,6 +283,7 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
     recent: patchList(state.recent, id, patch),
     recommended: patchList(state.recommended, id, patch),
     recentFixedApps: patchList(state.recentFixedApps, id, patch),
+    recentCapabilities: patchList(state.recentCapabilities, id, patch),
   })),
 
   remove: (id) => set((state) => ({
@@ -286,6 +295,7 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
     recent: state.recent.filter((item) => item.id !== id),
     recommended: state.recommended.filter((item) => item.id !== id),
     recentFixedApps: state.recentFixedApps.filter((item) => item.id !== id),
+    recentCapabilities: state.recentCapabilities.filter((item) => item.id !== id),
   })),
 
   toggleFavorite: async (applicationId, fallback) => {
@@ -317,6 +327,7 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
         recent: patchList(s.recent, applicationId, { is_favorite: favorite }),
         recommended: patchList(s.recommended, applicationId, { is_favorite: favorite }),
         recentFixedApps: patchList(s.recentFixedApps, applicationId, { is_favorite: favorite }),
+        recentCapabilities: patchList(s.recentCapabilities, applicationId, { is_favorite: favorite }),
       }));
       // The route-resolved entity carries the flag the ✩ in a chat header
       // reads, so it has to follow along (patch is a no-op when not cached).
@@ -349,7 +360,7 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
     const state = get();
     for (const list of [
       state.favorites, state.frequent, state.recent,
-      state.recommended, state.recentFixedApps,
+      state.recommended, state.recentFixedApps, state.recentCapabilities,
     ]) {
       const hit = list.find((item) => item.id === id);
       if (hit) return hit;
@@ -362,7 +373,7 @@ export const useWorkspaceBootstrapStore = create<BootstrapState>()((set, get) =>
     const state = get();
     for (const list of [
       state.favorites, state.frequent, state.recent,
-      state.recommended, state.recentFixedApps,
+      state.recommended, state.recentFixedApps, state.recentCapabilities,
     ]) {
       const hit = list.find((item) => item.slug === slug);
       if (hit) return hit;

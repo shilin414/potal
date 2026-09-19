@@ -378,6 +378,76 @@ func (q *Queries) GetConversationRowForUpdate(ctx context.Context, id uint64) (u
 	return id, err
 }
 
+const getTaskByIDOwned = `-- name: GetTaskByIDOwned :one
+SELECT c.id,
+       c.title,
+       c.application_id,
+       c.created_at,
+       c.updated_at,
+       a.slug AS application_slug,
+       a.name AS application_name,
+       a.icon AS application_icon,
+       a.color AS application_color,
+       a.kind AS application_kind,
+       COALESCE((SELECT m.role FROM messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1), '') AS preview_role,
+       COALESCE((SELECT m.content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1), '') AS preview,
+       CASE
+         WHEN EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.conversation_id = c.id
+             AND r.status NOT IN ('cancelled', 'succeeded', 'failed', 'interrupted')
+         ) THEN 'running'
+         WHEN (SELECT r2.status FROM runs r2 WHERE r2.conversation_id = c.id ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)
+              IN ('failed', 'interrupted') THEN 'error'
+         ELSE 'idle'
+       END AS execution_state
+FROM conversations c
+LEFT JOIN applications a ON a.id = c.application_id
+WHERE c.id = ? AND c.user_id = ?
+`
+
+type GetTaskByIDOwnedParams struct {
+	ID     uint64
+	UserID uint64
+}
+
+type GetTaskByIDOwnedRow struct {
+	ID               uint64
+	Title            string
+	ApplicationID    sql.NullInt64
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	ApplicationSlug  sql.NullString
+	ApplicationName  sql.NullString
+	ApplicationIcon  sql.NullString
+	ApplicationColor sql.NullString
+	ApplicationKind  sql.NullString
+	PreviewRole      interface{}
+	Preview          interface{}
+	ExecutionState   string
+}
+
+func (q *Queries) GetTaskByIDOwned(ctx context.Context, arg GetTaskByIDOwnedParams) (GetTaskByIDOwnedRow, error) {
+	row := q.db.QueryRowContext(ctx, getTaskByIDOwned, arg.ID, arg.UserID)
+	var i GetTaskByIDOwnedRow
+	err := row.Scan(
+		&i.ID,
+		&i.Title,
+		&i.ApplicationID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.ApplicationSlug,
+		&i.ApplicationName,
+		&i.ApplicationIcon,
+		&i.ApplicationColor,
+		&i.ApplicationKind,
+		&i.PreviewRole,
+		&i.Preview,
+		&i.ExecutionState,
+	)
+	return i, err
+}
+
 const listConversationsByApplication = `-- name: ListConversationsByApplication :many
 SELECT id, user_id, application_id, organization_id, title, created_at, updated_at
 FROM conversations
@@ -572,6 +642,134 @@ func (q *Queries) ListMessagesByConversation(ctx context.Context, conversationID
 		return nil, err
 	}
 	return items, nil
+}
+
+const listTasksByUserPage = `-- name: ListTasksByUserPage :many
+SELECT c.id,
+       c.title,
+       c.application_id,
+       c.created_at,
+       c.updated_at,
+       a.slug AS application_slug,
+       a.name AS application_name,
+       a.icon AS application_icon,
+       a.color AS application_color,
+       a.kind AS application_kind,
+       COALESCE((SELECT m.role FROM messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1), '') AS preview_role,
+       COALESCE((SELECT m.content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1), '') AS preview,
+       CASE
+         WHEN EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.conversation_id = c.id
+             AND r.status NOT IN ('cancelled', 'succeeded', 'failed', 'interrupted')
+         ) THEN 'running'
+         WHEN (SELECT r2.status FROM runs r2 WHERE r2.conversation_id = c.id ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)
+              IN ('failed', 'interrupted') THEN 'error'
+         ELSE 'idle'
+       END AS execution_state
+FROM conversations c
+LEFT JOIN applications a ON a.id = c.application_id
+WHERE c.user_id = ?
+  AND (? IS NULL OR c.application_id = ?)
+  AND (? IS NULL
+       OR c.title COLLATE utf8mb4_unicode_ci LIKE ?)
+  AND (? IS NULL
+       OR c.updated_at < ?
+       OR (c.updated_at = ? AND c.id < ?))
+ORDER BY c.updated_at DESC, c.id DESC
+LIMIT ?
+`
+
+type ListTasksByUserPageParams struct {
+	UserID          uint64
+	ApplicationID   sql.NullInt64
+	Search          interface{}
+	SearchLike      interface{}
+	CursorUpdatedAt sql.NullTime
+	CursorID        uint64
+	Limit           int32
+}
+
+type ListTasksByUserPageRow struct {
+	ID               uint64
+	Title            string
+	ApplicationID    sql.NullInt64
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	ApplicationSlug  sql.NullString
+	ApplicationName  sql.NullString
+	ApplicationIcon  sql.NullString
+	ApplicationColor sql.NullString
+	ApplicationKind  sql.NullString
+	PreviewRole      interface{}
+	Preview          interface{}
+	ExecutionState   string
+}
+
+// Product Task facade backed by conversations. Stable keyset order keeps the
+// result bounded and repeatable while new tasks are created concurrently.
+func (q *Queries) ListTasksByUserPage(ctx context.Context, arg ListTasksByUserPageParams) ([]ListTasksByUserPageRow, error) {
+	rows, err := q.db.QueryContext(ctx, listTasksByUserPage,
+		arg.UserID,
+		arg.ApplicationID,
+		arg.ApplicationID,
+		arg.Search,
+		arg.SearchLike,
+		arg.CursorUpdatedAt,
+		arg.CursorUpdatedAt,
+		arg.CursorUpdatedAt,
+		arg.CursorID,
+		arg.Limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListTasksByUserPageRow{}
+	for rows.Next() {
+		var i ListTasksByUserPageRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Title,
+			&i.ApplicationID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.ApplicationSlug,
+			&i.ApplicationName,
+			&i.ApplicationIcon,
+			&i.ApplicationColor,
+			&i.ApplicationKind,
+			&i.PreviewRole,
+			&i.Preview,
+			&i.ExecutionState,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const renameTaskOwned = `-- name: RenameTaskOwned :execresult
+UPDATE conversations
+SET title = ?
+WHERE id = ? AND user_id = ?
+`
+
+type RenameTaskOwnedParams struct {
+	Title  string
+	ID     uint64
+	UserID uint64
+}
+
+func (q *Queries) RenameTaskOwned(ctx context.Context, arg RenameTaskOwnedParams) (sql.Result, error) {
+	return q.db.ExecContext(ctx, renameTaskOwned, arg.Title, arg.ID, arg.UserID)
 }
 
 const touchConversationUpdated = `-- name: TouchConversationUpdated :exec

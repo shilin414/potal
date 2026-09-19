@@ -1,0 +1,10 @@
+.capability-picker { display: grid; gap: 14px; }
+.capability-picker__list { display: grid; gap: 4px; max-height: 56vh; overflow: auto; padding: 2px; }
+.capability-picker__row { width: 100%; display: flex; align-items: center; gap: 12px; border: 0; border-radius: 10px; padding: 10px; background: transparent; color: var(--color-text); text-align: left; cursor: pointer; }
+.capability-picker__row:hover, .capability-picker__row:focus-visible { background: var(--color-bg-card); outline: none; }
+.capability-picker__content { min-width: 0; flex: 1; display: grid; }
+.capability-picker__content strong, .capability-picker__content small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.capability-picker__content small { color: var(--color-text-dim); margin-top: 3px; }
+.capability-picker__badge { color: var(--color-text-dim); font-size: 12px; border: 1px solid var(--color-border); border-radius: 999px; padding: 2px 8px; }
+
+.capability-picker__tasks { display: grid; gap: 4px; padding-bottom: 10px; border-bottom: 1px solid var(--color-border); }.capability-picker__tasks > strong { color: var(--color-text-sec); font-size: 12px; }.capability-picker__tasks button { display: flex; justify-content: space-between; gap: 12px; border: 0; border-radius: 8px; padding: 9px 10px; background: var(--color-bg-card); color: var(--color-text); cursor: pointer; }.capability-picker__tasks small { color: var(--color-text-dim); }

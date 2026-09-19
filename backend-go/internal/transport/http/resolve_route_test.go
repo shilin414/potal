@@ -58,6 +58,8 @@ func TestNormalizeRouteKeepsStaticCatalogRoutesDistinct(t *testing.T) {
 		"/api/v2/applications/42/avatar":       "/api/v2/applications/{id}/avatar",
 		"/api/v2/applications/42/favorite":     "/api/v2/applications/{id}/favorite",
 		"/api/v2/workspace/bootstrap":          "/api/v2/workspace/bootstrap",
+		"/api/v2/tasks":                        "/api/v2/tasks",
+		"/api/v2/tasks/42":                     "/api/v2/tasks/{id}",
 		"/api/v2/applications":                 "/api/v2/applications",
 	}
 	for path, want := range cases {

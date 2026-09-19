@@ -81,7 +81,7 @@ afterEach(async () => {
 describe('Header navigation', () => {
   it('marks chat and fixed-app routes under their shared navigation entries', async () => {
     const chat = await mountHeader('/chat/customer-service');
-    expect(navButton(chat, '对话').getAttribute('aria-current')).toBe('page');
+    expect(navButton(chat, '首页').getAttribute('aria-current')).toBe('page');
     await act(async () => roots.pop()!.root.unmount());
     chat.remove();
 
@@ -89,32 +89,32 @@ describe('Header navigation', () => {
     expect(navButton(app, '应用').getAttribute('aria-current')).toBe('page');
   });
 
-  it('preserves the desktop 对话 behavior that opens the default chat agent', async () => {
+  it('opens the Workbench home from the 首页 navigation item', async () => {
     const host = await mountHeader('/agents');
 
-    await act(async () => navButton(host, '对话').click());
+    await act(async () => navButton(host, '首页').click());
 
     expect(host.querySelector('[data-testid="location"]')?.textContent)
-      .toBe('/chat/main-agent');
+      .toBe('/');
   });
 
   it('renders accessible buttons and responds to all three icon modes', async () => {
     const outline = await mountHeader('/');
-    expect(navButton(outline, '对话').tagName).toBe('BUTTON');
-    expect(navButton(outline, '对话').querySelector('.header-nav-icon')).toBeTruthy();
+    expect(navButton(outline, '首页').tagName).toBe('BUTTON');
+    expect(navButton(outline, '首页').querySelector('.header-nav-icon')).toBeTruthy();
     await act(async () => roots.pop()!.root.unmount());
     outline.remove();
 
     useNavigationPreferencesStore.setState({ iconMode: 'emoji' });
     const emoji = await mountHeader('/');
-    expect(navButton(emoji, '对话').textContent).toContain('💬');
+    expect(navButton(emoji, '首页').textContent).toContain('💬');
     await act(async () => roots.pop()!.root.unmount());
     emoji.remove();
 
     useNavigationPreferencesStore.setState({ iconMode: 'hidden' });
     const hidden = await mountHeader('/');
-    expect(navButton(hidden, '对话').textContent).toBe('对话');
-    expect(navButton(hidden, '对话').querySelector('.header-nav-icon')).toBeNull();
+    expect(navButton(hidden, '首页').textContent).toBe('首页');
+    expect(navButton(hidden, '首页').querySelector('.header-nav-icon')).toBeNull();
   });
 
   it('keeps enterprise navigation restricted to staff', async () => {
@@ -125,3 +125,4 @@ describe('Header navigation', () => {
     expect(host.textContent).not.toContain('企业控制台');
   });
 });
+

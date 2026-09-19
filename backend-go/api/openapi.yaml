@@ -1417,6 +1417,80 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/SimpleError" }
 
+  # ───────────────────────────────────────────────────────────── tasks ──
+  /api/v2/tasks:
+    get:
+      operationId: listTasks
+      tags: [tasks]
+      summary: Keyset-paginated user task list backed by conversations
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 20 }
+        - name: q
+          in: query
+          schema: { type: string, maxLength: 200 }
+        - name: application_id
+          in: query
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: Bounded task page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TaskPage" }
+        "400":
+          description: invalid cursor or query
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
+  /api/v2/tasks/{taskId}:
+    parameters:
+      - name: taskId
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    patch:
+      operationId: updateTask
+      tags: [tasks]
+      summary: Rename one owned task
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TaskUpdateRequest" }
+      responses:
+        "200":
+          description: Updated task summary
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TaskSummary" }
+        "400":
+          description: invalid title
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+        "404":
+          description: task not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+    delete:
+      operationId: deleteTask
+      tags: [tasks]
+      summary: Delete one owned task using the conversation cascade
+      responses:
+        "204": { description: Deleted }
+        "404":
+          description: task not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DetailError" }
+
   # ─────────────────────────────────────────────────────── conversations ──
   /api/conversations/:
     get:
@@ -2494,6 +2568,8 @@ components:
         - recent_fixed_apps
         - agent_categories
         - app_categories
+        - recent_capabilities
+        - recent_tasks
       properties:
         default_application:
           description: >
@@ -2530,6 +2606,50 @@ components:
           type: array
           description: category rail for 应用中心 / the 应用 selectors (non-chat)
           items: { $ref: "#/components/schemas/ApplicationCategory" }
+        recent_capabilities:
+          type: array
+          description: Mixed recently used agents and applications, capped at eight.
+          items: { $ref: "#/components/schemas/ApplicationSummary" }
+        recent_tasks:
+          type: array
+          description: Eight most recently updated tasks; no messages/runs/artifacts arrays.
+          items: { $ref: "#/components/schemas/TaskSummary" }
+
+    TaskSummary:
+      type: object
+      required: [id, title, created_at, updated_at, execution_state]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        application_id: { type: integer, format: int64, nullable: true }
+        application_slug: { type: string }
+        application_name: { type: string }
+        application_icon: { type: string }
+        application_color: { type: string }
+        application_kind: { type: string }
+        preview: { type: string }
+        preview_role: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        execution_state: { type: string, enum: [idle, running, error] }
+
+    TaskPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/TaskSummary" }
+        next_cursor:
+          type: string
+          description: Opaque keyset cursor; empty when no next page exists.
+
+    TaskUpdateRequest:
+      type: object
+      required: [title]
+      additionalProperties: false
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
 
     MentionCandidate:
       type: object

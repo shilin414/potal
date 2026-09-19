@@ -7,6 +7,7 @@
  * differences are encoded in runtime capabilities returned by the API.
  */
 import { api } from '@/services/api';
+import type { TaskSummary } from '@/types/task';
 
 export interface RunRecord {
   id: string;
@@ -236,6 +237,22 @@ export interface WorkspaceBootstrap {
   recent: ApplicationSummary[];
   recommended: ApplicationSummary[];
   recent_fixed_apps: ApplicationSummary[];
+  recent_capabilities?: ApplicationSummary[];
+  recent_tasks?: Array<{
+    id: string;
+    title: string;
+    application_id: number | null;
+    application_slug?: string;
+    application_name?: string;
+    application_icon?: string;
+    application_color?: string;
+    application_kind?: string;
+    preview?: string;
+    preview_role?: string;
+    created_at: string;
+    updated_at: string;
+    execution_state: TaskSummary['executionState'];
+  }>;
   agent_categories: ApplicationCategory[];
   app_categories: ApplicationCategory[];
 }

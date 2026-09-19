@@ -1,6 +1,6 @@
-# Creation Agent Studio · 创作智能体工作台
+# Potal Workbench · 企业 AI 工作台
 
-Creation Agent Studio 是一个以 Application 为入口、以统一 Run 为执行协议的 AI 应用工作台。当前主链路由 React 前端、Go 控制面/流式面/执行面、MySQL 5.7、Redis 和飞书 Aily 自定义智能体组成。
+Potal Workbench 是一个以 **Capability（智能体 / 应用）** 为入口、以 **Task（任务）** 组织用户工作、以统一 **Run（执行）** 协议驱动后端、以 **Artifact（成果）** 承载输出的企业 AI 工作台。当前 Task 由 Conversation 作为技术承载容器，前端只通过 Task Facade 使用任务语义；主链路由 React 前端、Go 控制面/流式面/执行面、MySQL 5.7、Redis 和飞书 Aily 自定义智能体组成。
 
 ## 当前状态
 
@@ -19,6 +19,29 @@ Creation Agent Studio 是一个以 Application 为入口、以统一 Run 为执�
 - [Go 重构交接提示词](docs/Go重构交接提示词.md)
 - [开发进度清单](docs/开发进度清单.md)
 - [Django 历史参考归档](docs/archive/django-reference/README.md)
+
+
+## Workbench V2 产品模型
+
+```text
+Capability（能力：智能体 / 应用）
+          │
+          ▼
+Task（任务；当前由 Conversation 承载）
+          │
+          ▼
+Run（一次真实执行） ──────► Artifact（成果）
+
+Automation（自动化）按计划触发新的执行或任务活动
+```
+
+- **任务 API**：`GET /api/v2/tasks` 使用 `(updated_at, id)` 游标分页，`PATCH /api/v2/tasks/{id}` 重命名，`DELETE /api/v2/tasks/{id}` 复用 Conversation 安全级联删除。
+- **兼容策略**：保留 `/api/conversations/` 等 legacy/internal API，现有 Chat、Share、Deep Link、SSE 与 Run CAS 不迁移数据模型。
+- **数据库**：不新增 `tasks` 表，只增加任务列表索引；只有出现一任务多会话、任务负责人/生命周期/权限等聚合需求时才引入真正的 Task Aggregate。
+- **启动数据**：`/api/v2/workspace/bootstrap` 继续保持常量级 Payload，并新增混排的 `recent_capabilities` 与精简的 `recent_tasks`。
+- **PC 工作台**：无全局 Header；固定左侧导航、最近使用、最近任务，中间 Main Workspace，右侧按需 Inspector。
+- **Mobile 工作台**：顶部能力切换、统一 Drawer、最近使用、最近任务与移动任务中心；PC/Mobile 共用业务层但使用独立布局层。
+- **Composer**：普通 `@` 文本直接作为任务内容发送；能力切换只通过显式 Capability Picker 完成。
 
 ## 运行架构
 
@@ -58,7 +81,7 @@ creation_agent_studio/
 │   ├── db/queries/              # sqlc 显式 SQL
 │   ├── internal/                # identity/catalog/execution/integrations/platform/transport
 │   └── tests/                   # MySQL/Redis 集成测试 + 真实 Aily 浏览器 E2E
-├── frontend/                    # React + TypeScript + Vite
+├── frontend/                    # React + TypeScript + Vite；workbench/ 为 V2 Shell/能力/任务/Inspector
 └── docs/
     └── archive/django-reference # 只读历史行为参考，不参与运行
 ```
@@ -86,7 +109,7 @@ go run ./cmd/worker
 
 # 终端 3：前端
 cd frontend
-npm install
+npm ci
 npx vite --port 3030 --strictPort
 ```
 

@@ -75,6 +75,75 @@ WHERE c.user_id = ? AND c.application_id = ?
 ORDER BY c.updated_at DESC
 LIMIT 200;
 
+-- name: ListTasksByUserPage :many
+-- Product Task facade backed by conversations. Stable keyset order keeps the
+-- result bounded and repeatable while new tasks are created concurrently.
+SELECT c.id,
+       c.title,
+       c.application_id,
+       c.created_at,
+       c.updated_at,
+       a.slug AS application_slug,
+       a.name AS application_name,
+       a.icon AS application_icon,
+       a.color AS application_color,
+       a.kind AS application_kind,
+       COALESCE((SELECT m.role FROM messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1), '') AS preview_role,
+       COALESCE((SELECT m.content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1), '') AS preview,
+       CASE
+         WHEN EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.conversation_id = c.id
+             AND r.status NOT IN ('cancelled', 'succeeded', 'failed', 'interrupted')
+         ) THEN 'running'
+         WHEN (SELECT r2.status FROM runs r2 WHERE r2.conversation_id = c.id ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)
+              IN ('failed', 'interrupted') THEN 'error'
+         ELSE 'idle'
+       END AS execution_state
+FROM conversations c
+LEFT JOIN applications a ON a.id = c.application_id
+WHERE c.user_id = sqlc.arg('user_id')
+  AND (sqlc.narg('application_id') IS NULL OR c.application_id = sqlc.narg('application_id'))
+  AND (sqlc.narg('search') IS NULL
+       OR c.title COLLATE utf8mb4_unicode_ci LIKE sqlc.arg('search_like'))
+  AND (sqlc.narg('cursor_updated_at') IS NULL
+       OR c.updated_at < sqlc.narg('cursor_updated_at')
+       OR (c.updated_at = sqlc.narg('cursor_updated_at') AND c.id < sqlc.arg('cursor_id')))
+ORDER BY c.updated_at DESC, c.id DESC
+LIMIT ?;
+
+-- name: GetTaskByIDOwned :one
+SELECT c.id,
+       c.title,
+       c.application_id,
+       c.created_at,
+       c.updated_at,
+       a.slug AS application_slug,
+       a.name AS application_name,
+       a.icon AS application_icon,
+       a.color AS application_color,
+       a.kind AS application_kind,
+       COALESCE((SELECT m.role FROM messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1), '') AS preview_role,
+       COALESCE((SELECT m.content FROM messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1), '') AS preview,
+       CASE
+         WHEN EXISTS (
+           SELECT 1 FROM runs r
+           WHERE r.conversation_id = c.id
+             AND r.status NOT IN ('cancelled', 'succeeded', 'failed', 'interrupted')
+         ) THEN 'running'
+         WHEN (SELECT r2.status FROM runs r2 WHERE r2.conversation_id = c.id ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)
+              IN ('failed', 'interrupted') THEN 'error'
+         ELSE 'idle'
+       END AS execution_state
+FROM conversations c
+LEFT JOIN applications a ON a.id = c.application_id
+WHERE c.id = ? AND c.user_id = ?;
+
+-- name: RenameTaskOwned :execresult
+UPDATE conversations
+SET title = ?
+WHERE id = ? AND user_id = ?;
+
 -- name: DeleteConversationMessages :exec
 DELETE FROM messages WHERE conversation_id = ?;
 

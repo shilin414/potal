@@ -52,14 +52,14 @@ describe('NavigationSettingsModal', () => {
   it('shows each navigation item and the outline icon controls by default', async () => {
     await mountModal();
     expect(document.body.textContent).toContain('导航与外观');
-    expect(document.body.textContent).toContain('对话');
-    expect(document.body.textContent).toContain('企业控制台');
+    expect(document.body.textContent).toContain('任务');
+    expect(document.body.textContent).toContain('企业管理');
     expect(document.body.textContent).toContain('恢复默认图标');
   });
 
   it('hides staff-only navigation customization from non-staff users', async () => {
     await mountModal(false);
-    expect(document.body.textContent).not.toContain('企业控制台');
+    expect(document.body.textContent).not.toContain('企业管理');
   });
 
   it('explains emoji and text-only modes instead of showing irrelevant selectors', async () => {

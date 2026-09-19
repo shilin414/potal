@@ -69,7 +69,7 @@
   min-width: 0;
 }
 
-/* 顶栏右侧主操作：新任务（回到首页）。与抽屉里的「新建对话」同款主色，
+/* 顶栏右侧主操作：新任务（回到首页）。与抽屉里的「新任务」同款主色，
    收成小圆角胶囊，免得在 56px 顶栏里显得笨重；hover/active 交给 antd 主题。 */
 .mobile-shell__task-btn.ant-btn {
   flex: none;

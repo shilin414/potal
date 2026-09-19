@@ -1,4 +1,4 @@
-export type NavigationItemId = 'root' | 'agents' | 'apps' | 'schedules' | 'enterprise';
+export type NavigationItemId = 'root' | 'tasks' | 'agents' | 'apps' | 'schedules' | 'enterprise';
 
 export interface NavigationContext {
   isStaff: boolean;
@@ -19,11 +19,19 @@ export const NAVIGATION_ITEMS: readonly NavigationItem[] = [
   {
     id: 'root',
     path: '/',
-    desktopLabel: '对话',
+    desktopLabel: '首页',
     mobileLabel: '首页',
-    defaultIcon: 'message',
+    defaultIcon: 'home',
     mobileDefaultIcon: 'home',
     emoji: '💬',
+  },
+  {
+    id: 'tasks',
+    path: '/tasks',
+    desktopLabel: '任务',
+    mobileLabel: '任务',
+    defaultIcon: 'message',
+    emoji: '▣',
   },
   {
     id: 'agents',
@@ -44,16 +52,16 @@ export const NAVIGATION_ITEMS: readonly NavigationItem[] = [
   {
     id: 'schedules',
     path: '/schedules',
-    desktopLabel: '定时任务',
-    mobileLabel: '定时任务',
+    desktopLabel: '自动化',
+    mobileLabel: '自动化',
     defaultIcon: 'clock',
     emoji: '⏰',
   },
   {
     id: 'enterprise',
     path: '/enterprise',
-    desktopLabel: '企业控制台',
-    mobileLabel: '企业控制台',
+    desktopLabel: '企业管理',
+    mobileLabel: '企业管理',
     defaultIcon: 'building',
     emoji: '🏢',
     visibility: ({ isStaff }) => isStaff,
@@ -71,6 +79,8 @@ export function isNavigationItemActive(
   switch (itemId) {
     case 'root':
       return pathname === '/' || pathname.startsWith('/chat/');
+    case 'tasks':
+      return pathname === '/tasks' || pathname.startsWith('/tasks/');
     case 'agents':
       return pathname === '/agents' || pathname.startsWith('/agents/');
     case 'apps':

@@ -788,7 +788,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
                 value={inputValue}
                 onChange={(e) => updateInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder={streaming ? '回复生成中…' : '描述你的需求…（Enter 发送，Shift+Enter 换行；@智能体 可切换）'}
+                placeholder={streaming ? '执行中…' : (conversationId ? '继续描述需求或补充要求' : '描述你的任务或问题')}
                 rows={1}
                 disabled={sending || streaming}
                 className="run-chat-textarea"
@@ -820,7 +820,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
         open={!!shareResult}
         onCancel={() => setShareResult(null)}
         footer={null}
-        title="分享对话"
+        title="分享任务"
         width={520}
         centered
       >
@@ -852,7 +852,7 @@ const RunChatPanel: React.FC<RunChatPanelProps> = ({
               转发到飞书（用户 / 群聊）
             </Button>
             <p className="run-chat-share-note">
-              链接指向服务端快照：只包含转发时选中的消息，之后的对话内容不会出现。
+              链接指向服务端快照：只包含转发时选中的消息，之后的任务内容不会出现。
             </p>
           </div>
         )}

@@ -118,8 +118,8 @@ describe('MobileAppShell navigation regression', () => {
     await act(async () => menuButton.click());
     const drawer = document.querySelector('[data-testid="drawer"]');
     expect(drawer).toBeTruthy();
-    expect(drawer?.textContent).toContain('最近会话');
-    expect(drawer?.textContent).toContain('主题');
+    expect(drawer?.textContent).toContain('最近任务');
+    expect(drawer?.textContent).toContain('最近使用');
     expect(drawer?.textContent).toContain('账号');
 
     const home = buttonByText('首页');

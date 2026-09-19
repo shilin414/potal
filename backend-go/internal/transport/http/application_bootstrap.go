@@ -2,12 +2,15 @@ package http
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
 	genapi "github.com/creation-agent-studio/backend-go/internal/gen/api"
+	db "github.com/creation-agent-studio/backend-go/internal/gen/db"
 
 	"github.com/creation-agent-studio/backend-go/internal/catalog"
 )
@@ -50,6 +53,8 @@ type workspaceBootstrap struct {
 	Recent             []applicationSummary  `json:"recent"`
 	Recommended        []applicationSummary  `json:"recommended"`
 	RecentFixedApps    []applicationSummary  `json:"recent_fixed_apps"`
+	RecentCapabilities []applicationSummary  `json:"recent_capabilities"`
+	RecentTasks        []genapi.TaskSummary  `json:"recent_tasks"`
 	AgentCategories    []applicationCategory `json:"agent_categories"`
 	AppCategories      []applicationCategory `json:"app_categories"`
 }
@@ -134,14 +139,35 @@ func (s *Server) GetWorkspaceBootstrap(w http.ResponseWriter, r *http.Request) {
 			bootstrapUsage(groups, row.App.ID), caller)
 	}
 
+	recent := bootstrapSummaries(groups.Recent, items)
+	recentFixedApps := bootstrapSummaries(groups.RecentFixedApps, items)
+	taskRows, err := s.Runs.Querier().ListTasksByUserPage(ctx, db.ListTasksByUserPageParams{
+		UserID:          uint64(caller.ID),
+		ApplicationID:   sql.NullInt64{},
+		Search:          nil,
+		SearchLike:      nil,
+		CursorUpdatedAt: sql.NullTime{},
+		CursorID:        0,
+		Limit:           8,
+	})
+	if err != nil {
+		writeSimpleError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	recentTasks := make([]genapi.TaskSummary, 0, len(taskRows))
+	for _, row := range taskRows {
+		recentTasks = append(recentTasks, taskSummaryFromListRow(row))
+	}
 	out := workspaceBootstrap{
-		Favorites:       bootstrapSummaries(groups.Favorites, items),
-		Frequent:        bootstrapSummaries(groups.Frequent, items),
-		Recent:          bootstrapSummaries(groups.Recent, items),
-		Recommended:     bootstrapSummaries(groups.Recommended, items),
-		RecentFixedApps: bootstrapSummaries(groups.RecentFixedApps, items),
-		AgentCategories: bootstrapCategoryRail(categories.Agents),
-		AppCategories:   bootstrapCategoryRail(categories.Apps),
+		Favorites:          bootstrapSummaries(groups.Favorites, items),
+		Frequent:           bootstrapSummaries(groups.Frequent, items),
+		Recent:             recent,
+		Recommended:        bootstrapSummaries(groups.Recommended, items),
+		RecentFixedApps:    recentFixedApps,
+		RecentCapabilities: mergeRecentCapabilities(recent, recentFixedApps, 8),
+		RecentTasks:        recentTasks,
+		AgentCategories:    bootstrapCategoryRail(categories.Agents),
+		AppCategories:      bootstrapCategoryRail(categories.Apps),
 	}
 	if groups.Default != nil {
 		if item, ok := items[groups.Default.ApplicationID]; ok {
@@ -156,6 +182,34 @@ func (s *Server) GetWorkspaceBootstrap(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+func mergeRecentCapabilities(recent, recentFixed []applicationSummary, limit int) []applicationSummary {
+	seen := make(map[int64]struct{})
+	merged := make([]applicationSummary, 0, len(recent)+len(recentFixed))
+	for _, items := range [][]applicationSummary{recent, recentFixed} {
+		for _, item := range items {
+			if _, exists := seen[item.ID]; exists {
+				continue
+			}
+			seen[item.ID] = struct{}{}
+			merged = append(merged, item)
+		}
+	}
+	sort.SliceStable(merged, func(i, j int) bool {
+		left, right := merged[i].LastUsedAt, merged[j].LastUsedAt
+		if left == nil {
+			return false
+		}
+		if right == nil {
+			return true
+		}
+		return *left > *right
+	})
+	if len(merged) > limit {
+		merged = merged[:limit]
+	}
+	return merged
 }
 
 // bootstrapGroupIDs collects every id the groups selected, deduplicated — the

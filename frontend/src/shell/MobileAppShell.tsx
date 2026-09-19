@@ -7,20 +7,12 @@ import {
   PlusOutlined,
   SearchOutlined,
 } from '@ant-design/icons';
-import ConversationHistory from '@/components/ConversationHistory/ConversationHistory';
-import AccountMenu from '@/components/AccountMenu/AccountMenu';
 import MobileAgentSwitcher from '@/components/Mobile/MobileAgentSwitcher';
-import {
-  NavigationItemIcon,
-  getVisibleNavigationItems,
-  isNavigationItemActive,
-} from '@/components/Navigation';
-import { ThemePicker } from '@/components/Theme';
+import MobileWorkbenchDrawer from '@/workbench/shell/MobileWorkbenchDrawer';
 import { useWorkspaceStore } from '@/stores/useWorkspaceStore';
 import { useApplicationEntityStore } from '@/stores/useApplicationEntityStore';
 import { useWorkspaceBootstrapStore } from '@/stores/useWorkspaceBootstrapStore';
 import { useRunChatStore } from '@/stores/useRunChatStore';
-import { useAuthStore } from '@/stores/useAuthStore';
 import type { ShellChrome } from './useShellChrome';
 import { MobileHeaderProvider, useMobileHeaderState } from './mobileHeader';
 import './shell.css';
@@ -32,8 +24,6 @@ const MobileShellContent: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
   const location = useLocation();
   const pageOverride = useMobileHeaderState();
   const path = location.pathname;
-  const isStaff = useAuthStore((state) => Boolean(state.user?.is_staff));
-  const visibleNavItems = getVisibleNavigationItems({ isStaff });
   const mobile = { ...chrome.mobile, ...pageOverride };
   const mode = mobile.mode ?? 'workspace';
   const showBack = mobile.showBack ?? mode === 'detail';
@@ -142,35 +132,11 @@ const MobileShellContent: React.FC<{ chrome: ShellChrome }> = ({ chrome }) => {
         open={mobileNavOpen}
         onClose={() => setMobileNavOpen(false)}
         width="82vw"
-        title="Creation Studio"
+        title="Potal"
         rootClassName="mobile-shell__drawer"
         styles={{ body: { padding: 0, display: 'flex', flexDirection: 'column' } }}
       >
-        <nav className="mobile-shell__nav" aria-label="主导航">
-          {visibleNavItems.map((item) => {
-            const active = isNavigationItemActive(item.id, path);
-            return (
-              <button
-                key={item.id}
-                type="button"
-                className={`mobile-shell__nav-item${active ? ' active' : ''}`}
-                aria-current={active ? 'page' : undefined}
-                onClick={() => go(item.path)}
-              >
-                <NavigationItemIcon item={item} surface="mobile" className="mobile-shell__nav-icon" />
-                <span>{item.mobileLabel}</span>
-              </button>
-            );
-          })}
-        </nav>
-        <div className="mobile-shell__history">
-          <ConversationHistory
-            onConversationSelect={(id) => go(id ? `/?conversation=${id}` : '/')}
-            onNewConversation={handleNewConversation}
-          />
-        </div>
-        <div className="mobile-shell__theme"><ThemePicker /></div>
-        <AccountMenu variant="panel" onLogoutComplete={() => setMobileNavOpen(false)} />
+        <MobileWorkbenchDrawer close={() => setMobileNavOpen(false)} />
       </Drawer>
     </div>
   );

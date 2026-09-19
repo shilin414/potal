@@ -624,6 +624,7 @@ type Querier interface {
 	// snapshot (disable / prompt edits become visible before the run is
 	// created).
 	GetScheduleRowForUpdate(ctx context.Context, id uint64) (Schedule, error)
+	GetTaskByIDOwned(ctx context.Context, arg GetTaskByIDOwnedParams) (GetTaskByIDOwnedRow, error)
 	GetUserByID(ctx context.Context, id uint64) (User, error)
 	GetUserByUsername(ctx context.Context, username string) (User, error)
 	HasActiveOccurrence(ctx context.Context, scheduleID uint64) (int64, error)
@@ -788,6 +789,9 @@ type Querier interface {
 	// Occurrences stuck in pending longer than the grace period: their
 	// creating scheduler died between INSERT and the run-creating commit.
 	ListStuckPendingOccurrences(ctx context.Context, arg ListStuckPendingOccurrencesParams) ([]ListStuckPendingOccurrencesRow, error)
+	// Product Task facade backed by conversations. Stable keyset order keeps the
+	// result bounded and repeatable while new tasks are created concurrently.
+	ListTasksByUserPage(ctx context.Context, arg ListTasksByUserPageParams) ([]ListTasksByUserPageRow, error)
 	// Serialize the admission decision per provider with a CONFLICTING WRITE on
 	// the shared row (migration 0013). A locking read is not enough: SELECT ...
 	// FOR UPDATE alone does not stop a concurrent decision from observing the same
@@ -846,6 +850,7 @@ type Querier interface {
 	// Crash recovery: rows stuck in 'sending' (worker died before ACK/commit)
 	// return to pending when their DB-clock lease lapsed.
 	ReclaimStuckDeliveries(ctx context.Context, leaseMicros interface{}) (sql.Result, error)
+	RenameTaskOwned(ctx context.Context, arg RenameTaskOwnedParams) (sql.Result, error)
 	// The one transition that goes BACK to 'sending': a previously REJECTED
 	// submission is retransmitted under the same identity/key (第九轮 P0-2).
 	//
