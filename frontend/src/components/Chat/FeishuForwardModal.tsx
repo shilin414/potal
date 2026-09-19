@@ -16,6 +16,11 @@
  * 响应对新会话 UI 一律无效。旧实现里 close → reopen 后，A 的迟到成功会把
  * 刚打开的 B 弹窗直接关掉，迟到失败会把 B 的选中目标覆盖成 A 的失败目
  * 标，且 B 会继承 A 的 sending 锁死发送按钮。
+ *
+ * Selection reconcile（九次复审 P1）：异步发送结果只从「当前选中」里移除
+ * 本轮已成功的目标 —— snapshot 决定本次发了谁，current 决定用户现在想选
+ * 谁；不得用发送开始时的快照整体覆盖 selected（用户在途期间取消的目标会
+ * 复活、新选的目标会被删）。
  */
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Avatar, Empty, Input, Modal, Spin, Tabs, message as antdMessage } from 'antd';
@@ -162,10 +167,12 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
       // 边界是「旧响应不操纵新会话的 UI」。
       if (sessionEpochRef.current !== epoch) return;
 
-      const succeeded = result.results.filter((r) => r.ok);
-      if (succeeded.length) {
+      const succeededIds = new Set(
+        result.results.filter((r) => r.ok).map((r) => r.target_id),
+      );
+      if (succeededIds.size) {
         saveForwardHistory(
-          selectedSnapshot.filter((t) => succeeded.some((r) => r.target_id === t.id)),
+          selectedSnapshot.filter((t) => succeededIds.has(t.id)),
         );
       }
       if (result.fail_count === 0) {
@@ -188,12 +195,13 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
         // Keep the modal open so the sender can retry failed targets
         // (七次复审 P2-9)：成功的自动移除、失败的保持选中 —— 旧的
         // setSelected([]) 把失败目标也取消选择，用户得从头再挑一遍。
-        const failedIds = new Set(
-          result.results
-            .filter((r) => !r.ok)
-            .map((r) => r.target_id),
-        );
-        setSelected(selectedSnapshot.filter((t) => failedIds.has(t.id)));
+        // reconcile 只做「从当前选中里移除本轮已成功的目标」（九次复审
+        // P1）：snapshot 决定本次发了谁，current 决定用户现在想选谁 ——
+        // 发送在途期间列表 / Tab / 搜索 / chip 都可操作，旧实现
+        // setSelected(snapshot 失败目标) 把发送开始时的快照当成发送结束时
+        // 整个 UI 的真相：用户刚取消的失败目标复活、新选的目标被删、切
+        // Tab 后旧目标整组写回。
+        setSelected((current) => current.filter((t) => !succeededIds.has(t.id)));
       }
     } catch (e: any) {
       if (sessionEpochRef.current !== epoch) return;
