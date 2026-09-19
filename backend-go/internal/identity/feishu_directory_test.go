@@ -150,3 +150,98 @@ func TestListUserChatsFollowsPageTokenContinuation(t *testing.T) {
 }
 
 func boolPtr(v bool) *bool { return &v }
+
+// officialSearchUserFixture is the response documented byte-for-byte by
+// feishu-doc 通讯录/用户/搜索用户.md (GET /open-apis/search/v1/user). It is
+// a raw JSON literal — not a Go map — so a wrong field name in either the
+// fixture or the decoder fails the assertion instead of compiling green
+// (六次复审 P1-2: the old decoder read data.entities, a field that does not
+// exist in this response, so every search compiled, passed CI and still
+// returned zero contacts).
+const officialSearchUserFixture = `{
+	"code": 0,
+	"msg": "ok",
+	"data": {
+		"has_more": true,
+		"page_token": "20",
+		"users": [
+			{
+				"open_id": "ou_xxx",
+				"user_id": "on_xxx",
+				"name": "张三",
+				"avatar": {"avatar_72": "https://s3-imfile.feishucdn.com/static-resource/v1/v2_00xx_72.png"}
+			}
+		]
+	}
+}`
+
+// TestSearchFeishuUsersDecodesOfficialUsersShape pins the decoder to the
+// official contract: data.users / data.has_more / data.page_token.
+func TestSearchFeishuUsersDecodesOfficialUsersShape(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/open-apis/search/v1/user" {
+			t.Errorf("path=%s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(officialSearchUserFixture))
+	}))
+	defer srv.Close()
+	client := NewFeishuClient(srv.URL, "id", "secret", srv.Client())
+	page, err := client.SearchFeishuUsers(context.Background(), "token", "张三", 20, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Users) != 1 {
+		t.Fatalf("users=%d, want 1 decoded from the official data.users shape", len(page.Users))
+	}
+	u := page.Users[0]
+	if u.OpenID != "ou_xxx" || u.Name != "张三" {
+		t.Fatalf("user=%+v", u)
+	}
+	if u.AvatarURL == "" {
+		t.Fatalf("avatar not decoded from avatar.avatar_72: %+v", u)
+	}
+	if !page.HasMore || page.PageToken != "20" {
+		t.Fatalf("pagination not decoded: has_more=%v page_token=%q", page.HasMore, page.PageToken)
+	}
+}
+
+// TestSearchFeishuUsersSendsQueryPageSizePageToken pins the REQUEST contract:
+// query / page_size / page_token must reach the provider, pageSize is
+// clamped into the documented 1-200 range, and an empty page_token is
+// omitted on the first page.
+func TestSearchFeishuUsersSendsQueryPageSizePageToken(t *testing.T) {
+	var gotQuery, gotPageSize, gotPageToken string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query().Get("query")
+		gotPageSize = r.URL.Query().Get("page_size")
+		gotPageToken = r.URL.Query().Get("page_token")
+		_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{"has_more":false,"users":[]}}`))
+	}))
+	defer srv.Close()
+	client := NewFeishuClient(srv.URL, "id", "secret", srv.Client())
+	if _, err := client.SearchFeishuUsers(context.Background(), "token", "张三", 50, "pt-9"); err != nil {
+		t.Fatal(err)
+	}
+	if gotQuery != "张三" || gotPageSize != "50" || gotPageToken != "pt-9" {
+		t.Fatalf("query=%q page_size=%q page_token=%q", gotQuery, gotPageSize, gotPageToken)
+	}
+	// Clamp into the provider range: 0 → default 20, >200 → max 200.
+	if _, err := client.SearchFeishuUsers(context.Background(), "token", "张三", 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	if gotPageSize != "20" {
+		t.Fatalf("page_size below range not clamped to 20: %q", gotPageSize)
+	}
+	if _, err := client.SearchFeishuUsers(context.Background(), "token", "张三", 999, ""); err != nil {
+		t.Fatal(err)
+	}
+	if gotPageSize != "200" {
+		t.Fatalf("page_size above range not clamped to 200: %q", gotPageSize)
+	}
+	// First page must omit page_token entirely.
+	if gotPageToken != "" {
+		t.Fatalf("empty page_token must not be sent: %q", gotPageToken)
+	}
+}
+
