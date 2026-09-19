@@ -278,3 +278,103 @@ describe('MobilePermissionEditor — recoverable load failure (P2-6)', () => {
     ).toBe(false);
   });
 });
+
+/** Deferred promise — lets a test dictate response ORDER (三次复审 P0). */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+describe('MobilePermissionEditor — target race (三次复审 P0)', () => {
+  const POLICY_A = {
+    application_id: 7,
+    access_mode: 'assigned',
+    departments: [{ department_id: 3, name: 'A资源部门', include_children: true, covered_users: 12 }],
+    users: [{ directory_user_id: 9, name: 'A资源人员', avatar_url: '', departments: ['A资源部门'] }],
+  };
+  const POLICY_B = {
+    application_id: 8,
+    access_mode: 'assigned',
+    departments: [{ department_id: 4, name: 'B资源部门', include_children: true, covered_users: 5 }],
+    users: [{ directory_user_id: 10, name: 'B资源人员', avatar_url: '', departments: ['B资源部门'] }],
+  };
+
+  it('a late A response cannot overwrite B — save writes B id + B grants', async () => {
+    const a = deferred<typeof POLICY_A>();
+    const b = deferred<typeof POLICY_B>();
+    mocks.access.mockImplementation((id: number) => (id === 7 ? a.promise : b.promise));
+    const onClose = vi.fn();
+
+    const { root } = await mountEditor({ id: 7, name: 'A' });
+    // Switch target while A is still in flight.
+    await act(async () => {
+      root.render(
+        <MobilePermissionEditor open application={{ id: 8, name: 'B' }} onClose={onClose} />,
+      );
+    });
+    await flush(20);
+
+    // B resolves FIRST — the editor shows B's policy.
+    await act(async () => { b.resolve(POLICY_B); });
+    await flush(20);
+    expect(document.body.textContent).toContain('B资源部门');
+
+    // A resolves LAST — it must be ignored entirely.
+    await act(async () => { a.resolve(POLICY_A); });
+    await flush(20);
+    expect(document.body.textContent).toContain('B资源部门');
+    expect(document.body.textContent).not.toContain('A资源部门');
+    expect(document.body.textContent).not.toContain('A资源人员');
+
+    // 保存 can only write B's id with B's grants — never B id + A grants.
+    mocks.updateAccess.mockResolvedValue(POLICY_B);
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="fs-action"]')!.click();
+    });
+    await flush(20);
+    expect(mocks.updateAccess).toHaveBeenCalledTimes(1);
+    expect(mocks.updateAccess).toHaveBeenCalledWith(8, {
+      access_mode: 'assigned',
+      department_grants: [{ department_id: 4, include_children: true }],
+      user_grants: [10],
+    });
+  });
+
+  it('a slow save for A cannot close B or overwrite its policy (save target guard)', async () => {
+    mocks.access.mockImplementation(async (id: number) => (
+      id === 7 ? POLICY_A : POLICY_B));
+    const saveResult = deferred<typeof POLICY_A>();
+    mocks.updateAccess.mockReturnValue(saveResult.promise);
+    const onClose = vi.fn();
+
+    const { root } = await mountEditor({ id: 7, name: 'A' });
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="fs-action"]')!.click();
+    });
+    await flush(20);
+    expect(mocks.updateAccess).toHaveBeenCalledWith(7, expect.anything());
+
+    // While A's save is still travelling, switch to B.
+    await act(async () => {
+      root.render(
+        <MobilePermissionEditor open application={{ id: 8, name: 'B' }} onClose={onClose} />,
+      );
+    });
+    await flush(20);
+    expect(document.body.textContent).toContain('B资源部门');
+
+    // A's save completes late — it must NOT close the editor (onSaved is
+    // target-guarded) nor replace B's policy.
+    await act(async () => { saveResult.resolve(POLICY_A); });
+    await flush(20);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(mocks.messageSuccess).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain('B资源部门');
+    expect(document.body.textContent).not.toContain('A资源部门');
+  });
+});

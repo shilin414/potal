@@ -1,7 +1,10 @@
 /**
  * AccessPage — desktop 权限管理（原样搬移自 EnterprisePage.tsx）。
+ *
+ * 权限加载/保存状态机由 useAccessPolicyEditor 承载（三次复审 P0）：目标
+ * 切换竞态、保存 target guard、policy.application_id 不变量都在共享层。
  */
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Button,
@@ -25,10 +28,10 @@ import { fetchApplicationDetail, type V2Application } from "@/services/runApi";
 import {
   enterpriseApi,
   type AccessMode,
-  type AccessPolicy,
   type DirectoryDepartment,
   type DirectoryUser,
 } from "../enterpriseApi";
+import { useAccessPolicyEditor } from "../hooks/useAccessPolicyEditor";
 
 function buildTree(deps: DirectoryDepartment[]) {
   const nodes = new Map<number, any>();
@@ -71,33 +74,47 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
     limit: 50,
   });
   const [selected, setSelected] = useState<AccessTarget | null>(null);
-  const [policy, setPolicy] = useState<AccessPolicy | null>(null);
-  const [deps, setDeps] = useState<DirectoryDepartment[]>([]);
   const [users, setUsers] = useState<DirectoryUser[]>([]);
-  const [saving, setSaving] = useState(false);
   const [includeChildren, setIncludeChildren] = useState(true);
   const [deepLinkError, setDeepLinkError] = useState<string | null>(null);
+  const {
+    policy, departments: deps, saving, ready,
+    save, setAccessMode, setDepartmentIds, patchDepartmentGrant, setUserGrants,
+  } = useAccessPolicyEditor({
+    applicationId: selected?.id ?? null,
+    enabled: Boolean(selected),
+    onSaved: () => { message.success("访问权限已保存"); },
+  });
   // One resolve attempt per deep-link id — a LATER loadMore may still surface
   // the row organically (the items.find branch picks it up), and a NEW
   // ?app= id always gets a fresh attempt. `deepLinkAttempt` only exists to
   // re-run the effect after an explicit retry (P2-6).
   const deepLinkTriedRef = useRef<number | null>(null);
   const [deepLinkAttempt, setDeepLinkAttempt] = useState(0);
-  const open = useCallback(async (app: AccessTarget) => {
+
+  // Opening a drawer selects its target; the shared hook loads the policy
+  // (guarded). The user-option seed is a directory-wide read — it does not
+  // belong to the ACL contract, so it failing never blocks editing.
+  const open = useCallback((app: AccessTarget) => {
     setSelected(app);
-    try {
-      const [p, d, u] = await Promise.all([
-        enterpriseApi.access(app.id),
-        enterpriseApi.departments(),
-        enterpriseApi.users({ limit: 100 }),
-      ]);
-      setPolicy(p);
-      setDeps(d);
-      setUsers(u.results);
-    } catch {
-      message.error("加载权限失败");
-    }
   }, []);
+  useEffect(() => {
+    const targetId = selected?.id;
+    if (!targetId) return undefined;
+    let stale = false;
+    enterpriseApi
+      .users({ limit: 100 })
+      .then((page) => {
+        if (!stale) setUsers(page.results);
+      })
+      .catch(() => {
+        /* searching still works; granted users stay visible in options */
+      });
+    return () => {
+      stale = true;
+    };
+  }, [selected]);
+
   // A changed ?app= id must clear the previous id's error banner (二次复审
   // P2-6).
   useEffect(() => {
@@ -108,7 +125,7 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
     const hit = items.find((x) => x.id === initial);
     if (hit) {
       setDeepLinkError(null);
-      void open({ id: hit.id, name: hit.name });
+      open({ id: hit.id, name: hit.name });
       return;
     }
     if (loading || deepLinkTriedRef.current === initial) return;
@@ -116,7 +133,7 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
     let stale = false;
     fetchApplicationDetail(initial)
       .then((detail) => {
-        if (!stale) void open({ id: initial, name: detail.name });
+        if (!stale) open({ id: initial, name: detail.name });
       })
       .catch((err: any) => {
         if (stale) return;
@@ -131,42 +148,29 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
       stale = true;
     };
   }, [initial, items, loading, selected, open, deepLinkAttempt]);
-  const save = async () => {
-    if (!selected || !policy) return;
-    setSaving(true);
-    try {
-      const next = await enterpriseApi.updateAccess(selected.id, {
-        access_mode: policy.access_mode,
-        department_grants: policy.departments.map((d) => ({
-          department_id: d.department_id,
-          include_children: d.include_children,
-        })),
-        user_grants: policy.users.map((u) => u.directory_user_id),
+
+  // 已授权人员永远有名字可显示（三次复审 §51）：把 policy.users 合并进
+  // options——搜索/首屏 100 条之外已有授权不再退化成 raw id。
+  const userOptions = useMemo(() => {
+    const byId = new Map<number, { value: number; label: string }>();
+    for (const u of policy?.users ?? []) {
+      byId.set(u.directory_user_id, {
+        value: u.directory_user_id,
+        label: u.departments?.length
+          ? `${u.name} · ${u.departments.join(" / ")}`
+          : u.name,
       });
-      setPolicy(next);
-      message.success("访问权限已保存");
-    } catch {
-      message.error("保存失败，请检查部门和人员是否仍有效");
-    } finally {
-      setSaving(false);
     }
-  };
-  const setDepIds = (ids: number[]) => {
-    if (!policy) return;
-    const old = new Map(policy.departments.map((d) => [d.department_id, d]));
-    setPolicy({
-      ...policy,
-      departments: ids.map(
-        (id) =>
-          old.get(id) || {
-            department_id: id,
-            name: deps.find((d) => d.id === id)?.name || "",
-            include_children: includeChildren,
-            covered_users: 0,
-          },
-      ),
-    });
-  };
+    for (const u of users) {
+      if (byId.has(u.id)) continue;
+      byId.set(u.id, {
+        value: u.id,
+        label: `${u.name} · ${u.departments.map((d) => d.name).join(" / ")}`,
+      });
+    }
+    return Array.from(byId.values());
+  }, [policy, users]);
+
   const searchUsers = async (value: string) => {
     try {
       const result = await enterpriseApi.users({ q: value, limit: 100 });
@@ -176,22 +180,30 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
     }
   };
   const setUserIds = (ids: number[]) => {
-    if (!policy) return;
-    const old = new Map(policy.users.map((u) => [u.directory_user_id, u]));
-    setPolicy({
-      ...policy,
-      users: ids.map(
-        (id) =>
-          old.get(id) || {
-            directory_user_id: id,
-            name: users.find((u) => u.id === id)?.name || "",
-            avatar_url: users.find((u) => u.id === id)?.avatar_url || "",
-            departments: (
-              users.find((u) => u.id === id)?.departments || []
-            ).map((d) => d.name),
-          },
-      ),
-    });
+    const pool = new Map<number, {
+      directory_user_id: number;
+      name: string;
+      avatar_url: string;
+      departments: string[];
+    }>();
+    for (const u of policy?.users ?? []) {
+      pool.set(u.directory_user_id, {
+        directory_user_id: u.directory_user_id,
+        name: u.name,
+        avatar_url: u.avatar_url,
+        departments: u.departments ?? [],
+      });
+    }
+    for (const u of users) {
+      if (pool.has(u.id)) continue;
+      pool.set(u.id, {
+        directory_user_id: u.id,
+        name: u.name,
+        avatar_url: u.avatar_url,
+        departments: u.departments.map((d) => d.name),
+      });
+    }
+    setUserGrants(ids.map((id) => pool.get(id)!).filter(Boolean));
   };
   const columns: ColumnsType<V2Application> = [
     { title: "资源", dataIndex: "name" },
@@ -199,7 +211,7 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
     {
       title: "操作",
       render: (_, app) => (
-        <Button onClick={() => void open(app)}>设置权限</Button>
+        <Button onClick={() => open(app)}>设置权限</Button>
       ),
     },
   ];
@@ -285,13 +297,15 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
       <Drawer
         title={`访问权限 · ${selected?.name || ""}`}
         open={Boolean(selected)}
-        onClose={() => {
-          setSelected(null);
-          setPolicy(null);
-        }}
+        onClose={() => setSelected(null)}
         width={620}
         extra={
-          <Button type="primary" loading={saving} onClick={() => void save()}>
+          <Button
+            type="primary"
+            loading={saving}
+            disabled={!ready}
+            onClick={() => void save()}
+          >
             保存
           </Button>
         }
@@ -304,12 +318,7 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
               <Typography.Title level={5}>访问范围</Typography.Title>
               <Radio.Group
                 value={policy.access_mode}
-                onChange={(e) =>
-                  setPolicy({
-                    ...policy,
-                    access_mode: e.target.value as AccessMode,
-                  })
-                }
+                onChange={(e) => setAccessMode(e.target.value as AccessMode)}
               >
                 <Radio value="all">全体有效员工</Radio>
                 <Radio value="assigned">指定范围</Radio>
@@ -335,7 +344,7 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
                     treeCheckable
                     showCheckedStrategy={TreeSelect.SHOW_PARENT}
                     value={policy.departments.map((d) => d.department_id)}
-                    onChange={setDepIds}
+                    onChange={(ids) => setDepartmentIds(ids as number[], includeChildren)}
                     style={{ width: "100%", marginTop: 10 }}
                     placeholder="选择部门"
                   />
@@ -362,14 +371,7 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
                             checkedChildren="含子部门"
                             unCheckedChildren="仅本部门"
                             onChange={(checked) =>
-                              setPolicy({
-                                ...policy,
-                                departments: policy.departments.map((d) =>
-                                  d.department_id === grant.department_id
-                                    ? { ...d, include_children: checked }
-                                    : d,
-                                ),
-                              })
+                              patchDepartmentGrant(grant.department_id, checked)
                             }
                           />
                         </Space>
@@ -387,10 +389,7 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
                     value={policy.users.map((u) => u.directory_user_id)}
                     onChange={setUserIds}
                     style={{ width: "100%" }}
-                    options={users.map((u) => ({
-                      value: u.id,
-                      label: `${u.name} · ${u.departments.map((d) => d.name).join(" / ")}`,
-                    }))}
+                    options={userOptions}
                     placeholder="搜索并选择人员"
                   />
                 </div>

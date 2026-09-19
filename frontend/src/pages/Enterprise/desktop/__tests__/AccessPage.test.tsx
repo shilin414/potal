@@ -68,15 +68,24 @@ vi.mock('antd', () => ({
       {action}
     </div>
   ),
-  Button: ({ children, onClick }: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
-    <button type="button" onClick={onClick}>{children}</button>
+  Button: ({
+    children, onClick, disabled,
+  }: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button type="button" onClick={onClick} disabled={disabled}>{children}</button>
   ),
   Card: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
-  Drawer: ({ open, title, children }: {
+  Drawer: ({
+    open, title, children, extra,
+  }: {
     open?: boolean;
     title?: React.ReactNode;
     children?: React.ReactNode;
-  }) => (open ? <div data-testid="drawer"><span>{title}</span>{children}</div> : null),
+    extra?: React.ReactNode;
+  }) => (open ? (
+    <div data-testid="drawer">
+      <span>{title}</span>{extra}{children}
+    </div>
+  ) : null),
   Empty: ({ description }: { description?: React.ReactNode }) => (
     <div data-testid="empty">{description}</div>
   ),
@@ -91,8 +100,9 @@ vi.mock('antd', () => ({
   Select: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
   Space: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
   Switch: () => <button type="button" data-testid="switch" />,
-  Table: ({ dataSource, locale }: {
+  Table: ({ dataSource, columns, locale }: {
     dataSource?: Array<{ id: number; name: string; slug: string }>;
+    columns?: Array<{ render?: (_: unknown, row: unknown) => React.ReactNode }>;
     locale?: { emptyText?: React.ReactNode };
   }) => (
     <table data-testid="table">
@@ -102,7 +112,10 @@ vi.mock('antd', () => ({
             <tr key={row.id} data-row={row.id}>
               <td>{row.name}</td>
               <td>{row.slug}</td>
-              <td><button type="button" data-open={row.id}>设置权限</button></td>
+              {/* The REAL 操作 cell — its buttons carry the live onClick. */}
+              <td data-open-cell={row.id}>
+                {columns?.[columns.length - 1]?.render?.(null, row)}
+              </td>
             </tr>
           ))
           : (
@@ -117,6 +130,8 @@ vi.mock('antd', () => ({
 }));
 
 import AccessPage from '../AccessPage';
+import { enterpriseApi } from '../../enterpriseApi';
+import { message } from 'antd';
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
@@ -279,5 +294,98 @@ describe('desktop AccessPage — list error semantics (P2-11)', () => {
     // hasMore is still true → the retry re-runs loadMore, not a full refresh.
     expect(mocks.loadMore).toHaveBeenCalledTimes(1);
     expect(mocks.refresh).not.toHaveBeenCalled();
+  });
+});
+
+/** Deferred promise — lets a test dictate response ORDER (三次复审 P0). */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => { resolve = res; });
+  return { promise, resolve };
+}
+
+describe('desktop AccessPage — permission target race (三次复审 P0)', () => {
+  const POLICY_A = {
+    application_id: 7,
+    access_mode: 'assigned' as const,
+    departments: [{ department_id: 3, name: 'A资源部门', include_children: true, covered_users: 12 }],
+    users: [],
+  };
+  const POLICY_B = {
+    application_id: 8,
+    access_mode: 'assigned' as const,
+    departments: [{ department_id: 4, name: 'B资源部门', include_children: true, covered_users: 5 }],
+    users: [],
+  };
+
+  beforeEach(() => {
+    vi.mocked(enterpriseApi.access).mockReset();
+    vi.mocked(enterpriseApi.updateAccess).mockReset();
+    vi.mocked(message.success).mockReset();
+    pageState.items = [];
+    pageState.error = null;
+    pageState.hasMore = false;
+  });
+
+  it('a late A response cannot overwrite B — save writes B id + B grants', async () => {
+    pageState.items = [row(7, 'A资源'), row(8, 'B资源')];
+    const a = deferred<typeof POLICY_A>();
+    const b = deferred<typeof POLICY_B>();
+    vi.mocked(enterpriseApi.access).mockImplementation(
+      (id: number) => (id === 7 ? a.promise : b.promise),
+    );
+
+    await mountPage();
+    await click(document.querySelector('[data-open-cell="7"] button')!); // drawer for A, pending
+    await click(document.querySelector('[data-open-cell="8"] button')!); // switch to B directly
+
+    await act(async () => { b.resolve(POLICY_B); });
+    await flush(20);
+    const drawer = () => document.querySelector('[data-testid="drawer"]')!;
+    expect(drawer().textContent).toContain('B资源部门');
+
+    await act(async () => { a.resolve(POLICY_A); }); // late A must be ignored
+    await flush(20);
+    expect(drawer().textContent).toContain('B资源部门');
+    expect(drawer().textContent).not.toContain('A资源部门');
+
+    vi.mocked(enterpriseApi.updateAccess).mockResolvedValue(POLICY_B);
+    const save = Array.from(document.querySelectorAll('button'))
+      .find((el) => el.textContent === '保存')!;
+    await click(save);
+    expect(vi.mocked(enterpriseApi.updateAccess)).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(enterpriseApi.updateAccess)).toHaveBeenCalledWith(8, {
+      access_mode: 'assigned',
+      department_grants: [{ department_id: 4, include_children: true }],
+      user_grants: [],
+    });
+  });
+
+  it('a slow save for A cannot toast/close over B (save target guard)', async () => {
+    pageState.items = [row(7, 'A资源'), row(8, 'B资源')];
+    vi.mocked(enterpriseApi.access).mockImplementation(
+      (id: number) => Promise.resolve(id === 7 ? POLICY_A : POLICY_B),
+    );
+    const saveResult = deferred<typeof POLICY_A>();
+    vi.mocked(enterpriseApi.updateAccess).mockReturnValue(saveResult.promise);
+
+    await mountPage();
+    await click(document.querySelector('[data-open-cell="7"] button')!);
+    await flush(20);
+    const save = () => Array.from(document.querySelectorAll('button'))
+      .find((el) => el.textContent === '保存')!;
+    await click(save()!);
+
+    // While A's save is travelling, switch the drawer to B.
+    await click(document.querySelector('[data-open-cell="8"] button')!);
+    await flush(20);
+
+    await act(async () => { saveResult.resolve(POLICY_A); });
+    await flush(20);
+    // The late A save neither toasts nor overwrites B's policy.
+    expect(vi.mocked(message.success)).not.toHaveBeenCalled();
+    const drawer = document.querySelector('[data-testid="drawer"]')!;
+    expect(drawer.textContent).toContain('B资源部门');
+    expect(drawer.textContent).not.toContain('A资源部门');
   });
 });

@@ -4,16 +4,16 @@
  * Full Screen Drawer：访问范围 → 授权部门（Flat Search Picker）→ 授权人员
  * （多选 Picker）。数据模型与桌面完全一致（access_mode / departments /
  * users / include_children），保存走同一个 updateAccess 契约。
+ *
+ * 加载/保存状态机完全由 useAccessPolicyEditor 承载（三次复审 P0）：目标
+ * 切换竞态、保存 target guard、policy.application_id 不变量都在共享层，
+ * 移动端只负责呈现。
  */
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { Button, Empty, Radio, Skeleton, Switch, message } from 'antd';
 import { CloseOutlined } from '@ant-design/icons';
-import {
-  enterpriseApi,
-  type AccessMode,
-  type AccessPolicy,
-  type DirectoryDepartment,
-} from '../enterpriseApi';
+import type { AccessMode } from '../enterpriseApi';
+import { useAccessPolicyEditor } from '../hooks/useAccessPolicyEditor';
 import {
   MobileEmptyState,
   MobileFullScreenDrawer,
@@ -32,92 +32,32 @@ export interface MobilePermissionEditorProps {
 export default function MobilePermissionEditor({
   open, application, onClose,
 }: MobilePermissionEditorProps) {
-  const [policy, setPolicy] = useState<AccessPolicy | null>(null);
-  const [deps, setDeps] = useState<DirectoryDepartment[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
   const [depPickerOpen, setDepPickerOpen] = useState(false);
   const [userPickerOpen, setUserPickerOpen] = useState(false);
 
-  // 与桌面 AccessPage 相同的加载契约：权限 + 部门。人员列表不再预取
-  // （二次复审 P2-4）——MobileUserPicker 打开时自己查询 users，这里取回的
-  // 第三份数据从未被使用，纯浪费一次 /users 请求。
-  // 依赖 applicationId 而非 application 对象（P2-5）：父组件每次 render 都会
-  // 产生新的 { id, name } 字面量，effect 若依赖对象 identity，编辑过程中父
-  // 级任何重渲染都会重置 policy 并丢掉用户未保存的修改；名称只用于标题显示。
-  // 加载失败 = 可恢复错误态 + 重试（P2-6）：不再 toast 一下然后永久 Skeleton。
-  const applicationId = application?.id;
-  const load = useCallback(async () => {
-    if (!applicationId) return;
-    setLoading(true);
-    setLoadError(null);
-    try {
-      const [p, d] = await Promise.all([
-        enterpriseApi.access(applicationId),
-        enterpriseApi.departments(),
-      ]);
-      setPolicy(p);
-      setDeps(d);
-    } catch {
-      setLoadError('加载访问权限失败');
-    } finally {
-      setLoading(false);
-    }
-  }, [applicationId]);
-
-  useEffect(() => {
-    if (open && applicationId) void load();
-  }, [open, applicationId, load]);
-
-  const save = useCallback(async () => {
-    if (!applicationId || !policy) return;
-    setSaving(true);
-    try {
-      const next = await enterpriseApi.updateAccess(applicationId, {
-        access_mode: policy.access_mode,
-        department_grants: policy.departments.map((d) => ({
-          department_id: d.department_id,
-          include_children: d.include_children,
-        })),
-        user_grants: policy.users.map((u) => u.directory_user_id),
-      });
-      setPolicy(next);
+  // 名称只用于标题显示；数据面只依赖 applicationId（二次复审 P2-5），目标
+  // 切换的竞态防护与保存校验全部在共享 hook（三次复审 P0）。
+  const applicationId = application?.id ?? null;
+  const {
+    policy, departments: deps, loading, loadError, saving, ready,
+    reload, save, setAccessMode, setDepartmentIds, patchDepartmentGrant,
+    setUserGrants,
+  } = useAccessPolicyEditor({
+    applicationId,
+    enabled: open,
+    onSaved: () => {
       message.success('访问权限已保存');
       onClose();
-    } catch {
-      message.error('保存失败，请检查部门和人员是否仍有效');
-    } finally {
-      setSaving(false);
-    }
-  }, [applicationId, policy, onClose]);
-
-  const setDepIds = (ids: number[]) => {
-    if (!policy) return;
-    const old = new Map(policy.departments.map((d) => [d.department_id, d]));
-    setPolicy({
-      ...policy,
-      departments: ids.map((id) => old.get(id) || {
-        department_id: id,
-        name: deps.find((d) => d.id === id)?.name || '',
-        include_children: true,
-        covered_users: 0,
-      }),
-    });
-  };
+    },
+  });
 
   const setUsers = (users: MobilePickedUser[]) => {
-    if (!policy) return;
-    const old = new Map(policy.users.map((u) => [u.directory_user_id, u]));
-    setPolicy({
-      ...policy,
-      users: users.map((u) => old.get(u.id) || {
-        directory_user_id: u.id,
-        name: u.name,
-        avatar_url: u.avatar_url,
-        departments: u.departments,
-      }),
-    });
+    setUserGrants(users.map((u) => ({
+      directory_user_id: u.id,
+      name: u.name,
+      avatar_url: u.avatar_url,
+      departments: u.departments,
+    })));
   };
 
   return (
@@ -127,7 +67,9 @@ export default function MobilePermissionEditor({
         title={`${application?.name ?? ''} 访问权限`}
         actionText="保存"
         actionLoading={saving}
-        actionDisabled={loading || Boolean(loadError) || !policy}
+        // ready 只在「当前目标的 policy 已加载、无错误、id 匹配」时为真 ——
+        // 保存绝不带着 A 的授权写向 B（P0）。
+        actionDisabled={!ready}
         onAction={() => void save()}
         onClose={onClose}
       >
@@ -138,7 +80,7 @@ export default function MobilePermissionEditor({
           // and 保存 stays disabled until a policy is actually loaded.
           <MobileEmptyState
             title="加载访问权限失败"
-            action={<Button onClick={() => void load()}>重试</Button>}
+            action={<Button onClick={() => void reload()}>重试</Button>}
           />
         ) : !policy ? (
           <Skeleton active />
@@ -148,10 +90,7 @@ export default function MobilePermissionEditor({
               <Radio.Group
                 className="mobile-permission__mode"
                 value={policy.access_mode}
-                onChange={(e) => setPolicy({
-                  ...policy,
-                  access_mode: e.target.value as AccessMode,
-                })}
+                onChange={(e) => setAccessMode(e.target.value as AccessMode)}
               >
                 <Radio value="all">全体有效员工</Radio>
                 <Radio value="assigned">指定范围</Radio>
@@ -186,19 +125,14 @@ export default function MobilePermissionEditor({
                             checked={grant.include_children}
                             checkedChildren="含子部门"
                             unCheckedChildren="仅本部门"
-                            onChange={(checked) => setPolicy({
-                              ...policy,
-                              departments: policy.departments.map((d) => (
-                                d.department_id === grant.department_id
-                                  ? { ...d, include_children: checked }
-                                  : d)),
-                            })}
+                            onChange={(checked) => patchDepartmentGrant(
+                              grant.department_id, checked)}
                           />
                           <button
                             type="button"
                             className="mobile-permission__grant-remove"
                             aria-label={`移除部门 ${grant.name}`}
-                            onClick={() => setDepIds(
+                            onClick={() => setDepartmentIds(
                               policy.departments
                                 .map((d) => d.department_id)
                                 .filter((id) => id !== grant.department_id))}
@@ -277,7 +211,7 @@ export default function MobilePermissionEditor({
         selectedIds={policy?.departments.map((d) => d.department_id) ?? []}
         onClose={() => setDepPickerOpen(false)}
         onDone={(ids) => {
-          setDepIds(ids);
+          setDepartmentIds(ids);
           setDepPickerOpen(false);
         }}
       />
