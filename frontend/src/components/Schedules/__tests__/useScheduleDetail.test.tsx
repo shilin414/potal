@@ -217,23 +217,28 @@ describe('useScheduleDetail — 关闭清空（复审 P1）', () => {
   });
 });
 
-describe('useScheduleDetail — loadMore 失效复位（复审意见 #2）', () => {
-  it('a loadMore invalidated by a target switch still clears loadingMoreOccurrences', async () => {
-    // A 的 loadMore 在途时切到任务 B：occSeq 被 bump，A 的旧响应必须作废，
-    // 且 loadingMoreOccurrences 必须复位 —— 否则 B 的「加载更多」永久楔死。
+describe('useScheduleDetail — loadMore 代际失效（四次复审 P1-2）', () => {
+  it('a target switch releases the stale loadMore spinner immediately; the new target pages on its own', async () => {
+    // A 的 loadMore 在途时切到任务 B：旧请求必须当场作废（spinner 立即
+    // false，而不是等旧 HTTP 结束），B 能立刻翻自己的下一页；旧请求晚到时
+    // 既不能覆盖 B 数据，也不能关掉 B loadMore 的 spinner。
     mockSchedule.mockResolvedValue(schedule(9));
     let resolveStale!: (value: ScheduleOccurrence[]) => void;
+    let resolveB!: (value: ScheduleOccurrence[]) => void;
     mockOccurrences
       .mockResolvedValueOnce(Array.from({ length: 51 }, (_, i) => occ(100 - i))) // A 首页
       .mockImplementationOnce(() => new Promise<ScheduleOccurrence[]>((res) => {
         resolveStale = res;
       })) // A loadMore 在途
-      .mockResolvedValueOnce([occ(7)]); // B 首页
+      .mockResolvedValueOnce(Array.from({ length: 51 }, (_, i) => occ(200 - i))) // B 首页
+      .mockImplementationOnce(() => new Promise<ScheduleOccurrence[]>((res) => {
+        resolveB = res;
+      })); // B loadMore 在途
     await act(async () => { root.render(<ProbeComponent />); });
     await flush(10);
     expect(latest.current!.hasMoreOccurrences).toBe(true);
 
-    const more = latest.current!.loadMoreOccurrences();
+    const stale = latest.current!.loadMoreOccurrences();
     await flush(10);
     expect(latest.current!.loadingMoreOccurrences).toBe(true);
 
@@ -241,14 +246,29 @@ describe('useScheduleDetail — loadMore 失效复位（复审意见 #2）', () 
     idRef.current = 10;
     await act(async () => { root.render(<ProbeComponent />); });
     await flush(10);
-    expect(latest.current!.occurrencesLoading).toBe(false);       // B 首页已落地
-    expect(latest.current!.loadingMoreOccurrences).toBe(true);    // A loadMore 仍在途
+    expect(latest.current!.occurrencesLoading).toBe(false);        // B 首页已落地
+    expect(latest.current!.loadingMoreOccurrences).toBe(false);    // A 的旧 loadMore 已当场作废
 
-    await act(async () => { resolveStale([occ(50), occ(49)]); });
-    await act(async () => { await more; });
+    // B 可以立即翻自己的下一页（A 的请求仍在途）。
+    const bMore = latest.current!.loadMoreOccurrences();
     await flush(10);
-    // A 的旧页被丢弃，loadingMoreOccurrences 复位。
+    expect(mockOccurrences).toHaveBeenLastCalledWith(10, 151, 51);
+    expect(latest.current!.loadingMoreOccurrences).toBe(true);     // B 自己的 spinner
+
+    // A 的旧响应此刻才返回：不得覆盖 B 数据、不得关掉 B 的 spinner。
+    await act(async () => { resolveStale([occ(50), occ(49)]); });
+    await act(async () => { await stale; });
+    await flush(10);
+    expect(latest.current!.occurrences.map((o) => o.id))
+      .toEqual(Array.from({ length: 50 }, (_, i) => 200 - i));
+    expect(latest.current!.loadingMoreOccurrences).toBe(true);     // B 的 spinner 仍在
+    expect(latest.current!.occurrenceError).toBeNull();
+
+    // B 的第二页落地，spinner 才复位。
+    await act(async () => { resolveB([occ(150), occ(149)]); });
+    await act(async () => { await bMore; });
+    await flush(10);
     expect(latest.current!.loadingMoreOccurrences).toBe(false);
-    expect(latest.current!.occurrences.map((o) => o.id)).toEqual([7]);
+    expect(latest.current!.occurrences).toHaveLength(52);
   });
 });

@@ -59,6 +59,10 @@ export function useScheduleDetail(
 
   const scheduleSeqRef = useRef(0);
   const occSeqRef = useRef(0);
+  // loadMore generation（四次复审 P1-2）：目标变化/新首页开始的瞬间立即作废
+  // 在途翻页 —— spinner 当场归还（不等旧 HTTP 自己结束），且旧 finally 关不
+  // 掉更新 loadMore 的 spinner。只有最新的 loadMore 拥有 spinner 状态。
+  const occLoadMoreSeqRef = useRef(0);
 
   // 目标变化与「关闭」都清空两域旧数据：关闭时的清空发生在抽屉不可见期
   // 间，重开新目标不会在首帧闪现上一个任务的配置/执行记录（复审 P1）。
@@ -97,6 +101,9 @@ export function useScheduleDetail(
   const loadOccurrences = useCallback(async () => {
     if (!open || !scheduleId) return;
     const seq = ++occSeqRef.current;
+    // 新结果集 → 在途翻页立即作废（四次复审 P1-2）。
+    occLoadMoreSeqRef.current += 1;
+    setLoadingMoreOccurrences(false);
     setOccurrencesLoading(true);
     setOccurrenceError(null);
     try {
@@ -129,6 +136,7 @@ export function useScheduleDetail(
     if (!beforeId) return;
     // 翻页与首页同代（不 bump seq）：目标变化会 bump，在途翻页自动作废。
     const seq = occSeqRef.current;
+    const myLoadMore = ++occLoadMoreSeqRef.current;
     setLoadingMoreOccurrences(true);
     try {
       const occs = await fetchScheduleOccurrences(
@@ -144,9 +152,12 @@ export function useScheduleDetail(
       // 已加载的执行记录保留；下一次点击 loadMore 即重试。
       setOccurrenceError(e instanceof Error ? e.message : '加载更多执行记录失败');
     } finally {
-      // 无条件复位：目标变化 bump 了 seq，若在此守卫，loadingMoreOccurrences
-      // 会永久卡 true（复审意见 #2）。
-      setLoadingMoreOccurrences(false);
+      // 只有最新的 loadMore 拥有 spinner（四次复审 P1-2）：目标切换时已
+      // bump 代际并复位 spinner，旧请求迟到的 finally 不得再碰它，也永远
+      // 不能关掉更新 loadMore 的 spinner。
+      if (occLoadMoreSeqRef.current === myLoadMore) {
+        setLoadingMoreOccurrences(false);
+      }
     }
   }, [
     open, scheduleId, occurrences, loadingMoreOccurrences,

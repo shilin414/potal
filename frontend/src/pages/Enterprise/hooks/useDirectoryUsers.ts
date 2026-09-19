@@ -66,10 +66,15 @@ export function useDirectoryUsers({
   }, [query, debouncedQuery, debounceMs]);
 
   const requestIdRef = useRef(0);
+  // loadMore generation (四次复审 P1-2): a NEW first page immediately revokes
+  // the previous result set's in-flight loadMore — its spinner is released
+  // the moment the new request STARTS, and a stale `finally` can never clear
+  // a NEWER loadMore's spinner. Only the newest loadMore owns the spinner.
+  const loadMoreSeqRef = useRef(0);
 
   // An INACTIVE surface (the users tab switched away, the picker sheet
-  // closed) must abandon whatever is in flight (三次复审 §43–§45): bumping
-  // the request id invalidates a travelling response so it can no longer
+  // closed) must abandon whatever is in flight (三次复审 §43–§45): bumping the
+  // request id invalidates a travelling response so it can no longer
   // land and repopulate a surface nobody is looking at (a reopen would
   // otherwise briefly flash the previous search's rows/error). The items
   // are deliberately KEPT — they are still real data, and a reopen
@@ -77,6 +82,7 @@ export function useDirectoryUsers({
   useEffect(() => {
     if (enabled) return;
     requestIdRef.current += 1;
+    loadMoreSeqRef.current += 1;
     setLoading(false);
     setLoadingMore(false);
   }, [enabled]);
@@ -84,6 +90,9 @@ export function useDirectoryUsers({
   const fetchFirstPage = useCallback(async () => {
     if (!enabled) return;
     const requestId = ++requestIdRef.current;
+    // New result set → the previous set's in-flight loadMore is void NOW.
+    loadMoreSeqRef.current += 1;
+    setLoadingMore(false);
     setLoading(true);
     setError(null);
     try {
@@ -115,6 +124,7 @@ export function useDirectoryUsers({
   const loadMore = useCallback(async () => {
     if (!enabled || !cursor || loadingMore || loading) return;
     const requestId = requestIdRef.current;
+    const myLoadMore = ++loadMoreSeqRef.current;
     setLoadingMore(true);
     try {
       const page = await enterpriseApi.users({
@@ -136,9 +146,12 @@ export function useDirectoryUsers({
       // 加载更多 keeps the already-rendered rows; the next click retries.
       setError('加载更多失败');
     } finally {
-      // 无条件复位：disabled/新搜索 bump 了 requestId，若在此守卫，
-      // loadingMore 会永久卡 true（复审意见 #2）。
-      setLoadingMore(false);
+      // Only the NEWEST loadMore owns the spinner (四次复审 P1-2): a new
+      // search already revoked this one and reset the spinner; a stale
+      // finally must not clear a NEWER loadMore's spinner either.
+      if (loadMoreSeqRef.current === myLoadMore) {
+        setLoadingMore(false);
+      }
     }
   }, [enabled, debouncedQuery, limit, includeInactive, cursor, loadingMore, loading]);
 

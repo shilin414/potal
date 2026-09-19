@@ -77,6 +77,12 @@ export function useSchedules(): UseSchedulesResult {
   const [search, setSearch] = useState('');
   const [mutatingId, setMutatingId] = useState<number | null>(null);
   const seqRef = useRef(0);
+  // loadMore generation（四次复审 P1-2）：结果集代际（seqRef）与翻页操作代际
+  // 是两个概念。新结果集（筛选/搜索/刷新）开始的瞬间立即作废旧结果集的
+  // 在途 loadMore —— spinner 当场归还，而不是等旧 HTTP 自己结束（卡住 60s
+  // 的旧请求不能挡住 paused 列表继续翻页）；同时旧 loadMore 迟到的 finally
+  // 也永远关不掉更新的 loadMore 的 spinner。
+  const loadMoreSeqRef = useRef(0);
 
   // 防抖只平滑「打字」：status 切换与首次挂载立即请求。
   const [debouncedSearch, setDebouncedSearch] = useState('');
@@ -92,6 +98,9 @@ export function useSchedules(): UseSchedulesResult {
     phase: SchedulesErrorPhase,
   ) => {
     const seq = ++seqRef.current;
+    // 新结果集 → 旧结果集的在途 loadMore 立即作废（四次复审 P1-2）。
+    loadMoreSeqRef.current += 1;
+    setLoadingMore(false);
     setLoading(true);
     setError(null);
     setErrorPhase(null);
@@ -135,6 +144,7 @@ export function useSchedules(): UseSchedulesResult {
     if (!beforeId) return;
     // 翻页与首页同代（不 bump seq）：筛选变化会 bump，在途翻页自动作废。
     const seq = seqRef.current;
+    const myLoadMore = ++loadMoreSeqRef.current;
     setLoadingMore(true);
     try {
       const items = await fetchSchedules(
@@ -154,10 +164,12 @@ export function useSchedules(): UseSchedulesResult {
         setErrorPhase('loadMore');
       }
     } finally {
-      // 无条件复位：筛选变化 bump 了 seq，若在此守卫 seq，loadingMore 会
-      // 永久卡 true（加载更多按钮楔死，复审意见 #2）。loadMore 自身的
-      // loadingMore 互斥已排除并发，无条件复位是安全的。
-      setLoadingMore(false);
+      // 只有最新的 loadMore 拥有 spinner（四次复审 P1-2）：新结果集开始时
+      // 已 bump loadMoreSeq 并复位 spinner —— 旧请求迟到的 finally 既不该
+      // 再碰它，也永远不能关掉更新 loadMore 的 spinner。
+      if (loadMoreSeqRef.current === myLoadMore) {
+        setLoadingMore(false);
+      }
     }
   }, [status, debouncedSearch, data, loading, loadingMore, hasMore]);
 

@@ -12,6 +12,10 @@
  *     covers the entire catalog instead of the pages already loaded;
  *   · a filter change resets to page one — keeping a grown cursor across a
  *     narrowed result set would skip past what the user is looking at;
+ *   · a loadMore invalidated by a NEW result set is void the moment the new
+ *     first page starts (loadMore generation, 四次复审 P1-2) — the stale
+ *     request's late finally can neither keep the new set's 加载更多 spinner
+ *     on nor clear a newer loadMore's spinner;
  *   · `loadMore` appends the next cursor page, deduplicating by id so an
  *     application edited between page fetches cannot render twice;
  *   · `patchItem` applies a local update (favourite / enabled / public
@@ -94,9 +98,20 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
   // request id guards against out-of-order responses when the user types
   // faster than the network answers.
   const requestIdRef = useRef(0);
+  // loadMore generation (四次复审 P1-2): result-set id and PAGING operation id
+  // are two different generations. A new first page immediately revokes the
+  // old result set's loadMore — its spinner is released the moment the new
+  // request STARTS, not when the stale HTTP finally settles (a wedged 60s
+  // request must not block the new filter's 加载更多). The loadMore seq also
+  // keeps a late `finally` from an OLD loadMore clearing the CURRENT one's
+  // spinner: only the newest loadMore owns the spinner state.
+  const loadMoreSeqRef = useRef(0);
   const fetchFirstPage = useCallback(async () => {
     if (!enabled) return; // closed sheet / gated surface — no traffic
     const requestId = ++requestIdRef.current;
+    // New result set → the previous set's in-flight loadMore is void NOW.
+    loadMoreSeqRef.current += 1;
+    setLoadingMore(false);
     setLoading(true);
     setError(null);
     try {
@@ -145,6 +160,7 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
   useEffect(() => {
     if (enabled) return;
     requestIdRef.current += 1;
+    loadMoreSeqRef.current += 1;
     setLoading(false);
     setLoadingMore(false);
   }, [enabled]);
@@ -152,6 +168,7 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
   const loadMore = useCallback(async () => {
     if (!enabled || !cursor || loadingMore || loading) return;
     const requestId = requestIdRef.current;
+    const myLoadMore = ++loadMoreSeqRef.current;
     setLoadingMore(true);
     try {
       const page = await fetchApplicationPage({
@@ -173,10 +190,12 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
       // 加载更多 keeps the already-rendered pages; the next click retries.
       setError(err?.response?.data?.detail || '加载更多失败');
     } finally {
-      // 无条件复位：新搜索/关闭 bump 了 requestId，若在此守卫，loadingMore
-      // 会永久卡 true（加载更多按钮楔死，复审意见 #2 同款漏修点）。loadMore
-      // 自身的 loadingMore 互斥已排除并发，无条件复位是安全的。
-      setLoadingMore(false);
+      // Only the NEWEST loadMore owns the spinner: a new first page already
+      // revoked this one (and reset the spinner) — a stale finally must not
+      // clear a NEWER loadMore's spinner either (四次复审 P1-2).
+      if (loadMoreSeqRef.current === myLoadMore) {
+        setLoadingMore(false);
+      }
     }
   }, [enabled, kind, scope, mode, includeUnbound, debouncedQuery, category, limit, cursor, loadingMore, loading]);
 

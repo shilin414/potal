@@ -215,16 +215,21 @@ describe('useApplicationPage', () => {
     expect(latest.current!.error).toBeTruthy();
   });
 
-  it('a loadMore invalidated by a new search still clears loadingMore (复审意见 #2)', async () => {
-    // loadMore 在途时新搜索 bump 了 request id：旧响应必须作废，且
-    // loadingMore 必须复位 —— 否则「加载更多」永久楔死（本 hook 曾漏修）。
+  it('a NEW result set releases the stale loadMore spinner immediately; the new set pages on its own (四次复审 P1-2)', async () => {
+    // A 的 loadMore 在途时新搜索开始：旧请求必须当场作废（spinner 立即
+    // false，而不是等旧 HTTP 结束），新结果集能立刻翻自己的下一页；旧请求
+    // 晚到时既不能覆盖新数据，也不能关掉新 loadMore 的 spinner。
     let resolveStale!: (value: ApplicationPage) => void;
+    let resolveB!: (value: ApplicationPage) => void;
     mockPage
       .mockResolvedValueOnce(page([1, 2], 'cursor-1', true))
       .mockImplementationOnce(() => new Promise<ApplicationPage>((res) => {
         resolveStale = res;
       }))
-      .mockResolvedValueOnce(page([9], '', false));
+      .mockResolvedValueOnce(page([9], 'cursor-9', true))
+      .mockImplementationOnce(() => new Promise<ApplicationPage>((res) => {
+        resolveB = res;
+      }));
     const latest: Probe<ReturnType<typeof useApplicationPage>> = { current: null };
     const host = document.createElement('div');
     hosts.push(host);
@@ -238,7 +243,7 @@ describe('useApplicationPage', () => {
     await flush(10);
     expect(latest.current!.hasMore).toBe(true);
 
-    const more = latest.current!.loadMore();
+    const stale = latest.current!.loadMore();
     await flush(10);
     expect(latest.current!.loadingMore).toBe(true);
 
@@ -246,13 +251,29 @@ describe('useApplicationPage', () => {
     await act(async () => { root.render(React.createElement(Probe, { query: '新词' })); });
     await flush(350); // 300ms 防抖到期 + 新首页落地
     expect(latest.current!.loading).toBe(false);
-    expect(latest.current!.loadingMore).toBe(true); // 旧 loadMore 仍在途
+    expect(latest.current!.loadingMore).toBe(false); // 旧 loadMore 已当场作废
 
-    await act(async () => { resolveStale(page([3, 4], '', false)); });
-    await act(async () => { await more; });
+    // 新结果集可以立即翻自己的下一页（旧请求仍在途）。
+    const bMore = latest.current!.loadMore();
     await flush(10);
-    // 旧页被丢弃，loadingMore 复位（按钮不再楔死）。
-    expect(latest.current!.loadingMore).toBe(false);
+    expect(mockPage).toHaveBeenLastCalledWith(expect.objectContaining({
+      q: '新词', cursor: 'cursor-9',
+    }));
+    expect(latest.current!.loadingMore).toBe(true);  // 新结果集自己的 spinner
+
+    // 旧响应此刻才返回：不得覆盖新数据、不得关掉新 spinner。
+    await act(async () => { resolveStale(page([3, 4], '', false)); });
+    await act(async () => { await stale; });
+    await flush(10);
     expect(latest.current!.items.map((item) => item.id)).toEqual([9]);
+    expect(latest.current!.loadingMore).toBe(true);  // 新 spinner 仍在
+    expect(latest.current!.error).toBeNull();
+
+    // 新结果集的第二页落地，spinner 才复位。
+    await act(async () => { resolveB(page([10], '', false)); });
+    await act(async () => { await bMore; });
+    await flush(10);
+    expect(latest.current!.loadingMore).toBe(false);
+    expect(latest.current!.items.map((item) => item.id)).toEqual([9, 10]);
   });
 });

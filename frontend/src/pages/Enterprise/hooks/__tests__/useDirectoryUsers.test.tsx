@@ -107,20 +107,23 @@ describe('useDirectoryUsers — disabled invalidation (§43–§45)', () => {
   });
 });
 
-describe('useDirectoryUsers — loadMore 失效复位（复审意见 #2）', () => {
-  it('a loadMore invalidated by a new search still clears loadingMore', async () => {
-    // loadMore 在途时新搜索 bump 了 request id：旧响应必须作废，且
-    // loadingMore 必须复位 —— 否则「加载更多」永久楔死。
+describe('useDirectoryUsers — loadMore 代际失效（四次复审 P1-2）', () => {
+  it('a NEW search releases the stale loadMore spinner immediately; the new set pages on its own', async () => {
+    // A 的 loadMore 在途时新搜索开始：旧请求必须当场作废（spinner 立即
+    // false，而不是等旧 HTTP 结束），新搜索能立刻翻下一页；旧请求晚到时
+    // 既不能覆盖新数据，也不能关掉新 loadMore 的 spinner。
     let resolveStale!: (page: { results: DirectoryUser[]; next_cursor: string | null }) => void;
+    let resolveB!: (page: { results: DirectoryUser[]; next_cursor: string | null }) => void;
     mockUsers
       .mockResolvedValueOnce({ results: [user(1, '张三')], next_cursor: 'c1' })
       .mockImplementationOnce(() => new Promise((res) => { resolveStale = res; }))
-      .mockResolvedValueOnce({ results: [user(9, '王五')], next_cursor: null });
+      .mockResolvedValueOnce({ results: [user(9, '王五')], next_cursor: 'c9' })
+      .mockImplementationOnce(() => new Promise((res) => { resolveB = res; }));
     await act(async () => { root.render(<ProbeComponent />); });
     await flush(10);
     expect(latest.current!.hasMore).toBe(true);
 
-    const more = latest.current!.loadMore();
+    const stale = latest.current!.loadMore();
     await flush(10);
     expect(latest.current!.loadingMore).toBe(true);
 
@@ -129,15 +132,33 @@ describe('useDirectoryUsers — loadMore 失效复位（复审意见 #2）', () 
     await act(async () => { root.render(<ProbeComponent />); });
     await flush(350); // 300ms 防抖到期 + 新首页落地
     expect(latest.current!.loading).toBe(false);
-    expect(latest.current!.loadingMore).toBe(true); // 旧 loadMore 仍在途
+    expect(latest.current!.loadingMore).toBe(false); // 旧 loadMore 已当场作废
 
+    // 新搜索可以立即翻自己的下一页（旧请求仍在途）。
+    const bMore = latest.current!.loadMore();
+    await flush(10);
+    expect(mockUsers).toHaveBeenLastCalledWith(expect.objectContaining({
+      q: '王', cursor: 'c9',
+    }));
+    expect(latest.current!.loadingMore).toBe(true);  // 新搜索自己的 spinner
+
+    // 旧响应此刻才返回：不得覆盖新数据、不得关掉新 spinner。
     await act(async () => {
       resolveStale({ results: [user(5, '李四')], next_cursor: null });
     });
-    await act(async () => { await more; });
+    await act(async () => { await stale; });
     await flush(10);
-    // 旧页被丢弃，loadingMore 复位。
-    expect(latest.current!.loadingMore).toBe(false);
     expect(latest.current!.items.map((u) => u.id)).toEqual([9]);
+    expect(latest.current!.loadingMore).toBe(true);  // 新 spinner 仍在
+    expect(latest.current!.error).toBeNull();
+
+    // 新搜索的第二页落地，spinner 才复位。
+    await act(async () => {
+      resolveB({ results: [user(10, '王五分身')], next_cursor: null });
+    });
+    await act(async () => { await bMore; });
+    await flush(10);
+    expect(latest.current!.loadingMore).toBe(false);
+    expect(latest.current!.items.map((u) => u.id)).toEqual([9, 10]);
   });
 });
