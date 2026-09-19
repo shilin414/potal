@@ -327,7 +327,12 @@ export function useScheduleEditor({
     try {
       setSaving(true);
       const payload = formToPayload(await readValues());
-      if (!deliveryOn) payload.deliveries = undefined;
+      // 关闭投递必须显式清空（六次复审 P1-1）：后端 PATCH 的契约是
+      // 「deliveries 缺失 = 保留原有投递」—— 旧的 `undefined` 会让数据
+      // 库里的旧投递静默存活，用户已明确关闭飞书通知、任务执行后却仍
+      // 继续发送。显式 `[]` 才是「把目标集合替换为空集合」：后端
+      // replaceDeliveries([]) 会删掉该 schedule 的全部 delivery 行。
+      payload.deliveries = deliveryOn ? (payload.deliveries ?? []) : [];
       // 原智能体已不可执行（§41）：保存只会被后端 validation 以
       // "application is not schedulable" 拒绝 —— 在前端就拦下，要求换一个。
       if (

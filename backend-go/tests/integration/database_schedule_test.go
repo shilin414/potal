@@ -538,3 +538,50 @@ func TestScheduleListSearchIsServerSideCaseInsensitiveAndLiteral(t *testing.T) {
 		t.Fatalf("q + before_id must return only the earlier matches, got %v", got)
 	}
 }
+
+// TestUpdatePatchDeliveriesEmptyArrayClearsRows pins the PATCH deliveries
+// contract on a real database (六次复审 P1-1): "deliveries": [] must CLEAR
+// the stored targets — the frontend sends exactly this when the notification
+// switch is turned OFF — while omitting the field keeps them (absent = keep,
+// [] = clear). The old frontend sent `undefined`, which the backend
+// correctly reads as "keep", so a disabled schedule kept delivering to
+// Feishu.
+func TestUpdatePatchDeliveriesEmptyArrayClearsRows(t *testing.T) {
+	env := newScheduleEnv(t)
+	ctx := context.Background()
+	q := db.New(env.db)
+	id := env.seedSchedule(t, time.Now().UTC().Add(24*time.Hour), schedule.OverlapQueue)
+	t.Cleanup(func() {
+		_ = q.DeleteScheduleDeliveries(ctx, uint64(id))
+		_, _ = q.DeleteSchedule(ctx, uint64(id))
+	})
+	if _, err := q.UpsertScheduleDelivery(ctx, db.UpsertScheduleDeliveryParams{
+		ScheduleID:         uint64(id),
+		Channel:            "feishu",
+		SenderIdentityMode: "owner_user",
+		TargetType:         "chat",
+		TargetID:           "oc_test",
+		TargetName:         "运营群",
+		ContentMode:        "summary",
+		Enabled:            true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Absent field = keep: a patch without deliveries must not touch rows.
+	if _, err := env.svc.Update(ctx, id, 42, false, &schedule.UpdateInput{}); err != nil {
+		t.Fatalf("patch without deliveries: %v", err)
+	}
+	if n := env.count(t, `SELECT COUNT(*) FROM schedule_deliveries WHERE schedule_id = ?`, id); n != 1 {
+		t.Fatalf("deliveries after field-absent patch = %d, want 1 (absent = keep)", n)
+	}
+
+	// "deliveries": [] = clear: rows must go to zero.
+	empty := []schedule.DeliveryInput{}
+	if _, err := env.svc.Update(ctx, id, 42, false, &schedule.UpdateInput{Deliveries: &empty}); err != nil {
+		t.Fatalf("patch with empty deliveries: %v", err)
+	}
+	if n := env.count(t, `SELECT COUNT(*) FROM schedule_deliveries WHERE schedule_id = ?`, id); n != 0 {
+		t.Fatalf("deliveries after empty-array patch = %d, want 0 ([] = clear)", n)
+	}
+}
