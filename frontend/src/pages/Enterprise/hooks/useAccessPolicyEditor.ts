@@ -8,7 +8,7 @@
  * after B's, so the page showed B's title over A's grants, and 保存 would
  * then write A's ACL onto B (`updateAccess(B, A_POLICY)`).
  *
- * The hook pins three layers of defense:
+ * The hook pins four layers of defense:
  *   · request generation guard — a stale target's response can never land
  *     (open/switch/close all invalidate in-flight generations);
  *   · `ready` business invariant — the editor is only ready when the loaded
@@ -16,7 +16,13 @@
  *     to run otherwise (even if the sequence guard were ever removed);
  *   · save target guard — a slow save for A that completes after the switch
  *     to B applies its response (and notifies) only while the editor still
- *     targets A, so it can never close/overwrite B's surface.
+ *     targets A, so it can never close/overwrite B's surface;
+ *   · editor session epoch (四次复审 P1-1/P1-2) — the session identity is
+ *     not just the target id: close → reopen of the SAME id is a NEW session
+ *     (an ABA race the id-only guard cannot see). Every open/close/switch
+ *     bumps the epoch and immediately releases `saving`, so an old session's
+ *     late response can neither overwrite the reopened editor's fresh policy
+ *     nor keep the new session's 保存 button spinning.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { message } from 'antd';
@@ -82,7 +88,11 @@ export function useAccessPolicyEditor({
   // The LIVE target (P0-3): a save in flight compares against this ref, not
   // against its own closure, so switching targets mid-save is detected.
   const targetIdRef = useRef<number | null>(applicationId);
-  useEffect(() => { targetIdRef.current = applicationId; }, [applicationId]);
+  // Editor session epoch (四次复审 P1-1): the session identity is
+  // (applicationId, enabled) OVER TIME, not just the current id — close →
+  // reopen of the same id must produce a NEW session, which an id-only
+  // comparison cannot distinguish (A → null → A is an ABA transition).
+  const editorEpochRef = useRef(0);
   // Save generation: only the NEWEST save may reset the spinner. A save for
   // A that finishes after the switch to B must not leave `saving` wedged on
   // (B's button would spin forever), nor must it cancel B's own in-flight
@@ -90,6 +100,21 @@ export function useAccessPolicyEditor({
   const saveSeqRef = useRef(0);
   const onSavedRef = useRef(onSaved);
   useEffect(() => { onSavedRef.current = onSaved; });
+
+  // A new editor session starts on every open / close / target switch
+  // (四次复审 P1-1/P1-2). The previous session's save no longer owns ANY UI
+  // state:
+  //   · the epoch bump makes its late response stale even when the target id
+  //     cycles back to the same value (close A → reopen A);
+  //   · the save-seq bump + `setSaving(false)` release the spinner to the
+  //     new session immediately — the new target's 保存 must not wait for a
+  //     wedged old request to settle.
+  useEffect(() => {
+    editorEpochRef.current += 1;
+    saveSeqRef.current += 1;
+    setSaving(false);
+    targetIdRef.current = applicationId;
+  }, [applicationId, enabled]);
 
   const reload = useCallback(async () => {
     if (!applicationId || !enabled) return;
@@ -152,9 +177,16 @@ export function useAccessPolicyEditor({
     if (!applicationId || !policy || policy.application_id !== applicationId) {
       return false;
     }
+    const saveEpoch = editorEpochRef.current;
     const saveTargetId = applicationId;
     const mySave = ++saveSeqRef.current;
     setSaving(true);
+    // A save response may only touch the UI while ITS editor session is still
+    // live: same epoch (no close / reopen / target switch in between — this is
+    // what defeats the close→reopen same-id ABA, 四次复审 P1-1) AND the live
+    // target still matches the save target.
+    const stillCurrent = () => editorEpochRef.current === saveEpoch
+      && targetIdRef.current === saveTargetId;
     try {
       const next = await enterpriseApi.updateAccess(saveTargetId, {
         access_mode: policy.access_mode,
@@ -165,21 +197,23 @@ export function useAccessPolicyEditor({
         user_grants: policy.users.map((u) => u.directory_user_id),
       });
       // A slow save for A must not close B's editor or overwrite its policy
-      // (P0-3): the response only applies while the target is unchanged.
-      if (targetIdRef.current === saveTargetId) {
+      // (P0-3), and — after a close→reopen of the SAME id — must not
+      // overwrite the reopened session's freshly loaded policy either.
+      if (stillCurrent()) {
         setPolicy(next);
         onSavedRef.current?.();
       }
       return true;
     } catch {
-      if (targetIdRef.current === saveTargetId) {
+      if (stillCurrent()) {
         message.error('保存失败，请检查部门和人员是否仍有效');
       }
       return false;
     } finally {
       // Only the newest save resets the spinner — an older save finishing
       // after a newer one started must neither wedge `saving` on (review #1)
-      // nor cancel the newer save's spinner.
+      // nor cancel the newer save's spinner. A session change also bumps the
+      // seq (and already set saving=false), so a stale save skips here too.
       if (saveSeqRef.current === mySave) {
         setSaving(false);
       }

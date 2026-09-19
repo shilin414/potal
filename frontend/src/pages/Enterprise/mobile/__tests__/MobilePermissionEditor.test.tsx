@@ -78,11 +78,12 @@ vi.mock('@/components/MobileConsole', () => ({
       {action}
     </div>
   ),
-  MobileFullScreenDrawer: ({ open, title, actionText, actionDisabled, onAction, children }: {
+  MobileFullScreenDrawer: ({ open, title, actionText, actionDisabled, actionLoading, onAction, children }: {
     open: boolean;
-    title?: string;
-    actionText?: string;
+    title?: React.ReactNode;
+    actionText?: React.ReactNode;
     actionDisabled?: boolean;
+    actionLoading?: boolean;
     onAction?: () => void;
     children?: React.ReactNode;
   }) => (
@@ -94,6 +95,7 @@ vi.mock('@/components/MobileConsole', () => ({
             type="button"
             data-testid="fs-action"
             disabled={actionDisabled}
+            data-loading={actionLoading ? 'true' : 'false'}
             onClick={onAction}
           >
             {actionText}
@@ -376,5 +378,118 @@ describe('MobilePermissionEditor — target race (三次复审 P0)', () => {
     expect(mocks.messageSuccess).not.toHaveBeenCalled();
     expect(document.body.textContent).toContain('B资源部门');
     expect(document.body.textContent).not.toContain('A资源部门');
+  });
+
+  it('switching targets immediately releases saving — B can save without waiting for A (四次复审 P1-2)', async () => {
+    mocks.access.mockImplementation(async (id: number) => (
+      id === 7 ? POLICY_A : POLICY_B));
+    const saveA = deferred<typeof POLICY_A>();
+    mocks.updateAccess.mockImplementation((id: number) => (
+      id === 7 ? saveA.promise : Promise.resolve(POLICY_B)));
+    const onClose = vi.fn();
+
+    const { root } = await mountEditor({ id: 7, name: 'A' });
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="fs-action"]')!.click();
+    });
+    await flush(20);
+    expect(mocks.updateAccess).toHaveBeenCalledWith(7, expect.anything());
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="fs-action"]')!.dataset.loading,
+    ).toBe('true'); // A's save spinner on
+
+    // Switch to B while A's save is still travelling.
+    await act(async () => {
+      root.render(
+        <MobilePermissionEditor open application={{ id: 8, name: 'B' }} onClose={onClose} />,
+      );
+    });
+    await flush(20);
+
+    // B's editor must NOT inherit A's save lifecycle: the spinner is released
+    // the moment the session changes — without waiting for A to settle.
+    const saveButton = document.querySelector<HTMLButtonElement>('[data-testid="fs-action"]')!;
+    expect(saveButton.dataset.loading).toBe('false');
+    expect(saveButton.disabled).toBe(false); // B's policy loaded → save enabled
+
+    // B saves immediately, while A is STILL pending.
+    await act(async () => { saveButton.click(); });
+    await flush(20);
+    expect(mocks.updateAccess).toHaveBeenCalledTimes(2);
+    expect(mocks.updateAccess).toHaveBeenLastCalledWith(8, expect.anything());
+    expect(onClose).toHaveBeenCalledTimes(1); // only B's own save closed it
+
+    // A finally settles — it can no longer touch anything.
+    await act(async () => { saveA.resolve(POLICY_A); });
+    await flush(20);
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(mocks.messageSuccess).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('MobilePermissionEditor — close/reopen ABA（四次复审 P1-1）', () => {
+  const POLICY_A = {
+    application_id: 7,
+    access_mode: 'assigned',
+    departments: [{ department_id: 3, name: 'A资源部门', include_children: true, covered_users: 12 }],
+    users: [{ directory_user_id: 9, name: 'A资源人员', avatar_url: '', departments: ['A资源部门'] }],
+  };
+  /** What updateAccess(7) would answer — the SAVED state differs from the loaded one. */
+  const POLICY_A_SAVED = {
+    ...POLICY_A,
+    departments: [{ department_id: 3, name: 'A资源部门-已保存', include_children: true, covered_users: 12 }],
+  };
+
+  it('a save resolving after close→reopen of the SAME id cannot touch the new session', async () => {
+    mocks.access.mockResolvedValue(POLICY_A);
+    const saveResult = deferred<typeof POLICY_A_SAVED>();
+    mocks.updateAccess.mockReturnValue(saveResult.promise);
+    const onClose = vi.fn();
+
+    // Session #1 for A: load + save (pending).
+    const { root } = await mountEditor({ id: 7, name: 'A' });
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[data-testid="fs-action"]')!.click();
+    });
+    await flush(20);
+    expect(mocks.updateAccess).toHaveBeenCalledWith(7, expect.anything());
+
+    // Close while the save is still travelling.
+    await act(async () => {
+      root.render(
+        <MobilePermissionEditor open={false} application={null} onClose={onClose} />,
+      );
+    });
+    await flush(20);
+    expect(document.querySelector('[data-testid="fs-drawer"]')).toBeNull();
+
+    // Reopen A — a NEW session (same id!). It loads its own fresh policy…
+    await act(async () => {
+      root.render(
+        <MobilePermissionEditor open application={{ id: 7, name: 'A' }} onClose={onClose} />,
+      );
+    });
+    await flush(20);
+    expect(document.querySelector('[data-testid="fs-drawer"]')).toBeTruthy();
+    expect(document.body.textContent).toContain('A资源部门');
+    // …and its save button is NOT spinning: the old session's save released
+    // the spinner the moment the editor closed/reopened.
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="fs-action"]')!.dataset.loading,
+    ).toBe('false');
+
+    // The old save settles NOW. Same id (A → null → A), but a different
+    // session epoch — it must not overwrite the fresh policy, must not toast,
+    // and must not close the reopened editor via onSaved→onClose.
+    await act(async () => { saveResult.resolve(POLICY_A_SAVED); });
+    await flush(20);
+    expect(document.querySelector('[data-testid="fs-drawer"]')).toBeTruthy();
+    expect(document.body.textContent).toContain('A资源部门');
+    expect(document.body.textContent).not.toContain('A资源部门-已保存');
+    expect(mocks.messageSuccess).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(
+      document.querySelector<HTMLButtonElement>('[data-testid="fs-action"]')!.dataset.loading,
+    ).toBe('false');
   });
 });

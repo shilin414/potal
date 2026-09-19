@@ -505,4 +505,47 @@ describe('desktop AccessPage — drawer 三态 + save spinner 复位（复审）
     expect(drawer().querySelector('[data-testid="skeleton"]')).toBeTruthy();
     expect(drawer().querySelector('[data-testid="empty"]')).toBeNull();
   });
+
+  it('a save resolving after close→reopen of the SAME id cannot touch the new session (四次复审 P1-1 ABA)', async () => {
+    pageState.items = [row(7, 'A资源')];
+    vi.mocked(enterpriseApi.access).mockResolvedValue(POLICY_A);
+    /** What updateAccess(7) answers — the SAVED state differs from the loaded one. */
+    const POLICY_A_SAVED = {
+      ...POLICY_A,
+      departments: [{ department_id: 3, name: 'A资源部门-已保存', include_children: true, covered_users: 12 }],
+    };
+    const saveResult = deferred<typeof POLICY_A_SAVED>();
+    vi.mocked(enterpriseApi.updateAccess).mockReturnValue(saveResult.promise);
+
+    await mountPage();
+    await click(document.querySelector('[data-open-cell="7"] button')!);
+    await flush(20);
+    const save = () => Array.from(document.querySelectorAll('button'))
+      .find((el) => el.textContent === '保存')!;
+    await click(save()!);
+    expect(save()!.dataset.loading).toBe('true'); // session #1 save spinner on
+
+    // Close the drawer while the save is still travelling.
+    await click(document.querySelector('[data-testid="drawer-close"]')!);
+    await flush(20);
+    expect(document.querySelector('[data-testid="drawer"]')).toBeNull();
+
+    // Reopen A — a NEW session with the SAME id loads its own fresh policy…
+    await click(document.querySelector('[data-open-cell="7"] button')!);
+    await flush(20);
+    const drawer = () => document.querySelector('[data-testid="drawer"]')!;
+    expect(drawer().textContent).toContain('A资源部门');
+    // …and its 保存 button is NOT spinning: the old session's save released
+    // the spinner the moment the drawer closed/reopened (P1-2).
+    expect(save()!.dataset.loading).toBe('false');
+
+    // The old save settles NOW — same id (A → null → A) but a different
+    // session epoch: no toast, no overwrite of the fresh policy.
+    await act(async () => { saveResult.resolve(POLICY_A_SAVED); });
+    await flush(20);
+    expect(vi.mocked(message.success)).not.toHaveBeenCalled();
+    expect(drawer().textContent).toContain('A资源部门');
+    expect(drawer().textContent).not.toContain('A资源部门-已保存');
+    expect(save()!.dataset.loading).toBe('false');
+  });
 });
