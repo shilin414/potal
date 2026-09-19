@@ -52,6 +52,21 @@ export function useScheduleEditor({
   const [preview, setPreview] = useState<string[]>([]);
   const [previewing, setPreviewing] = useState(false);
 
+  // 会话代际（四次复审 P1-3）：open / editing?.id / presetApplicationId 任一
+  // 变化 = 新编辑会话。旧会话晚到的保存响应不再操纵新会话的 UI —— 不
+  // message.success、不 onSaved、不 onClose（曾能把正在编辑任务 B 的新编辑器
+  // 直接关掉），saving 也立即归还新会话（不继承旧会话的 spinner）。
+  // 注意边界：这里取消的只是「旧响应对新 UI 的操纵」，已发往服务器的
+  // PATCH 本身无法撤销 —— 这是前端会话守卫的正确边界。
+  const editorEpochRef = useRef(0);
+  const saveSeqRef = useRef(0);
+  const editingId = editing?.id ?? null;
+  useEffect(() => {
+    editorEpochRef.current += 1;
+    saveSeqRef.current += 1;
+    setSaving(false);
+  }, [open, editingId, presetApplicationId]);
+
   // 可调度智能体（二次复审 P1-2）：复用 useApplicationPage 走服务端分页 +
   // 服务端搜索（mode 'consume' 让后端过滤 enabled/bound），拥有 >50 个智能体
   // 也能通过 loadMore 全部选到；搜索词直发后端，浏览器不再只在前 N 条里
@@ -225,6 +240,8 @@ export function useScheduleEditor({
   }, [readValues]);
 
   const handleOk = async () => {
+    const saveEpoch = editorEpochRef.current;
+    const mySave = ++saveSeqRef.current;
     try {
       const payload = formToPayload(await readValues());
       if (!deliveryOn) payload.deliveries = undefined;
@@ -240,18 +257,27 @@ export function useScheduleEditor({
       setSaving(true);
       if (editing) {
         await updateSchedule(editing.id, payload);
-        message.success('定时任务已更新');
       } else {
         await createSchedule(payload);
-        message.success('定时任务已创建');
       }
+      // 保存请求结束时会话已换（关闭/重开/换了编辑对象，四次复审 P1-3）：
+      // 旧响应不再 toast / onSaved / onClose —— 否则正在编辑任务 B 的
+      // 新编辑器会被任务 A 的晚到响应直接关掉。
+      if (editorEpochRef.current !== saveEpoch) return;
+      message.success(editing ? '定时任务已更新' : '定时任务已创建');
       onSaved();
       onClose();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : '保存失败';
-      message.error(msg);
+      // 同理：旧会话的失败 toast 也不属于新会话。
+      if (editorEpochRef.current === saveEpoch) {
+        message.error(e instanceof Error ? e.message : '保存失败');
+      }
     } finally {
-      setSaving(false);
+      // 只有最新一次保存才复位 spinner；会话切换时 saveSeq 已被 bump 且
+      // saving 已被会话 effect 置回 false，旧保存在此跳过即可。
+      if (saveSeqRef.current === mySave) {
+        setSaving(false);
+      }
     }
   };
 
