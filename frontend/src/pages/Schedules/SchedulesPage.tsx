@@ -31,7 +31,7 @@ import './SchedulesPage.css';
 function DesktopScheduleCenter() {
   const {
     data, loading, loadingMore, error, errorPhase, hasMore, loadMore,
-    status, search, mutatingId,
+    status, search, isMutating,
     setStatus, setSearch, reload, toggleEnabled, runNow, remove,
   } = useSchedules();
   const [editorOpen, setEditorOpen] = useState(false);
@@ -91,7 +91,7 @@ function DesktopScheduleCenter() {
       render: (_: unknown, s: Schedule) => (
         <Switch
           checked={s.enabled}
-          loading={mutatingId === s.id}
+          loading={isMutating(s.id)}
           onChange={(checked) => void toggleEnabled(s.id, checked)}
           aria-label={`${s.enabled ? '停用' : '启用'} ${s.name}`}
         />
@@ -106,7 +106,7 @@ function DesktopScheduleCenter() {
           <Button
             size="small"
             type="link"
-            loading={mutatingId === s.id}
+            loading={isMutating(s.id)}
             onClick={() => void runNow(s.id)}
           >
             立即运行
@@ -121,7 +121,7 @@ function DesktopScheduleCenter() {
               await remove(s.id);
             }}
           >
-            <Button size="small" type="link" danger loading={mutatingId === s.id}>删除</Button>
+            <Button size="small" type="link" danger loading={isMutating(s.id)}>删除</Button>
           </Popconfirm>
         </Space>
       ),

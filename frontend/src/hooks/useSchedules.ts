@@ -57,7 +57,8 @@ export interface UseSchedulesResult {
 
   status: ScheduleStatusFilter;
   search: string;
-  mutatingId: number | null;
+  /** 行级 mutation 并发跟踪（四次复审 P2-1）：任务 A 暂停与任务 B 立即运行可以同时在途。 */
+  isMutating: (id: number) => boolean;
   setStatus: (s: ScheduleStatusFilter) => void;
   setSearch: (s: string) => void;
   reload: () => Promise<void>;
@@ -75,7 +76,26 @@ export function useSchedules(): UseSchedulesResult {
   const [hasMore, setHasMore] = useState(false);
   const [status, setStatus] = useState<ScheduleStatusFilter>('all');
   const [search, setSearch] = useState('');
-  const [mutatingId, setMutatingId] = useState<number | null>(null);
+  // 行级 mutation 用 Set 而不是单值（四次复审 P2-1）：mutatingId = A 会被
+  // B 的开始覆盖，A 先结束时置 null 让仍在途的 B 看起来「不在执行」——
+  // 用户可以对同一行重复点击。每行独立进出，并发互不干扰。
+  const [mutatingIds, setMutatingIds] = useState<Set<number>>(new Set());
+  const beginMutation = useCallback((id: number) => {
+    setMutatingIds((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+  }, []);
+  const endMutation = useCallback((id: number) => {
+    setMutatingIds((prev) => {
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
+  }, []);
+  const isMutating = useCallback(
+    (id: number) => mutatingIds.has(id), [mutatingIds]);
   const seqRef = useRef(0);
   // loadMore generation（四次复审 P1-2）：结果集代际（seqRef）与翻页操作代际
   // 是两个概念。新结果集（筛选/搜索/刷新）开始的瞬间立即作废旧结果集的
@@ -178,7 +198,7 @@ export function useSchedules(): UseSchedulesResult {
   }, []);
 
   const toggleEnabled = useCallback(async (id: number, enabled: boolean) => {
-    setMutatingId(id);
+    beginMutation(id);
     const rollback = () => patchLocal(id, { enabled: !enabled });
     patchLocal(id, { enabled }); // 乐观更新，失败回滚
     try {
@@ -202,12 +222,12 @@ export function useSchedules(): UseSchedulesResult {
       rollback();
       message.error(e instanceof Error ? e.message : (enabled ? '启用失败' : '停用失败'));
     } finally {
-      setMutatingId(null);
+      endMutation(id);
     }
-  }, [patchLocal, status]);
+  }, [patchLocal, status, beginMutation, endMutation]);
 
   const runNow = useCallback(async (id: number) => {
-    setMutatingId(id);
+    beginMutation(id);
     try {
       await runScheduleNow(id);
       message.success('已加入执行队列');
@@ -217,12 +237,12 @@ export function useSchedules(): UseSchedulesResult {
       message.error(e instanceof Error ? e.message : '立即运行失败');
       return false;
     } finally {
-      setMutatingId(null);
+      endMutation(id);
     }
-  }, [load, status, debouncedSearch]);
+  }, [load, status, debouncedSearch, beginMutation, endMutation]);
 
   const remove = useCallback(async (id: number) => {
-    setMutatingId(id);
+    beginMutation(id);
     try {
       await deleteSchedule(id);
       message.success('定时任务已删除');
@@ -232,9 +252,9 @@ export function useSchedules(): UseSchedulesResult {
       message.error(e instanceof Error ? e.message : '删除失败');
       return false;
     } finally {
-      setMutatingId(null);
+      endMutation(id);
     }
-  }, []);
+  }, [beginMutation, endMutation]);
 
   return {
     data,
@@ -246,7 +266,7 @@ export function useSchedules(): UseSchedulesResult {
     loadMore,
     status,
     search,
-    mutatingId,
+    isMutating,
     setStatus,
     setSearch,
     reload,

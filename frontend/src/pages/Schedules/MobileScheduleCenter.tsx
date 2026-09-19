@@ -45,7 +45,7 @@ function ScheduleCardSkeleton() {
 export function MobileScheduleCenter() {
   const {
     data, loading, loadingMore, error, errorPhase, hasMore, loadMore,
-    status, search, mutatingId,
+    status, search, isMutating,
     setStatus, setSearch, reload, toggleEnabled, runNow, remove,
   } = useSchedules();
   const [editorOpen, setEditorOpen] = useState(false);
@@ -86,7 +86,7 @@ export function MobileScheduleCenter() {
   const actions: MobileAction[] = sheetFor ? [
     {
       key: 'run', label: '立即运行', icon: <CaretRightOutlined />,
-      disabled: mutatingId === sheetFor.id,
+      disabled: isMutating(sheetFor.id),
       onClick: () => void runNow(sheetFor.id),
     },
     {
@@ -97,7 +97,7 @@ export function MobileScheduleCenter() {
       key: 'toggle',
       label: sheetFor.enabled ? '暂停' : '启用',
       icon: sheetFor.enabled ? <PauseCircleOutlined /> : <PlayCircleOutlined />,
-      disabled: mutatingId === sheetFor.id,
+      disabled: isMutating(sheetFor.id),
       onClick: () => void toggleEnabled(sheetFor.id, !sheetFor.enabled),
     },
     {

@@ -17,6 +17,7 @@ import {
   disableSchedule,
   enableSchedule,
   fetchSchedules,
+  runScheduleNow,
 } from '@/services/scheduleApi';
 import type { Schedule } from '@/types/schedule';
 
@@ -32,6 +33,7 @@ vi.mock('@/services/scheduleApi', async (importOriginal) => ({
 const mockFetch = vi.mocked(fetchSchedules);
 const mockEnable = vi.mocked(enableSchedule);
 const mockDisable = vi.mocked(disableSchedule);
+const mockRunNow = vi.mocked(runScheduleNow);
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -71,6 +73,7 @@ beforeEach(() => {
   mockFetch.mockReset();
   mockEnable.mockReset();
   mockDisable.mockReset();
+  mockRunNow.mockReset();
   latest = { current: null };
   host = document.createElement('div');
   document.body.appendChild(host);
@@ -388,5 +391,42 @@ describe('useSchedules — toggle 与筛选语义归并（四次复审 P1-4）',
     // 失败：乐观翻转回滚，行留在列表里。
     expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
     expect(latest.current!.data.find((s) => s.id === 5)?.enabled).toBe(true);
+  });
+});
+
+describe('useSchedules — 并发行级 mutation（四次复审 P2-1）', () => {
+  it('A finishing first does not free B: rows mutate concurrently and independently', async () => {
+    let resolveA!: (value: Schedule) => void;
+    let resolveB!: (value: unknown) => void;
+    mockFetch.mockResolvedValue(page(2, 5)); // 挂载首页 + runNow 成功后的 refresh
+    mockDisable.mockImplementationOnce(
+      () => new Promise<Schedule>((res) => { resolveA = res; }));
+    mockRunNow.mockImplementationOnce(
+      () => new Promise<unknown>((res) => { resolveB = res; }));
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
+
+    // 任务 A 暂停、任务 B 立即运行 —— 两个请求同时在途。
+    const a = latest.current!.toggleEnabled(5, false);
+    const b = latest.current!.runNow(4);
+    await flush(10);
+    expect(latest.current!.isMutating(5)).toBe(true);
+    expect(latest.current!.isMutating(4)).toBe(true);
+
+    // A 先结束：A 的行解锁，B 仍在 mutation。单值 mutatingId 会在这里把 B
+    // 误清成「不在执行」—— 用户就能对 B 重复点击。
+    await act(async () => { resolveA({ ...schedule(5), enabled: false }); });
+    await act(async () => { await a; });
+    await flush(10);
+    expect(latest.current!.isMutating(5)).toBe(false);
+    expect(latest.current!.isMutating(4)).toBe(true);
+
+    // B 结束后自己的行才解锁。
+    await act(async () => { resolveB(undefined); });
+    await act(async () => { await b; });
+    await flush(10);
+    expect(latest.current!.isMutating(4)).toBe(false);
+    expect(latest.current!.isMutating(5)).toBe(false);
   });
 });
