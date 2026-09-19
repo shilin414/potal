@@ -183,14 +183,28 @@ export function useSchedules(): UseSchedulesResult {
     patchLocal(id, { enabled }); // 乐观更新，失败回滚
     try {
       const updated = enabled ? await enableSchedule(id) : await disableSchedule(id);
-      patchLocal(id, updated);
+      // 与服务端筛选语义对齐（四次复审 P1-4）：running = enabled、
+      // paused = disabled、failed/all 与 enabled 无关。停用一个任务后它就
+      // 不再属于「运行中」结果集 —— 留在列表里只是行内状态翻转，与后端
+      // 重新查询的语义冲突。在当前结果集内做成员归并（而不是 reload，
+      // reload 会把用户已 loadMore 的 150 条打回第一页 50 条）。
+      const belongs =
+        status === 'all'
+        || status === 'failed'
+        || (status === 'running' && updated.enabled)
+        || (status === 'paused' && !updated.enabled);
+      if (belongs) {
+        patchLocal(id, updated);
+      } else {
+        setData((prev) => prev.filter((s) => s.id !== id));
+      }
     } catch (e) {
       rollback();
       message.error(e instanceof Error ? e.message : (enabled ? '启用失败' : '停用失败'));
     } finally {
       setMutatingId(null);
     }
-  }, [patchLocal]);
+  }, [patchLocal, status]);
 
   const runNow = useCallback(async (id: number) => {
     setMutatingId(id);

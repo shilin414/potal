@@ -13,7 +13,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react-dom/test-utils';
 import { useSchedules, type UseSchedulesResult } from '../useSchedules';
-import { fetchSchedules } from '@/services/scheduleApi';
+import {
+  disableSchedule,
+  enableSchedule,
+  fetchSchedules,
+} from '@/services/scheduleApi';
 import type { Schedule } from '@/types/schedule';
 
 vi.mock('@/services/scheduleApi', async (importOriginal) => ({
@@ -26,6 +30,8 @@ vi.mock('@/services/scheduleApi', async (importOriginal) => ({
 }));
 
 const mockFetch = vi.mocked(fetchSchedules);
+const mockEnable = vi.mocked(enableSchedule);
+const mockDisable = vi.mocked(disableSchedule);
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -63,6 +69,8 @@ function ProbeComponent() {
 
 beforeEach(() => {
   mockFetch.mockReset();
+  mockEnable.mockReset();
+  mockDisable.mockReset();
   latest = { current: null };
   host = document.createElement('div');
   document.body.appendChild(host);
@@ -311,5 +319,74 @@ describe('useSchedules — loadMore 代际失效（四次复审 P1-2）', () => 
     await flush(10);
     expect(latest.current!.loadingMore).toBe(false);
     expect(latest.current!.data).toHaveLength(53);
+  });
+});
+
+describe('useSchedules — toggle 与筛选语义归并（四次复审 P1-4）', () => {
+  // 服务端筛选：running = enabled、paused = disabled、failed/all 与 enabled
+  // 无关。toggle 成功后行必须立刻从不再匹配的结果集消失，而不是留在
+  // 「运行中」列表里只把状态翻成暂停。
+  it('pausing a row in the RUNNING view removes it from the list', async () => {
+    mockFetch
+      .mockResolvedValueOnce(page(2, 5))  // 挂载 all 首页 ids 5,4
+      .mockResolvedValueOnce(page(2, 5)); // running 首页 ids 5,4
+    mockDisable.mockResolvedValueOnce({ ...schedule(5), enabled: false });
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    await act(async () => { latest.current!.setStatus('running'); });
+    await flush(10);
+    expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
+
+    await act(async () => { await latest.current!.toggleEnabled(5, false); });
+    await flush(10);
+    expect(mockDisable).toHaveBeenCalledWith(5);
+    expect(latest.current!.data.map((s) => s.id)).toEqual([4]); // 已停用 → 离开运行中
+  });
+
+  it('enabling a row in the PAUSED view removes it from the list', async () => {
+    mockFetch
+      .mockResolvedValueOnce(page(2, 5))
+      .mockResolvedValueOnce(page(2, 5)); // paused 首页 ids 5,4
+    mockEnable.mockResolvedValueOnce({ ...schedule(5), enabled: true });
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    await act(async () => { latest.current!.setStatus('paused'); });
+    await flush(10);
+    expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
+
+    await act(async () => { await latest.current!.toggleEnabled(5, true); });
+    await flush(10);
+    expect(mockEnable).toHaveBeenCalledWith(5);
+    expect(latest.current!.data.map((s) => s.id)).toEqual([4]); // 已启用 → 离开已暂停
+  });
+
+  it('toggling under ALL keeps the row with the server-returned state', async () => {
+    mockFetch.mockResolvedValueOnce(page(2, 5));
+    mockDisable.mockResolvedValueOnce({ ...schedule(5), enabled: false });
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+
+    await act(async () => { await latest.current!.toggleEnabled(5, false); });
+    await flush(10);
+    // all 与 enabled 无关：行保留，状态用服务器返回值。
+    expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
+    expect(latest.current!.data.find((s) => s.id === 5)?.enabled).toBe(false);
+  });
+
+  it('a failed toggle rolls the optimistic flip back and keeps the row', async () => {
+    mockFetch
+      .mockResolvedValueOnce(page(2, 5))
+      .mockResolvedValueOnce(page(2, 5)); // running 首页
+    mockDisable.mockRejectedValueOnce(new Error('停用失败'));
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    await act(async () => { latest.current!.setStatus('running'); });
+    await flush(10);
+
+    await act(async () => { await latest.current!.toggleEnabled(5, false); });
+    await flush(10);
+    // 失败：乐观翻转回滚，行留在列表里。
+    expect(latest.current!.data.map((s) => s.id)).toEqual([5, 4]);
+    expect(latest.current!.data.find((s) => s.id === 5)?.enabled).toBe(true);
   });
 });
