@@ -69,6 +69,11 @@ export default function MobileUserPicker({
     query,
     enabled: open,
     includeInactive: false,
+    // Picker 会话（五次复审 §37–§38）：关闭 → null、打开 → 'picker'。
+    // 每次开关周期都是新会话：立即作废在途请求并清空旧会话的
+    // items/error，配合上面的 query 清空 + hook 的同步防抖，快速关闭
+    // 重开的第一帧不再闪旧词请求或旧结果。
+    sessionKey: open ? 'mobile-user-picker' : null,
   });
 
   const pickedIds = new Set(picked.map((u) => u.id));

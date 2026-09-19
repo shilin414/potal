@@ -56,6 +56,14 @@ export interface UseApplicationPageOptions {
    * a closed Drawer). Turning it true triggers the first page.
    */
   enabled?: boolean;
+  /**
+   * Picker 会话标识（五次复审 §37–§38）：remote-search Picker 的宿主
+   * Surface 换会话（关闭重开 / 换编辑对象 / 换授权目标）时传入新值。
+   * 变化 = 新会话：立即作废在途请求与 loadMore、清空 items/cursor/
+   * error，并把 debouncedQuery 同步为当前 query（不等防抖）—— 快速
+   * 关闭重开的第一帧不再闪上一个会话的搜索词、结果或错误。
+   */
+  sessionKey?: string | number | null;
 }
 
 
@@ -73,7 +81,7 @@ const dedupeById = (items: V2Application[]): V2Application[] => {
 export function useApplicationPage(options: UseApplicationPageOptions) {
   const {
     kind, scope, mode, includeUnbound, category, query, limit = 24,
-    debounceMs = 300, enabled = true,
+    debounceMs = 300, enabled = true, sessionKey,
   } = options;
 
   const [items, setItems] = useState<V2Application[]>([]);
@@ -84,15 +92,22 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
   const [error, setError] = useState<string | null>(null);
 
   // The debounce only smooths TYPING: category switches and the initial
-  // mount fire immediately (a tab switch must not lag 300 ms).
+  // mount fire immediately (a tab switch must not lag 300 ms). While the
+  // surface is CLOSED the query is synced immediately (五次复审 §39) — the
+  // host clears its search box on close, and waiting out the debounce would
+  // let a quick reopen fire one more request with the stale term.
   const [debouncedQuery, setDebouncedQuery] = useState(query ?? '');
   useEffect(() => {
+    if (!enabled) {
+      setDebouncedQuery(query ?? '');
+      return undefined;
+    }
     const next = query ?? '';
     if (next === debouncedQuery) return undefined;
     const timer = setTimeout(() => setDebouncedQuery(next), debounceMs);
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query, debounceMs]);
+  }, [enabled, query, debounceMs]);
 
   // A new filter combination is a NEW result set: reset to page one. The
   // request id guards against out-of-order responses when the user types
@@ -106,6 +121,27 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
   // keeps a late `finally` from an OLD loadMore clearing the CURRENT one's
   // spinner: only the newest loadMore owns the spinner state.
   const loadMoreSeqRef = useRef(0);
+
+  // Picker 会话切换的 render-time 重置（五次复审 §37–§38）：sessionKey 变化
+  // 的那一帧（而不是 passive effect 之后）就作废在途请求、清空会话状态，
+  // 并把 debouncedQuery 同步为当前 query —— 同一次 commit 的首屏请求因此
+  // 直接携带正确的（通常是已清空的）搜索词，不会先漏发一次旧词请求。
+  // render-time setState 是 React 官方的「props 变化时调整 state」模式：
+  // React 会立刻用新 state 重渲染再提交，effect 里看到的已是重置后的值。
+  const prevSessionRef = useRef(sessionKey);
+  if (prevSessionRef.current !== sessionKey) {
+    prevSessionRef.current = sessionKey;
+    requestIdRef.current += 1;
+    loadMoreSeqRef.current += 1;
+    setItems([]);
+    setCursor('');
+    setHasMore(false);
+    setError(null);
+    setLoadingMore(false);
+    setDebouncedQuery(query ?? '');
+    if (enabled) setLoading(true);
+  }
+
   const fetchFirstPage = useCallback(async () => {
     if (!enabled) return; // closed sheet / gated surface — no traffic
     const requestId = ++requestIdRef.current;
@@ -147,7 +183,7 @@ export function useApplicationPage(options: UseApplicationPageOptions) {
     }
   }, [enabled, kind, scope, mode, includeUnbound, debouncedQuery, category, limit]);
 
-  useEffect(() => { void fetchFirstPage(); }, [fetchFirstPage]);
+  useEffect(() => { void fetchFirstPage(); }, [fetchFirstPage, sessionKey]);
 
   // A surface that goes INACTIVE (a closed Drawer, a hidden sheet) must also
   // abandon whatever is in flight (执行报告 §22 / P2-4): `enabled: false` used

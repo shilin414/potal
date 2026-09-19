@@ -162,3 +162,77 @@ describe('useDirectoryUsers — loadMore 代际失效（四次复审 P1-2）', (
     expect(latest.current!.items.map((u) => u.id)).toEqual([9, 10]);
   });
 });
+
+describe('useDirectoryUsers — 快速关闭重开（五次复审 §33–§38）', () => {
+  it('close → IMMEDIATELY open: no stale-q request, no stale items, no stale error', async () => {
+    // 旧实现的测试要等 350ms 才敢重开 —— 实际用户 50ms 后就会重开。那时
+    // 防抖还没到期，重开的第一帧会带着上一次的 q 先发一次请求、闪一次旧
+    // 结果。sessionKey + 关闭期间同步防抖后，重开的第一屏必须直接 q=''。
+    mockUsers.mockResolvedValue({ results: [user(1, '张伟')], next_cursor: null });
+    options = { query: '张伟', enabled: true, sessionKey: 'a' };
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(350); // A 会话搜索落地
+    expect(latest.current!.items.map((u) => u.name)).toEqual(['张伟']);
+
+    // 关闭 A（selected → null）：sessionKey 立即重置 + 防抖同步清空。
+    options = { query: '张伟', enabled: false, sessionKey: null };
+    await act(async () => { root.render(<ProbeComponent />); });
+    // 注意：这里不等 350ms —— 关闭的下一帧立即重开。
+    await flush(10);
+    expect(latest.current!.items).toEqual([]);
+
+    // 立即重开 B：首屏请求不得携带 A 遗留的 q。
+    mockUsers.mockClear();
+    mockUsers.mockResolvedValue({ results: [user(2, '李四')], next_cursor: null });
+    options = { query: '', enabled: true, sessionKey: 'b' };
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+
+    expect(mockUsers).toHaveBeenCalledTimes(1);
+    expect(mockUsers).toHaveBeenLastCalledWith(
+      expect.not.objectContaining({ q: '张伟' }),
+    );
+    expect(latest.current!.items.map((u) => u.name)).toEqual(['李四']);
+    expect(latest.current!.error).toBeNull();
+  });
+
+  it('a stale error from the closed session never flashes on reopen', async () => {
+    mockUsers.mockRejectedValueOnce(new Error('network down'));
+    options = { query: '张伟', enabled: true, sessionKey: 'a' };
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(350);
+    expect(latest.current!.error).toBe('加载人员失败');
+
+    // 关闭 → 立即重开：旧会话的 error 已被 sessionKey 重置清掉。
+    mockUsers.mockResolvedValue({ results: [user(2, '李四')], next_cursor: null });
+    options = { query: '', enabled: true, sessionKey: 'b' };
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+    expect(latest.current!.error).toBeNull();
+    expect(latest.current!.items.map((u) => u.name)).toEqual(['李四']);
+  });
+
+  it('switching straight from A to B (no close in between) clears the old session in the same frame', async () => {
+    // A→B 直接切换（enabled 保持 true）：sessionKey 变化即新会话 ——
+    // 旧会话的 items 当帧清空，首屏请求直接 q=''（宿主 render-time 清了
+    // query 的前提下），不会带着 A 的搜索词先请求一次。
+    mockUsers.mockResolvedValue({ results: [user(1, '张伟')], next_cursor: null });
+    options = { query: '张伟', enabled: true, sessionKey: 'a' };
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(350);
+    expect(latest.current!.items.map((u) => u.name)).toEqual(['张伟']);
+
+    mockUsers.mockClear();
+    mockUsers.mockResolvedValue({ results: [user(9, '王五')], next_cursor: null });
+    // 宿主在会话切换的同一帧清空了 query（AccessPage 的 render-time 重置）。
+    options = { query: '', enabled: true, sessionKey: 'b' };
+    await act(async () => { root.render(<ProbeComponent />); });
+    await flush(10);
+
+    expect(mockUsers).toHaveBeenCalledTimes(1);
+    expect(mockUsers).toHaveBeenLastCalledWith(
+      expect.not.objectContaining({ q: '张伟' }),
+    );
+    expect(latest.current!.items.map((u) => u.name)).toEqual(['王五']);
+  });
+});

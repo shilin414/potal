@@ -31,6 +31,14 @@ export interface UseDirectoryUsersOptions {
    * the backend defaults to false.
    */
   includeInactive?: boolean;
+  /**
+   * Picker 会话标识（五次复审 §37–§38）：授权 Drawer 换目标 / Picker
+   * 关闭重开时传入新值。变化 = 新会话：立即作废在途请求与 loadMore、
+   * 清空 items/cursor/error，并把 debouncedQuery 同步为当前 query
+   * （不等防抖）—— 快速关闭重开的第一帧不再闪上一个会话的搜索词、
+   * 结果或错误。
+   */
+  sessionKey?: string | number | null;
 }
 
 const dedupeById = (items: DirectoryUser[]): DirectoryUser[] => {
@@ -50,6 +58,7 @@ export function useDirectoryUsers({
   limit = 50,
   debounceMs = 300,
   includeInactive = true,
+  sessionKey,
 }: UseDirectoryUsersOptions) {
   const [items, setItems] = useState<DirectoryUser[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
@@ -60,10 +69,16 @@ export function useDirectoryUsers({
 
   const [debouncedQuery, setDebouncedQuery] = useState(query);
   useEffect(() => {
+    // 关闭期间搜索词清空立即同步（五次复审 §39）：宿主在关闭时清空搜索框，
+    // 等满 300ms 防抖会让快速重开的第一帧仍带旧词多发一次请求。
+    if (!enabled) {
+      setDebouncedQuery(query);
+      return undefined;
+    }
     if (query === debouncedQuery) return undefined;
     const timer = setTimeout(() => setDebouncedQuery(query), debounceMs);
     return () => clearTimeout(timer);
-  }, [query, debouncedQuery, debounceMs]);
+  }, [enabled, query, debouncedQuery, debounceMs]);
 
   const requestIdRef = useRef(0);
   // loadMore generation (四次复审 P1-2): a NEW first page immediately revokes
@@ -71,6 +86,26 @@ export function useDirectoryUsers({
   // the moment the new request STARTS, and a stale `finally` can never clear
   // a NEWER loadMore's spinner. Only the newest loadMore owns the spinner.
   const loadMoreSeqRef = useRef(0);
+
+  // Picker 会话切换的 render-time 重置（五次复审 §37–§38）：sessionKey 变化
+  // 的那一帧（而不是 passive effect 之后）就作废在途请求、清空会话状态，
+  // 并把 debouncedQuery 同步为当前 query —— 同一次 commit 的首屏请求因此
+  // 直接携带正确的（通常是已清空的）搜索词，不会先漏发一次旧词请求。
+  // render-time setState 是 React 官方的「props 变化时调整 state」模式：
+  // React 会立刻用新 state 重渲染再提交，effect 里看到的已是重置后的值。
+  const prevSessionRef = useRef(sessionKey);
+  if (prevSessionRef.current !== sessionKey) {
+    prevSessionRef.current = sessionKey;
+    requestIdRef.current += 1;
+    loadMoreSeqRef.current += 1;
+    setItems([]);
+    setCursor(null);
+    setHasMore(false);
+    setError(null);
+    setLoadingMore(false);
+    setDebouncedQuery(query);
+    if (enabled) setLoading(true);
+  }
 
   // An INACTIVE surface (the users tab switched away, the picker sheet
   // closed) must abandon whatever is in flight (三次复审 §43–§45): bumping the
@@ -119,7 +154,7 @@ export function useDirectoryUsers({
     }
   }, [enabled, debouncedQuery, limit, includeInactive]);
 
-  useEffect(() => { void fetchFirstPage(); }, [fetchFirstPage]);
+  useEffect(() => { void fetchFirstPage(); }, [fetchFirstPage, sessionKey]);
 
   const loadMore = useCallback(async () => {
     if (!enabled || !cursor || loadingMore || loading) return;
