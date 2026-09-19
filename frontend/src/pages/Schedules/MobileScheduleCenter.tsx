@@ -44,7 +44,8 @@ function ScheduleCardSkeleton() {
 
 export function MobileScheduleCenter() {
   const {
-    data, loading, error, status, search, mutatingId,
+    data, loading, loadingMore, error, hasMore, loadMore,
+    status, search, mutatingId,
     setStatus, setSearch, reload, toggleEnabled, runNow, remove,
   } = useSchedules();
   const [editorOpen, setEditorOpen] = useState(false);
@@ -190,6 +191,17 @@ export function MobileScheduleCenter() {
               </button>
             </div>
           ))}
+          {/* >50 条任务继续可见（三次复审 P1）：Desktop/Mobile 共用
+              useSchedules 的 keyset 分页。 */}
+          {hasMore && (
+            <button
+              type="button"
+              className="mobile-console-more"
+              onClick={() => void loadMore()}
+            >
+              {loadingMore ? '加载中…' : '加载更多'}
+            </button>
+          )}
         </div>
       ))}
 

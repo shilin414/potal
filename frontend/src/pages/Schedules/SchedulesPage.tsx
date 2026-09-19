@@ -30,7 +30,8 @@ import './SchedulesPage.css';
 /** Desktop 表格 — 保留原样（开发执行报告 §54）。 */
 function DesktopScheduleCenter() {
   const {
-    data, loading, error, status, search, mutatingId,
+    data, loading, loadingMore, error, hasMore, loadMore,
+    status, search, mutatingId,
     setStatus, setSearch, reload, toggleEnabled, runNow, remove,
   } = useSchedules();
   const [editorOpen, setEditorOpen] = useState(false);
@@ -201,6 +202,15 @@ function DesktopScheduleCenter() {
             pagination={false}
             scroll={{ x: 860 }}
           />
+          {/* >50 条任务继续可见（三次复审 P1 §17–§22）：keyset 翻页，
+              Desktop 与 Mobile 共用 useSchedules 的分页语义。 */}
+          {hasMore && (
+            <div style={{ textAlign: 'center', marginTop: 16 }}>
+              <Button loading={loadingMore} onClick={() => void loadMore()}>
+                加载更多
+              </Button>
+            </div>
+          )}
         </div>
       ))}
 
