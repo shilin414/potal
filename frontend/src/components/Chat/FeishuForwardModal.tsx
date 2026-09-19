@@ -3,20 +3,24 @@
  * card, mirroring the reference project's 转发到飞书: contact/group tabs,
  * search, multi-select, recent-target history, per-target results.
  *
+ * 数据面复用 useFeishuTargets（五次复审 P2-8）：搜索词直发后端（user 走
+ * 目录搜索、chat 由后端翻全量后按名称过滤），请求带代际守卫 —— 旧实现
+ * loadTargets 没有请求序号，慢的旧查询返回后会覆盖新查询的结果。
+ *
  * Scope errors (403) surface a re-authorization action that reuses the
  * existing OAuth start → callback chain, which now requests the forwarding
  * scopes — that is how already-logged-in users top up permissions.
  */
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Avatar, Empty, Input, Modal, Spin, Tabs, message as antdMessage } from 'antd';
 import { CheckOutlined, ReloadOutlined, SendOutlined } from '@ant-design/icons';
 import {
-  fetchFeishuTargets,
   forwardShareToFeishu,
   loadForwardHistory,
   saveForwardHistory,
   type FeishuForwardTarget,
 } from '@/services/shareApi';
+import { useFeishuTargets } from '@/hooks/useFeishuTargets';
 import './FeishuForwardModal.css';
 
 interface FeishuForwardModalProps {
@@ -34,71 +38,46 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
 }) => {
   const [tab, setTab] = useState<'user' | 'chat'>('chat');
   const [query, setQuery] = useState('');
-  const [targets, setTargets] = useState<FeishuForwardTarget[]>([]);
-  const [loading, setLoading] = useState(false);
   const [needReauth, setNeedReauth] = useState(false);
   const [selected, setSelected] = useState<FeishuForwardTarget[]>([]);
   const [history, setHistory] = useState<FeishuForwardTarget[]>([]);
   const [sending, setSending] = useState(false);
-  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /** Chat list is fetched once per open and filtered locally. */
-  const chatCache = useRef<FeishuForwardTarget[]>([]);
 
   useEffect(() => {
     if (!open) return;
     setHistory(loadForwardHistory());
   }, [open]);
 
-  const loadTargets = async (type: 'user' | 'chat', q: string) => {
-    setLoading(true);
-    setNeedReauth(false);
-    try {
-      const list = await fetchFeishuTargets(type, q || undefined);
-      if (type === 'chat') chatCache.current = list;
-      setTargets(list);
-    } catch (e: any) {
-      const status = e?.response?.status;
-      if (status === 403 || status === 400) {
-        setNeedReauth(true);
-      } else {
-        antdMessage.error(e?.response?.data?.error || '获取转发目标失败');
-      }
-      setTargets([]);
-    } finally {
-      setLoading(false);
-    }
-  };
+  // 两个 tab 的目标都走共享远程搜索 hook（五次复审 P2-8）：请求代际保证
+  // 只有最新 query 的响应落地。非活跃 tab 的 hook 完全静默（enabled=false）
+  // —— 后端已按 page_token 翻全量页，切走 tab 时在后台整轮拉群聊既浪费
+  // 飞书 API 配额也毫无可见性；切回时按当前 query 重拉一遍即可。
+  // sessionKey：每次打开都是新会话，关闭即清空，重开不闪旧结果。
+  const chats = useFeishuTargets({
+    type: 'chat',
+    enabled: open && tab === 'chat',
+    query: query.trim(),
+    sessionKey: open ? 'feishu-forward' : null,
+  });
+  const users = useFeishuTargets({
+    type: 'user',
+    enabled: open && tab === 'user',
+    query: query.trim(),
+    sessionKey: open ? 'feishu-forward' : null,
+  });
 
-  // (Re)load when the modal opens or the tab changes. Chat loads once and
-  // filters locally; user search is debounced server-side.
-  useEffect(() => {
-    if (!open || needReauth) return;
-    if (tab === 'chat') {
-      if (chatCache.current.length === 0) void loadTargets('chat', '');
-      else setTargets(
-        chatCache.current.filter((t) => t.name.includes(query.trim())),
-      );
-    } else {
-      if (searchTimer.current) clearTimeout(searchTimer.current);
-      if (!query.trim()) {
-        setTargets([]);
-        setLoading(false);
-        return;
-      }
-      searchTimer.current = setTimeout(() => {
-        void loadTargets('user', query.trim());
-      }, 400);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, tab, query]);
+  const active = tab === 'chat' ? chats : users;
+  const targets = active.items;
+  const loading = active.loading;
+  // 目标接口 403/400 = 飞书授权缺权限（派生自最新失败，不另存状态）。
+  const authError = active.errorStatus === 403 || active.errorStatus === 400;
+  const showReauth = needReauth || authError;
 
   const reset = () => {
     setTab('chat');
     setQuery('');
-    setTargets([]);
     setSelected([]);
     setNeedReauth(false);
-    chatCache.current = [];
   };
 
   const close = () => {
@@ -170,7 +149,7 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
       centered
       destroyOnClose
     >
-      {needReauth ? (
+      {showReauth ? (
         <div className="ffm-reauth">
           <p>当前飞书授权缺少转发所需权限（IM / 通讯录）。</p>
           <p className="ffm-reauth__hint">
@@ -217,7 +196,19 @@ const FeishuForwardModal: React.FC<FeishuForwardModalProps> = ({
           )}
 
           <div className="ffm-list">
-            {loading ? (
+            {/* 加载失败 ≠ 没有目标（五次复审 §28，ERROR ≠ EMPTY）：错误
+                可见 + 可重试，不再静默空列表。 */}
+            {active.error ? (
+              <div className="ffm-list__center ffm-list__error">
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description={active.error}
+                />
+                <button type="button" className="ffm-error-retry" onClick={() => void active.refresh()}>
+                  <ReloadOutlined /> 重试
+                </button>
+              </div>
+            ) : loading ? (
               <div className="ffm-list__center"><Spin /></div>
             ) : targets.length === 0 ? (
               <div className="ffm-list__center">

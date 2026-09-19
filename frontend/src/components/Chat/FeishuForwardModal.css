@@ -199,3 +199,23 @@
   font-family: inherit;
   cursor: pointer;
 }
+
+/* 目标加载失败态（五次复审 §28）：错误可见 + 重试，不静默成空列表。 */
+.ffm-list__error {
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ffm-error-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  font-size: 13px;
+  font-family: inherit;
+  cursor: pointer;
+}
