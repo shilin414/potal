@@ -110,7 +110,38 @@ vi.mock('antd', () => ({
     ({ children }: { children?: React.ReactNode }) => <label>{children}</label>,
     { Group: ({ children }: { children?: React.ReactNode }) => <div>{children}</div> },
   ),
-  Select: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
+  Select: ({
+    options, onSearch, onPopupScroll, loading, mode,
+  }: {
+    options?: Array<{ value: number; label: string }>;
+    onSearch?: (value: string) => void;
+    onPopupScroll?: (e: {
+      currentTarget: { scrollTop: number; scrollHeight: number; clientHeight: number };
+    }) => void;
+    loading?: boolean;
+    mode?: string;
+  }) => (
+    <div
+      data-testid="user-select"
+      data-mode={mode}
+      data-loading={loading ? 'true' : 'false'}
+      data-options={JSON.stringify((options ?? []).map((o) => o.value))}
+    >
+      <button type="button" data-testid="select-search" onClick={() => onSearch?.('张伟')}>
+        search
+      </button>
+      <button
+        type="button"
+        data-testid="select-scroll"
+        onClick={() => onPopupScroll?.({
+          // 近底部：scrollHeight - scrollTop - clientHeight = 10 < 24。
+          currentTarget: { scrollTop: 90, scrollHeight: 100, clientHeight: 0 },
+        })}
+      >
+        scroll
+      </button>
+    </div>
+  ),
   Space: ({ children }: { children?: React.ReactNode }) => <div>{children}</div>,
   Switch: () => <button type="button" data-testid="switch" />,
   Table: ({ dataSource, columns, locale }: {
@@ -143,7 +174,7 @@ vi.mock('antd', () => ({
 }));
 
 import AccessPage from '../AccessPage';
-import { enterpriseApi } from '../../enterpriseApi';
+import { enterpriseApi, type DirectoryUser } from '../../enterpriseApi';
 import { message } from 'antd';
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -547,5 +578,80 @@ describe('desktop AccessPage — drawer 三态 + save spinner 复位（复审）
     expect(drawer().textContent).toContain('A资源部门');
     expect(drawer().textContent).not.toContain('A资源部门-已保存');
     expect(save()!.dataset.loading).toBe('false');
+  });
+});
+
+describe('desktop AccessPage — user picker server search + pagination (四次复审 P2-2)', () => {
+  const dirUser = (id: number): DirectoryUser => ({
+    id, name: `员工${id}`, avatar_url: '', open_id: `o-${id}`, active_status: 1,
+    is_resigned: false, local_user_id: null, is_active: true,
+    departments: [{ id: 1, name: '研发部', is_primary: true }],
+  } as unknown as DirectoryUser);
+
+  const POLICY_ASSIGNED = {
+    application_id: 7,
+    access_mode: 'assigned' as const,
+    departments: [],
+    users: [{ directory_user_id: 999, name: '已授权人员', avatar_url: '', departments: ['财务部'] }],
+  };
+
+  beforeEach(() => {
+    vi.mocked(enterpriseApi.users).mockReset();
+    vi.mocked(enterpriseApi.access).mockReset().mockResolvedValue(POLICY_ASSIGNED);
+    pageState.items = [];
+    pageState.error = null;
+    pageState.hasMore = false;
+  });
+
+  it('popup scroll loads the next cursor page — the 101st candidate becomes selectable', async () => {
+    pageState.items = [row(7, 'A资源')];
+    vi.mocked(enterpriseApi.users)
+      .mockImplementationOnce(async () => ({
+        results: Array.from({ length: 50 }, (_, i) => dirUser(i + 1)),
+        next_cursor: 'c1',
+      }))
+      .mockImplementationOnce(async () => ({
+        results: Array.from({ length: 51 }, (_, i) => dirUser(i + 51)),
+        next_cursor: null,
+      }));
+
+    await mountPage();
+    await click(document.querySelector('[data-open-cell="7"] button')!);
+    await flush(20);
+
+    const select = () => document.querySelector('[data-testid="user-select"]')!;
+    const options = () => JSON.parse(select().dataset.options!) as number[];
+    // 第一页 50 人已在候选；已授权但不在目录页里的 999 也有 label
+    // （policy.users 合并进 options，不退化成 raw id）。
+    expect(options()).toContain(999);
+    expect(options()).toContain(50);
+    expect(options()).not.toContain(101);
+
+    // 下拉滚到底 → 拉下一 cursor 页 → 第 101 人也可选（旧 limit:100 截断点）。
+    await click(document.querySelector('[data-testid="select-scroll"]')!);
+    await flush(20);
+    expect(vi.mocked(enterpriseApi.users)).toHaveBeenLastCalledWith(
+      expect.objectContaining({ cursor: 'c1' }),
+    );
+    expect(options()).toContain(101);
+    expect(options()).toContain(999); // 已授权 label 不丢
+  });
+
+  it('the search term goes to the SERVER (q), not browser filtering', async () => {
+    pageState.items = [row(7, 'A资源')];
+    vi.mocked(enterpriseApi.users).mockImplementation(
+      async () => ({ results: [dirUser(1)], next_cursor: null }),
+    );
+
+    await mountPage();
+    await click(document.querySelector('[data-open-cell="7"] button')!);
+    await flush(20);
+    expect(vi.mocked(enterpriseApi.users)).toHaveBeenCalledTimes(1);
+
+    await click(document.querySelector('[data-testid="select-search"]')!);
+    await flush(350); // useDirectoryUsers 的 300ms 防抖
+    expect(vi.mocked(enterpriseApi.users)).toHaveBeenLastCalledWith(
+      expect.objectContaining({ q: '张伟' }),
+    );
   });
 });

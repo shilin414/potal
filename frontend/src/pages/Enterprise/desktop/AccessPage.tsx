@@ -27,12 +27,11 @@ import { useLocation } from "react-router-dom";
 import { useApplicationPage } from "@/hooks/useApplicationPage";
 import { fetchApplicationDetail, type V2Application } from "@/services/runApi";
 import {
-  enterpriseApi,
   type AccessMode,
   type DirectoryDepartment,
-  type DirectoryUser,
 } from "../enterpriseApi";
 import { useAccessPolicyEditor } from "../hooks/useAccessPolicyEditor";
+import { useDirectoryUsers } from "../hooks/useDirectoryUsers";
 
 function buildTree(deps: DirectoryDepartment[]) {
   const nodes = new Map<number, any>();
@@ -75,9 +74,20 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
     limit: 50,
   });
   const [selected, setSelected] = useState<AccessTarget | null>(null);
-  const [users, setUsers] = useState<DirectoryUser[]>([]);
   const [includeChildren, setIncludeChildren] = useState(true);
   const [deepLinkError, setDeepLinkError] = useState<string | null>(null);
+
+  // Desktop/Mobile 同一数据语义（四次复审 P2-2）：授权人员 Select 也走
+  // useDirectoryUsers 的服务端搜索 + cursor 分页（下拉滚动加载），与
+  // MobileUserPicker 完全一致 —— 企业 10000 人时不再被「前 100 条」截断。
+  const [userQuery, setUserQuery] = useState("");
+  const directoryUsers = useDirectoryUsers({
+    query: userQuery,
+    enabled: Boolean(selected),
+    // ACL 只提供在职员工（二次复审 D1）：离职人员不再出现在候选里。
+    includeInactive: false,
+  });
+
   const {
     policy, departments: deps,
     loading: policyLoading, loadError: policyLoadError,
@@ -96,27 +106,10 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
   const [deepLinkAttempt, setDeepLinkAttempt] = useState(0);
 
   // Opening a drawer selects its target; the shared hook loads the policy
-  // (guarded). The user-option seed is a directory-wide read — it does not
-  // belong to the ACL contract, so it failing never blocks editing.
+  // (guarded) and useDirectoryUsers loads the first candidate page.
   const open = useCallback((app: AccessTarget) => {
     setSelected(app);
   }, []);
-  useEffect(() => {
-    const targetId = selected?.id;
-    if (!targetId) return undefined;
-    let stale = false;
-    enterpriseApi
-      .users({ limit: 100 })
-      .then((page) => {
-        if (!stale) setUsers(page.results);
-      })
-      .catch(() => {
-        /* searching still works; granted users stay visible in options */
-      });
-    return () => {
-      stale = true;
-    };
-  }, [selected]);
 
   // A changed ?app= id must clear the previous id's error banner (二次复审
   // P2-6).
@@ -153,7 +146,8 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
   }, [initial, items, loading, selected, open, deepLinkAttempt]);
 
   // 已授权人员永远有名字可显示（三次复审 §51）：把 policy.users 合并进
-  // options——搜索/首屏 100 条之外已有授权不再退化成 raw id。
+  // options——搜索/已加载页之外已有授权不再退化成 raw id。目录候选来自
+  // useDirectoryUsers（服务端搜索 + 分页），不再是一次性 limit:100。
   const userOptions = useMemo(() => {
     const byId = new Map<number, { value: number; label: string }>();
     for (const u of policy?.users ?? []) {
@@ -164,7 +158,7 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
           : u.name,
       });
     }
-    for (const u of users) {
+    for (const u of directoryUsers.items) {
       if (byId.has(u.id)) continue;
       byId.set(u.id, {
         value: u.id,
@@ -172,21 +166,8 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
       });
     }
     return Array.from(byId.values());
-  }, [policy, users]);
+  }, [policy, directoryUsers.items]);
 
-  // A stale search response must not overwrite a newer one (复审 P2): each
-  // keystroke bumps the generation; only the newest may setUsers.
-  const userSearchSeqRef = useRef(0);
-  const searchUsers = async (value: string) => {
-    const seq = ++userSearchSeqRef.current;
-    try {
-      const result = await enterpriseApi.users({ q: value, limit: 100 });
-      if (seq !== userSearchSeqRef.current) return;
-      setUsers(result.results);
-    } catch {
-      /* keep current options */
-    }
-  };
   const setUserIds = (ids: number[]) => {
     const pool = new Map<number, {
       directory_user_id: number;
@@ -202,7 +183,7 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
         departments: u.departments ?? [],
       });
     }
-    for (const u of users) {
+    for (const u of directoryUsers.items) {
       if (pool.has(u.id)) continue;
       pool.set(u.id, {
         directory_user_id: u.id,
@@ -402,11 +383,26 @@ export default function AccessPage({ kind }: { kind: "chat" | "fixed" }) {
                 </div>
                 <div>
                   <Typography.Title level={5}>授权人员</Typography.Title>
+                  {/* 与 MobileUserPicker 同一契约（四次复审 P2-2）：搜索词直发
+                      后端（覆盖全部员工而非已加载页），下拉滚到底拉下一页，
+                      >100 人的搜索结果也能全部选到。 */}
                   <Select
                     mode="multiple"
                     showSearch
                     filterOption={false}
-                    onSearch={(value) => void searchUsers(value)}
+                    loading={directoryUsers.loading}
+                    onSearch={setUserQuery}
+                    onPopupScroll={(e) => {
+                      const { scrollTop, scrollHeight, clientHeight } =
+                        e.currentTarget;
+                      if (
+                        directoryUsers.hasMore
+                        && !directoryUsers.loadingMore
+                        && scrollHeight - scrollTop - clientHeight < 24
+                      ) {
+                        void directoryUsers.loadMore();
+                      }
+                    }}
                     value={policy.users.map((u) => u.directory_user_id)}
                     onChange={setUserIds}
                     style={{ width: "100%" }}
