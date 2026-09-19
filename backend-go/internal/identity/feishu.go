@@ -329,9 +329,16 @@ func (c *FeishuClient) ListUserChats(ctx context.Context, token string) ([]Feish
 				AvatarURL: avatarFromRaw(it.Avatar),
 			})
 		}
-		if !payload.HasMore || payload.PageToken == "" {
+		if !payload.HasMore {
 			completed = true
 			break
+		}
+		// has_more=true + empty page_token (七次复审 P1-1): the provider
+		// says another page exists but hands us no way to read it. Treating
+		// that as "complete" would silently drop chat 101+ while the caller
+		// believes it has the full list — TRUNCATED != COMPLETE, so fail loud.
+		if payload.PageToken == "" {
+			return nil, fmt.Errorf("feishu: chat has_more without page_token")
 		}
 		if _, dup := seenTokens[payload.PageToken]; dup {
 			return nil, fmt.Errorf("feishu: repeated chat page token %q", payload.PageToken)
@@ -428,6 +435,19 @@ func (c *FeishuClient) SearchFeishuUsers(ctx context.Context, token, query strin
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return nil, fmt.Errorf("feishu: search user decode: %w", err)
+	}
+	// Continuation invariant (七次复审 P1-1): has_more=true obligates a
+	// non-empty page_token, and the token must make progress (the official
+	// contract guarantees page_token != "" whenever has_more is true). Either
+	// violation would truncate the directory search while the caller still
+	// believes the picker saw every match — fail loud instead.
+	if payload.HasMore {
+		if payload.PageToken == "" {
+			return nil, fmt.Errorf("feishu: user search has_more without page_token")
+		}
+		if pageToken != "" && payload.PageToken == pageToken {
+			return nil, fmt.Errorf("feishu: user search page_token made no progress")
+		}
 	}
 	out := &FeishuContactUserPage{
 		Users:     make([]FeishuContactUser, 0, len(payload.Users)),

@@ -308,3 +308,73 @@ func TestListUserChatsRepeatedPageTokenFails(t *testing.T) {
 		t.Fatalf("provider calls=%d, want fast-fail on the 2nd page", calls)
 	}
 }
+
+// TestListUserChatsHasMoreWithoutTokenFails (七次复审 P1-1): the provider
+// answering has_more=true with an EMPTY page_token claims a next page exists
+// while providing no way to read it. The old code folded that into the
+// normal end-of-list branch, so the first 100 chats masqueraded as the
+// complete set (TRUNCATED != COMPLETE) — it must ERROR instead, after
+// exactly one provider call.
+func TestListUserChatsHasMoreWithoutTokenFails(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"code": 0, "msg": "ok",
+			"data": map[string]any{
+				"items":      []any{map[string]any{"chat_id": "oc-1", "name": "第一页群"}},
+				"has_more":   true,
+				"page_token": "",
+			},
+		})
+	}))
+	defer srv.Close()
+	client := NewFeishuClient(srv.URL, "id", "secret", srv.Client())
+	chats, err := client.ListUserChats(context.Background(), "token")
+	if err == nil {
+		t.Fatalf("expected has_more-without-token error, got %d chats as if complete", len(chats))
+	}
+	if !strings.Contains(err.Error(), "chat has_more without page_token") {
+		t.Fatalf("err=%v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("provider calls=%d, want exactly 1 (no continuation possible)", calls)
+	}
+}
+
+// TestSearchFeishuUsersHasMoreWithoutTokenFails (七次复审 P1-1): the user
+// search must uphold the same continuation invariant — has_more=true with an
+// empty page_token is a provider contract violation, not "the last page".
+func TestSearchFeishuUsersHasMoreWithoutTokenFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{"has_more":true,"page_token":"","users":[]}}`))
+	}))
+	defer srv.Close()
+	client := NewFeishuClient(srv.URL, "id", "secret", srv.Client())
+	page, err := client.SearchFeishuUsers(context.Background(), "token", "张三", 20, "")
+	if err == nil {
+		t.Fatalf("expected has_more-without-token error, got page=%+v as if complete", page)
+	}
+	if !strings.Contains(err.Error(), "user search has_more without page_token") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+// TestSearchFeishuUsersRepeatedTokenFails (七次复审 P1-1): the provider
+// echoing back the SAME page_token it was given makes no progress — every
+// continuation page would repeat forever. Fail loud instead of letting the
+// caller loop (the frontend loadMore would spin on identical pages).
+func TestSearchFeishuUsersRepeatedTokenFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":0,"msg":"ok","data":{"has_more":true,"page_token":"pt-stuck","users":[]}}`))
+	}))
+	defer srv.Close()
+	client := NewFeishuClient(srv.URL, "id", "secret", srv.Client())
+	page, err := client.SearchFeishuUsers(context.Background(), "token", "张三", 20, "pt-stuck")
+	if err == nil {
+		t.Fatalf("expected repeated-token error, got page=%+v", page)
+	}
+	if !strings.Contains(err.Error(), "made no progress") {
+		t.Fatalf("err=%v", err)
+	}
+}
